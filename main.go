@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -12,9 +13,10 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
-// run implements the whole of Phase 0's behavior: load the config, print it
-// redacted, and exit. It takes stdout/stderr explicitly so it is testable
-// without touching the real process streams.
+// run loads the config, prints it redacted, and (in --once mode) checks
+// connectivity against every configured instance before exiting. It takes
+// stdout/stderr explicitly so it is testable without touching the real
+// process streams.
 func run(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("cutoffarr", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -50,7 +52,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// goes straight to stdout.
 	printRedactedConfig(stdout, *cfg)
 
-	if !*once {
+	if *once {
+		// Phase 1: for each configured instance, run the read-only
+		// connectivity check sequentially. Any one instance's failure is
+		// logged as a warning by checkInstanceConnectivity itself and
+		// must not stop the remaining instances or affect the exit code.
+		for _, inst := range cfg.Instances {
+			checkInstanceConnectivity(context.Background(), logger, inst)
+		}
+	} else {
 		logger.Info("daemon mode is not implemented yet; it arrives in a later phase")
 	}
 
