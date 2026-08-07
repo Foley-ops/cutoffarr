@@ -253,7 +253,23 @@ instances: []
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "level=WARN") {
-		t.Errorf("stdout does not contain a WARN level log for empty instances:\n%s", stdout.String())
+	out := stdout.String()
+	if !strings.Contains(out, "level=WARN") {
+		t.Errorf("stdout does not contain a WARN level log for empty instances:\n%s", out)
+	}
+
+	// The redacted config printout is mandatory startup output and must be
+	// the very first thing printed, ahead of any other log line including
+	// this warning.
+	configIdx := strings.Index(out, "configuration loaded")
+	warnIdx := strings.Index(out, "no instances configured")
+	if configIdx == -1 || warnIdx == -1 {
+		t.Fatalf("expected both the config printout and the no-instances warning in stdout:\n%s", out)
+	}
+	if configIdx != 0 {
+		t.Errorf("expected the redacted config printout to be the very first output, but it started at byte %d:\n%s", configIdx, out)
+	}
+	if configIdx > warnIdx {
+		t.Errorf("expected the redacted config printout (at %d) to appear before the no-instances warning (at %d):\n%s", configIdx, warnIdx, out)
 	}
 }

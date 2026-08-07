@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"regexp"
@@ -59,10 +61,12 @@ func (c Config) Redacted() Config {
 // true rather than Go's bool zero value of false).
 //
 // poll_interval and webhook_debounce are captured as raw yaml.Node values
-// (not pointers: yaml.v3 only takes its raw-node fast path for a field typed
-// exactly as yaml.Node) so that both "24h"-style strings and a bare "0" can
-// be read back as text and handed to time.ParseDuration ourselves. An
-// undecoded Node has a zero Kind, which is how we detect "absent from file".
+// (not pointers to bool/int/string like the other optional fields above) so
+// that both "24h"-style strings and a bare "0" can be read back as text and
+// handed to time.ParseDuration ourselves. yaml.v3 would decode into a
+// *yaml.Node just as well; the value-typed field is chosen here because an
+// undecoded Node has a zero Kind, which is how we detect "absent from file"
+// without an extra nil check.
 type rawConfig struct {
 	DryRun          *bool         `yaml:"dry_run"`
 	PollInterval    yaml.Node     `yaml:"poll_interval"`
@@ -92,7 +96,7 @@ func expandEnvVars(raw string) (string, error) {
 	var missing []string
 	seenMissing := make(map[string]bool)
 	expanded := envVarPattern.ReplaceAllStringFunc(raw, func(match string) string {
-		name := envVarPattern.FindStringSubmatch(match)[1]
+		name := match[2 : len(match)-1] // strip the surrounding "${" and "}"
 		val, ok := os.LookupEnv(name)
 		if !ok {
 			if !seenMissing[name] {
@@ -123,8 +127,15 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: %w", err)
 	}
 
+	// KnownFields(true) makes an unrecognized key (e.g. a typo like
+	// "dryrun" instead of "dry_run") a fatal parse error instead of being
+	// silently ignored. A completely empty document (io.EOF from Decode)
+	// is not an error: it means every field is absent, same as
+	// yaml.Unmarshal's behavior on empty input, and defaults apply below.
 	var raw rawConfig
-	if err := yaml.Unmarshal([]byte(expanded), &raw); err != nil {
+	dec := yaml.NewDecoder(strings.NewReader(expanded))
+	dec.KnownFields(true)
+	if err := dec.Decode(&raw); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("config: parsing yaml: %w", err)
 	}
 
@@ -210,6 +221,10 @@ func validateConfig(cfg *Config) error {
 
 	if cfg.PollInterval != 0 && cfg.PollInterval < time.Hour {
 		return fmt.Errorf("config: poll_interval %s is below the minimum of 1h (use 0 to disable the sweep)", cfg.PollInterval)
+	}
+
+	if cfg.WebhookPort < 1 || cfg.WebhookPort > 65535 {
+		return fmt.Errorf("config: webhook_port %d is out of range (must be between 1 and 65535)", cfg.WebhookPort)
 	}
 
 	seenNames := make(map[string]bool, len(cfg.Instances))

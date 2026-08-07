@@ -377,6 +377,78 @@ func TestLoadConfig_MissingFileIsFatal(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_UnknownTopLevelKeyFatal(t *testing.T) {
+	path := writeConfig(t, `
+dryrun: false
+instances: []
+`)
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("LoadConfig returned nil error, want error for unknown top-level key")
+	}
+	if !strings.Contains(err.Error(), "dryrun") {
+		t.Errorf("error %q does not name the unknown key %q", err.Error(), "dryrun")
+	}
+}
+
+func TestLoadConfig_UnknownInstanceKeyFatal(t *testing.T) {
+	path := writeConfig(t, `
+instances:
+  - name: radarr-main
+    type: radarr
+    url: http://radarr:7878
+    apikey: key1
+`)
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("LoadConfig returned nil error, want error for unknown instance key")
+	}
+	if !strings.Contains(err.Error(), "apikey") {
+		t.Errorf("error %q does not name the unknown key %q", err.Error(), "apikey")
+	}
+}
+
+func TestLoadConfig_WebhookPortZeroFatal(t *testing.T) {
+	path := writeConfig(t, `
+webhook_port: 0
+instances: []
+`)
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("LoadConfig returned nil error, want error for webhook_port 0")
+	}
+	if !strings.Contains(err.Error(), "webhook_port") {
+		t.Errorf("error %q does not mention webhook_port", err.Error())
+	}
+}
+
+func TestLoadConfig_WebhookPortOutOfRangeFatal(t *testing.T) {
+	for _, v := range []string{"-1", "65536", "100000"} {
+		t.Run(v, func(t *testing.T) {
+			path := writeConfig(t, "webhook_port: "+v+"\ninstances: []\n")
+			_, err := LoadConfig(path)
+			if err == nil {
+				t.Fatalf("LoadConfig returned nil error, want error for webhook_port %s", v)
+			}
+			if !strings.Contains(err.Error(), "webhook_port") {
+				t.Errorf("error %q does not mention webhook_port", err.Error())
+			}
+		})
+	}
+}
+
+func TestLoadConfig_WebhookPortBoundsAreValid(t *testing.T) {
+	for _, v := range []string{"1", "65535"} {
+		t.Run(v, func(t *testing.T) {
+			path := writeConfig(t, "webhook_port: "+v+"\ninstances: []\n")
+			_, err := LoadConfig(path)
+			if err != nil {
+				t.Fatalf("LoadConfig returned error for webhook_port %s: %v", v, err)
+			}
+		})
+	}
+}
+
 func TestConfig_RedactedHidesAPIKeys(t *testing.T) {
 	cfg := Config{
 		Instances: []Instance{

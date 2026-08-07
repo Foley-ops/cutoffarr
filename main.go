@@ -42,15 +42,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	logger := slog.New(slog.NewTextHandler(stdout, &slog.HandlerOptions{Level: slogLevel(cfg.LogLevel)}))
 
-	if len(cfg.Instances) == 0 {
-		logger.Warn("no instances configured")
-	}
-
 	// The redacted config printout is a mandatory startup behavior, not a
 	// leveled log message: it must appear regardless of log_level (e.g.
 	// warn or error), so it bypasses the slog handler's level filter and
-	// goes straight to stdout.
+	// goes straight to stdout. It must also be the first thing printed, so
+	// it runs before any other log line, including the no-instances
+	// warning below.
 	printRedactedConfig(stdout, *cfg)
+
+	if len(cfg.Instances) == 0 {
+		logger.Warn("no instances configured")
+	}
 
 	if *once {
 		// Phase 1: for each configured instance, run the read-only

@@ -33,6 +33,12 @@ type qualityProfileResponse struct {
 	UpgradeAllowed    *bool   `json:"upgradeAllowed"`
 }
 
+// maxResponseBodyBytes caps how much of a single *arr API response body is
+// read into memory. Per plan §2.6, a response that reaches this cap is
+// treated the same as any other malformed response for that instance: warn
+// and skip, rather than buffering an unbounded (or truncated) body.
+const maxResponseBodyBytes = 4 * 1024 * 1024 // 4 MB
+
 // expectedAppNameByType is the *arr appName each configured instance type
 // is expected to report from /system/status. Used only for the informational
 // sanity check in this phase, per plan §5's warning not to trust field
@@ -109,9 +115,11 @@ func checkInstanceConnectivity(ctx context.Context, logger *slog.Logger, inst In
 }
 
 // fetchBody issues a GET against path via client and returns the full
-// response body. Any transport error, non-2xx status (client.Do's job),
-// or body-read error is returned as-is for the caller to treat as this
-// instance's cycle being skipped.
+// response body, capped at maxResponseBodyBytes. Any transport error,
+// non-2xx status (client.Do's job), or body-read error is returned as-is
+// for the caller to treat as this instance's cycle being skipped. A body
+// that reaches the cap exactly is indistinguishable from one that was
+// truncated by it, so it is also reported as an error per plan §2.6.
 func fetchBody(ctx context.Context, client *APIClient, path string) ([]byte, error) {
 	resp, err := client.Do(ctx, http.MethodGet, path, nil)
 	if err != nil {
@@ -119,9 +127,12 @@ func fetchBody(ctx context.Context, client *APIClient, path string) ([]byte, err
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("reading response body from %s: %w", path, err)
+	}
+	if len(body) == maxResponseBodyBytes {
+		return nil, fmt.Errorf("reading response body from %s: response reached the %d byte limit (possibly truncated)", path, maxResponseBodyBytes)
 	}
 	return body, nil
 }

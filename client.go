@@ -14,6 +14,13 @@ import (
 // retries, and reads are kept equally simple.
 const apiClientTimeout = 15 * time.Second
 
+// errorBodySnippetLimit caps how much of a non-2xx response body is read
+// into the returned error, so a large or unexpected response (e.g. an HTML
+// error page from a reverse proxy) can't bloat error output. It is enough
+// to distinguish, for example, a JSON "invalid API key" body from a wrong
+// URL returning an HTML 404 page.
+const errorBodySnippetLimit = 200
+
 // APIClient is a minimal wrapper around net/http for talking to a single
 // Sonarr or Radarr instance. It is introduced in this phase but not called
 // anywhere yet; Phase 1 is the first phase that issues real *arr API calls.
@@ -54,7 +61,8 @@ func (c *APIClient) Do(ctx context.Context, method, path string, body io.Reader)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		defer resp.Body.Close()
-		return nil, fmt.Errorf("client: %s %s: unexpected status %d", method, reqURL, resp.StatusCode)
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodySnippetLimit))
+		return nil, fmt.Errorf("client: %s %s: unexpected status %d: %s", method, reqURL, resp.StatusCode, snippet)
 	}
 
 	return resp, nil

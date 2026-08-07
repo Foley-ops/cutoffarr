@@ -72,6 +72,44 @@ func TestAPIClient_Do_NonTwoxxStatusIsError(t *testing.T) {
 	}
 }
 
+func TestAPIClient_Do_ErrorIncludesResponseBodySnippet(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"Unauthorized"}`))
+	}))
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL, "bad-key")
+	_, err := c.Do(context.Background(), http.MethodGet, "/api/v3/system/status", nil)
+	if err == nil {
+		t.Fatal("Do returned nil error, want error for 401 response")
+	}
+	if !strings.Contains(err.Error(), `{"error":"Unauthorized"}`) {
+		t.Errorf("error %q does not contain the response body snippet", err.Error())
+	}
+}
+
+func TestAPIClient_Do_ErrorResponseBodySnippetIsTruncatedAt200Bytes(t *testing.T) {
+	long := strings.Repeat("x", 300)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(long))
+	}))
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL, "key")
+	_, err := c.Do(context.Background(), http.MethodGet, "/api/v3/movie", nil)
+	if err == nil {
+		t.Fatal("Do returned nil error, want error for 500 response")
+	}
+	if !strings.Contains(err.Error(), strings.Repeat("x", 200)) {
+		t.Errorf("error does not contain the expected 200-byte snippet: %q", err.Error())
+	}
+	if strings.Contains(err.Error(), strings.Repeat("x", 201)) {
+		t.Errorf("error contains more than 200 bytes of the body, want truncation: %q", err.Error())
+	}
+}
+
 func TestAPIClient_Do_SuccessReturnsResponse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusCreated)

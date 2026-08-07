@@ -239,6 +239,99 @@ func TestCheckInstanceConnectivity_MalformedQualityProfileJSON_SkipsWithWarning(
 	}
 }
 
+// TestCheckInstanceConnectivity_BaseURLWithTrailingSlash_JoinsPathsCorrectly
+// pins the url.JoinPath behavior this package relies on: a base URL ending
+// in "/" must not produce a doubled slash before the API path.
+func TestCheckInstanceConnectivity_BaseURLWithTrailingSlash_JoinsPathsCorrectly(t *testing.T) {
+	var gotPaths, gotAPIKeys []string
+	srv := httptest.NewServer(recordingHandler(t, http.StatusOK, radarrStatusJSON, http.StatusOK, radarrProfilesJSON, &gotPaths, &gotAPIKeys))
+	defer srv.Close()
+
+	logger, _ := newConnectivityTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-trailing-slash", Type: "radarr", URL: srv.URL + "/", APIKey: "key"}
+
+	checkInstanceConnectivity(context.Background(), logger, inst)
+
+	if len(gotPaths) != 2 {
+		t.Fatalf("got %d requests, want 2: %v", len(gotPaths), gotPaths)
+	}
+	if gotPaths[0] != "/api/v3/system/status" {
+		t.Errorf("first request path = %q, want /api/v3/system/status", gotPaths[0])
+	}
+	if gotPaths[1] != "/api/v3/qualityprofile" {
+		t.Errorf("second request path = %q, want /api/v3/qualityprofile", gotPaths[1])
+	}
+}
+
+// TestCheckInstanceConnectivity_BaseURLWithSubpath_JoinsPathsCorrectly pins
+// the url.JoinPath behavior needed for a reverse-proxied instance reachable
+// under a subpath (e.g. http://host/radarr instead of a bare host).
+func TestCheckInstanceConnectivity_BaseURLWithSubpath_JoinsPathsCorrectly(t *testing.T) {
+	var gotPaths, gotAPIKeys []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/radarr/api/v3/system/status", func(w http.ResponseWriter, r *http.Request) {
+		gotPaths = append(gotPaths, r.URL.Path)
+		gotAPIKeys = append(gotAPIKeys, r.Header.Get("X-Api-Key"))
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(radarrStatusJSON))
+	})
+	mux.HandleFunc("/radarr/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
+		gotPaths = append(gotPaths, r.URL.Path)
+		gotAPIKeys = append(gotAPIKeys, r.Header.Get("X-Api-Key"))
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(radarrProfilesJSON))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, _ := newConnectivityTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-subpath", Type: "radarr", URL: srv.URL + "/radarr", APIKey: "key"}
+
+	checkInstanceConnectivity(context.Background(), logger, inst)
+
+	if len(gotPaths) != 2 {
+		t.Fatalf("got %d requests, want 2: %v", len(gotPaths), gotPaths)
+	}
+	if gotPaths[0] != "/radarr/api/v3/system/status" {
+		t.Errorf("first request path = %q, want /radarr/api/v3/system/status", gotPaths[0])
+	}
+	if gotPaths[1] != "/radarr/api/v3/qualityprofile" {
+		t.Errorf("second request path = %q, want /radarr/api/v3/qualityprofile", gotPaths[1])
+	}
+}
+
+func TestCheckInstanceConnectivity_OversizedSystemStatusBody_SkipsWithWarning(t *testing.T) {
+	// A body that fills (or exceeds) the response size cap: fetchBody must
+	// treat this as a possibly-truncated, malformed response rather than
+	// buffering it unboundedly or crashing.
+	oversized := strings.Repeat("a", maxResponseBodyBytes)
+	var gotPaths, gotAPIKeys []string
+	srv := httptest.NewServer(recordingHandler(t, http.StatusOK, oversized, http.StatusOK, radarrProfilesJSON, &gotPaths, &gotAPIKeys))
+	defer srv.Close()
+
+	logger, buf := newConnectivityTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-oversized", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	done := make(chan struct{})
+	go func() {
+		checkInstanceConnectivity(context.Background(), logger, inst)
+		close(done)
+	}()
+	<-done // must not hang or crash
+
+	if len(gotPaths) != 1 {
+		t.Fatalf("expected qualityprofile to never be called after oversized system/status body, got: %v", gotPaths)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") {
+		t.Errorf("expected a warning to be logged for an oversized response body:\n%s", out)
+	}
+	if !strings.Contains(out, "radarr-oversized") {
+		t.Errorf("warning does not mention instance name:\n%s", out)
+	}
+}
+
 func TestCheckInstanceConnectivity_UnreachableServer_SkipsWithWarning(t *testing.T) {
 	// Bind an ephemeral port and immediately close it, so nothing is
 	// listening: the client's dial will fail with connection refused.
@@ -351,6 +444,12 @@ func TestCheckInstanceConnectivity_AbsentSystemStatusField_LogsWarnNamingField(t
 	// Processing should still continue past a missing field (informational only, not a skip).
 	if !strings.Contains(out, "name=HD-1080p") {
 		t.Errorf("expected processing to continue past a missing field:\n%s", out)
+	}
+	// With appName absent (status.AppName == nil), the appName/type mismatch
+	// check must be skipped entirely rather than comparing against a nil
+	// dereference or an empty string: locks in the status.AppName != nil guard.
+	if strings.Contains(out, "appName does not match configured instance type") {
+		t.Errorf("mismatch warning must not fire when appName is absent:\n%s", out)
 	}
 }
 
