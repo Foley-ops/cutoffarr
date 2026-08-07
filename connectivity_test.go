@@ -270,49 +270,87 @@ func TestCheckInstanceConnectivity_UnreachableServer_SkipsWithWarning(t *testing
 	}
 }
 
-func TestCheckInstanceConnectivity_ZeroValueField_LogsWarnNamingField(t *testing.T) {
-	statusJSON := `{"appName": "", "version": "5.14.0.9383"}`
-	var gotPaths, gotAPIKeys []string
-	srv := httptest.NewServer(recordingHandler(t, http.StatusOK, statusJSON, http.StatusOK, radarrProfilesJSON, &gotPaths, &gotAPIKeys))
-	defer srv.Close()
-
-	logger, buf := newConnectivityTestLogger(slog.LevelInfo)
-	inst := Instance{Name: "radarr-zero", Type: "radarr", URL: srv.URL, APIKey: "key"}
-
-	checkInstanceConnectivity(context.Background(), logger, inst)
-
-	out := buf.String()
-	if !strings.Contains(out, "level=WARN") {
-		t.Errorf("expected a warning about the zero-value field:\n%s", out)
-	}
-	if !strings.Contains(out, "appName") {
-		t.Errorf("warning does not name the zero-value field appName:\n%s", out)
-	}
-	// Processing should still continue (informational, not a skip).
-	if !strings.Contains(out, "name=HD-1080p") {
-		t.Errorf("expected processing to continue past a zero-value field:\n%s", out)
-	}
-}
-
-func TestCheckInstanceConnectivity_ZeroValueProfileField_LogsWarnNamingField(t *testing.T) {
+// TestCheckInstanceConnectivity_PresentZeroValuedProfileFields_NoWarning is
+// the controller-mandated regression test for the amended rule: cutoff:0,
+// cutoffFormatScore:0, and upgradeAllowed:false are all legitimate,
+// common real-world values (e.g. a profile whose cutoff is already the
+// lowest/highest quality, or one where upgrades are deliberately
+// disabled). Because the JSON keys are present, decoding them must NOT be
+// treated as a missing/renamed field, so no warning should fire.
+func TestCheckInstanceConnectivity_PresentZeroValuedProfileFields_NoWarning(t *testing.T) {
 	profilesJSON := `[{"id": 1, "name": "HD-1080p", "upgradeAllowed": false, "cutoff": 0, "cutoffFormatScore": 0}]`
 	var gotPaths, gotAPIKeys []string
 	srv := httptest.NewServer(recordingHandler(t, http.StatusOK, radarrStatusJSON, http.StatusOK, profilesJSON, &gotPaths, &gotAPIKeys))
 	defer srv.Close()
 
 	logger, buf := newConnectivityTestLogger(slog.LevelInfo)
-	inst := Instance{Name: "radarr-zero-profile", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	inst := Instance{Name: "radarr-present-zero", Type: "radarr", URL: srv.URL, APIKey: "key"}
 
 	checkInstanceConnectivity(context.Background(), logger, inst)
 
 	out := buf.String()
-	for _, field := range []string{"cutoff", "cutoffFormatScore", "upgradeAllowed"} {
-		if !strings.Contains(out, field) {
-			t.Errorf("warning does not name zero-value field %q:\n%s", field, out)
+	if strings.Contains(out, "level=WARN") {
+		t.Errorf("present-but-zero field values must not warn:\n%s", out)
+	}
+	for _, want := range []string{"cutoff=0", "cutoffFormatScore=0", "upgradeAllowed=false"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected the present zero value to still be logged normally: missing %q:\n%s", want, out)
 		}
 	}
+}
+
+// TestCheckInstanceConnectivity_AbsentProfileField_LogsWarnNamingField is
+// the controller-mandated regression test proving the other half of the
+// amended rule: when a JSON key is entirely absent (as opposed to present
+// with a zero value) — the actual signal that our assumed field name may
+// not match the real API — a warning naming the field must fire.
+func TestCheckInstanceConnectivity_AbsentProfileField_LogsWarnNamingField(t *testing.T) {
+	profilesJSON := `[{"id": 1, "name": "HD-1080p", "upgradeAllowed": true, "cutoffFormatScore": 10000}]` // cutoff key entirely absent
+	var gotPaths, gotAPIKeys []string
+	srv := httptest.NewServer(recordingHandler(t, http.StatusOK, radarrStatusJSON, http.StatusOK, profilesJSON, &gotPaths, &gotAPIKeys))
+	defer srv.Close()
+
+	logger, buf := newConnectivityTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-absent-field", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	checkInstanceConnectivity(context.Background(), logger, inst)
+
+	out := buf.String()
 	if !strings.Contains(out, "level=WARN") {
-		t.Errorf("expected warnings about zero-value profile fields:\n%s", out)
+		t.Errorf("expected a warning about the missing cutoff field:\n%s", out)
+	}
+	if !strings.Contains(out, "field=cutoff") {
+		t.Errorf("warning does not name the missing field cutoff:\n%s", out)
+	}
+	if !strings.Contains(out, "cutoff=absent") {
+		t.Errorf("expected the info line to show the missing field as absent:\n%s", out)
+	}
+}
+
+func TestCheckInstanceConnectivity_AbsentSystemStatusField_LogsWarnNamingField(t *testing.T) {
+	statusJSON := `{"version": "5.14.0.9383"}` // appName key entirely absent
+	var gotPaths, gotAPIKeys []string
+	srv := httptest.NewServer(recordingHandler(t, http.StatusOK, statusJSON, http.StatusOK, radarrProfilesJSON, &gotPaths, &gotAPIKeys))
+	defer srv.Close()
+
+	logger, buf := newConnectivityTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-absent-appname", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	checkInstanceConnectivity(context.Background(), logger, inst)
+
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") {
+		t.Errorf("expected a warning about the missing appName field:\n%s", out)
+	}
+	if !strings.Contains(out, "field=appName") {
+		t.Errorf("warning does not name the missing field appName:\n%s", out)
+	}
+	if !strings.Contains(out, "appName=absent") {
+		t.Errorf("expected the info line to show the missing field as absent:\n%s", out)
+	}
+	// Processing should still continue past a missing field (informational only, not a skip).
+	if !strings.Contains(out, "name=HD-1080p") {
+		t.Errorf("expected processing to continue past a missing field:\n%s", out)
 	}
 }
 

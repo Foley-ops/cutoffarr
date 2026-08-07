@@ -13,18 +13,24 @@ import (
 // systemStatusResponse decodes the subset of /api/v3/system/status that
 // this phase cares about. Extra fields present in the real response (there
 // are many) are ignored by encoding/json automatically.
+//
+// Fields are pointers so that "key absent from the JSON" (nil) can be told
+// apart from "key present with the zero value" (non-nil pointing at the
+// zero value). Only the former means our assumed field name may not match
+// the real API; the latter is a legitimate value and must not warn.
 type systemStatusResponse struct {
-	AppName string `json:"appName"`
-	Version string `json:"version"`
+	AppName *string `json:"appName"`
+	Version *string `json:"version"`
 }
 
 // qualityProfileResponse decodes the subset of one element of the
-// /api/v3/qualityprofile array that this phase cares about.
+// /api/v3/qualityprofile array that this phase cares about. See
+// systemStatusResponse for why the fields are pointers.
 type qualityProfileResponse struct {
-	Name              string `json:"name"`
-	Cutoff            int    `json:"cutoff"`
-	CutoffFormatScore int    `json:"cutoffFormatScore"`
-	UpgradeAllowed    bool   `json:"upgradeAllowed"`
+	Name              *string `json:"name"`
+	Cutoff            *int    `json:"cutoff"`
+	CutoffFormatScore *int    `json:"cutoffFormatScore"`
+	UpgradeAllowed    *bool   `json:"upgradeAllowed"`
 }
 
 // expectedAppNameByType is the *arr appName each configured instance type
@@ -63,14 +69,14 @@ func checkInstanceConnectivity(ctx context.Context, logger *slog.Logger, inst In
 	}
 
 	logger.Info("system status",
-		"instance", inst.Name, "type", inst.Type, "appName", status.AppName, "version", status.Version)
+		"instance", inst.Name, "type", inst.Type, "appName", derefOrAbsent(status.AppName), "version", derefOrAbsent(status.Version))
 
-	warnIfZeroValue(logger, inst, "system/status", "appName", status.AppName == "")
-	warnIfZeroValue(logger, inst, "system/status", "version", status.Version == "")
+	warnIfFieldAbsent(logger, inst, "system/status", "appName", status.AppName == nil)
+	warnIfFieldAbsent(logger, inst, "system/status", "version", status.Version == nil)
 
-	if expected, ok := expectedAppNameByType[inst.Type]; ok && !strings.EqualFold(status.AppName, expected) {
+	if expected, ok := expectedAppNameByType[inst.Type]; ok && status.AppName != nil && !strings.EqualFold(*status.AppName, expected) {
 		logger.Warn("appName does not match configured instance type",
-			"instance", inst.Name, "type", inst.Type, "appName", status.AppName, "expectedAppName", expected)
+			"instance", inst.Name, "type", inst.Type, "appName", *status.AppName, "expectedAppName", expected)
 	}
 
 	profilesBody, err := fetchBody(ctx, client, "/api/v3/qualityprofile")
@@ -92,12 +98,13 @@ func checkInstanceConnectivity(ctx context.Context, logger *slog.Logger, inst In
 	for _, p := range profiles {
 		logger.Info("quality profile",
 			"instance", inst.Name, "type", inst.Type,
-			"name", p.Name, "cutoff", p.Cutoff, "cutoffFormatScore", p.CutoffFormatScore, "upgradeAllowed", p.UpgradeAllowed)
+			"name", derefOrAbsent(p.Name), "cutoff", derefOrAbsent(p.Cutoff),
+			"cutoffFormatScore", derefOrAbsent(p.CutoffFormatScore), "upgradeAllowed", derefOrAbsent(p.UpgradeAllowed))
 
-		warnIfZeroValue(logger, inst, "qualityprofile", "name", p.Name == "")
-		warnIfZeroValue(logger, inst, "qualityprofile", "cutoff", p.Cutoff == 0)
-		warnIfZeroValue(logger, inst, "qualityprofile", "cutoffFormatScore", p.CutoffFormatScore == 0)
-		warnIfZeroValue(logger, inst, "qualityprofile", "upgradeAllowed", !p.UpgradeAllowed)
+		warnIfFieldAbsent(logger, inst, "qualityprofile", "name", p.Name == nil)
+		warnIfFieldAbsent(logger, inst, "qualityprofile", "cutoff", p.Cutoff == nil)
+		warnIfFieldAbsent(logger, inst, "qualityprofile", "cutoffFormatScore", p.CutoffFormatScore == nil)
+		warnIfFieldAbsent(logger, inst, "qualityprofile", "upgradeAllowed", p.UpgradeAllowed == nil)
 	}
 }
 
@@ -119,17 +126,30 @@ func fetchBody(ctx context.Context, client *APIClient, path string) ([]byte, err
 	return body, nil
 }
 
-// warnIfZeroValue logs a warning naming field when isZero is true. Per plan
-// §5: "If an expected field decodes to its zero value, log a warn naming
-// the field rather than silently continuing" — this is a cheap signal that
-// our assumed field name may not match the real API (a genuinely absent
-// JSON key decodes to Go's zero value with no error), surfaced for the
-// human gate to confirm against the running instances. It is informational
-// only: it never causes the instance to be skipped.
-func warnIfZeroValue(logger *slog.Logger, inst Instance, endpoint, field string, isZero bool) {
-	if !isZero {
+// derefOrAbsent returns *p, or the string "absent" if p is nil. Used to log
+// a pointer-typed decoded field: a nil pointer means the JSON key was not
+// present in the response at all (as opposed to present with a zero
+// value), which is otherwise indistinguishable once logged as a bare zero.
+func derefOrAbsent[T any](p *T) any {
+	if p == nil {
+		return "absent"
+	}
+	return *p
+}
+
+// warnIfFieldAbsent logs a warning naming field when absent is true. Per
+// plan §5's warning not to trust field names blindly ("if a field named
+// here doesn't exist, stop and report — do not improvise"): a JSON key
+// that is entirely missing from the response — not merely present with a
+// zero value, which is a legitimate, common real value for fields like
+// upgradeAllowed or cutoffFormatScore — is the actual signal that our
+// assumed field name may not match the real API. Surfaced for the human
+// gate to confirm against the running instances. It is informational only:
+// it never causes the instance to be skipped.
+func warnIfFieldAbsent(logger *slog.Logger, inst Instance, endpoint, field string, absent bool) {
+	if !absent {
 		return
 	}
-	logger.Warn(fmt.Sprintf("field %q decoded to zero value", field),
+	logger.Warn(fmt.Sprintf("field %q missing from response", field),
 		"instance", inst.Name, "type", inst.Type, "endpoint", endpoint, "field", field)
 }
