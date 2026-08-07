@@ -44,7 +44,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		logger.Warn("no instances configured")
 	}
 
-	logConfig(logger, *cfg)
+	// The redacted config printout is a mandatory startup behavior, not a
+	// leveled log message: it must appear regardless of log_level (e.g.
+	// warn or error), so it bypasses the slog handler's level filter and
+	// goes straight to stdout.
+	printRedactedConfig(stdout, *cfg)
 
 	if !*once {
 		logger.Info("daemon mode is not implemented yet; it arrives in a later phase")
@@ -69,28 +73,29 @@ func slogLevel(level string) slog.Level {
 	}
 }
 
-// logConfig prints the loaded configuration with every API key redacted.
-// Instances are logged individually so the api_key placeholder is always
-// explicit in the output, never merely omitted.
-func logConfig(logger *slog.Logger, cfg Config) {
+// printRedactedConfig prints the loaded configuration with every API key
+// redacted, writing directly to w rather than through the leveled logger.
+// This is deliberate: "print the redacted config at startup" is a mandatory
+// behavior, not a leveled log message, so it must be visible regardless of
+// the configured log_level (including warn and error, which would otherwise
+// filter out an Info-level log record). Instances are printed individually
+// so the api_key placeholder is always explicit in the output, never merely
+// omitted.
+func printRedactedConfig(w io.Writer, cfg Config) {
 	redacted := cfg.Redacted()
 
-	logger.Info("configuration loaded",
-		"dry_run", redacted.DryRun,
-		"poll_interval", redacted.PollInterval.String(),
-		"webhook_port", redacted.WebhookPort,
-		"webhook_debounce", redacted.WebhookDebounce.String(),
-		"log_level", redacted.LogLevel,
-		"exclusion_tag", redacted.ExclusionTag,
-		"instance_count", len(redacted.Instances),
+	fmt.Fprintf(w, "configuration loaded: dry_run=%t poll_interval=%s webhook_port=%d webhook_debounce=%s log_level=%s exclusion_tag=%s instance_count=%d\n",
+		redacted.DryRun,
+		redacted.PollInterval,
+		redacted.WebhookPort,
+		redacted.WebhookDebounce,
+		redacted.LogLevel,
+		redacted.ExclusionTag,
+		len(redacted.Instances),
 	)
 
 	for _, inst := range redacted.Instances {
-		logger.Info("configured instance",
-			"name", inst.Name,
-			"type", inst.Type,
-			"url", inst.URL,
-			"api_key", inst.APIKey,
-		)
+		fmt.Fprintf(w, "configured instance: name=%s type=%s url=%s api_key=%s\n",
+			inst.Name, inst.Type, inst.URL, inst.APIKey)
 	}
 }

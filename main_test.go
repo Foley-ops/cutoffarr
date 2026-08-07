@@ -113,6 +113,60 @@ instances: []
 	}
 }
 
+func TestRun_RedactedConfigPrintedUnconditionally_LogLevelWarn(t *testing.T) {
+	t.Setenv("MAIN_TEST_WARN_API_KEY", "sekret-warn-value")
+	path := writeMainTestConfig(t, `
+log_level: warn
+instances:
+  - name: radarr-main
+    type: radarr
+    url: http://radarr:7878
+    api_key: ${MAIN_TEST_WARN_API_KEY}
+`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), "sekret-warn-value") {
+		t.Errorf("stdout contains the raw API key, want it redacted:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "<redacted>") {
+		t.Errorf("stdout does not contain the redaction marker even though log_level=warn (config printout must be unconditional):\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "radarr-main") {
+		t.Errorf("stdout does not mention the configured instance name even though log_level=warn:\n%s", stdout.String())
+	}
+}
+
+func TestRun_RedactedConfigPrintedUnconditionally_LogLevelError(t *testing.T) {
+	t.Setenv("MAIN_TEST_ERROR_API_KEY", "sekret-error-value")
+	path := writeMainTestConfig(t, `
+log_level: error
+instances:
+  - name: sonarr-main
+    type: sonarr
+    url: http://sonarr:8989
+    api_key: ${MAIN_TEST_ERROR_API_KEY}
+`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), "sekret-error-value") {
+		t.Errorf("stdout contains the raw API key, want it redacted:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "<redacted>") {
+		t.Errorf("stdout does not contain the redaction marker even though log_level=error (config printout must be unconditional):\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "sonarr-main") {
+		t.Errorf("stdout does not mention the configured instance name even though log_level=error:\n%s", stdout.String())
+	}
+}
+
 func TestRun_EmptyInstancesLogsWarnNotFatal(t *testing.T) {
 	path := writeMainTestConfig(t, `
 log_level: debug

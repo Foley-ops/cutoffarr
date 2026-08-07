@@ -154,6 +154,29 @@ instances:
 	}
 }
 
+func TestLoadConfig_UnsetEnvVarNamedOnceEvenIfReferencedTwice(t *testing.T) {
+	os.Unsetenv("TEST_DUPLICATE_UNSET_VAR")
+	path := writeConfig(t, `
+instances:
+  - name: radarr-main
+    type: radarr
+    url: http://radarr:7878
+    api_key: ${TEST_DUPLICATE_UNSET_VAR}
+  - name: sonarr-main
+    type: sonarr
+    url: http://sonarr:8989
+    api_key: ${TEST_DUPLICATE_UNSET_VAR}
+`)
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("LoadConfig returned nil error, want error for unset env var")
+	}
+	count := strings.Count(err.Error(), "TEST_DUPLICATE_UNSET_VAR")
+	if count != 1 {
+		t.Errorf("error mentions TEST_DUPLICATE_UNSET_VAR %d times, want exactly 1 (deduplicated): %q", count, err.Error())
+	}
+}
+
 func TestLoadConfig_DuplicateInstanceNamesFatal(t *testing.T) {
 	path := writeConfig(t, `
 instances:

@@ -86,14 +86,19 @@ var envVarPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
 // expandEnvVars replaces every ${VAR} reference in raw with the value of the
 // corresponding environment variable. A referenced-but-unset variable is a
-// fatal error naming the variable.
+// fatal error naming the variable; each distinct missing variable is named
+// only once even if referenced multiple times in the file.
 func expandEnvVars(raw string) (string, error) {
 	var missing []string
+	seenMissing := make(map[string]bool)
 	expanded := envVarPattern.ReplaceAllStringFunc(raw, func(match string) string {
 		name := envVarPattern.FindStringSubmatch(match)[1]
 		val, ok := os.LookupEnv(name)
 		if !ok {
-			missing = append(missing, name)
+			if !seenMissing[name] {
+				seenMissing[name] = true
+				missing = append(missing, name)
+			}
 			return match
 		}
 		return val
