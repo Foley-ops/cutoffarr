@@ -1,0 +1,19 @@
+# Private planning docs — never push
+cutoffarr-implementation-plan.md
+
+# Local config / secrets (commit config.example.yml instead)
+config.yml
+config.yaml
+*.env
+.env*
+
+# Build artifacts
+/cutoffarr
+*.exe
+dist/
+bin/
+
+# OS / editor noise
+.DS_Store
+.vscode/
+.idea/
