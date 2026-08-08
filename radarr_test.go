@@ -912,3 +912,186 @@ instances:
 		t.Errorf("expected the healthy instance's movie library to still be inspected:\n%s", out)
 	}
 }
+
+// --- Phase 3: decision engine wiring into main.go's run() -----------------
+
+// fullRadarrPipelineMux wires a mux serving every endpoint a full
+// connectivity + library inspection + decision engine pass touches:
+// system/status, qualityprofile (hit twice: once by checkInstanceConnectivity,
+// once by the decision engine's own fetchQualityProfiles), movie,
+// wanted/cutoff, tag, and moviefile.
+func fullRadarrPipelineMux(moviesJSON, wantedCutoffJSON, tagsJSON string, moviefileHandler http.HandlerFunc) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/system/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"appName": "Radarr", "version": "5.14.0.9383"}`))
+	})
+	mux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[{"id": 1, "name": "HD-1080p", "upgradeAllowed": true, "cutoff": 7, "cutoffFormatScore": 100}]`))
+	})
+	mux.HandleFunc("/api/v3/movie", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(moviesJSON))
+	})
+	mux.HandleFunc("/api/v3/wanted/cutoff", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(wantedCutoffJSON))
+	})
+	mux.HandleFunc("/api/v3/tag", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(tagsJSON))
+	})
+	mux.HandleFunc("/api/v3/moviefile", moviefileHandler)
+	return mux
+}
+
+// TestRun_RadarrInstance_DecisionEngineProducesReportLines proves the
+// full pipeline is wired end to end through run(): connectivity succeeds,
+// inspectRadarrLibrary's returned movies/wantedIDs are handed to
+// runRadarrDecisionEngine, which fetches profiles/tag/moviefile and emits
+// would-unmonitor/skip report lines for every monitored movie.
+func TestRun_RadarrInstance_DecisionEngineProducesReportLines(t *testing.T) {
+	moviesJSON := `[
+		{"id": 1, "title": "Would Unmonitor Movie", "monitored": true, "hasFile": true, "qualityProfileId": 1, "tags": [], "movieFile": {"id": 1}},
+		{"id": 2, "title": "No File Movie", "monitored": true, "hasFile": false, "qualityProfileId": 1, "tags": []}
+	]`
+	mux := fullRadarrPipelineMux(moviesJSON, emptyWantedCutoffJSON, decisionEngineNoTagsJSON, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[{"id": 1, "customFormatScore": 200}]`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := `
+instances:
+  - name: radarr-main
+    type: radarr
+    url: ` + srv.URL + `
+    api_key: key1
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "msg=would-unmonitor") || !strings.Contains(out, `title="Would Unmonitor Movie"`) {
+		t.Errorf("expected a would-unmonitor line for the passing movie:\n%s", out)
+	}
+	if !strings.Contains(out, "msg=skip") || !strings.Contains(out, `title="No File Movie"`) || !strings.Contains(out, `reason="no file"`) {
+		t.Errorf("expected a skip line for the no-file movie:\n%s", out)
+	}
+	if !strings.Contains(out, "msg=\"radarr decision summary\"") {
+		t.Errorf("expected the end-of-instance decision summary:\n%s", out)
+	}
+}
+
+// TestRun_RadarrInstance_IncompleteWantedCutoff_DecisionEngineNeverRuns is
+// the self-review-mandated dangerous-direction guard: refactor (a) makes
+// fetchWantedCutoff return ok=false for a partial id set, and this proves
+// that failure actually prevents the decision engine from running at all
+// through the real main.go wiring — no would-unmonitor/skip lines, and no
+// requests to the decision engine's own endpoints (qualityprofile hit only
+// once, by connectivity; tag and moviefile never hit).
+func TestRun_RadarrInstance_IncompleteWantedCutoff_DecisionEngineNeverRuns(t *testing.T) {
+	moviesJSON := `[{"id": 1, "title": "Some Movie", "monitored": true, "hasFile": true, "qualityProfileId": 1, "tags": []}]`
+	// totalRecords claims 50 but the first page returns 0 records: partial set.
+	incompleteWantedCutoffJSON := `{"page": 1, "pageSize": 100, "totalRecords": 50, "records": []}`
+
+	var gotTagRequests, gotMoviefileRequests, gotProfileRequests []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/system/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"appName": "Radarr", "version": "5.14.0.9383"}`))
+	})
+	mux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
+		gotProfileRequests = append(gotProfileRequests, r.URL.Path)
+		w.Write([]byte(`[{"id": 1, "name": "HD-1080p", "upgradeAllowed": true, "cutoff": 7, "cutoffFormatScore": 100}]`))
+	})
+	mux.HandleFunc("/api/v3/movie", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(moviesJSON))
+	})
+	mux.HandleFunc("/api/v3/wanted/cutoff", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(incompleteWantedCutoffJSON))
+	})
+	mux.HandleFunc("/api/v3/tag", func(w http.ResponseWriter, r *http.Request) {
+		gotTagRequests = append(gotTagRequests, r.URL.Path)
+		w.Write([]byte(`[]`))
+	})
+	mux.HandleFunc("/api/v3/moviefile", func(w http.ResponseWriter, r *http.Request) {
+		gotMoviefileRequests = append(gotMoviefileRequests, r.URL.Path)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := `
+instances:
+  - name: radarr-main
+    type: radarr
+    url: ` + srv.URL + `
+    api_key: key1
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	out := stdout.String()
+	if strings.Contains(out, "msg=would-unmonitor") || strings.Contains(out, "msg=skip") {
+		t.Errorf("a partial wanted/cutoff id set must never produce decision lines:\n%s", out)
+	}
+	if len(gotProfileRequests) != 1 {
+		t.Errorf("expected qualityprofile to be hit exactly once (by connectivity only, never by the decision engine), got %d", len(gotProfileRequests))
+	}
+	if len(gotTagRequests) != 0 {
+		t.Errorf("expected /tag to never be requested, got %d", len(gotTagRequests))
+	}
+	if len(gotMoviefileRequests) != 0 {
+		t.Errorf("expected /moviefile to never be requested, got %d", len(gotMoviefileRequests))
+	}
+}
+
+// TestRun_RadarrInstance_ExclusionTagConfigThreadedToDecisionEngine proves
+// cfg.ExclusionTag reaches runRadarrDecisionEngine: a non-default
+// exclusion_tag configured in the YAML must be the label resolveExclusionTagID
+// looks up (visible in the "exclusion tag not defined" info log naming it,
+// since this instance's /tag response does not contain it).
+func TestRun_RadarrInstance_ExclusionTagConfigThreadedToDecisionEngine(t *testing.T) {
+	moviesJSON := `[{"id": 1, "title": "Some Movie", "monitored": true, "hasFile": false, "qualityProfileId": 1, "tags": []}]`
+	mux := fullRadarrPipelineMux(moviesJSON, emptyWantedCutoffJSON, `[{"id": 1, "label": "unrelated-tag"}]`, func(w http.ResponseWriter, r *http.Request) {})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := `
+exclusion_tag: my-custom-exclusion-label
+instances:
+  - name: radarr-main
+    type: radarr
+    url: ` + srv.URL + `
+    api_key: key1
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "exclusionTag=my-custom-exclusion-label") {
+		t.Errorf("expected the configured exclusion_tag label to reach the decision engine's tag resolution:\n%s", out)
+	}
+}
