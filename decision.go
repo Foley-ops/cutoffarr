@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -116,4 +118,59 @@ func resolveExclusionTagID(ctx context.Context, logger *slog.Logger, client *API
 	logger.Info("exclusion tag not defined in this instance; no movies excluded",
 		"instance", inst.Name, "type", inst.Type, "exclusionTag", label)
 	return 0, false, true
+}
+
+// movieFileDetail decodes one element of the array GET
+// /api/v3/moviefile?movieId=<id> returns — the only endpoint where
+// customFormatScore actually exists (per the STRICT decision rule's live
+// Phase 2 findings: it is absent from /movie and /movie/{id}).
+type movieFileDetail struct {
+	ID                *int `json:"id"`
+	CustomFormatScore *int `json:"customFormatScore"`
+}
+
+// fetchMovieFileDetails fetches GET /api/v3/moviefile?movieId=<movieID> for
+// a single movie. Used only for movies that have already passed rules 1-5
+// of the STRICT decision rule (evaluateMovie fetches it lazily, last), to
+// minimize API calls. A request or decode failure is per-movie, not
+// instance-fatal (§2.6): the caller treats ok=false as "could not fetch
+// custom format score" and skips just this movie, continuing to the rest
+// of the library.
+func fetchMovieFileDetails(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, movieID int) ([]movieFileDetail, bool) {
+	query := url.Values{"movieId": {strconv.Itoa(movieID)}}
+	body, err := fetchBody(ctx, client, "/api/v3/moviefile", query)
+	if err != nil {
+		logger.Warn("moviefile request failed",
+			"instance", inst.Name, "type", inst.Type, "movieId", movieID, "error", err)
+		return nil, false
+	}
+
+	var files []movieFileDetail
+	if err := json.Unmarshal(body, &files); err != nil {
+		logger.Warn("moviefile response is not valid JSON",
+			"instance", inst.Name, "type", inst.Type, "movieId", movieID, "error", err)
+		return nil, false
+	}
+
+	return files, true
+}
+
+// selectMovieFile picks the movieFileDetail this movie's file actually
+// corresponds to out of the array /api/v3/moviefile?movieId=<id> returns,
+// per the STRICT decision rule: "take the element whose id matches the
+// movie's movieFile.id, or the single element". In practice a movie has at
+// most one file, so the single-element case is the norm; matching by id is
+// a defensive fallback for the (unexpected) case of multiple elements.
+func selectMovieFile(files []movieFileDetail, wantID *int) (movieFileDetail, bool) {
+	if len(files) == 1 {
+		return files[0], true
+	}
+	if wantID != nil {
+		for _, f := range files {
+			if f.ID != nil && *f.ID == *wantID {
+				return f, true
+			}
+		}
+	}
+	return movieFileDetail{}, false
 }

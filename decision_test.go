@@ -247,6 +247,115 @@ func TestResolveExclusionTagID_RecordMissingIdOrLabel_SkipsRecordNotInstance(t *
 	}
 }
 
+// --- fetchMovieFileDetails / selectMovieFile ------------------------------
+
+func TestFetchMovieFileDetails_HappyPath_PassesMovieIdAsQueryParam(t *testing.T) {
+	var gotQuery string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/moviefile", func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Write([]byte(`[{"id": 42, "customFormatScore": 12000}]`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	files, ok := fetchMovieFileDetails(context.Background(), logger, client, inst, 5)
+	if !ok {
+		t.Fatalf("fetchMovieFileDetails returned ok=false, want true:\n%s", buf.String())
+	}
+	if gotQuery != "movieId=5" {
+		t.Errorf("query = %q, want movieId=5", gotQuery)
+	}
+	if len(files) != 1 || files[0].ID == nil || *files[0].ID != 42 || files[0].CustomFormatScore == nil || *files[0].CustomFormatScore != 12000 {
+		t.Errorf("files = %+v, want one element {id:42 customFormatScore:12000}", files)
+	}
+}
+
+func TestFetchMovieFileDetails_RequestFailure_ReturnsNotOK(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/moviefile", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-broken", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	_, ok := fetchMovieFileDetails(context.Background(), logger, client, inst, 5)
+	if ok {
+		t.Error("fetchMovieFileDetails returned ok=true, want false when the request fails")
+	}
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("expected a warning:\n%s", buf.String())
+	}
+}
+
+func TestFetchMovieFileDetails_MalformedJSON_ReturnsNotOK(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/moviefile", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("not json"))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-malformed", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	_, ok := fetchMovieFileDetails(context.Background(), logger, client, inst, 5)
+	if ok {
+		t.Error("fetchMovieFileDetails returned ok=true, want false for malformed JSON")
+	}
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("expected a warning:\n%s", buf.String())
+	}
+}
+
+func TestSelectMovieFile_SingleElement_TakenRegardlessOfID(t *testing.T) {
+	files := []movieFileDetail{{ID: intPtr(999), CustomFormatScore: intPtr(1)}}
+	got, found := selectMovieFile(files, intPtr(1)) // wantID deliberately mismatched
+	if !found || got.CustomFormatScore == nil || *got.CustomFormatScore != 1 {
+		t.Errorf("selectMovieFile = %+v, %v; want the single element regardless of id mismatch", got, found)
+	}
+}
+
+func TestSelectMovieFile_MultipleElements_MatchesByID(t *testing.T) {
+	files := []movieFileDetail{
+		{ID: intPtr(1), CustomFormatScore: intPtr(10)},
+		{ID: intPtr(2), CustomFormatScore: intPtr(20)},
+	}
+	got, found := selectMovieFile(files, intPtr(2))
+	if !found || got.CustomFormatScore == nil || *got.CustomFormatScore != 20 {
+		t.Errorf("selectMovieFile = %+v, %v; want the element matching id=2", got, found)
+	}
+}
+
+func TestSelectMovieFile_MultipleElementsNoMatch_NotFound(t *testing.T) {
+	files := []movieFileDetail{
+		{ID: intPtr(1), CustomFormatScore: intPtr(10)},
+		{ID: intPtr(2), CustomFormatScore: intPtr(20)},
+	}
+	_, found := selectMovieFile(files, intPtr(99))
+	if found {
+		t.Error("selectMovieFile found = true, want false when no element matches the wanted id")
+	}
+}
+
+func TestSelectMovieFile_Empty_NotFound(t *testing.T) {
+	_, found := selectMovieFile(nil, intPtr(1))
+	if found {
+		t.Error("selectMovieFile found = true, want false for an empty file list")
+	}
+}
+
+func intPtr(i int) *int { return &i }
+
 func TestFetchQualityProfiles_MalformedJSON_SkipsInstance(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
