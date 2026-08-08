@@ -482,7 +482,14 @@ func TestInspectRadarrLibrary_WantedCutoffPaging_AccumulatesAcrossPagesWithCorre
 	}
 }
 
-func TestInspectRadarrLibrary_WantedCutoffEmptyPageBeforeTotalReached_WarnsAndStopsWithoutInfiniteLoop(t *testing.T) {
+// TestInspectRadarrLibrary_WantedCutoffEmptyPageBeforeTotalReached_WarnsAndSkipsInstance
+// pins refactor (a)'s completeness contract: an id set fetched from fewer
+// records than totalRecords claimed is a partial set. Absence-from-set
+// means "would-unmonitor" to the decision engine, so a partial set produces
+// false positives in the dangerous direction — it must never be treated as
+// usable, so fetchWantedCutoff must report ok=false (instance skipped for
+// the cycle), not merely warn-and-continue with what was fetched.
+func TestInspectRadarrLibrary_WantedCutoffEmptyPageBeforeTotalReached_WarnsAndSkipsInstance(t *testing.T) {
 	var gotRequests, gotQueries []string
 	// totalRecords claims 50, but the very first page returns 0 records.
 	handler := staticWantedCutoffHandler(http.StatusOK, `{"page": 1, "pageSize": 100, "totalRecords": 50, "records": []}`)
@@ -496,7 +503,7 @@ func TestInspectRadarrLibrary_WantedCutoffEmptyPageBeforeTotalReached_WarnsAndSt
 	logger, buf := newRadarrTestLogger(slog.LevelInfo)
 	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
 
-	inspectRadarrLibrary(context.Background(), logger, inst, nil)
+	inspectRadarrLibrary(context.Background(), logger, inst, []string{"Movie In Cutoff"})
 
 	if len(gotQueries) != 1 {
 		t.Fatalf("expected paging to stop after a single empty page (no infinite loop), got %d requests: %v", len(gotQueries), gotQueries)
@@ -504,6 +511,9 @@ func TestInspectRadarrLibrary_WantedCutoffEmptyPageBeforeTotalReached_WarnsAndSt
 	out := buf.String()
 	if !strings.Contains(out, "level=WARN") {
 		t.Errorf("expected a warning about the empty page before totalRecords was reached:\n%s", out)
+	}
+	if strings.Contains(out, "inWantedCutoff") {
+		t.Errorf("a partial wanted/cutoff id set must skip the instance: no in/out determination should be logged:\n%s", out)
 	}
 }
 
@@ -607,7 +617,10 @@ func TestInspectRadarrLibrary_WantedCutoffRecordMissingId_WarnsWithTitleContext(
 
 // TestInspectRadarrLibrary_WantedCutoffPageCap_WarnsWhenHitWithoutCompleting
 // pins the hard page-cap defense. maxWantedCutoffPages is temporarily
-// lowered so the test doesn't need to make 1000 real HTTP round trips.
+// lowered so the test doesn't need to make 1000 real HTTP round trips. Per
+// refactor (a)'s completeness contract, hitting the cap without completing
+// also means the id set is partial, so the instance must be skipped (no
+// in/out determination logged), not merely warned-and-continued.
 func TestInspectRadarrLibrary_WantedCutoffPageCap_WarnsWhenHitWithoutCompleting(t *testing.T) {
 	original := maxWantedCutoffPages
 	maxWantedCutoffPages = 3
@@ -634,7 +647,7 @@ func TestInspectRadarrLibrary_WantedCutoffPageCap_WarnsWhenHitWithoutCompleting(
 	logger, buf := newRadarrTestLogger(slog.LevelInfo)
 	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
 
-	inspectRadarrLibrary(context.Background(), logger, inst, nil)
+	inspectRadarrLibrary(context.Background(), logger, inst, []string{"Movie In Cutoff"})
 
 	if len(gotQueries) != 3 {
 		t.Fatalf("expected paging to stop exactly at the (lowered) cap of 3 pages, got %d requests: %v", len(gotQueries), gotQueries)
@@ -645,6 +658,9 @@ func TestInspectRadarrLibrary_WantedCutoffPageCap_WarnsWhenHitWithoutCompleting(
 	}
 	if !strings.Contains(out, "page cap") && !strings.Contains(out, "pageCap") {
 		t.Errorf("expected the page-cap warning to mention the cap:\n%s", out)
+	}
+	if strings.Contains(out, "inWantedCutoff") {
+		t.Errorf("a partial wanted/cutoff id set (page cap hit) must skip the instance: no in/out determination should be logged:\n%s", out)
 	}
 }
 

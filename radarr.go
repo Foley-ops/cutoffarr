@@ -280,15 +280,30 @@ func logSampleMovies(logger *slog.Logger, inst Instance, samples []string, match
 //     cannot be done safely; warn and skip the instance for the cycle
 //     (ok=false), same as any other malformed response.
 //   - a page returning 0 records ends paging; if fewer records were fetched
-//     than totalRecords claimed, warn (but this is not a skip: whatever was
-//     fetched is still returned).
-//   - a hard cap of maxWantedCutoffPages bounds the loop; hitting it also
-//     warns without being a skip.
+//     than totalRecords claimed, the resulting id set is only partial.
+//   - a hard cap of maxWantedCutoffPages bounds the loop; hitting it without
+//     reaching totalRecords also leaves the id set partial.
+//
+// completeness contract (mandated refactor): an incomplete id set — either
+// of the two partial cases above — must return ok=false (warn + instance
+// skipped), never a partial map with ok=true. The decision engine (Phase 3)
+// treats absence from this set as "would-unmonitor"; a partial set would
+// silently manufacture false positives in that dangerous direction (a
+// movie merely missing from an incomplete fetch would look exactly like
+// one whose quality cutoff is genuinely met), so it must never be handed
+// off as if it were the whole truth.
 func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance) (map[int]bool, bool) {
 	ids := make(map[int]bool)
 	var totalRecords int
 	fetched := 0
 	completed := false
+	// endedEarly distinguishes, for the post-loop incomplete-set warning,
+	// "stopped because a page returned 0 records before totalRecords was
+	// reached" (already warned about specifically inside the loop above)
+	// from "ran out of the maxWantedCutoffPages budget" (warned about
+	// below, only in the latter case, so the message accurately says what
+	// actually happened).
+	endedEarly := false
 
 	for page := 1; page <= maxWantedCutoffPages; page++ {
 		query := url.Values{
@@ -334,10 +349,16 @@ func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClie
 
 		if len(records) == 0 {
 			if fetched != totalRecords {
+				// Leave completed=false: fewer records were fetched than
+				// totalRecords claimed, so the id set below is only
+				// partial. Per the completeness contract this must not be
+				// returned as ok=true; the check after the loop handles it.
 				logger.Warn("wanted/cutoff paging stopped: page returned 0 records before totalRecords was reached",
 					"instance", inst.Name, "type", inst.Type, "page", page, "fetched", fetched, "totalRecords", totalRecords)
+				endedEarly = true
+			} else {
+				completed = true
 			}
-			completed = true
 			break
 		}
 
@@ -362,8 +383,13 @@ func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClie
 	}
 
 	if !completed {
-		logger.Warn("wanted/cutoff paging hit the page cap without completing",
-			"instance", inst.Name, "type", inst.Type, "pageCap", maxWantedCutoffPages, "fetched", fetched, "totalRecords", totalRecords)
+		if !endedEarly {
+			logger.Warn("wanted/cutoff paging hit the page cap without completing",
+				"instance", inst.Name, "type", inst.Type, "pageCap", maxWantedCutoffPages, "fetched", fetched, "totalRecords", totalRecords)
+		}
+		logger.Warn("skipping instance: wanted/cutoff id set is incomplete",
+			"instance", inst.Name, "type", inst.Type, "fetched", fetched, "totalRecords", totalRecords)
+		return nil, false
 	}
 
 	logger.Info("wanted/cutoff",
