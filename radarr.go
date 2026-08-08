@@ -43,7 +43,7 @@ type movieListElement struct {
 	Monitored        *bool             `json:"monitored"`
 	HasFile          *bool             `json:"hasFile"`
 	QualityProfileID *int              `json:"qualityProfileId"`
-	Tags             []int             `json:"tags"`
+	Tags             *[]int            `json:"tags"`
 	MovieFile        *movieFileElement `json:"movieFile"`
 }
 
@@ -87,7 +87,8 @@ type wantedCutoffPage struct {
 }
 
 type wantedCutoffRecord struct {
-	ID *int `json:"id"`
+	ID    *int    `json:"id"`
+	Title *string `json:"title"`
 }
 
 // movieCounts summarizes the full /movie library scan.
@@ -194,6 +195,12 @@ func fetchMovies(ctx context.Context, logger *slog.Logger, client *APIClient, in
 		if m.Title != nil {
 			key := normalizeTitle(*m.Title)
 			if wanted[key] {
+				// If two library movies normalize to the same title (e.g.
+				// two cuts/releases sharing a name), the later one in scan
+				// order silently overwrites the earlier match here. Known
+				// limitation, acceptable for Phase 2's ad hoc sampling —
+				// disambiguating same-titled movies (e.g. by year) is out
+				// of scope for this phase.
 				matches[key] = sampleMovieMatch{element: m, raw: raw}
 			}
 		}
@@ -220,12 +227,13 @@ func logSampleMovies(logger *slog.Logger, inst Instance, samples []string, match
 			"instance", inst.Name, "type", inst.Type, "sample", sample,
 			"id", derefOrAbsent(m.ID), "title", derefOrAbsent(m.Title),
 			"monitored", derefOrAbsent(m.Monitored), "hasFile", derefOrAbsent(m.HasFile),
-			"qualityProfileId", derefOrAbsent(m.QualityProfileID), "tags", fmt.Sprint(m.Tags))
+			"qualityProfileId", derefOrAbsent(m.QualityProfileID), "tags", fmt.Sprint(derefOrAbsent(m.Tags)))
 
 		warnIfFieldAbsent(logger, inst, "movie", "id", m.ID == nil)
 		warnIfFieldAbsent(logger, inst, "movie", "monitored", m.Monitored == nil)
 		warnIfFieldAbsent(logger, inst, "movie", "hasFile", m.HasFile == nil)
 		warnIfFieldAbsent(logger, inst, "movie", "qualityProfileId", m.QualityProfileID == nil)
+		warnIfFieldAbsent(logger, inst, "movie", "tags", m.Tags == nil)
 
 		// Quality name and custom format score are only expected to exist
 		// when the movie actually has a file; movieFile being nil entirely
@@ -300,9 +308,17 @@ func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClie
 		}
 
 		for _, r := range envelope.Records {
-			if r.ID != nil {
-				ids[*r.ID] = true
+			if r.ID == nil {
+				// Without an id this record can't be cross-referenced
+				// against the /movie library at all; title is the only
+				// other identifying information the envelope carries
+				// (plan §5: "decode records minimally: id, title"), so it
+				// is the natural context to report here.
+				logger.Warn("wanted/cutoff record missing id field; excluded from the cutoff set",
+					"instance", inst.Name, "type", inst.Type, "page", page, "title", derefOrAbsent(r.Title))
+				continue
 			}
+			ids[*r.ID] = true
 		}
 		fetched += len(envelope.Records)
 

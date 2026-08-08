@@ -274,6 +274,56 @@ func TestInspectRadarrLibrary_AbsentIdField_WarnsNamingField(t *testing.T) {
 	}
 }
 
+// TestInspectRadarrLibrary_AbsentTagsField_WarnsNamingField and
+// TestInspectRadarrLibrary_PresentEmptyTagsField_NoWarn together pin the
+// same present-vs-absent distinction already proven for the other movie
+// fields, now extended to "tags": decoding into a *[]int (rather than a
+// bare []int) makes an entirely-missing "tags" key (nil pointer)
+// distinguishable from a present-but-empty "tags": [] (non-nil pointer to
+// a zero-length slice), exactly like every other pointer-decoded field.
+func TestInspectRadarrLibrary_AbsentTagsField_WarnsNamingField(t *testing.T) {
+	moviesJSON := `[{"id": 1, "title": "No Tags Movie", "monitored": true, "hasFile": false, "qualityProfileId": 1}]` // tags key entirely absent
+	var gotRequests []string
+	srv := radarrTestServer(t, http.StatusOK, moviesJSON, staticWantedCutoffHandler(http.StatusOK, emptyWantedCutoffJSON), &gotRequests)
+	defer srv.Close()
+
+	logger, buf := newRadarrTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	inspectRadarrLibrary(context.Background(), logger, inst, []string{"No Tags Movie"})
+
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") {
+		t.Errorf("expected a warning about the missing tags field:\n%s", out)
+	}
+	if !strings.Contains(out, "field=tags") {
+		t.Errorf("warning does not name the missing field tags:\n%s", out)
+	}
+	if !strings.Contains(out, "tags=absent") {
+		t.Errorf("expected the info line to show the missing tags as absent:\n%s", out)
+	}
+}
+
+func TestInspectRadarrLibrary_PresentEmptyTagsField_NoWarn(t *testing.T) {
+	moviesJSON := `[{"id": 1, "title": "Empty Tags Movie", "monitored": true, "hasFile": false, "qualityProfileId": 1, "tags": []}]`
+	var gotRequests []string
+	srv := radarrTestServer(t, http.StatusOK, moviesJSON, staticWantedCutoffHandler(http.StatusOK, emptyWantedCutoffJSON), &gotRequests)
+	defer srv.Close()
+
+	logger, buf := newRadarrTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	inspectRadarrLibrary(context.Background(), logger, inst, []string{"Empty Tags Movie"})
+
+	out := buf.String()
+	if strings.Contains(out, "level=WARN") {
+		t.Errorf("present-but-empty tags must not warn:\n%s", out)
+	}
+	if !strings.Contains(out, "tags=[]") {
+		t.Errorf("expected the present empty tags value to still be logged normally:\n%s", out)
+	}
+}
+
 func TestInspectRadarrLibrary_MovieRequestNonTwoxx_SkipsInstanceWithWarning(t *testing.T) {
 	var gotRequests []string
 	srv := radarrTestServer(t, http.StatusInternalServerError, radarrMovieJSON, staticWantedCutoffHandler(http.StatusOK, emptyWantedCutoffJSON), &gotRequests)
@@ -446,6 +496,39 @@ func TestInspectRadarrLibrary_WantedCutoffMissingTotalRecords_WarnsAndSkipsInsta
 	}
 	if strings.Contains(out, "inWantedCutoff") {
 		t.Errorf("instance should be skipped for wanted/cutoff purposes: no in/out determination should be logged:\n%s", out)
+	}
+}
+
+// TestInspectRadarrLibrary_WantedCutoffRecordMissingId_WarnsWithTitleContext
+// pins wantedCutoffRecord decoding "title" (plan §5: "decode records
+// minimally: id, title") and using it at the one place an individual
+// record is referenced: a record with no usable id can't be added to the
+// cutoff set, and title is the only other identifying information
+// available for the warning that reports the loss.
+func TestInspectRadarrLibrary_WantedCutoffRecordMissingId_WarnsWithTitleContext(t *testing.T) {
+	var gotRequests, gotQueries []string
+	handler := staticWantedCutoffHandler(http.StatusOK, `{"totalRecords": 1, "records": [{"title": "Untitled Cutoff Record"}]}`) // id absent
+	wrapped := func(w http.ResponseWriter, r *http.Request) {
+		gotQueries = append(gotQueries, r.URL.RawQuery)
+		handler(w, r)
+	}
+	srv := radarrTestServer(t, http.StatusOK, radarrMovieJSON, wrapped, &gotRequests)
+	defer srv.Close()
+
+	logger, buf := newRadarrTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	inspectRadarrLibrary(context.Background(), logger, inst, nil)
+
+	if len(gotQueries) != 1 {
+		t.Fatalf("expected a single page request (totalRecords=1 reached after page 1), got %d: %v", len(gotQueries), gotQueries)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") {
+		t.Errorf("expected a warning about the record missing its id field:\n%s", out)
+	}
+	if !strings.Contains(out, "Untitled Cutoff Record") {
+		t.Errorf("expected the warning to include the record's title for context:\n%s", out)
 	}
 }
 
