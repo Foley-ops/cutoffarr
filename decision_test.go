@@ -356,6 +356,277 @@ func TestSelectMovieFile_Empty_NotFound(t *testing.T) {
 
 func intPtr(i int) *int { return &i }
 
+// --- evaluateMovie: STRICT decision rule ----------------------------------
+
+// evaluateTestProfiles is a small fixed profile set reused across
+// evaluateMovie tests: profile 1 allows upgrades with a CF cutoff of 100;
+// profile 2 has upgrades disabled.
+var evaluateTestProfiles = map[int]qualityProfile{
+	1: {Name: "HD-1080p", CutoffFormatScore: 100, UpgradeAllowed: true},
+	2: {Name: "Locked-Profile", CutoffFormatScore: 100, UpgradeAllowed: false},
+}
+
+// moviefileServer wires a mux serving moviefileJSON at /api/v3/moviefile
+// for any movieId, recording every request into gotRequests.
+func moviefileServer(t *testing.T, status int, moviefileJSON string, gotRequests *[]string) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/moviefile", func(w http.ResponseWriter, r *http.Request) {
+		*gotRequests = append(*gotRequests, r.URL.RawQuery)
+		w.WriteHeader(status)
+		w.Write([]byte(moviefileJSON))
+	})
+	return httptest.NewServer(mux)
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+func TestEvaluateMovie_NoFile_SkipsWithReasonBeforeAnyMoviefileCall(t *testing.T) {
+	var gotRequests []string
+	srv := moviefileServer(t, http.StatusOK, `[]`, &gotRequests)
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	m := movieListElement{ID: intPtr(1), Title: strPtr("No File Movie"), HasFile: boolPtr(false), QualityProfileID: intPtr(1)}
+	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
+
+	if d.wouldUnmonitor {
+		t.Error("wouldUnmonitor = true, want false")
+	}
+	if d.reason != "no file" {
+		t.Errorf("reason = %q, want %q", d.reason, "no file")
+	}
+	if len(gotRequests) != 0 {
+		t.Errorf("expected zero /moviefile requests for a no-file movie, got %d: %v", len(gotRequests), gotRequests)
+	}
+}
+
+func TestEvaluateMovie_UnknownProfile_SkipsWithReason(t *testing.T) {
+	var gotRequests []string
+	srv := moviefileServer(t, http.StatusOK, `[]`, &gotRequests)
+	defer srv.Close()
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	m := movieListElement{ID: intPtr(1), Title: strPtr("Unknown Profile Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(999)}
+	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
+
+	if d.reason != "unknown quality profile" {
+		t.Errorf("reason = %q, want %q", d.reason, "unknown quality profile")
+	}
+	if len(gotRequests) != 0 {
+		t.Errorf("expected zero /moviefile requests, got %d", len(gotRequests))
+	}
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("expected a warning about the unknown profile:\n%s", buf.String())
+	}
+}
+
+func TestEvaluateMovie_UpgradesDisabled_SkipsWithExactReasonString(t *testing.T) {
+	var gotRequests []string
+	srv := moviefileServer(t, http.StatusOK, `[]`, &gotRequests)
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	m := movieListElement{ID: intPtr(1), Title: strPtr("Locked Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(2)}
+	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
+
+	// Exact string mandated by the brief.
+	if d.reason != "profile has upgrades disabled" {
+		t.Errorf("reason = %q, want exact %q", d.reason, "profile has upgrades disabled")
+	}
+	if d.profileName != "Locked-Profile" {
+		t.Errorf("profileName = %q, want %q", d.profileName, "Locked-Profile")
+	}
+	if len(gotRequests) != 0 {
+		t.Errorf("expected zero /moviefile requests, got %d", len(gotRequests))
+	}
+}
+
+func TestEvaluateMovie_ExcludedByTag_SkipsWithReason(t *testing.T) {
+	var gotRequests []string
+	srv := moviefileServer(t, http.StatusOK, `[]`, &gotRequests)
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	tags := []int{5, 99}
+	m := movieListElement{ID: intPtr(1), Title: strPtr("Excluded Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1), Tags: &tags}
+	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
+
+	if d.reason != "excluded by tag" {
+		t.Errorf("reason = %q, want %q", d.reason, "excluded by tag")
+	}
+	if len(gotRequests) != 0 {
+		t.Errorf("expected zero /moviefile requests, got %d", len(gotRequests))
+	}
+}
+
+// TestEvaluateMovie_TagNotActive_RuleFourAlwaysPasses pins that when the
+// exclusion tag is not defined in this instance (tagActive=false), rule 4
+// passes for every movie regardless of its actual tags — the movie below
+// carries tag id 99 (which would exclude it if active) but must still
+// proceed past rule 4 since tagActive is false.
+func TestEvaluateMovie_TagNotActive_RuleFourAlwaysPasses(t *testing.T) {
+	var gotRequests []string
+	srv := moviefileServer(t, http.StatusOK, `[{"id": 1, "customFormatScore": 200}]`, &gotRequests)
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	tags := []int{99}
+	m := movieListElement{ID: intPtr(1), Title: strPtr("Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1), Tags: &tags,
+		MovieFile: &movieFileElement{ID: intPtr(1)}}
+	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, false, map[int]bool{})
+
+	if !d.wouldUnmonitor {
+		t.Errorf("wouldUnmonitor = false, reason=%q; want true (rule 4 must not apply when tag is not active)", d.reason)
+	}
+}
+
+func TestEvaluateMovie_InWantedCutoffSet_SkipsWithReason(t *testing.T) {
+	var gotRequests []string
+	srv := moviefileServer(t, http.StatusOK, `[]`, &gotRequests)
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	m := movieListElement{ID: intPtr(1), Title: strPtr("Cutoff Not Met Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1)}
+	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{1: true})
+
+	if d.reason != "quality cutoff not met" {
+		t.Errorf("reason = %q, want %q", d.reason, "quality cutoff not met")
+	}
+	if len(gotRequests) != 0 {
+		t.Errorf("expected zero /moviefile requests for a movie in the wanted/cutoff set, got %d", len(gotRequests))
+	}
+}
+
+func TestEvaluateMovie_MoviefileFetchFails_SkipsWithExactReasonString(t *testing.T) {
+	var gotRequests []string
+	srv := moviefileServer(t, http.StatusInternalServerError, `[]`, &gotRequests)
+	defer srv.Close()
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	m := movieListElement{ID: intPtr(1), Title: strPtr("Fetch Fails Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1)}
+	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
+
+	// Exact string mandated by the brief.
+	if d.reason != "could not fetch custom format score" {
+		t.Errorf("reason = %q, want exact %q", d.reason, "could not fetch custom format score")
+	}
+	if len(gotRequests) != 1 {
+		t.Errorf("expected exactly 1 /moviefile request, got %d", len(gotRequests))
+	}
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("expected a warning:\n%s", buf.String())
+	}
+}
+
+func TestEvaluateMovie_MoviefileMissingCustomFormatScore_SkipsWithReasonAndWarns(t *testing.T) {
+	var gotRequests []string
+	srv := moviefileServer(t, http.StatusOK, `[{"id": 1}]`, &gotRequests) // customFormatScore key absent
+	defer srv.Close()
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	m := movieListElement{ID: intPtr(1), Title: strPtr("Missing Score Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
+		MovieFile: &movieFileElement{ID: intPtr(1)}}
+	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
+
+	if d.reason != "could not fetch custom format score" {
+		t.Errorf("reason = %q, want %q", d.reason, "could not fetch custom format score")
+	}
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("expected a warning:\n%s", buf.String())
+	}
+}
+
+func TestEvaluateMovie_CFBelowThreshold_SkipsWithReason(t *testing.T) {
+	var gotRequests []string
+	srv := moviefileServer(t, http.StatusOK, `[{"id": 1, "customFormatScore": 50}]`, &gotRequests) // threshold is 100
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	m := movieListElement{ID: intPtr(1), Title: strPtr("Below Threshold Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
+		MovieFile: &movieFileElement{ID: intPtr(1)}}
+	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
+
+	if d.wouldUnmonitor {
+		t.Error("wouldUnmonitor = true, want false")
+	}
+	if d.reason != "custom format cutoff not met" {
+		t.Errorf("reason = %q, want %q", d.reason, "custom format cutoff not met")
+	}
+	if d.cfScore == nil || *d.cfScore != 50 {
+		t.Errorf("cfScore = %v, want 50", d.cfScore)
+	}
+}
+
+// TestEvaluateMovie_AllRulesPass_WouldUnmonitorWithExactReasonString pins
+// the plan's verbatim would-unmonitor reason text: "cutoff met".
+func TestEvaluateMovie_AllRulesPass_WouldUnmonitorWithExactReasonString(t *testing.T) {
+	var gotRequests []string
+	srv := moviefileServer(t, http.StatusOK, `[{"id": 1, "customFormatScore": 150}]`, &gotRequests) // threshold is 100
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	m := movieListElement{ID: intPtr(1), Title: strPtr("Passes All Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
+		MovieFile: &movieFileElement{ID: intPtr(1)}}
+	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
+
+	if !d.wouldUnmonitor {
+		t.Fatalf("wouldUnmonitor = false, reason=%q; want true", d.reason)
+	}
+	// Exact string mandated by the brief's report-line example.
+	if d.reason != "cutoff met" {
+		t.Errorf("reason = %q, want exact %q", d.reason, "cutoff met")
+	}
+	if d.profileName != "HD-1080p" {
+		t.Errorf("profileName = %q, want %q", d.profileName, "HD-1080p")
+	}
+	if d.cfScore == nil || *d.cfScore != 150 {
+		t.Errorf("cfScore = %v, want 150", d.cfScore)
+	}
+}
+
+// TestEvaluateMovie_CFEqualToThreshold_PassesRuleSix pins the ">=" boundary
+// from the STRICT rule ("customFormatScore >= the profile's
+// cutoffFormatScore").
+func TestEvaluateMovie_CFEqualToThreshold_PassesRuleSix(t *testing.T) {
+	var gotRequests []string
+	srv := moviefileServer(t, http.StatusOK, `[{"id": 1, "customFormatScore": 100}]`, &gotRequests) // exactly the threshold
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	m := movieListElement{ID: intPtr(1), Title: strPtr("Exactly At Threshold Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
+		MovieFile: &movieFileElement{ID: intPtr(1)}}
+	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
+
+	if !d.wouldUnmonitor {
+		t.Errorf("wouldUnmonitor = false, reason=%q; want true (score equal to threshold must pass rule 6)", d.reason)
+	}
+}
+
+func strPtr(s string) *string { return &s }
+
 func TestFetchQualityProfiles_MalformedJSON_SkipsInstance(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
