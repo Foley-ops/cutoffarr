@@ -310,10 +310,14 @@ func logSampleMovies(logger *slog.Logger, inst Instance, samples []string, match
 //     than totalRecords claimed, the resulting id set is only partial.
 //   - a hard cap of maxWantedCutoffPages bounds the loop; hitting it without
 //     reaching totalRecords also leaves the id set partial.
+//   - any record missing its id can never be added to the set and can never
+//     be reconstructed, so the set is not authoritative from that point on.
 //
-// completeness contract (mandated refactor): an incomplete id set — either
-// of the two partial cases above — must return ok=false (warn + instance
-// skipped), never a partial map with ok=true. The decision engine (Phase 3)
+// completeness contract (mandated refactor, extended by a controller-
+// mandated fix to also cover the third case above): an incomplete or
+// untrustworthy id set — any of the three cases above — must return
+// ok=false (warn + instance skipped), never a partial map with ok=true.
+// The decision engine (Phase 3)
 // treats absence from this set as "would-unmonitor"; a partial set would
 // silently manufacture false positives in that dangerous direction (a
 // movie merely missing from an incomplete fetch would look exactly like
@@ -394,10 +398,18 @@ func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClie
 				// Without an id this record can't be cross-referenced
 				// against the /movie library at all; title is the only
 				// other identifying information the envelope carries, so
-				// it is the natural context to report here.
-				logger.Warn("wanted/cutoff record missing id field; excluded from the cutoff set",
+				// it is the natural context to report here. This makes the
+				// whole id set non-authoritative — there is no way to
+				// recover which movie this record meant, so its true
+				// cutoff-not-met membership can never be reconstructed —
+				// which is the same "partial set masquerading as complete"
+				// hazard refactor (a) guards against for the
+				// empty-page-early and page-cap cases: warn and skip the
+				// instance for the cycle instead of silently returning an
+				// incomplete set as if it were the whole truth.
+				logger.Warn("skipping instance: wanted/cutoff record missing id field; id set cannot be trusted",
 					"instance", inst.Name, "type", inst.Type, "page", page, "title", derefOrAbsent(r.Title))
-				continue
+				return nil, false
 			}
 			ids[*r.ID] = true
 		}

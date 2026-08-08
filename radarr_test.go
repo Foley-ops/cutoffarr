@@ -643,13 +643,25 @@ func TestInspectRadarrLibrary_WantedCutoffMissingRecordsKey_WarnsAndSkipsInstanc
 	}
 }
 
-// TestInspectRadarrLibrary_WantedCutoffRecordMissingId_WarnsWithTitleContext
+// TestInspectRadarrLibrary_WantedCutoffRecordMissingId_WarnsAndSkipsInstance
 // pins wantedCutoffRecord decoding "title" (plan §5: "decode records
 // minimally: id, title") and using it at the one place an individual
 // record is referenced: a record with no usable id can't be added to the
 // cutoff set, and title is the only other identifying information
 // available for the warning that reports the loss.
-func TestInspectRadarrLibrary_WantedCutoffRecordMissingId_WarnsWithTitleContext(t *testing.T) {
+//
+// FIX 2 (controller-mandated correction, applied after the initial Phase 3
+// review): a record missing its id was previously warned-about-but-
+// skipped, while the rest of the page's (and any later pages') ids were
+// still folded into the returned set and the fetch still reported ok=true.
+// That made the returned set silently non-authoritative: a movie's true
+// membership could never be reconstructed from an id-less record, so the
+// set could under-report the true cutoff-not-met population without any
+// indication that had happened — the same "partial set masquerading as
+// complete" hazard refactor (a) closes for the empty-page-early and
+// page-cap cases. It must be treated identically: warn and return
+// (nil, false), consistent with those other two partial cases.
+func TestInspectRadarrLibrary_WantedCutoffRecordMissingId_WarnsAndSkipsInstance(t *testing.T) {
 	var gotRequests, gotQueries []string
 	handler := staticWantedCutoffHandler(http.StatusOK, `{"totalRecords": 1, "records": [{"title": "Untitled Cutoff Record"}]}`) // id absent
 	wrapped := func(w http.ResponseWriter, r *http.Request) {
@@ -662,10 +674,15 @@ func TestInspectRadarrLibrary_WantedCutoffRecordMissingId_WarnsWithTitleContext(
 	logger, buf := newRadarrTestLogger(slog.LevelInfo)
 	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
 
-	inspectRadarrLibrary(context.Background(), logger, inst, nil)
+	// A sample that matches a library movie is required so this test can
+	// discriminate correctly: if the id-less record were wrongly treated as
+	// merely "excluded from the set" (ok=true), this sample would still
+	// produce a "sample cutoff status ... inWantedCutoff=false" line —
+	// that line's presence is exactly the bug this test catches.
+	inspectRadarrLibrary(context.Background(), logger, inst, []string{"Movie In Cutoff"})
 
 	if len(gotQueries) != 1 {
-		t.Fatalf("expected a single page request (totalRecords=1 reached after page 1), got %d: %v", len(gotQueries), gotQueries)
+		t.Fatalf("expected a single page request, got %d: %v", len(gotQueries), gotQueries)
 	}
 	out := buf.String()
 	if !strings.Contains(out, "level=WARN") {
@@ -673,6 +690,9 @@ func TestInspectRadarrLibrary_WantedCutoffRecordMissingId_WarnsWithTitleContext(
 	}
 	if !strings.Contains(out, "Untitled Cutoff Record") {
 		t.Errorf("expected the warning to include the record's title for context:\n%s", out)
+	}
+	if strings.Contains(out, "inWantedCutoff") {
+		t.Errorf("a record missing its id makes the whole set non-authoritative: instance must be skipped, no in/out determination logged:\n%s", out)
 	}
 }
 
