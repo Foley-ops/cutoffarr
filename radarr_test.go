@@ -108,6 +108,67 @@ func TestInspectRadarrLibrary_LogsLibraryCounts(t *testing.T) {
 	}
 }
 
+// TestInspectRadarrLibrary_ReturnsFullDecodedMovieSliceAndWantedIDs pins
+// refactor (b): fetchMovies/inspectRadarrLibrary must hand back every
+// decoded movie (not just samples), plus the wanted/cutoff id set and
+// ok=true, so a caller (the decision engine) can evaluate the whole
+// library without a second /movie round trip.
+func TestInspectRadarrLibrary_ReturnsFullDecodedMovieSliceAndWantedIDs(t *testing.T) {
+	var gotRequests []string
+	wantedJSON := `{"page": 1, "pageSize": 100, "totalRecords": 1, "records": [{"id": 2, "title": "Movie Not In Cutoff"}]}`
+	srv := radarrTestServer(t, http.StatusOK, radarrMovieJSON, staticWantedCutoffHandler(http.StatusOK, wantedJSON), &gotRequests)
+	defer srv.Close()
+
+	logger, _ := newRadarrTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	movies, wantedIDs, ok := inspectRadarrLibrary(context.Background(), logger, inst, nil)
+
+	if !ok {
+		t.Fatal("inspectRadarrLibrary returned ok=false, want true")
+	}
+	if len(movies) != 3 {
+		t.Fatalf("got %d decoded movies, want 3 (the full library, not just samples): %+v", len(movies), movies)
+	}
+	var sawUnrelated bool
+	for _, m := range movies {
+		if m.Title != nil && *m.Title == "Unrelated Movie" {
+			sawUnrelated = true
+			if m.Monitored == nil || *m.Monitored {
+				t.Errorf("Unrelated Movie decoded monitored = %v, want false", derefOrAbsent(m.Monitored))
+			}
+		}
+	}
+	if !sawUnrelated {
+		t.Errorf("expected the full decoded slice to include the non-sample movie 'Unrelated Movie': %+v", movies)
+	}
+	if len(wantedIDs) != 1 || !wantedIDs[2] {
+		t.Errorf("wantedIDs = %v, want {2: true}", wantedIDs)
+	}
+}
+
+// TestInspectRadarrLibrary_MovieFetchFailure_ReturnsNotOK pins that a
+// failed /movie fetch is reflected in inspectRadarrLibrary's own ok return
+// value (not just the log output), so a caller can gate further work on it
+// without re-parsing logs.
+func TestInspectRadarrLibrary_MovieFetchFailure_ReturnsNotOK(t *testing.T) {
+	var gotRequests []string
+	srv := radarrTestServer(t, http.StatusInternalServerError, radarrMovieJSON, staticWantedCutoffHandler(http.StatusOK, emptyWantedCutoffJSON), &gotRequests)
+	defer srv.Close()
+
+	logger, _ := newRadarrTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-broken", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	movies, wantedIDs, ok := inspectRadarrLibrary(context.Background(), logger, inst, nil)
+
+	if ok {
+		t.Error("inspectRadarrLibrary returned ok=true, want false when /movie fails")
+	}
+	if movies != nil || wantedIDs != nil {
+		t.Errorf("expected nil movies/wantedIDs on failure, got movies=%v wantedIDs=%v", movies, wantedIDs)
+	}
+}
+
 func TestInspectRadarrLibrary_NoSamplesFlag_NoPerMovieLogging(t *testing.T) {
 	var gotRequests []string
 	srv := radarrTestServer(t, http.StatusOK, radarrMovieJSON, staticWantedCutoffHandler(http.StatusOK, emptyWantedCutoffJSON), &gotRequests)

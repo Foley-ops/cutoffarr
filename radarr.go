@@ -54,9 +54,25 @@ type movieListElement struct {
 // this phase cares about. It is only expected to be present at all when the
 // movie actually has a file (hasFile == true); its absence is normal and
 // must never warn.
+//
+// ID and QualityCutoffNotMet are used by the Phase 3 decision engine, not
+// by Phase 2's --samples logging (which continues to warn only on Quality
+// and CustomFormatScore per the existing convention — see logSampleMovies):
+//   - ID correlates this movie's file against the array GET
+//     /api/v3/moviefile?movieId=<id> returns (per the STRICT decision
+//     rule's tie-break: "take the element whose id matches the movie's
+//     movieFile.id, or the single element").
+//   - QualityCutoffNotMet is Radarr's own quality-cutoff determination for
+//     this file, used only by the decision engine's cross-check to
+//     independently verify the /wanted/cutoff-derived id set against data
+//     computed by a different Radarr code path (never used to *decide*
+//     would-unmonitor/skip, per the STRICT rule §5 which is wanted/cutoff
+//     set membership only).
 type movieFileElement struct {
-	Quality           *movieFileQualityElement `json:"quality"`
-	CustomFormatScore *int                     `json:"customFormatScore"`
+	ID                  *int                     `json:"id"`
+	Quality             *movieFileQualityElement `json:"quality"`
+	CustomFormatScore   *int                     `json:"customFormatScore"`
+	QualityCutoffNotMet *bool                    `json:"qualityCutoffNotMet"`
 }
 
 // movieFileQualityElement mirrors the expected movieFile.quality.quality.name
@@ -115,13 +131,17 @@ type sampleMovieMatch struct {
 // never returns an error: the binding error-handling rule (plan §2.6) is
 // "skip that instance for the cycle and log a warning", so callers loop
 // over every configured radarr instance regardless of what happened to any
-// previous one.
-func inspectRadarrLibrary(ctx context.Context, logger *slog.Logger, inst Instance, samples []string) {
+// previous one. It returns every decoded movie (refactor b) and the
+// wanted/cutoff id set so a caller (the Phase 3 decision engine) can
+// evaluate the whole library without re-fetching either endpoint; ok=false
+// means either fetch failed or produced an unusable (partial) result, and
+// movies/wantedIDs are both nil in that case — callers must not proceed.
+func inspectRadarrLibrary(ctx context.Context, logger *slog.Logger, inst Instance, samples []string) ([]movieListElement, map[int]bool, bool) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	counts, matches, ok := fetchMovies(ctx, logger, client, inst, samples)
+	counts, movies, matches, ok := fetchMovies(ctx, logger, client, inst, samples)
 	if !ok {
-		return
+		return nil, nil, false
 	}
 
 	logger.Info("movie library",
@@ -132,29 +152,34 @@ func inspectRadarrLibrary(ctx context.Context, logger *slog.Logger, inst Instanc
 
 	wantedIDs, ok := fetchWantedCutoff(ctx, logger, client, inst)
 	if !ok {
-		return
+		return nil, nil, false
 	}
 
 	logSampleCutoffStatus(logger, inst, samples, matches, wantedIDs)
+
+	return movies, wantedIDs, true
 }
 
-// fetchMovies streams GET /api/v3/movie, tallying library-wide counts and
+// fetchMovies streams GET /api/v3/movie, tallying library-wide counts,
 // capturing the decoded fields plus raw JSON for any movie whose title
-// matches a configured sample. Decoding is streaming (json.Decoder reading
-// one array element into a json.RawMessage at a time) rather than
+// matches a configured sample, and (refactor b) collecting every decoded
+// movie into a returned slice so the decision engine can evaluate the
+// whole library from this single fetch. Decoding is streaming (json.Decoder
+// reading one array element into a json.RawMessage at a time) rather than
 // json.Unmarshal-ing the whole body, so peak memory is bounded by a single
 // movie's size rather than the entire library — required because /movie
 // can exceed the 4 MB cap used for the connectivity endpoints.
-func fetchMovies(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, samples []string) (movieCounts, map[string]sampleMovieMatch, bool) {
+func fetchMovies(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, samples []string) (movieCounts, []movieListElement, map[string]sampleMovieMatch, bool) {
 	var counts movieCounts
 	wanted := sampleLookupSet(samples)
 	matches := make(map[string]sampleMovieMatch, len(wanted))
+	var movies []movieListElement
 
 	resp, err := client.Do(ctx, http.MethodGet, "/api/v3/movie", nil)
 	if err != nil {
 		logger.Warn("skipping instance: movie request failed",
 			"instance", inst.Name, "type", inst.Type, "error", err)
-		return counts, nil, false
+		return counts, nil, nil, false
 	}
 	defer resp.Body.Close()
 
@@ -164,12 +189,12 @@ func fetchMovies(ctx context.Context, logger *slog.Logger, client *APIClient, in
 	if err != nil {
 		logger.Warn("skipping instance: movie response is not valid JSON",
 			"instance", inst.Name, "type", inst.Type, "error", err)
-		return counts, nil, false
+		return counts, nil, nil, false
 	}
 	if delim, isDelim := tok.(json.Delim); !isDelim || delim != '[' {
 		logger.Warn("skipping instance: movie response is not a JSON array",
 			"instance", inst.Name, "type", inst.Type)
-		return counts, nil, false
+		return counts, nil, nil, false
 	}
 
 	for dec.More() {
@@ -177,14 +202,14 @@ func fetchMovies(ctx context.Context, logger *slog.Logger, client *APIClient, in
 		if err := dec.Decode(&raw); err != nil {
 			logger.Warn("skipping instance: movie response element is not valid JSON",
 				"instance", inst.Name, "type", inst.Type, "error", err)
-			return counts, nil, false
+			return counts, nil, nil, false
 		}
 
 		var m movieListElement
 		if err := json.Unmarshal(raw, &m); err != nil {
 			logger.Warn("skipping instance: movie response element is not valid JSON",
 				"instance", inst.Name, "type", inst.Type, "error", err)
-			return counts, nil, false
+			return counts, nil, nil, false
 		}
 
 		counts.total++
@@ -194,6 +219,8 @@ func fetchMovies(ctx context.Context, logger *slog.Logger, client *APIClient, in
 		if m.HasFile != nil && *m.HasFile {
 			counts.hasFile++
 		}
+
+		movies = append(movies, m)
 
 		if m.Title != nil {
 			key := normalizeTitle(*m.Title)
@@ -223,10 +250,10 @@ func fetchMovies(ctx context.Context, logger *slog.Logger, client *APIClient, in
 	if err != nil || closeTok != json.Delim(']') {
 		logger.Warn("skipping instance: movie response is not a well-formed JSON array (missing closing bracket)",
 			"instance", inst.Name, "type", inst.Type, "error", err)
-		return counts, nil, false
+		return counts, nil, nil, false
 	}
 
-	return counts, matches, true
+	return counts, movies, matches, true
 }
 
 // logSampleMovies logs, for each configured sample title (in the order
