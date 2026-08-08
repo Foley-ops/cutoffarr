@@ -227,6 +227,21 @@ func validateConfig(cfg *Config) error {
 		return fmt.Errorf("config: webhook_port %d is out of range (must be between 1 and 65535)", cfg.WebhookPort)
 	}
 
+	// FIX 8 (controller-mandated correction after the initial Phase 3
+	// review): exclusion_tag is now load-bearing (the decision engine's
+	// rule 4 resolves it to a tag id), and an explicitly empty string
+	// would silently disable that rule for every movie in every instance
+	// with no indication that happened — an empty label can never match a
+	// real Radarr tag, so it's indistinguishable in the resulting logs
+	// from a deliberately unset exclusion tag. cfg.ExclusionTag is only
+	// ever "" here if the YAML explicitly set exclusion_tag: "" — an
+	// absent key defaults to defaultExclusionTag in toConfig before this
+	// runs, never to the empty string — so this check unambiguously
+	// targets the explicit-empty-string case only.
+	if cfg.ExclusionTag == "" {
+		return fmt.Errorf("config: exclusion_tag must not be empty (omit it entirely to use the default %q)", defaultExclusionTag)
+	}
+
 	seenNames := make(map[string]bool, len(cfg.Instances))
 	for i, inst := range cfg.Instances {
 		if inst.Name == "" {

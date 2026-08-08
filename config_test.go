@@ -273,6 +273,44 @@ instances: []
 	}
 }
 
+// TestLoadConfig_EmptyExclusionTagFatal is FIX 8 (controller-mandated
+// correction after the initial Phase 3 review): exclusion_tag is now
+// load-bearing (Phase 3's decision engine rule 4 resolves it to a tag id),
+// and an explicit empty string silently disables that rule for every movie
+// without any indication that happened — an empty label matches no real
+// Radarr tag, so resolveExclusionTagID's "exclusion tag not defined"
+// outcome would be indistinguishable from a deliberately-omitted config
+// key. An absent exclusion_tag key still defaults to "cutoffarr-exclude"
+// (toConfig's default only applies when the *string pointer itself is nil,
+// i.e. the key was never in the YAML at all), so this check unambiguously
+// means "explicitly set to empty in the file".
+func TestLoadConfig_EmptyExclusionTagFatal(t *testing.T) {
+	path := writeConfig(t, `
+exclusion_tag: ""
+instances: []
+`)
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("LoadConfig returned nil error, want error for an empty exclusion_tag")
+	}
+	if !strings.Contains(err.Error(), "exclusion_tag") {
+		t.Errorf("error %q does not mention exclusion_tag", err.Error())
+	}
+}
+
+func TestLoadConfig_AbsentExclusionTagStillDefaultsAndIsValid(t *testing.T) {
+	path := writeConfig(t, `
+instances: []
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	if cfg.ExclusionTag != "cutoffarr-exclude" {
+		t.Errorf("ExclusionTag = %q, want the default %q when the key is absent entirely", cfg.ExclusionTag, "cutoffarr-exclude")
+	}
+}
+
 func TestLoadConfig_PollIntervalZeroDisablesSweepAndIsValid(t *testing.T) {
 	path := writeConfig(t, `
 poll_interval: 0

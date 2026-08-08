@@ -164,11 +164,23 @@ func inspectRadarrLibrary(ctx context.Context, logger *slog.Logger, inst Instanc
 // capturing the decoded fields plus raw JSON for any movie whose title
 // matches a configured sample, and (refactor b) collecting every decoded
 // movie into a returned slice so the decision engine can evaluate the
-// whole library from this single fetch. Decoding is streaming (json.Decoder
-// reading one array element into a json.RawMessage at a time) rather than
-// json.Unmarshal-ing the whole body, so peak memory is bounded by a single
-// movie's size rather than the entire library — required because /movie
-// can exceed the 4 MB cap used for the connectivity endpoints.
+// whole library from this single fetch.
+//
+// FIX 7 (controller-mandated correction after the initial Phase 3 review):
+// decoding is streaming (json.Decoder reading one array element into a
+// json.RawMessage at a time) rather than json.Unmarshal-ing the whole body
+// at once, so the raw response is never buffered in full — required
+// because /movie can exceed the 4 MB cap used for the connectivity
+// endpoints. This bounds the memory cost of the *raw JSON* to roughly one
+// element at a time, same as before refactor (b). It does NOT bound the
+// function's overall peak memory to a single movie's size any more: every
+// decoded movieListElement is now retained in the returned movies slice
+// for the whole call (that is refactor (b)'s entire purpose — the decision
+// engine needs every movie), so overall memory is O(number of movies) —
+// the size of one decoded struct times the library size, which is far
+// smaller than the raw JSON per movie would be, but is no longer O(1).
+// sampleMovieMatch.raw (the exact bytes for --samples output) is retained
+// only for movies matching a configured sample, unchanged from before.
 func fetchMovies(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, samples []string) (movieCounts, []movieListElement, map[string]sampleMovieMatch, bool) {
 	var counts movieCounts
 	wanted := sampleLookupSet(samples)
