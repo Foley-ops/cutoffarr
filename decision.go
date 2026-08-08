@@ -391,12 +391,91 @@ func formatSkipCounts(counts map[string]int) string {
 	return strings.Join(parts, ", ")
 }
 
-// runCrossCheck is a placeholder pending the dedicated cross-check
-// implementation (plan §6, adapted to the STRICT rule): it currently
-// treats every call as passed with zero items checked. TODO: replace with
-// the real deterministic sampling + agree/disagree logic.
+// crossCheckSampleSize is "up to 10" from the plan, applied independently
+// to each of the two candidate categories (would-unmonitor and
+// monitored+hasFile skip), so up to 20 items are checked in total.
+const crossCheckSampleSize = 10
+
+// sampleEveryKth deterministically samples up to n items from ids: sorted
+// ascending, then every k-th item is taken where k = len(ids)/n (at least
+// 1), per the binding requirement ("seed from movie-id ordering... do NOT
+// use math/rand without a seed argument or time-based seeds"). Calling it
+// twice with the same input always yields the same output.
+func sampleEveryKth(ids []int, n int) []int {
+	if len(ids) == 0 {
+		return nil
+	}
+	sorted := append([]int(nil), ids...)
+	sort.Ints(sorted)
+	if len(sorted) <= n {
+		return sorted
+	}
+	step := len(sorted) / n
+	if step < 1 {
+		step = 1
+	}
+	sampled := make([]int, 0, n)
+	for i := 0; i < len(sorted) && len(sampled) < n; i += step {
+		sampled = append(sampled, sorted[i])
+	}
+	return sampled
+}
+
+// runCrossCheck implements plan §6's cross-check, adapted to the STRICT
+// rule (runs after decisions, read-only, no additional API calls: it
+// re-uses data already collected during evaluateMovie plus the same
+// wantedIDs set the decision engine consulted for rule 5). For up to 10
+// deterministically sampled would-unmonitor decisions and up to 10
+// deterministically sampled monitored+hasFile skip decisions (fewer if
+// fewer exist), it independently verifies that wanted-set membership
+// (wantedIDs[id], the same source the decision used for rule 5) agrees
+// with the movie's own movieFile.qualityCutoffNotMet from the
+// already-fetched /movie data — the two are computed by different Radarr
+// code paths and should never disagree. For would-unmonitor items it also
+// re-states the CF score and threshold that were used. Any disagreement is
+// logged at error level naming the movie and both values; the caller's
+// summary must then read "FAILED" rather than "passed" (the human gate
+// reads this, per the plan, to stop the project before any write path
+// exists).
 func runCrossCheck(logger *slog.Logger, inst Instance, decisions []movieDecision, wantedIDs map[int]bool) (passed bool, checked int) {
-	return true, 0
+	byID := make(map[int]movieDecision, len(decisions))
+	var wouldUnmonitorIDs, skipIDs []int
+	for _, d := range decisions {
+		byID[d.id] = d
+		if d.wouldUnmonitor {
+			wouldUnmonitorIDs = append(wouldUnmonitorIDs, d.id)
+		} else if d.hasFile {
+			skipIDs = append(skipIDs, d.id)
+		}
+	}
+
+	sampled := append(sampleEveryKth(wouldUnmonitorIDs, crossCheckSampleSize), sampleEveryKth(skipIDs, crossCheckSampleSize)...)
+
+	passed = true
+	for _, id := range sampled {
+		d := byID[id]
+		inWantedSet := wantedIDs[id]
+		qualityCutoffNotMet := d.qualityCutoffNotMet != nil && *d.qualityCutoffNotMet
+		agree := inWantedSet == qualityCutoffNotMet
+
+		attrs := []any{
+			"instance", inst.Name, "id", id, "title", d.title,
+			"inWantedSet", inWantedSet, "qualityCutoffNotMet", derefOrAbsent(d.qualityCutoffNotMet),
+		}
+		if d.wouldUnmonitor {
+			attrs = append(attrs, "cfScore", derefOrAbsent(d.cfScore), "cfThreshold", d.cfThreshold)
+		}
+		logger.Info("cross-check", attrs...)
+
+		if !agree {
+			passed = false
+			logger.Error("cross-check disagreement: wanted-set membership does not match movieFile.qualityCutoffNotMet",
+				"instance", inst.Name, "id", id, "title", d.title,
+				"inWantedSet", inWantedSet, "qualityCutoffNotMet", derefOrAbsent(d.qualityCutoffNotMet))
+		}
+	}
+
+	return passed, len(sampled)
 }
 
 // selectMovieFile picks the movieFileDetail this movie's file actually

@@ -862,6 +862,252 @@ func TestRunRadarrDecisionEngine_MovieMissingID_WarnsAndExcludedFromReport(t *te
 	}
 }
 
+// --- sampleEveryKth --------------------------------------------------------
+
+func TestSampleEveryKth_FewerThanN_ReturnsAllSorted(t *testing.T) {
+	got := sampleEveryKth([]int{5, 1, 3}, 10)
+	want := []int{1, 3, 5}
+	if len(got) != len(want) {
+		t.Fatalf("sampleEveryKth = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("sampleEveryKth[%d] = %d, want %d", i, got[i], want[i])
+		}
+	}
+}
+
+func TestSampleEveryKth_Empty_ReturnsEmpty(t *testing.T) {
+	if got := sampleEveryKth(nil, 10); len(got) != 0 {
+		t.Errorf("sampleEveryKth(nil, 10) = %v, want empty", got)
+	}
+}
+
+// TestSampleEveryKth_MoreThanN_ReturnsExactlyNDeterministically pins the
+// binding requirement: deterministic randomness seeded from movie-id
+// ordering (sort candidates by id, take every k-th), not math/rand.
+// Calling twice with the same input must yield the same result.
+func TestSampleEveryKth_MoreThanN_ReturnsExactlyNDeterministically(t *testing.T) {
+	ids := make([]int, 25)
+	for i := range ids {
+		ids[i] = 100 - i // deliberately unsorted, descending
+	}
+	got1 := sampleEveryKth(ids, 10)
+	got2 := sampleEveryKth(ids, 10)
+	if len(got1) != 10 {
+		t.Fatalf("got %d items, want exactly 10: %v", len(got1), got1)
+	}
+	for i := range got1 {
+		if got1[i] != got2[i] {
+			t.Fatalf("non-deterministic: first call %v, second call %v", got1, got2)
+		}
+	}
+	for i := 1; i < len(got1); i++ {
+		if got1[i] <= got1[i-1] {
+			t.Errorf("sample not sorted ascending: %v", got1)
+		}
+	}
+}
+
+// --- runCrossCheck -----------------------------------------------------
+
+func agreeTrue() *bool  { return boolPtr(true) }
+func agreeFalse() *bool { return boolPtr(false) }
+
+func TestRunCrossCheck_ZeroCandidates_PassesWithZeroItems(t *testing.T) {
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr"}
+
+	passed, checked := runCrossCheck(logger, inst, nil, map[int]bool{})
+	if !passed || checked != 0 {
+		t.Errorf("runCrossCheck = (%v, %d), want (true, 0) for zero candidates", passed, checked)
+	}
+	if strings.Contains(buf.String(), "level=ERROR") {
+		t.Errorf("no candidates should never error:\n%s", buf.String())
+	}
+}
+
+// TestRunCrossCheck_AgreeingSamples_PassesAndLogsBothCategories covers both
+// candidate categories: a would-unmonitor decision (not in wanted set,
+// qualityCutoffNotMet=false: agree) restating its CF score/threshold, and a
+// monitored+hasFile skip decision (in wanted set, qualityCutoffNotMet=true:
+// agree).
+func TestRunCrossCheck_AgreeingSamples_PassesAndLogsBothCategories(t *testing.T) {
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr"}
+
+	score := 150
+	decisions := []movieDecision{
+		{id: 1, title: "Would Unmonitor Movie", wouldUnmonitor: true, hasFile: true, qualityCutoffNotMet: agreeFalse(), cfScore: &score, cfThreshold: 100},
+		{id: 2, title: "Skip In Cutoff Movie", wouldUnmonitor: false, hasFile: true, reason: "quality cutoff not met", qualityCutoffNotMet: agreeTrue()},
+	}
+	wantedIDs := map[int]bool{2: true} // id 1 not in set (agrees with false); id 2 in set (agrees with true)
+
+	passed, checked := runCrossCheck(logger, inst, decisions, wantedIDs)
+	if !passed {
+		t.Errorf("passed = false, want true:\n%s", buf.String())
+	}
+	if checked != 2 {
+		t.Errorf("checked = %d, want 2", checked)
+	}
+	out := buf.String()
+	if strings.Contains(out, "level=ERROR") {
+		t.Errorf("agreeing samples must not error:\n%s", out)
+	}
+	if !strings.Contains(out, "msg=cross-check") {
+		t.Errorf("expected cross-check log lines:\n%s", out)
+	}
+	for _, want := range []string{`title="Would Unmonitor Movie"`, "cfScore=150", "cfThreshold=100"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected would-unmonitor cross-check line to contain %q:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, `title="Skip In Cutoff Movie"`) {
+		t.Errorf("expected the skip-category candidate to also be cross-checked:\n%s", out)
+	}
+}
+
+// TestRunCrossCheck_Disagreement_FailsWithErrorLog pins the binding rule:
+// any disagreement between wanted-set membership and
+// movieFile.qualityCutoffNotMet is an error-level log naming the movie and
+// both values, and the caller's summary must read "FAILED" — the human
+// gate is meant to catch this before any write path exists.
+func TestRunCrossCheck_Disagreement_FailsWithErrorLog(t *testing.T) {
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr"}
+
+	decisions := []movieDecision{
+		// In the wanted set (inWantedSet=true) but qualityCutoffNotMet
+		// says false: disagreement.
+		{id: 1, title: "Disagreeing Movie", wouldUnmonitor: false, hasFile: true, reason: "quality cutoff not met", qualityCutoffNotMet: agreeFalse()},
+	}
+	wantedIDs := map[int]bool{1: true}
+
+	passed, checked := runCrossCheck(logger, inst, decisions, wantedIDs)
+	if passed {
+		t.Error("passed = true, want false for a disagreement")
+	}
+	if checked != 1 {
+		t.Errorf("checked = %d, want 1", checked)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=ERROR") {
+		t.Errorf("expected an error-level log for the disagreement:\n%s", out)
+	}
+	if !strings.Contains(out, "Disagreeing Movie") {
+		t.Errorf("expected the error to name the movie:\n%s", out)
+	}
+	if !strings.Contains(out, "inWantedSet=true") || !strings.Contains(out, "qualityCutoffNotMet=false") {
+		t.Errorf("expected the error to state both values:\n%s", out)
+	}
+}
+
+// TestRunCrossCheck_SamplesUpToTenPerCategory pins the up-to-10-per-
+// category sampling cap: 15 would-unmonitor candidates (all agreeing) plus
+// 15 skip candidates (all agreeing) must be capped at 10 + 10 = 20 checked
+// items, not 30.
+func TestRunCrossCheck_SamplesUpToTenPerCategory(t *testing.T) {
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr"}
+
+	var decisions []movieDecision
+	wantedIDs := map[int]bool{}
+	for i := 1; i <= 15; i++ {
+		decisions = append(decisions, movieDecision{id: i, title: "WU", wouldUnmonitor: true, hasFile: true, qualityCutoffNotMet: agreeFalse()})
+	}
+	for i := 101; i <= 115; i++ {
+		decisions = append(decisions, movieDecision{id: i, title: "Skip", wouldUnmonitor: false, hasFile: true, qualityCutoffNotMet: agreeFalse()})
+		wantedIDs[i] = false
+	}
+
+	passed, checked := runCrossCheck(logger, inst, decisions, wantedIDs)
+	if !passed {
+		t.Error("passed = false, want true (all candidates agree)")
+	}
+	if checked != 20 {
+		t.Errorf("checked = %d, want 20 (10 would-unmonitor + 10 skip)", checked)
+	}
+}
+
+// TestRunCrossCheck_HasFileFalseSkip_ExcludedFromCandidates pins the
+// candidate filter: a skip decision for a movie with hasFile==false (e.g.
+// "no file") is not a "monitored+hasFile skip item" and must not be
+// sampled at all.
+func TestRunCrossCheck_HasFileFalseSkip_ExcludedFromCandidates(t *testing.T) {
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr"}
+
+	decisions := []movieDecision{
+		{id: 1, title: "No File Movie", wouldUnmonitor: false, hasFile: false, reason: "no file"},
+	}
+	_, checked := runCrossCheck(logger, inst, decisions, map[int]bool{})
+	if checked != 0 {
+		t.Errorf("checked = %d, want 0 (hasFile=false skip must not be a cross-check candidate)", checked)
+	}
+}
+
+// TestRunRadarrDecisionEngine_CrossCheckPassed_SummaryStatesPassedWithCount
+// and TestRunRadarrDecisionEngine_CrossCheckDisagreement_SummaryStatesFailed
+// pin the full pipeline's cross-check integration end to end: the
+// orchestrator threads its own decisions and wantedIDs into runCrossCheck
+// and reflects the result in the end-of-instance summary line, per the
+// plan's binding requirement that a disagreement's FAILED state is visible
+// in exactly the log the human gate reads.
+func TestRunRadarrDecisionEngine_CrossCheckPassed_SummaryStatesPassedWithCount(t *testing.T) {
+	var gotMoviefileRequests []string
+	// movieFile.qualityCutoffNotMet=false agrees with "not in wanted set".
+	moviefileHandler := func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[{"id": 1, "customFormatScore": 200}]`))
+	}
+	srv := decisionEngineTestServer(t, decisionEngineProfilesJSON, decisionEngineNoTagsJSON, moviefileHandler, &gotMoviefileRequests)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("Would Unmonitor Movie"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
+			MovieFile: &movieFileElement{ID: intPtr(1), QualityCutoffNotMet: boolPtr(false)}},
+	}
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude")
+
+	out := buf.String()
+	if strings.Contains(out, "level=ERROR") {
+		t.Errorf("agreeing cross-check must not error:\n%s", out)
+	}
+	if !strings.Contains(out, `crossCheck="passed (1 items)"`) {
+		t.Errorf("expected the summary to state the cross-check passed with its item count:\n%s", out)
+	}
+}
+
+func TestRunRadarrDecisionEngine_CrossCheckDisagreement_SummaryStatesFailed(t *testing.T) {
+	var gotMoviefileRequests []string
+	moviefileHandler := func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[{"id": 1, "customFormatScore": 200}]`))
+	}
+	srv := decisionEngineTestServer(t, decisionEngineProfilesJSON, decisionEngineNoTagsJSON, moviefileHandler, &gotMoviefileRequests)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	// wouldUnmonitor (not in wantedIDs, score 200 >= threshold 100), but
+	// movieFile.qualityCutoffNotMet=true disagrees with "not in set".
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("Disagreeing Movie"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
+			MovieFile: &movieFileElement{ID: intPtr(1), QualityCutoffNotMet: boolPtr(true)}},
+	}
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude")
+
+	out := buf.String()
+	if !strings.Contains(out, "level=ERROR") {
+		t.Errorf("expected an error-level log for the cross-check disagreement:\n%s", out)
+	}
+	if !strings.Contains(out, "crossCheck=FAILED") {
+		t.Errorf("expected the summary to state the cross-check FAILED:\n%s", out)
+	}
+}
+
 func TestFetchQualityProfiles_MalformedJSON_SkipsInstance(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
