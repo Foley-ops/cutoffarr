@@ -41,11 +41,34 @@ func NewAPIClient(baseURL, apiKey string) *APIClient {
 
 // Do issues an HTTP request against path (joined onto the client's base
 // URL), setting the X-Api-Key header on every call. Any non-2xx response is
-// treated as an error for that call.
+// treated as an error for that call. It is a thin wrapper around DoQuery
+// with no query parameters attached.
 func (c *APIClient) Do(ctx context.Context, method, path string, body io.Reader) (*http.Response, error) {
-	reqURL, err := url.JoinPath(c.baseURL, path)
+	return c.DoQuery(ctx, method, path, nil, body)
+}
+
+// DoQuery is Do plus a query url.Values, attached to the request URL
+// correctly. It exists as a sibling to Do rather than an added parameter to
+// it because url.JoinPath (used to join path onto the client's base URL)
+// treats "?" as a literal path character and percent-encodes it (confirmed
+// empirically): embedding a query string directly in the path argument
+// would corrupt it. DoQuery instead joins only the path, then attaches the
+// query via url.Values.Encode() on the parsed result. A nil or empty query
+// attaches no "?" at all, matching Do's existing behavior exactly.
+func (c *APIClient) DoQuery(ctx context.Context, method, path string, query url.Values, body io.Reader) (*http.Response, error) {
+	joined, err := url.JoinPath(c.baseURL, path)
 	if err != nil {
 		return nil, fmt.Errorf("client: building request url from base %q and path %q: %w", c.baseURL, path, err)
+	}
+
+	reqURL := joined
+	if len(query) > 0 {
+		parsed, err := url.Parse(joined)
+		if err != nil {
+			return nil, fmt.Errorf("client: parsing joined url %q: %w", joined, err)
+		}
+		parsed.RawQuery = query.Encode()
+		reqURL = parsed.String()
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, reqURL, body)

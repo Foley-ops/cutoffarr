@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -65,7 +66,7 @@ var expectedAppNameByType = map[string]string{
 func checkInstanceConnectivity(ctx context.Context, logger *slog.Logger, inst Instance) bool {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	statusBody, err := fetchBody(ctx, client, "/api/v3/system/status")
+	statusBody, err := fetchBody(ctx, client, "/api/v3/system/status", nil)
 	if err != nil {
 		logger.Warn("skipping instance: system/status request failed",
 			"instance", inst.Name, "type", inst.Type, "error", err)
@@ -92,7 +93,7 @@ func checkInstanceConnectivity(ctx context.Context, logger *slog.Logger, inst In
 			"instance", inst.Name, "type", inst.Type, "appName", *status.AppName, "expectedAppName", expected)
 	}
 
-	profilesBody, err := fetchBody(ctx, client, "/api/v3/qualityprofile")
+	profilesBody, err := fetchBody(ctx, client, "/api/v3/qualityprofile", nil)
 	if err != nil {
 		logger.Warn("skipping instance: qualityprofile request failed",
 			"instance", inst.Name, "type", inst.Type, "error", err)
@@ -123,14 +124,15 @@ func checkInstanceConnectivity(ctx context.Context, logger *slog.Logger, inst In
 	return true
 }
 
-// fetchBody issues a GET against path via client and returns the full
-// response body, capped at maxResponseBodyBytes. Any transport error,
-// non-2xx status (client.Do's job), or body-read error is returned as-is
-// for the caller to treat as this instance's cycle being skipped. A body
-// that reaches the cap exactly is indistinguishable from one that was
-// truncated by it, so it is also reported as an error per plan §2.6.
-func fetchBody(ctx context.Context, client *APIClient, path string) ([]byte, error) {
-	resp, err := client.Do(ctx, http.MethodGet, path, nil)
+// fetchBody issues a GET against path (optionally with query parameters)
+// via client and returns the full response body, capped at
+// maxResponseBodyBytes. Any transport error, non-2xx status (client.Do's
+// job), or body-read error is returned as-is for the caller to treat as
+// this instance's cycle being skipped. A body that reaches the cap exactly
+// is indistinguishable from one that was truncated by it, so it is also
+// reported as an error per plan §2.6.
+func fetchBody(ctx context.Context, client *APIClient, path string, query url.Values) ([]byte, error) {
+	resp, err := client.DoQuery(ctx, http.MethodGet, path, query, nil)
 	if err != nil {
 		return nil, err
 	}

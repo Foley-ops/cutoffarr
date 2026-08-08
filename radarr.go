@@ -390,17 +390,15 @@ func logSampleCutoffStatus(logger *slog.Logger, inst Instance, samples []string,
 }
 
 // fetchLargeBody issues a GET request against path with the given query
-// parameters and returns the full response body, capped at
-// movieStreamSanityLimit. It mirrors fetchBody in connectivity.go (same
-// cap-reached-means-malformed treatment) but is kept as separate code here
-// rather than sharing that function, for two reasons: it uses a different,
-// much larger cap required by this phase's binding large-response handling
-// (the 4 MB connectivity cap is too small for /wanted/cutoff's use of
-// fetchLargeBody as well, even though individual pages are small), and it
-// needs to attach query parameters, which APIClient.Do cannot do (see
-// doGet below).
+// parameters (via APIClient.DoQuery) and returns the full response body,
+// capped at movieStreamSanityLimit. It mirrors fetchBody in connectivity.go
+// (same cap-reached-means-malformed treatment, same DoQuery plumbing) but
+// is kept as separate code here rather than sharing that function, because
+// it uses a different, much larger cap required by this phase's binding
+// large-response handling (the 4 MB connectivity cap is too small for
+// /wanted/cutoff, even though individual pages are small).
 func fetchLargeBody(ctx context.Context, client *APIClient, path string, query url.Values) ([]byte, error) {
-	resp, err := doGet(ctx, client, path, query)
+	resp, err := client.DoQuery(ctx, http.MethodGet, path, query, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -414,47 +412,6 @@ func fetchLargeBody(ctx context.Context, client *APIClient, path string, query u
 		return nil, fmt.Errorf("reading response body from %s: response reached the %d byte limit (possibly truncated)", path, movieStreamSanityLimit)
 	}
 	return body, nil
-}
-
-// doGet issues a GET request against path with query attached, using
-// client's base URL, API key, and http.Client (same package, so its
-// unexported fields are reachable directly rather than duplicating
-// NewAPIClient's construction). It exists because APIClient.Do joins its
-// path argument with url.JoinPath, which treats "?" as a literal path
-// character and percent-encodes it (confirmed empirically) — embedding a
-// query string in the path passed to Do would corrupt it. doGet instead
-// joins only the path, then attaches the query via url.Values.Encode.
-// Request construction and non-2xx handling (with the same
-// errorBodySnippetLimit-bounded body snippet) otherwise match APIClient.Do.
-func doGet(ctx context.Context, client *APIClient, path string, query url.Values) (*http.Response, error) {
-	joined, err := url.JoinPath(client.baseURL, path)
-	if err != nil {
-		return nil, fmt.Errorf("radarr: building request url from base %q and path %q: %w", client.baseURL, path, err)
-	}
-	reqURL, err := url.Parse(joined)
-	if err != nil {
-		return nil, fmt.Errorf("radarr: parsing joined url %q: %w", joined, err)
-	}
-	reqURL.RawQuery = query.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("radarr: building request: %w", err)
-	}
-	req.Header.Set("X-Api-Key", client.apiKey)
-
-	resp, err := client.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("radarr: GET %s: %w", reqURL.String(), err)
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		defer resp.Body.Close()
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodySnippetLimit))
-		return nil, fmt.Errorf("radarr: GET %s: unexpected status %d: %s", reqURL.String(), resp.StatusCode, snippet)
-	}
-
-	return resp, nil
 }
 
 // normalizeTitle folds a title to a comparison key: trimmed of surrounding
