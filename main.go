@@ -23,6 +23,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	configPath := fs.String("config", "/config/config.yml", "path to the cutoffarr YAML config file")
 	once := fs.Bool("once", false, "run a single pass and exit (daemon mode arrives in a later phase)")
 	forceDryRun := fs.Bool("dry-run", false, "force dry-run mode on; cannot be used to disable dry-run set by config")
+	samplesFlag := fs.String("samples", "", "comma-separated movie titles to dump full detail for during Radarr library inspection (--once only)")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -59,8 +60,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 		// connectivity check sequentially. Any one instance's failure is
 		// logged as a warning by checkInstanceConnectivity itself and
 		// must not stop the remaining instances or affect the exit code.
+		//
+		// Phase 2: for radarr instances only, follow up with the read-only
+		// library inspection (GET /movie, paged GET /wanted/cutoff).
+		// Sonarr instances are connectivity-only until Phase 6.
+		samples := parseSamples(*samplesFlag)
 		for _, inst := range cfg.Instances {
 			checkInstanceConnectivity(context.Background(), logger, inst)
+			if inst.Type == "radarr" {
+				inspectRadarrLibrary(context.Background(), logger, inst, samples)
+			}
 		}
 	} else {
 		logger.Info("daemon mode is not implemented yet; it arrives in a later phase")
