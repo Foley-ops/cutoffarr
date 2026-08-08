@@ -832,6 +832,54 @@ func TestRunRadarrDecisionEngine_SummaryCountsCorrect(t *testing.T) {
 	}
 }
 
+// TestRunRadarrDecisionEngine_PerMovieMoviefileFailure_DoesNotStopOtherMovies
+// pins the plan's binding per-movie-not-instance-skip rule explicitly at
+// the orchestrator level: when /moviefile fails for one movie partway
+// through the library, the loop must still evaluate and report every other
+// movie, not abort the rest of the instance.
+func TestRunRadarrDecisionEngine_PerMovieMoviefileFailure_DoesNotStopOtherMovies(t *testing.T) {
+	var gotMoviefileRequests []string
+	// id 1 fails (500); id 3 succeeds. Movie order is 1, 2 (no file, never
+	// reaches moviefile), 3, so the failure happens before the last movie
+	// is evaluated.
+	moviefileHandler := func(w http.ResponseWriter, r *http.Request) {
+		gotMoviefileRequests = append(gotMoviefileRequests, r.URL.RawQuery)
+		if r.URL.Query().Get("movieId") == "1" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Write([]byte(`[{"id": 1, "customFormatScore": 200}]`))
+	}
+	srv := decisionEngineTestServer(t, decisionEngineProfilesJSON, decisionEngineNoTagsJSON, moviefileHandler, &gotMoviefileRequests)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("Fails Movie"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
+			MovieFile: &movieFileElement{ID: intPtr(1)}},
+		{ID: intPtr(2), Title: strPtr("No File Movie"), Monitored: boolPtr(true), HasFile: boolPtr(false), QualityProfileID: intPtr(1)},
+		{ID: intPtr(3), Title: strPtr("Succeeds Movie"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
+			MovieFile: &movieFileElement{ID: intPtr(1)}},
+	}
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude")
+
+	out := buf.String()
+	if !strings.Contains(out, `title="Fails Movie"`) || !strings.Contains(out, `reason="could not fetch custom format score"`) {
+		t.Errorf("expected the failing movie's skip line:\n%s", out)
+	}
+	if !strings.Contains(out, `title="No File Movie"`) || !strings.Contains(out, `reason="no file"`) {
+		t.Errorf("expected the no-file movie to still be reported (not skipped due to the earlier failure):\n%s", out)
+	}
+	if !strings.Contains(out, `title="Succeeds Movie"`) || !strings.Contains(out, "msg=would-unmonitor") {
+		t.Errorf("expected the later movie to still be evaluated and reported would-unmonitor:\n%s", out)
+	}
+	if !strings.Contains(out, "totalMonitored=3") {
+		t.Errorf("expected all 3 monitored movies counted:\n%s", out)
+	}
+}
+
 // TestRunRadarrDecisionEngine_MovieMissingID_WarnsAndExcludedFromReport is a
 // defensive-coding test: a monitored movie missing its id field cannot be
 // evaluated against rules 5/6 (no id to look up) or safely reported, so it
@@ -1026,6 +1074,35 @@ func TestRunCrossCheck_SamplesUpToTenPerCategory(t *testing.T) {
 	}
 	if checked != 20 {
 		t.Errorf("checked = %d, want 20 (10 would-unmonitor + 10 skip)", checked)
+	}
+}
+
+// TestRunCrossCheck_QualityCutoffNotMetAbsent_WarnsButDoesNotFailTheCheck
+// pins a defensive edge case: if movieFile.qualityCutoffNotMet is entirely
+// absent from the /movie data for a sampled candidate (e.g. an older Radarr
+// response shape), silently treating that as "false" could mask a genuine
+// disagreement. It must instead warn distinctly and not, on its own,
+// contribute to a FAILED verdict.
+func TestRunCrossCheck_QualityCutoffNotMetAbsent_WarnsButDoesNotFailTheCheck(t *testing.T) {
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr"}
+
+	decisions := []movieDecision{
+		{id: 1, title: "Missing Field Movie", wouldUnmonitor: true, hasFile: true, qualityCutoffNotMet: nil, cfScore: intPtr(200), cfThreshold: 100},
+	}
+	passed, checked := runCrossCheck(logger, inst, decisions, map[int]bool{})
+	if !passed {
+		t.Error("passed = false, want true: an absent field alone must not fail the check")
+	}
+	if checked != 1 {
+		t.Errorf("checked = %d, want 1", checked)
+	}
+	out := buf.String()
+	if strings.Contains(out, "level=ERROR") {
+		t.Errorf("an absent field must warn, not error:\n%s", out)
+	}
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "Missing Field Movie") {
+		t.Errorf("expected a warning naming the movie with the absent field:\n%s", out)
 	}
 }
 

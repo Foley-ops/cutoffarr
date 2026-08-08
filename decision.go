@@ -455,8 +455,6 @@ func runCrossCheck(logger *slog.Logger, inst Instance, decisions []movieDecision
 	for _, id := range sampled {
 		d := byID[id]
 		inWantedSet := wantedIDs[id]
-		qualityCutoffNotMet := d.qualityCutoffNotMet != nil && *d.qualityCutoffNotMet
-		agree := inWantedSet == qualityCutoffNotMet
 
 		attrs := []any{
 			"instance", inst.Name, "id", id, "title", d.title,
@@ -467,11 +465,23 @@ func runCrossCheck(logger *slog.Logger, inst Instance, decisions []movieDecision
 		}
 		logger.Info("cross-check", attrs...)
 
-		if !agree {
+		if d.qualityCutoffNotMet == nil {
+			// Data-quality issue distinct from an actual disagreement: we
+			// cannot verify agreement without a value to compare against.
+			// Silently treating "absent" as "false" here could mask a real
+			// disagreement (inWantedSet=false would then trivially "agree"
+			// with a value we never actually observed), so this is called
+			// out on its own and does not, by itself, fail the check.
+			logger.Warn("cross-check: movieFile.qualityCutoffNotMet missing from /movie data; cannot verify wanted-set agreement for this movie",
+				"instance", inst.Name, "id", id, "title", d.title)
+			continue
+		}
+
+		if inWantedSet != *d.qualityCutoffNotMet {
 			passed = false
 			logger.Error("cross-check disagreement: wanted-set membership does not match movieFile.qualityCutoffNotMet",
 				"instance", inst.Name, "id", id, "title", d.title,
-				"inWantedSet", inWantedSet, "qualityCutoffNotMet", derefOrAbsent(d.qualityCutoffNotMet))
+				"inWantedSet", inWantedSet, "qualityCutoffNotMet", *d.qualityCutoffNotMet)
 		}
 	}
 
