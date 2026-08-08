@@ -367,6 +367,13 @@ var evaluateTestProfiles = map[int]qualityProfile{
 	2: {Name: "Locked-Profile", CutoffFormatScore: 100, UpgradeAllowed: false},
 }
 
+// noTags is a shared present-but-empty tags slice, used by evaluateMovie
+// fixtures that need to pass rule 4 cleanly (as opposed to Tags left nil,
+// which after FIX 1 is untrusted input when the exclusion tag is active —
+// see TestEvaluateMovie_TagActiveAndTagsNil_SkipsWithReasonAndWarns).
+// Read-only; safe to share a single backing slice across tests.
+var noTags = []int{}
+
 // moviefileServer wires a mux serving moviefileJSON at /api/v3/moviefile
 // for any movieId, recording every request into gotRequests.
 func moviefileServer(t *testing.T, status int, moviefileJSON string, gotRequests *[]string) *httptest.Server {
@@ -554,6 +561,100 @@ func TestEvaluateMovie_UpgradesDisabledAndInWantedSet_UpgradesDisabledReasonWins
 	}
 }
 
+// TestEvaluateMovie_TagActiveAndTagsNil_SkipsWithReasonAndWarns is FIX 1
+// (controller-mandated correction after the whole-branch review): "tags"
+// entirely absent from the movie's JSON (m.Tags == nil) is untrusted
+// input the same way "monitored" absent is (FIX 6) — containsTag(nil, id)
+// returns false, so without this fix a movie whose tags we simply
+// couldn't observe would silently pass rule 4 and could reach
+// would-unmonitor, the one remaining untrusted-input route to that
+// outcome. When the exclusion tag is actually active in this instance,
+// that uncertainty must not be allowed to let the movie through: it is
+// warned about (house warnIfFieldAbsent convention) and skipped with a
+// dedicated reason.
+func TestEvaluateMovie_TagActiveAndTagsNil_SkipsWithReasonAndWarns(t *testing.T) {
+	var gotRequests []string
+	srv := moviefileServer(t, http.StatusOK, `[]`, &gotRequests)
+	defer srv.Close()
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	m := movieListElement{ID: intPtr(1), Title: strPtr("No Tags Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1)} // Tags left nil
+	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
+
+	if d.reason != ReasonTagsUnknown {
+		t.Errorf("reason = %q, want %q", d.reason, ReasonTagsUnknown)
+	}
+	if d.wouldUnmonitor {
+		t.Error("wouldUnmonitor = true, want false")
+	}
+	if len(gotRequests) != 0 {
+		t.Errorf("expected zero /moviefile requests, got %d", len(gotRequests))
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") {
+		t.Errorf("expected a warning about the missing tags field:\n%s", out)
+	}
+	if !strings.Contains(out, "field=tags") {
+		t.Errorf("warning does not name the missing field tags:\n%s", out)
+	}
+}
+
+// TestEvaluateMovie_TagActiveAndTagsPresentEmpty_PassesRuleFourNoWarn pins
+// the other half of FIX 1's present-vs-absent distinction: tags present
+// but an empty list is a legitimate, common value (a movie with no tags at
+// all) and must pass rule 4 normally, with no warning.
+func TestEvaluateMovie_TagActiveAndTagsPresentEmpty_PassesRuleFourNoWarn(t *testing.T) {
+	var gotRequests []string
+	srv := moviefileServer(t, http.StatusOK, `[{"id": 1, "customFormatScore": 200}]`, &gotRequests)
+	defer srv.Close()
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	m := movieListElement{ID: intPtr(1), Title: strPtr("Empty Tags Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1), Tags: &noTags,
+		MovieFile: &movieFileElement{ID: intPtr(1)}}
+	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
+
+	if !d.wouldUnmonitor {
+		t.Errorf("wouldUnmonitor = false, reason=%q; want true (present-but-empty tags must pass rule 4 cleanly)", d.reason)
+	}
+	if strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("present-but-empty tags must not warn:\n%s", buf.String())
+	}
+}
+
+// TestEvaluateMovie_TagNotActiveAndTagsNil_WarnsButProceeds pins the third
+// case FIX 1 specifies: when no exclusion tag is defined in this instance
+// at all (tagActive=false), rule 4 is vacuous regardless of tags, so nil
+// tags is harmless to the decision and evaluation must proceed normally —
+// but a warning still fires for gate visibility, since an absent field may
+// still indicate the assumed field name is wrong.
+func TestEvaluateMovie_TagNotActiveAndTagsNil_WarnsButProceeds(t *testing.T) {
+	var gotRequests []string
+	srv := moviefileServer(t, http.StatusOK, `[{"id": 1, "customFormatScore": 200}]`, &gotRequests)
+	defer srv.Close()
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	m := movieListElement{ID: intPtr(1), Title: strPtr("No Tags Movie Inactive Tag"), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
+		MovieFile: &movieFileElement{ID: intPtr(1)}} // Tags left nil
+	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, false, map[int]bool{})
+
+	if !d.wouldUnmonitor {
+		t.Errorf("wouldUnmonitor = false, reason=%q; want true (rule 4 is vacuous when the tag isn't active, so absent tags is harmless to the decision)", d.reason)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") {
+		t.Errorf("expected a warning about the missing tags field even though the tag isn't active (gate visibility):\n%s", out)
+	}
+	if !strings.Contains(out, "field=tags") {
+		t.Errorf("warning does not name the missing field tags:\n%s", out)
+	}
+}
+
 // TestEvaluateMovie_TagNotActive_RuleFourAlwaysPasses pins that when the
 // exclusion tag is not defined in this instance (tagActive=false), rule 4
 // passes for every movie regardless of its actual tags — the movie below
@@ -585,7 +686,7 @@ func TestEvaluateMovie_InWantedCutoffSet_SkipsWithReason(t *testing.T) {
 	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	m := movieListElement{ID: intPtr(1), Title: strPtr("Cutoff Not Met Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1)}
+	m := movieListElement{ID: intPtr(1), Title: strPtr("Cutoff Not Met Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1), Tags: &noTags}
 	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{1: true})
 
 	if d.reason != ReasonQualityCutoffNotMet {
@@ -604,7 +705,7 @@ func TestEvaluateMovie_MoviefileFetchFails_SkipsWithExactReasonString(t *testing
 	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	m := movieListElement{ID: intPtr(1), Title: strPtr("Fetch Fails Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1)}
+	m := movieListElement{ID: intPtr(1), Title: strPtr("Fetch Fails Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1), Tags: &noTags}
 	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
 
 	// Exact string mandated by the brief.
@@ -627,7 +728,7 @@ func TestEvaluateMovie_MoviefileMissingCustomFormatScore_SkipsWithReasonAndWarns
 	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	m := movieListElement{ID: intPtr(1), Title: strPtr("Missing Score Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
+	m := movieListElement{ID: intPtr(1), Title: strPtr("Missing Score Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1), Tags: &noTags,
 		MovieFile: &movieFileElement{ID: intPtr(1)}}
 	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
 
@@ -647,7 +748,7 @@ func TestEvaluateMovie_CFBelowThreshold_SkipsWithReason(t *testing.T) {
 	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	m := movieListElement{ID: intPtr(1), Title: strPtr("Below Threshold Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
+	m := movieListElement{ID: intPtr(1), Title: strPtr("Below Threshold Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1), Tags: &noTags,
 		MovieFile: &movieFileElement{ID: intPtr(1)}}
 	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
 
@@ -672,7 +773,7 @@ func TestEvaluateMovie_AllRulesPass_WouldUnmonitorWithExactReasonString(t *testi
 	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	m := movieListElement{ID: intPtr(1), Title: strPtr("Passes All Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
+	m := movieListElement{ID: intPtr(1), Title: strPtr("Passes All Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1), Tags: &noTags,
 		MovieFile: &movieFileElement{ID: intPtr(1)}}
 	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
 
@@ -702,7 +803,7 @@ func TestEvaluateMovie_CFEqualToThreshold_PassesRuleSix(t *testing.T) {
 	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	m := movieListElement{ID: intPtr(1), Title: strPtr("Exactly At Threshold Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
+	m := movieListElement{ID: intPtr(1), Title: strPtr("Exactly At Threshold Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1), Tags: &noTags,
 		MovieFile: &movieFileElement{ID: intPtr(1)}}
 	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
 

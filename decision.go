@@ -173,6 +173,7 @@ const (
 	ReasonNoFile               = "no file"
 	ReasonUnknownProfile       = "unknown quality profile"
 	ReasonUpgradesDisabled     = "profile has upgrades disabled"
+	ReasonTagsUnknown          = "could not verify exclusion tags"
 	ReasonExcludedByTag        = "excluded by tag"
 	ReasonQualityCutoffNotMet  = "quality cutoff not met"
 	ReasonCouldNotFetchCFScore = "could not fetch custom format score"
@@ -293,6 +294,26 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 	// Rule 4: tags do not include the exclusion tag id (only when the tag
 	// is actually defined in this instance; otherwise rule 4 always
 	// passes, per the tag-resolution rules).
+	//
+	// FIX 1 (controller-mandated correction after the whole-branch
+	// review): "tags" entirely absent from the movie's JSON (m.Tags ==
+	// nil, as opposed to present-but-empty) is untrusted input the same
+	// way "monitored" absent is (FIX 6) — containsTag(nil, id) reports
+	// false, so without this guard a movie whose tags we simply couldn't
+	// observe would silently pass rule 4 and could reach would-unmonitor:
+	// the one remaining untrusted-input route to that outcome, violating
+	// §2.6. When the exclusion tag is actually active, that uncertainty
+	// must not let the movie through: warn (house warnIfFieldAbsent
+	// convention) and skip with a dedicated reason. When the tag is not
+	// active in this instance, rule 4 is vacuous regardless of tags — nil
+	// tags is harmless to the decision — so evaluation still proceeds, but
+	// the warn still fires for gate visibility (an absent field may still
+	// mean our assumed field name is wrong).
+	warnIfFieldAbsent(logger, inst, "movie", "tags", m.Tags == nil)
+	if tagActive && m.Tags == nil {
+		d.reason = ReasonTagsUnknown
+		return d
+	}
 	if tagActive && containsTag(m.Tags, exclusionTagID) {
 		d.reason = ReasonExcludedByTag
 		return d
