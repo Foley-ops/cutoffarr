@@ -157,6 +157,29 @@ func fetchMovieFileDetails(ctx context.Context, logger *slog.Logger, client *API
 	return files, true
 }
 
+// Decision reason strings (FIX 3, controller-mandated correction after the
+// initial Phase 3 review): the single authoritative source for every
+// would-unmonitor/skip reason evaluateMovie can produce, so the exact
+// wording exists in exactly one place instead of being duplicated across
+// evaluateMovie's branches (ReasonCouldNotFetchCFScore previously appeared
+// as two separate literals) and repeated as free-standing string literals
+// in tests. ReasonNoFile through ReasonCutoffMet are listed in the STRICT
+// decision rule's evaluation order (rules 2-6); ReasonCutoffMet is the
+// would-unmonitor reason, not a skip reason. ReasonUpgradesDisabled,
+// ReasonCouldNotFetchCFScore, and ReasonCutoffMet are exact strings
+// mandated by the brief; the others are this implementation's own
+// consistent choice of wording where the brief left it unspecified.
+const (
+	ReasonNoFile               = "no file"
+	ReasonUnknownProfile       = "unknown quality profile"
+	ReasonUpgradesDisabled     = "profile has upgrades disabled"
+	ReasonExcludedByTag        = "excluded by tag"
+	ReasonQualityCutoffNotMet  = "quality cutoff not met"
+	ReasonCouldNotFetchCFScore = "could not fetch custom format score"
+	ReasonCFCutoffNotMet       = "custom format cutoff not met"
+	ReasonCutoffMet            = "cutoff met"
+)
+
 // movieDecision is the outcome of evaluating one monitored movie against
 // the STRICT decision rule.
 type movieDecision struct {
@@ -249,7 +272,7 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 
 	// Rule 2: hasFile == true.
 	if !hasFile {
-		d.reason = "no file"
+		d.reason = ReasonNoFile
 		return d
 	}
 
@@ -257,13 +280,13 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 	if !profileFound {
 		logger.Warn("skipping movie: unknown quality profile",
 			"instance", inst.Name, "type", inst.Type, "title", d.title, "qualityProfileId", derefOrAbsent(m.QualityProfileID))
-		d.reason = "unknown quality profile"
+		d.reason = ReasonUnknownProfile
 		d.profileName = "unknown"
 		return d
 	}
 	d.cfThreshold = profile.CutoffFormatScore
 	if !profile.UpgradeAllowed {
-		d.reason = "profile has upgrades disabled"
+		d.reason = ReasonUpgradesDisabled
 		return d
 	}
 
@@ -271,13 +294,13 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 	// is actually defined in this instance; otherwise rule 4 always
 	// passes, per the tag-resolution rules).
 	if tagActive && containsTag(m.Tags, exclusionTagID) {
-		d.reason = "excluded by tag"
+		d.reason = ReasonExcludedByTag
 		return d
 	}
 
 	// Rule 5: movie id is NOT in the complete /wanted/cutoff id set.
 	if wantedIDs[id] {
-		d.reason = "quality cutoff not met"
+		d.reason = ReasonQualityCutoffNotMet
 		return d
 	}
 
@@ -286,7 +309,7 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 	// so /moviefile is fetched lazily, exactly once, right here.
 	files, ok := fetchMovieFileDetails(ctx, logger, client, inst, id)
 	if !ok {
-		d.reason = "could not fetch custom format score"
+		d.reason = ReasonCouldNotFetchCFScore
 		return d
 	}
 	var wantFileID *int
@@ -297,18 +320,18 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 	if !found || mf.CustomFormatScore == nil {
 		logger.Warn("skipping movie: could not determine custom format score from moviefile response",
 			"instance", inst.Name, "type", inst.Type, "title", d.title, "id", id)
-		d.reason = "could not fetch custom format score"
+		d.reason = ReasonCouldNotFetchCFScore
 		return d
 	}
 	score := *mf.CustomFormatScore
 	d.cfScore = &score
 	if score < profile.CutoffFormatScore {
-		d.reason = "custom format cutoff not met"
+		d.reason = ReasonCFCutoffNotMet
 		return d
 	}
 
 	d.wouldUnmonitor = true
-	d.reason = "cutoff met"
+	d.reason = ReasonCutoffMet
 	return d
 }
 

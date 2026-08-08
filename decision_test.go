@@ -396,8 +396,8 @@ func TestEvaluateMovie_NoFile_SkipsWithReasonBeforeAnyMoviefileCall(t *testing.T
 	if d.wouldUnmonitor {
 		t.Error("wouldUnmonitor = true, want false")
 	}
-	if d.reason != "no file" {
-		t.Errorf("reason = %q, want %q", d.reason, "no file")
+	if d.reason != ReasonNoFile {
+		t.Errorf("reason = %q, want %q", d.reason, ReasonNoFile)
 	}
 	// FIX 5 (controller-mandated correction): the profile display name is
 	// resolved via a map read only (no evaluation-order or reason change)
@@ -428,8 +428,8 @@ func TestEvaluateMovie_NoFile_UnknownProfileID_ProfileNameStaysEmptyNotUnknown(t
 	m := movieListElement{ID: intPtr(1), Title: strPtr("No File Unknown Profile Movie"), HasFile: boolPtr(false), QualityProfileID: intPtr(999)}
 	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
 
-	if d.reason != "no file" {
-		t.Errorf("reason = %q, want %q", d.reason, "no file")
+	if d.reason != ReasonNoFile {
+		t.Errorf("reason = %q, want %q", d.reason, ReasonNoFile)
 	}
 	if d.profileName != "" {
 		t.Errorf("profileName = %q, want empty (rule 3 was never reached, so it must not read \"unknown\")", d.profileName)
@@ -447,8 +447,8 @@ func TestEvaluateMovie_UnknownProfile_SkipsWithReason(t *testing.T) {
 	m := movieListElement{ID: intPtr(1), Title: strPtr("Unknown Profile Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(999)}
 	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
 
-	if d.reason != "unknown quality profile" {
-		t.Errorf("reason = %q, want %q", d.reason, "unknown quality profile")
+	if d.reason != ReasonUnknownProfile {
+		t.Errorf("reason = %q, want %q", d.reason, ReasonUnknownProfile)
 	}
 	if len(gotRequests) != 0 {
 		t.Errorf("expected zero /moviefile requests, got %d", len(gotRequests))
@@ -470,8 +470,8 @@ func TestEvaluateMovie_UpgradesDisabled_SkipsWithExactReasonString(t *testing.T)
 	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
 
 	// Exact string mandated by the brief.
-	if d.reason != "profile has upgrades disabled" {
-		t.Errorf("reason = %q, want exact %q", d.reason, "profile has upgrades disabled")
+	if d.reason != ReasonUpgradesDisabled {
+		t.Errorf("reason = %q, want exact %q", d.reason, ReasonUpgradesDisabled)
 	}
 	if d.profileName != "Locked-Profile" {
 		t.Errorf("profileName = %q, want %q", d.profileName, "Locked-Profile")
@@ -493,8 +493,61 @@ func TestEvaluateMovie_ExcludedByTag_SkipsWithReason(t *testing.T) {
 	m := movieListElement{ID: intPtr(1), Title: strPtr("Excluded Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1), Tags: &tags}
 	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
 
-	if d.reason != "excluded by tag" {
-		t.Errorf("reason = %q, want %q", d.reason, "excluded by tag")
+	if d.reason != ReasonExcludedByTag {
+		t.Errorf("reason = %q, want %q", d.reason, ReasonExcludedByTag)
+	}
+	if len(gotRequests) != 0 {
+		t.Errorf("expected zero /moviefile requests, got %d", len(gotRequests))
+	}
+}
+
+// TestEvaluateMovie_ExcludedByTagAndInWantedSet_TagReasonWins is FIX 4's
+// rule-precedence pin: a movie that fails BOTH rule 4 (excluded by tag) and
+// rule 5 (in the wanted/cutoff set, i.e. would also fail on quality cutoff)
+// must report rule 4's reason, since rules are evaluated in order and the
+// first failing rule wins. If rule 5 were consulted first (or the id set
+// weren't consulted at all because the code fell through past rule 4
+// incorrectly), this would report "quality cutoff not met" instead.
+func TestEvaluateMovie_ExcludedByTagAndInWantedSet_TagReasonWins(t *testing.T) {
+	var gotRequests []string
+	srv := moviefileServer(t, http.StatusOK, `[]`, &gotRequests)
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	tags := []int{99} // 99 is the exclusion tag id used throughout this file's fixtures
+	m := movieListElement{ID: intPtr(1), Title: strPtr("Excluded And In Cutoff Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1), Tags: &tags}
+	wantedIDs := map[int]bool{1: true} // also fails rule 5, if it were reached
+	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, wantedIDs)
+
+	if d.reason != ReasonExcludedByTag {
+		t.Errorf("reason = %q, want %q (rule 4 must win over rule 5 per the mandated evaluation order)", d.reason, ReasonExcludedByTag)
+	}
+	if len(gotRequests) != 0 {
+		t.Errorf("expected zero /moviefile requests, got %d", len(gotRequests))
+	}
+}
+
+// TestEvaluateMovie_UpgradesDisabledAndInWantedSet_UpgradesDisabledReasonWins
+// is FIX 4's other rule-precedence pin: a movie whose profile has upgrades
+// disabled (rule 3) that would ALSO fail rule 5 (in the wanted/cutoff set)
+// must report rule 3's reason — the earlier rule in evaluation order — not
+// rule 5's, and must never reach /moviefile.
+func TestEvaluateMovie_UpgradesDisabledAndInWantedSet_UpgradesDisabledReasonWins(t *testing.T) {
+	var gotRequests []string
+	srv := moviefileServer(t, http.StatusOK, `[]`, &gotRequests)
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	m := movieListElement{ID: intPtr(1), Title: strPtr("Locked And In Cutoff Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(2)} // profile 2 has upgrades disabled
+	wantedIDs := map[int]bool{1: true}                                                                                                     // also fails rule 5, if it were reached
+	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, wantedIDs)
+
+	if d.reason != ReasonUpgradesDisabled {
+		t.Errorf("reason = %q, want %q (rule 3 must win over rule 5 per the mandated evaluation order)", d.reason, ReasonUpgradesDisabled)
 	}
 	if len(gotRequests) != 0 {
 		t.Errorf("expected zero /moviefile requests, got %d", len(gotRequests))
@@ -535,8 +588,8 @@ func TestEvaluateMovie_InWantedCutoffSet_SkipsWithReason(t *testing.T) {
 	m := movieListElement{ID: intPtr(1), Title: strPtr("Cutoff Not Met Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1)}
 	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{1: true})
 
-	if d.reason != "quality cutoff not met" {
-		t.Errorf("reason = %q, want %q", d.reason, "quality cutoff not met")
+	if d.reason != ReasonQualityCutoffNotMet {
+		t.Errorf("reason = %q, want %q", d.reason, ReasonQualityCutoffNotMet)
 	}
 	if len(gotRequests) != 0 {
 		t.Errorf("expected zero /moviefile requests for a movie in the wanted/cutoff set, got %d", len(gotRequests))
@@ -555,8 +608,8 @@ func TestEvaluateMovie_MoviefileFetchFails_SkipsWithExactReasonString(t *testing
 	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
 
 	// Exact string mandated by the brief.
-	if d.reason != "could not fetch custom format score" {
-		t.Errorf("reason = %q, want exact %q", d.reason, "could not fetch custom format score")
+	if d.reason != ReasonCouldNotFetchCFScore {
+		t.Errorf("reason = %q, want exact %q", d.reason, ReasonCouldNotFetchCFScore)
 	}
 	if len(gotRequests) != 1 {
 		t.Errorf("expected exactly 1 /moviefile request, got %d", len(gotRequests))
@@ -578,8 +631,8 @@ func TestEvaluateMovie_MoviefileMissingCustomFormatScore_SkipsWithReasonAndWarns
 		MovieFile: &movieFileElement{ID: intPtr(1)}}
 	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
 
-	if d.reason != "could not fetch custom format score" {
-		t.Errorf("reason = %q, want %q", d.reason, "could not fetch custom format score")
+	if d.reason != ReasonCouldNotFetchCFScore {
+		t.Errorf("reason = %q, want %q", d.reason, ReasonCouldNotFetchCFScore)
 	}
 	if !strings.Contains(buf.String(), "level=WARN") {
 		t.Errorf("expected a warning:\n%s", buf.String())
@@ -601,8 +654,8 @@ func TestEvaluateMovie_CFBelowThreshold_SkipsWithReason(t *testing.T) {
 	if d.wouldUnmonitor {
 		t.Error("wouldUnmonitor = true, want false")
 	}
-	if d.reason != "custom format cutoff not met" {
-		t.Errorf("reason = %q, want %q", d.reason, "custom format cutoff not met")
+	if d.reason != ReasonCFCutoffNotMet {
+		t.Errorf("reason = %q, want %q", d.reason, ReasonCFCutoffNotMet)
 	}
 	if d.cfScore == nil || *d.cfScore != 50 {
 		t.Errorf("cfScore = %v, want 50", d.cfScore)
@@ -627,8 +680,8 @@ func TestEvaluateMovie_AllRulesPass_WouldUnmonitorWithExactReasonString(t *testi
 		t.Fatalf("wouldUnmonitor = false, reason=%q; want true", d.reason)
 	}
 	// Exact string mandated by the brief's report-line example.
-	if d.reason != "cutoff met" {
-		t.Errorf("reason = %q, want exact %q", d.reason, "cutoff met")
+	if d.reason != ReasonCutoffMet {
+		t.Errorf("reason = %q, want exact %q", d.reason, ReasonCutoffMet)
 	}
 	if d.profileName != "HD-1080p" {
 		t.Errorf("profileName = %q, want %q", d.profileName, "HD-1080p")
@@ -1098,7 +1151,7 @@ func TestRunCrossCheck_AgreeingSamples_PassesAndLogsBothCategories(t *testing.T)
 	score := 150
 	decisions := []movieDecision{
 		{id: 1, title: "Would Unmonitor Movie", wouldUnmonitor: true, hasFile: true, qualityCutoffNotMet: agreeFalse(), cfScore: &score, cfThreshold: 100},
-		{id: 2, title: "Skip In Cutoff Movie", wouldUnmonitor: false, hasFile: true, reason: "quality cutoff not met", qualityCutoffNotMet: agreeTrue()},
+		{id: 2, title: "Skip In Cutoff Movie", wouldUnmonitor: false, hasFile: true, reason: ReasonQualityCutoffNotMet, qualityCutoffNotMet: agreeTrue()},
 	}
 	wantedIDs := map[int]bool{2: true} // id 1 not in set (agrees with false); id 2 in set (agrees with true)
 
@@ -1138,7 +1191,7 @@ func TestRunCrossCheck_Disagreement_FailsWithErrorLog(t *testing.T) {
 	decisions := []movieDecision{
 		// In the wanted set (inWantedSet=true) but qualityCutoffNotMet
 		// says false: disagreement.
-		{id: 1, title: "Disagreeing Movie", wouldUnmonitor: false, hasFile: true, reason: "quality cutoff not met", qualityCutoffNotMet: agreeFalse()},
+		{id: 1, title: "Disagreeing Movie", wouldUnmonitor: false, hasFile: true, reason: ReasonQualityCutoffNotMet, qualityCutoffNotMet: agreeFalse()},
 	}
 	wantedIDs := map[int]bool{1: true}
 
@@ -1251,7 +1304,7 @@ func TestRunCrossCheck_HasFileFalseSkip_ExcludedFromCandidates(t *testing.T) {
 	inst := Instance{Name: "radarr-main", Type: "radarr"}
 
 	decisions := []movieDecision{
-		{id: 1, title: "No File Movie", wouldUnmonitor: false, hasFile: false, reason: "no file"},
+		{id: 1, title: "No File Movie", wouldUnmonitor: false, hasFile: false, reason: ReasonNoFile},
 	}
 	_, verified, unverifiable := runCrossCheck(logger, inst, decisions, map[int]bool{})
 	if verified != 0 || unverifiable != 0 {
