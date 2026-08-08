@@ -238,6 +238,19 @@ func validateConfig(cfg *Config) error {
 	// absent key defaults to defaultExclusionTag in toConfig before this
 	// runs, never to the empty string — so this check unambiguously
 	// targets the explicit-empty-string case only.
+	//
+	// FIX 3 (controller-mandated correction after the whole-branch
+	// review): trimmed before the emptiness check (and the trimmed value
+	// stored back into cfg.ExclusionTag) so a whitespace-only value like
+	// "  " — which is all-whitespace-equivalent to "" for this purpose,
+	// since it can no more match a real Radarr tag label than an empty
+	// string can — doesn't slip past the check untouched. Storing the
+	// trimmed value also protects resolveExclusionTagID's case-insensitive
+	// strings.EqualFold match (decision.go), which does not itself strip
+	// whitespace: a label with accidental surrounding padding would
+	// otherwise silently fail to match the real tag's label, the same
+	// class of silent-disable this whole check exists to prevent.
+	cfg.ExclusionTag = strings.TrimSpace(cfg.ExclusionTag)
 	if cfg.ExclusionTag == "" {
 		return fmt.Errorf("config: exclusion_tag must not be empty (omit it entirely to use the default %q)", defaultExclusionTag)
 	}
