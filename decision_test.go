@@ -399,8 +399,40 @@ func TestEvaluateMovie_NoFile_SkipsWithReasonBeforeAnyMoviefileCall(t *testing.T
 	if d.reason != "no file" {
 		t.Errorf("reason = %q, want %q", d.reason, "no file")
 	}
+	// FIX 5 (controller-mandated correction): the profile display name is
+	// resolved via a map read only (no evaluation-order or reason change)
+	// before rule 2, so a "no file" report line still carries a usable
+	// profile attr instead of being blank.
+	if d.profileName != "HD-1080p" {
+		t.Errorf("profileName = %q, want %q (resolved even though rule 2 failed first)", d.profileName, "HD-1080p")
+	}
 	if len(gotRequests) != 0 {
 		t.Errorf("expected zero /moviefile requests for a no-file movie, got %d: %v", len(gotRequests), gotRequests)
+	}
+}
+
+// TestEvaluateMovie_NoFile_UnknownProfileID_ProfileNameStaysEmptyNotUnknown
+// pins FIX 5's boundary: "unknown" is reserved specifically for a movie
+// that actually reaches and fails rule 3 for that reason. A "no file" (rule
+// 2) skip with an unresolvable profile id must not be eagerly mislabeled
+// "unknown" — that would misleadingly suggest rule 3 was evaluated (and
+// failed) when it was never reached.
+func TestEvaluateMovie_NoFile_UnknownProfileID_ProfileNameStaysEmptyNotUnknown(t *testing.T) {
+	var gotRequests []string
+	srv := moviefileServer(t, http.StatusOK, `[]`, &gotRequests)
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	m := movieListElement{ID: intPtr(1), Title: strPtr("No File Unknown Profile Movie"), HasFile: boolPtr(false), QualityProfileID: intPtr(999)}
+	d := evaluateMovie(context.Background(), logger, client, inst, m, evaluateTestProfiles, 99, true, map[int]bool{})
+
+	if d.reason != "no file" {
+		t.Errorf("reason = %q, want %q", d.reason, "no file")
+	}
+	if d.profileName != "" {
+		t.Errorf("profileName = %q, want empty (rule 3 was never reached, so it must not read \"unknown\")", d.profileName)
 	}
 }
 
@@ -907,6 +939,71 @@ func TestRunRadarrDecisionEngine_MovieMissingID_WarnsAndExcludedFromReport(t *te
 	}
 	if !strings.Contains(out, "totalMonitored=0") {
 		t.Errorf("expected the movie missing id to not be counted:\n%s", out)
+	}
+}
+
+// TestRunRadarrDecisionEngine_MonitoredFieldAbsent_WarnsButStillExcluded is
+// FIX 6 (controller-mandated correction after the initial Phase 3 review):
+// a movie whose "monitored" key is entirely absent from /movie (as opposed
+// to present with monitored: false, a legitimate value) was previously
+// silently dropped with no signal at all — inconsistent with the house
+// warn-on-absent-key convention (warnIfFieldAbsent) used everywhere else a
+// field this important is missing. The movie must still be excluded from
+// the report (monitored can't be assumed true; excluding is the safe
+// direction), but now with a warning naming the field, matching
+// connectivity.go/radarr.go's existing pattern exactly.
+func TestRunRadarrDecisionEngine_MonitoredFieldAbsent_WarnsButStillExcluded(t *testing.T) {
+	var gotMoviefileRequests []string
+	srv := decisionEngineTestServer(t, decisionEngineProfilesJSON, decisionEngineNoTagsJSON, staticMoviefileHandler(200), &gotMoviefileRequests)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("No Monitored Field Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1)}, // Monitored left nil
+	}
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude")
+
+	out := buf.String()
+	if strings.Contains(out, "msg=would-unmonitor") || strings.Contains(out, "msg=skip") {
+		t.Errorf("a movie with monitored absent must still be excluded from the report entirely (safe direction):\n%s", out)
+	}
+	if !strings.Contains(out, "totalMonitored=0") {
+		t.Errorf("expected the movie to not be counted:\n%s", out)
+	}
+	if !strings.Contains(out, "level=WARN") {
+		t.Errorf("expected a warning about the missing monitored field (house warnIfFieldAbsent convention), not silence:\n%s", out)
+	}
+	if !strings.Contains(out, `field="monitored"`) && !strings.Contains(out, "field=monitored") {
+		t.Errorf("warning does not name the missing field monitored:\n%s", out)
+	}
+	if len(gotMoviefileRequests) != 0 {
+		t.Errorf("expected zero /moviefile requests, got %d", len(gotMoviefileRequests))
+	}
+}
+
+// TestRunRadarrDecisionEngine_MonitoredFalse_PresentValue_NoWarn pins the
+// other half of the present-vs-absent distinction FIX 6 relies on:
+// monitored: false is a legitimate, common real value (an intentionally
+// unmonitored movie) and must never warn, only monitored being entirely
+// absent should.
+func TestRunRadarrDecisionEngine_MonitoredFalse_PresentValue_NoWarn(t *testing.T) {
+	var gotMoviefileRequests []string
+	srv := decisionEngineTestServer(t, decisionEngineProfilesJSON, decisionEngineNoTagsJSON, staticMoviefileHandler(200), &gotMoviefileRequests)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("Explicitly Unmonitored Movie"), Monitored: boolPtr(false), HasFile: boolPtr(true), QualityProfileID: intPtr(1)},
+	}
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude")
+
+	out := buf.String()
+	if strings.Contains(out, "level=WARN") {
+		t.Errorf("monitored: false is a legitimate present value and must not warn:\n%s", out)
 	}
 }
 

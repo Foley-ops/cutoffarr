@@ -227,6 +227,26 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 		d.qualityCutoffNotMet = m.MovieFile.QualityCutoffNotMet
 	}
 
+	// Profile display name resolution (FIX 5, controller-mandated
+	// correction after the initial Phase 3 review): a map read only, done
+	// eagerly so every report line — even one that fails as early as rule
+	// 2 — carries a usable profile attr where one can actually be
+	// resolved. This does NOT evaluate or reorder rule 3: profileFound is
+	// only consulted by the rule 3 check below, unchanged. d.profileName
+	// is set here only on a successful lookup; "unknown" is reserved for
+	// the rule 3 not-found branch itself, so a movie that fails earlier
+	// (e.g. rule 2) with an unresolvable profile id is left with an empty
+	// profileName rather than being eagerly mislabeled "unknown" before
+	// rule 3 was ever reached.
+	var profile qualityProfile
+	profileFound := false
+	if m.QualityProfileID != nil {
+		profile, profileFound = profiles[*m.QualityProfileID]
+		if profileFound {
+			d.profileName = profile.Name
+		}
+	}
+
 	// Rule 2: hasFile == true.
 	if !hasFile {
 		d.reason = "no file"
@@ -234,11 +254,6 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 	}
 
 	// Rule 3: quality profile exists in the fetched set AND upgradeAllowed.
-	var profile qualityProfile
-	profileFound := false
-	if m.QualityProfileID != nil {
-		profile, profileFound = profiles[*m.QualityProfileID]
-	}
 	if !profileFound {
 		logger.Warn("skipping movie: unknown quality profile",
 			"instance", inst.Name, "type", inst.Type, "title", d.title, "qualityProfileId", derefOrAbsent(m.QualityProfileID))
@@ -246,7 +261,6 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 		d.profileName = "unknown"
 		return d
 	}
-	d.profileName = profile.Name
 	d.cfThreshold = profile.CutoffFormatScore
 	if !profile.UpgradeAllowed {
 		d.reason = "profile has upgrades disabled"
@@ -330,6 +344,16 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	skipCounts := make(map[string]int)
 
 	for _, m := range movies {
+		// FIX 6 (controller-mandated correction after the initial Phase 3
+		// review): "monitored" entirely absent from the JSON (as opposed
+		// to present with monitored: false, a legitimate common value) is
+		// the same present-vs-absent distinction warnIfFieldAbsent already
+		// makes everywhere else a field this important is missing — a
+		// movie this important silently dropped with no signal at all was
+		// an inconsistency with that house convention. Still excluded
+		// either way (monitored can't be assumed true; excluding is the
+		// safe direction), just no longer silent about why.
+		warnIfFieldAbsent(logger, inst, "movie", "monitored", m.Monitored == nil)
 		if m.Monitored == nil || !*m.Monitored {
 			// Rule 1: excluded from the report entirely, per the plan.
 			continue
