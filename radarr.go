@@ -16,9 +16,12 @@ import (
 // will read before giving up. It deliberately supersedes maxResponseBodyBytes
 // (4 MB, connectivity.go) for this endpoint only: a real movie library can
 // legitimately exceed 4 MB, but an unbounded read is still not acceptable.
-// Reaching this cap is treated the same as any other decode failure per
-// plan §2.6 (warn and skip the instance for the cycle) — a response
-// truncated by the limit reader naturally fails JSON decoding.
+// Reaching this cap, or any other body truncation, is treated the same as
+// any other decode failure per plan §2.6 (warn and skip the instance for
+// the cycle). Truncation is caught either by the JSON decoder failing
+// outright mid-element, or — for a body cut exactly on an element boundary,
+// which the decoder does not treat as an error on its own — by the
+// explicit closing-bracket check after the element loop in fetchMovies.
 const movieStreamSanityLimit = 512 * 1024 * 1024 // 512 MB
 
 // wantedCutoffPageSize is the page size requested from /wanted/cutoff, per
@@ -82,8 +85,8 @@ func movieFileQualityName(mf *movieFileElement) *string {
 // cannot tell when to stop) and is treated as malformed per §2.6: warn and
 // skip the instance for the cycle.
 type wantedCutoffPage struct {
-	TotalRecords *int                 `json:"totalRecords"`
-	Records      []wantedCutoffRecord `json:"records"`
+	TotalRecords *int                  `json:"totalRecords"`
+	Records      *[]wantedCutoffRecord `json:"records"`
 }
 
 type wantedCutoffRecord struct {
@@ -206,6 +209,23 @@ func fetchMovies(ctx context.Context, logger *slog.Logger, client *APIClient, in
 		}
 	}
 
+	// dec.More() above returns false both when the array closed cleanly
+	// (the next token really is "]") and when the underlying reader hit
+	// EOF or the sanity limit partway through — e.g. a body cut exactly
+	// between two complete elements (server died, proxy dropped the
+	// connection). It swallows that read error rather than surfacing it,
+	// so on its own the loop above cannot tell "the library legitimately
+	// ended" apart from "the response was cut off here". Explicitly
+	// requiring the next token to be the closing "]" catches the latter:
+	// a truncated tail fails here instead of silently returning partial
+	// counts as if nothing were wrong.
+	closeTok, err := dec.Token()
+	if err != nil || closeTok != json.Delim(']') {
+		logger.Warn("skipping instance: movie response is not a well-formed JSON array (missing closing bracket)",
+			"instance", inst.Name, "type", inst.Type, "error", err)
+		return counts, nil, false
+	}
+
 	return counts, matches, true
 }
 
@@ -254,7 +274,8 @@ func logSampleMovies(logger *slog.Logger, inst Instance, samples []string, match
 }
 
 // fetchWantedCutoff fully pages GET /api/v3/wanted/cutoff (pageSize=100),
-// returning the set of movie ids it contains. Defensive paging per plan §5:
+// returning the set of movie ids it contains. Defensive paging, per this
+// phase's binding requirements:
 //   - totalRecords absent from the first page's envelope means paging
 //     cannot be done safely; warn and skip the instance for the cycle
 //     (ok=false), same as any other malformed response.
@@ -289,6 +310,19 @@ func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClie
 			return nil, false
 		}
 
+		// An entirely absent "records" key is malformed per §2.6: there is
+		// no way to tell whether the server simply omitted the field
+		// (our assumed field name may be wrong) or genuinely meant "no
+		// records on this page", so it cannot be treated the same as a
+		// present-but-empty "records": [] (handled below as the normal
+		// end-of-paging case).
+		if envelope.Records == nil {
+			logger.Warn("skipping instance: wanted/cutoff response missing records",
+				"instance", inst.Name, "type", inst.Type, "page", page)
+			return nil, false
+		}
+		records := *envelope.Records
+
 		if page == 1 {
 			if envelope.TotalRecords == nil {
 				logger.Warn("skipping instance: wanted/cutoff response missing totalRecords",
@@ -298,7 +332,7 @@ func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClie
 			totalRecords = *envelope.TotalRecords
 		}
 
-		if len(envelope.Records) == 0 {
+		if len(records) == 0 {
 			if fetched != totalRecords {
 				logger.Warn("wanted/cutoff paging stopped: page returned 0 records before totalRecords was reached",
 					"instance", inst.Name, "type", inst.Type, "page", page, "fetched", fetched, "totalRecords", totalRecords)
@@ -307,20 +341,19 @@ func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClie
 			break
 		}
 
-		for _, r := range envelope.Records {
+		for _, r := range records {
 			if r.ID == nil {
 				// Without an id this record can't be cross-referenced
 				// against the /movie library at all; title is the only
-				// other identifying information the envelope carries
-				// (plan §5: "decode records minimally: id, title"), so it
-				// is the natural context to report here.
+				// other identifying information the envelope carries, so
+				// it is the natural context to report here.
 				logger.Warn("wanted/cutoff record missing id field; excluded from the cutoff set",
 					"instance", inst.Name, "type", inst.Type, "page", page, "title", derefOrAbsent(r.Title))
 				continue
 			}
 			ids[*r.ID] = true
 		}
-		fetched += len(envelope.Records)
+		fetched += len(records)
 
 		if fetched >= totalRecords {
 			completed = true
@@ -361,7 +394,9 @@ func logSampleCutoffStatus(logger *slog.Logger, inst Instance, samples []string,
 // movieStreamSanityLimit. It mirrors fetchBody in connectivity.go (same
 // cap-reached-means-malformed treatment) but is kept as separate code here
 // rather than sharing that function, for two reasons: it uses a different,
-// much larger cap per plan §5's binding large-response handling, and it
+// much larger cap required by this phase's binding large-response handling
+// (the 4 MB connectivity cap is too small for /wanted/cutoff's use of
+// fetchLargeBody as well, even though individual pages are small), and it
 // needs to attach query parameters, which APIClient.Do cannot do (see
 // doGet below).
 func fetchLargeBody(ctx context.Context, client *APIClient, path string, query url.Values) ([]byte, error) {

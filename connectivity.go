@@ -50,19 +50,26 @@ var expectedAppNameByType = map[string]string{
 
 // checkInstanceConnectivity performs this phase's only *arr API calls for a
 // single instance: GET /api/v3/system/status followed by
-// GET /api/v3/qualityprofile. It logs what it finds and returns; it never
-// returns an error because the binding error-handling rule for this phase
-// (plan §2.6) is "skip that instance for the cycle and log a warning" —
-// callers are expected to loop over every configured instance regardless of
-// what happened to any previous one.
-func checkInstanceConnectivity(ctx context.Context, logger *slog.Logger, inst Instance) {
+// GET /api/v3/qualityprofile. It logs what it finds and returns ok=true if
+// both endpoints were reachable and returned parseable responses, false if
+// either failed and the instance was declared skipped for the cycle
+// (logged as a warning). It never returns an error because the binding
+// error-handling rule for this phase (plan §2.6) is "skip that instance for
+// the cycle and log a warning" — callers are expected to loop over every
+// configured instance regardless of what happened to any previous one; the
+// ok return value lets a caller also skip any later, dependent work (e.g.
+// Phase 2's radarr library inspection) for an instance already declared
+// skipped here. Informational-only warnings — an absent field, or an
+// appName/type mismatch — do not affect ok; they never cause a skip (see
+// warnIfFieldAbsent).
+func checkInstanceConnectivity(ctx context.Context, logger *slog.Logger, inst Instance) bool {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	statusBody, err := fetchBody(ctx, client, "/api/v3/system/status")
 	if err != nil {
 		logger.Warn("skipping instance: system/status request failed",
 			"instance", inst.Name, "type", inst.Type, "error", err)
-		return
+		return false
 	}
 	logger.Debug("system/status raw response",
 		"instance", inst.Name, "type", inst.Type, "body", string(statusBody))
@@ -71,7 +78,7 @@ func checkInstanceConnectivity(ctx context.Context, logger *slog.Logger, inst In
 	if err := json.Unmarshal(statusBody, &status); err != nil {
 		logger.Warn("skipping instance: system/status response is not valid JSON",
 			"instance", inst.Name, "type", inst.Type, "error", err)
-		return
+		return false
 	}
 
 	logger.Info("system status",
@@ -89,7 +96,7 @@ func checkInstanceConnectivity(ctx context.Context, logger *slog.Logger, inst In
 	if err != nil {
 		logger.Warn("skipping instance: qualityprofile request failed",
 			"instance", inst.Name, "type", inst.Type, "error", err)
-		return
+		return false
 	}
 	logger.Debug("qualityprofile raw response",
 		"instance", inst.Name, "type", inst.Type, "body", string(profilesBody))
@@ -98,7 +105,7 @@ func checkInstanceConnectivity(ctx context.Context, logger *slog.Logger, inst In
 	if err := json.Unmarshal(profilesBody, &profiles); err != nil {
 		logger.Warn("skipping instance: qualityprofile response is not valid JSON",
 			"instance", inst.Name, "type", inst.Type, "error", err)
-		return
+		return false
 	}
 
 	for _, p := range profiles {
@@ -112,6 +119,8 @@ func checkInstanceConnectivity(ctx context.Context, logger *slog.Logger, inst In
 		warnIfFieldAbsent(logger, inst, "qualityprofile", "cutoffFormatScore", p.CutoffFormatScore == nil)
 		warnIfFieldAbsent(logger, inst, "qualityprofile", "upgradeAllowed", p.UpgradeAllowed == nil)
 	}
+
+	return true
 }
 
 // fetchBody issues a GET against path via client and returns the full

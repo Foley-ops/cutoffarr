@@ -62,12 +62,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 		// must not stop the remaining instances or affect the exit code.
 		//
 		// Phase 2: for radarr instances only, follow up with the read-only
-		// library inspection (GET /movie, paged GET /wanted/cutoff).
+		// library inspection (GET /movie, paged GET /wanted/cutoff) — but
+		// only if connectivity actually succeeded; an instance already
+		// declared skipped for the cycle must not go on to further calls.
 		// Sonarr instances are connectivity-only until Phase 6.
 		samples := parseSamples(*samplesFlag)
 		for _, inst := range cfg.Instances {
-			checkInstanceConnectivity(context.Background(), logger, inst)
-			if inst.Type == "radarr" {
+			ok := checkInstanceConnectivity(context.Background(), logger, inst)
+			if ok && inst.Type == "radarr" {
 				inspectRadarrLibrary(context.Background(), logger, inst, samples)
 			}
 		}

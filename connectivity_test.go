@@ -79,7 +79,10 @@ func TestCheckInstanceConnectivity_RadarrHappyPath(t *testing.T) {
 	logger, buf := newConnectivityTestLogger(slog.LevelInfo)
 	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "radarr-key"}
 
-	checkInstanceConnectivity(context.Background(), logger, inst)
+	ok := checkInstanceConnectivity(context.Background(), logger, inst)
+	if !ok {
+		t.Errorf("checkInstanceConnectivity returned ok=false, want true on the happy path")
+	}
 
 	if len(gotPaths) != 2 {
 		t.Fatalf("got %d requests, want 2: %v", len(gotPaths), gotPaths)
@@ -119,7 +122,10 @@ func TestCheckInstanceConnectivity_SonarrHappyPath(t *testing.T) {
 	logger, buf := newConnectivityTestLogger(slog.LevelInfo)
 	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "sonarr-key"}
 
-	checkInstanceConnectivity(context.Background(), logger, inst)
+	ok := checkInstanceConnectivity(context.Background(), logger, inst)
+	if !ok {
+		t.Errorf("checkInstanceConnectivity returned ok=false, want true on the happy path")
+	}
 
 	if len(gotPaths) != 2 || gotPaths[0] != "/api/v3/system/status" || gotPaths[1] != "/api/v3/qualityprofile" {
 		t.Fatalf("unexpected request paths: %v", gotPaths)
@@ -153,7 +159,10 @@ func TestCheckInstanceConnectivity_SystemStatusNonTwoxx_SkipsWithWarning(t *test
 	logger, buf := newConnectivityTestLogger(slog.LevelInfo)
 	inst := Instance{Name: "radarr-broken", Type: "radarr", URL: srv.URL, APIKey: "key"}
 
-	checkInstanceConnectivity(context.Background(), logger, inst)
+	ok := checkInstanceConnectivity(context.Background(), logger, inst)
+	if ok {
+		t.Errorf("checkInstanceConnectivity returned ok=true, want false when system/status fails")
+	}
 
 	if len(gotPaths) != 1 {
 		t.Fatalf("expected qualityprofile to never be called after system/status failure, got requests: %v", gotPaths)
@@ -179,7 +188,10 @@ func TestCheckInstanceConnectivity_QualityProfileNonTwoxx_SkipsWithWarning(t *te
 	logger, buf := newConnectivityTestLogger(slog.LevelInfo)
 	inst := Instance{Name: "radarr-half-broken", Type: "radarr", URL: srv.URL, APIKey: "key"}
 
-	checkInstanceConnectivity(context.Background(), logger, inst)
+	ok := checkInstanceConnectivity(context.Background(), logger, inst)
+	if ok {
+		t.Errorf("checkInstanceConnectivity returned ok=true, want false when qualityprofile fails")
+	}
 
 	if len(gotPaths) != 2 {
 		t.Fatalf("expected both endpoints to be called, got: %v", gotPaths)
@@ -205,7 +217,10 @@ func TestCheckInstanceConnectivity_MalformedSystemStatusJSON_SkipsWithWarning(t 
 	logger, buf := newConnectivityTestLogger(slog.LevelInfo)
 	inst := Instance{Name: "radarr-malformed", Type: "radarr", URL: srv.URL, APIKey: "key"}
 
-	checkInstanceConnectivity(context.Background(), logger, inst)
+	ok := checkInstanceConnectivity(context.Background(), logger, inst)
+	if ok {
+		t.Errorf("checkInstanceConnectivity returned ok=true, want false for malformed system/status JSON")
+	}
 
 	if len(gotPaths) != 1 {
 		t.Fatalf("expected qualityprofile to never be called after malformed system/status, got: %v", gotPaths)
@@ -228,7 +243,10 @@ func TestCheckInstanceConnectivity_MalformedQualityProfileJSON_SkipsWithWarning(
 	logger, buf := newConnectivityTestLogger(slog.LevelInfo)
 	inst := Instance{Name: "radarr-malformed-profiles", Type: "radarr", URL: srv.URL, APIKey: "key"}
 
-	checkInstanceConnectivity(context.Background(), logger, inst)
+	ok := checkInstanceConnectivity(context.Background(), logger, inst)
+	if ok {
+		t.Errorf("checkInstanceConnectivity returned ok=true, want false for malformed qualityprofile JSON")
+	}
 
 	out := buf.String()
 	if !strings.Contains(out, "level=WARN") {
@@ -312,12 +330,16 @@ func TestCheckInstanceConnectivity_OversizedSystemStatusBody_SkipsWithWarning(t 
 	logger, buf := newConnectivityTestLogger(slog.LevelInfo)
 	inst := Instance{Name: "radarr-oversized", Type: "radarr", URL: srv.URL, APIKey: "key"}
 
+	var ok bool
 	done := make(chan struct{})
 	go func() {
-		checkInstanceConnectivity(context.Background(), logger, inst)
+		ok = checkInstanceConnectivity(context.Background(), logger, inst)
 		close(done)
 	}()
 	<-done // must not hang or crash
+	if ok {
+		t.Errorf("checkInstanceConnectivity returned ok=true, want false for an oversized system/status body")
+	}
 
 	if len(gotPaths) != 1 {
 		t.Fatalf("expected qualityprofile to never be called after oversized system/status body, got: %v", gotPaths)
@@ -347,12 +369,16 @@ func TestCheckInstanceConnectivity_UnreachableServer_SkipsWithWarning(t *testing
 	logger, buf := newConnectivityTestLogger(slog.LevelInfo)
 	inst := Instance{Name: "radarr-unreachable", Type: "radarr", URL: "http://" + addr, APIKey: "key"}
 
+	var ok bool
 	done := make(chan struct{})
 	go func() {
-		checkInstanceConnectivity(context.Background(), logger, inst)
+		ok = checkInstanceConnectivity(context.Background(), logger, inst)
 		close(done)
 	}()
 	<-done // must not hang or crash
+	if ok {
+		t.Errorf("checkInstanceConnectivity returned ok=true, want false for an unreachable server")
+	}
 
 	out := buf.String()
 	if !strings.Contains(out, "level=WARN") {
@@ -406,7 +432,10 @@ func TestCheckInstanceConnectivity_AbsentProfileField_LogsWarnNamingField(t *tes
 	logger, buf := newConnectivityTestLogger(slog.LevelInfo)
 	inst := Instance{Name: "radarr-absent-field", Type: "radarr", URL: srv.URL, APIKey: "key"}
 
-	checkInstanceConnectivity(context.Background(), logger, inst)
+	ok := checkInstanceConnectivity(context.Background(), logger, inst)
+	if !ok {
+		t.Errorf("checkInstanceConnectivity returned ok=false, want true: an absent field is informational-only and must not skip the instance")
+	}
 
 	out := buf.String()
 	if !strings.Contains(out, "level=WARN") {
@@ -429,7 +458,10 @@ func TestCheckInstanceConnectivity_AbsentSystemStatusField_LogsWarnNamingField(t
 	logger, buf := newConnectivityTestLogger(slog.LevelInfo)
 	inst := Instance{Name: "radarr-absent-appname", Type: "radarr", URL: srv.URL, APIKey: "key"}
 
-	checkInstanceConnectivity(context.Background(), logger, inst)
+	ok := checkInstanceConnectivity(context.Background(), logger, inst)
+	if !ok {
+		t.Errorf("checkInstanceConnectivity returned ok=false, want true: an absent field is informational-only and must not skip the instance")
+	}
 
 	out := buf.String()
 	if !strings.Contains(out, "level=WARN") {
@@ -462,7 +494,10 @@ func TestCheckInstanceConnectivity_AppNameMismatch_LogsWarnButStillProcessesProf
 	logger, buf := newConnectivityTestLogger(slog.LevelInfo)
 	inst := Instance{Name: "radarr-mislabeled", Type: "radarr", URL: srv.URL, APIKey: "key"}
 
-	checkInstanceConnectivity(context.Background(), logger, inst)
+	ok := checkInstanceConnectivity(context.Background(), logger, inst)
+	if !ok {
+		t.Errorf("checkInstanceConnectivity returned ok=false, want true: an appName/type mismatch is informational-only and must not skip the instance")
+	}
 
 	out := buf.String()
 	if !strings.Contains(out, "level=WARN") {

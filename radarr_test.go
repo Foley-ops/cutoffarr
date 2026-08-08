@@ -368,6 +368,41 @@ func TestInspectRadarrLibrary_MovieResponseMalformedJSON_SkipsInstanceWithWarnin
 	}
 }
 
+// TestInspectRadarrLibrary_MovieResponseTruncatedBetweenElements_SkipsInstanceWithWarning
+// pins the fix for a gap in the streaming decoder: dec.More() returns false
+// both when the array closes cleanly (a genuine "]") and when the
+// underlying reader hits EOF or the sanity limit mid-stream — it swallows
+// the read error rather than surfacing it. A body with two syntactically
+// complete elements but no closing "]" (simulating a server dying or a
+// proxy cutting the connection exactly on an element boundary) must be
+// treated as malformed per §2.6, not as "the library happened to end
+// after 2 movies".
+func TestInspectRadarrLibrary_MovieResponseTruncatedBetweenElements_SkipsInstanceWithWarning(t *testing.T) {
+	truncated := `[{"id":1,"title":"A","monitored":true,"hasFile":false},{"id":2,"title":"B","monitored":true,"hasFile":true}` // no closing "]"
+	var gotRequests []string
+	srv := radarrTestServer(t, http.StatusOK, truncated, staticWantedCutoffHandler(http.StatusOK, emptyWantedCutoffJSON), &gotRequests)
+	defer srv.Close()
+
+	logger, buf := newRadarrTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-truncated", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	inspectRadarrLibrary(context.Background(), logger, inst, nil)
+
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") {
+		t.Errorf("expected a warning for the between-element-truncated /movie body:\n%s", out)
+	}
+	if !strings.Contains(out, "radarr-truncated") {
+		t.Errorf("warning does not mention instance name:\n%s", out)
+	}
+	if strings.Contains(out, "total=2") {
+		t.Errorf("truncated body must not report partial counts as if the library had ended normally:\n%s", out)
+	}
+	if len(gotRequests) != 1 {
+		t.Fatalf("expected /wanted/cutoff to never be called after a truncated /movie body, got requests: %v", gotRequests)
+	}
+}
+
 // --- /wanted/cutoff paging -----------------------------------------------
 
 // wantedCutoffMultiPageHandler serves a 250-record /wanted/cutoff listing
@@ -496,6 +531,44 @@ func TestInspectRadarrLibrary_WantedCutoffMissingTotalRecords_WarnsAndSkipsInsta
 	}
 	if strings.Contains(out, "inWantedCutoff") {
 		t.Errorf("instance should be skipped for wanted/cutoff purposes: no in/out determination should be logged:\n%s", out)
+	}
+}
+
+// TestInspectRadarrLibrary_WantedCutoffMissingRecordsKey_WarnsAndSkipsInstance
+// pins the pointer-decode of wantedCutoffPage.Records: an entirely absent
+// "records" key (as opposed to a present-but-empty "records": []) is
+// malformed per §2.6 (can't tell whether the server omitted the field or
+// really meant "no records"), so it must warn and skip the instance rather
+// than being treated like the normal empty-page-ends-paging case.
+func TestInspectRadarrLibrary_WantedCutoffMissingRecordsKey_WarnsAndSkipsInstance(t *testing.T) {
+	var gotRequests, gotQueries []string
+	handler := staticWantedCutoffHandler(http.StatusOK, `{"page": 1, "pageSize": 100, "totalRecords": 5}`) // records key entirely absent
+	wrapped := func(w http.ResponseWriter, r *http.Request) {
+		gotQueries = append(gotQueries, r.URL.RawQuery)
+		handler(w, r)
+	}
+	srv := radarrTestServer(t, http.StatusOK, radarrMovieJSON, wrapped, &gotRequests)
+	defer srv.Close()
+
+	logger, buf := newRadarrTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	// A sample that matched a library movie is required to make this test
+	// discriminate correctly: an absent "records" key wrongly treated as
+	// "present but empty" would still be ok=true and would proceed to log
+	// "sample cutoff status ... inWantedCutoff=false" for this sample —
+	// that line's presence is exactly the bug this test catches.
+	inspectRadarrLibrary(context.Background(), logger, inst, []string{"Movie In Cutoff"})
+
+	if len(gotQueries) != 1 {
+		t.Fatalf("expected paging to stop after the first page when records is missing, got %d requests: %v", len(gotQueries), gotQueries)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") {
+		t.Errorf("expected a warning about the missing records field:\n%s", out)
+	}
+	if strings.Contains(out, "inWantedCutoff") {
+		t.Errorf("instance should be skipped for wanted/cutoff purposes (records key entirely absent is malformed, not an empty page): no in/out determination should be logged:\n%s", out)
 	}
 }
 
@@ -676,5 +749,89 @@ instances:
 	out := stdout.String()
 	if !strings.Contains(out, `title="Movie In Cutoff"`) {
 		t.Errorf("expected --samples to be threaded through to the radarr inspection:\n%s", out)
+	}
+}
+
+// TestRun_ConnectivityFailedRadarrInstance_NeverCallsMovieOrWantedCutoff
+// pins the fix for a gap in main.go's wiring: checkInstanceConnectivity
+// logs "skipping instance..." when either connectivity endpoint fails, but
+// previously returned nothing, so main.go still went ahead and called
+// inspectRadarrLibrary on an instance already declared skipped for the
+// cycle. checkInstanceConnectivity now returns ok, and main.go must gate
+// the radarr library inspection on it. A later, healthy instance in the
+// same config must still be checked — one broken instance must not stop
+// the rest.
+func TestRun_ConnectivityFailedRadarrInstance_NeverCallsMovieOrWantedCutoff(t *testing.T) {
+	var brokenHitMovieOrCutoff bool
+	brokenMux := http.NewServeMux()
+	brokenMux.HandleFunc("/api/v3/system/status", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError) // connectivity fails here
+	})
+	brokenMux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[]`))
+	})
+	brokenMux.HandleFunc("/api/v3/movie", func(w http.ResponseWriter, r *http.Request) {
+		brokenHitMovieOrCutoff = true
+	})
+	brokenMux.HandleFunc("/api/v3/wanted/cutoff", func(w http.ResponseWriter, r *http.Request) {
+		brokenHitMovieOrCutoff = true
+	})
+	brokenSrv := httptest.NewServer(brokenMux)
+	defer brokenSrv.Close()
+
+	var gotHealthyMoviePaths []string
+	healthyMux := http.NewServeMux()
+	healthyMux.HandleFunc("/api/v3/system/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"appName": "Radarr", "version": "5.14.0.9383"}`))
+	})
+	healthyMux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[]`))
+	})
+	healthyMux.HandleFunc("/api/v3/movie", func(w http.ResponseWriter, r *http.Request) {
+		gotHealthyMoviePaths = append(gotHealthyMoviePaths, r.URL.Path)
+		w.Write([]byte(radarrMovieJSON))
+	})
+	healthyMux.HandleFunc("/api/v3/wanted/cutoff", func(w http.ResponseWriter, r *http.Request) {
+		gotHealthyMoviePaths = append(gotHealthyMoviePaths, r.URL.Path)
+		w.Write([]byte(emptyWantedCutoffJSON))
+	})
+	healthySrv := httptest.NewServer(healthyMux)
+	defer healthySrv.Close()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := `
+instances:
+  - name: radarr-broken
+    type: radarr
+    url: ` + brokenSrv.URL + `
+    api_key: key1
+  - name: radarr-healthy
+    type: radarr
+    url: ` + healthySrv.URL + `
+    api_key: key2
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if brokenHitMovieOrCutoff {
+		t.Errorf("connectivity-failed instance must not receive /movie or /wanted/cutoff requests")
+	}
+	if len(gotHealthyMoviePaths) != 2 || gotHealthyMoviePaths[0] != "/api/v3/movie" || gotHealthyMoviePaths[1] != "/api/v3/wanted/cutoff" {
+		t.Errorf("expected the later healthy instance to still receive /movie then /wanted/cutoff requests, got: %v", gotHealthyMoviePaths)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "radarr-broken") {
+		t.Errorf("expected a warning naming the broken instance:\n%s", out)
+	}
+	if !strings.Contains(out, "radarr-healthy") || !strings.Contains(out, "total=3") {
+		t.Errorf("expected the healthy instance's movie library to still be inspected:\n%s", out)
 	}
 }
