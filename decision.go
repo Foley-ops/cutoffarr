@@ -360,10 +360,18 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		}
 	}
 
-	crossCheckPassed, crossCheckCount := runCrossCheck(logger, inst, decisions, wantedIDs)
-	crossCheckSummary := fmt.Sprintf("passed (%d items)", crossCheckCount)
-	if !crossCheckPassed {
+	status, verified, unverifiable := runCrossCheck(logger, inst, decisions, wantedIDs)
+	var crossCheckSummary string
+	switch status {
+	case crossCheckStatusFailed:
+		// Deliberately no counts here: this is the human-gate signal (plan:
+		// "disagreement must stop the project before writes"), kept as the
+		// single unmistakable token it always was.
 		crossCheckSummary = "FAILED"
+	case crossCheckStatusInconclusive:
+		crossCheckSummary = fmt.Sprintf("inconclusive (%d verified, %d unverifiable)", verified, unverifiable)
+	default:
+		crossCheckSummary = fmt.Sprintf("passed (%d verified, %d unverifiable)", verified, unverifiable)
 	}
 
 	logger.Info("radarr decision summary",
@@ -421,6 +429,19 @@ func sampleEveryKth(ids []int, n int) []int {
 	return sampled
 }
 
+// Cross-check result states. "inconclusive" exists specifically so that a
+// sample containing zero actually-comparable items can never render as a
+// pass (FIX 1, controller-mandated correction after the initial Phase 3
+// review): a naive "checked N items, no disagreements found" summary is
+// indistinguishable from "verified nothing, found nothing wrong (because
+// there was nothing to compare)" unless verified and unverifiable counts
+// are tracked and surfaced separately.
+const (
+	crossCheckStatusPassed       = "passed"
+	crossCheckStatusFailed       = "failed"
+	crossCheckStatusInconclusive = "inconclusive"
+)
+
 // runCrossCheck implements plan §6's cross-check, adapted to the STRICT
 // rule (runs after decisions, read-only, no additional API calls: it
 // re-uses data already collected during evaluateMovie plus the same
@@ -432,12 +453,22 @@ func sampleEveryKth(ids []int, n int) []int {
 // with the movie's own movieFile.qualityCutoffNotMet from the
 // already-fetched /movie data — the two are computed by different Radarr
 // code paths and should never disagree. For would-unmonitor items it also
-// re-states the CF score and threshold that were used. Any disagreement is
-// logged at error level naming the movie and both values; the caller's
-// summary must then read "FAILED" rather than "passed" (the human gate
-// reads this, per the plan, to stop the project before any write path
-// exists).
-func runCrossCheck(logger *slog.Logger, inst Instance, decisions []movieDecision, wantedIDs map[int]bool) (passed bool, checked int) {
+// re-states the CF score and threshold that were used.
+//
+// verified counts items that were actually compared (qualityCutoffNotMet
+// present); unverifiable counts items sampled but skipped because that
+// field was absent (confirmed present on live Radarr 6.3.0 — 3 samples
+// read false, 146 true library-wide — so this guards a future/different
+// version, not today's observed behavior). Any disagreement among the
+// verified items is logged at error level naming the movie and both
+// values, and status is crossCheckStatusFailed — the caller's summary must
+// then read "FAILED" (the human gate reads this, per the plan, to stop the
+// project before any write path exists). If every sampled item was
+// unverifiable, status is crossCheckStatusInconclusive (with its own
+// warning) rather than Passed: a sample that verified nothing must never
+// be indistinguishable from one that verified everything and found no
+// problems.
+func runCrossCheck(logger *slog.Logger, inst Instance, decisions []movieDecision, wantedIDs map[int]bool) (status string, verified int, unverifiable int) {
 	byID := make(map[int]movieDecision, len(decisions))
 	var wouldUnmonitorIDs, skipIDs []int
 	for _, d := range decisions {
@@ -451,7 +482,7 @@ func runCrossCheck(logger *slog.Logger, inst Instance, decisions []movieDecision
 
 	sampled := append(sampleEveryKth(wouldUnmonitorIDs, crossCheckSampleSize), sampleEveryKth(skipIDs, crossCheckSampleSize)...)
 
-	passed = true
+	disagreementFound := false
 	for _, id := range sampled {
 		d := byID[id]
 		inWantedSet := wantedIDs[id]
@@ -470,22 +501,35 @@ func runCrossCheck(logger *slog.Logger, inst Instance, decisions []movieDecision
 			// cannot verify agreement without a value to compare against.
 			// Silently treating "absent" as "false" here could mask a real
 			// disagreement (inWantedSet=false would then trivially "agree"
-			// with a value we never actually observed), so this is called
-			// out on its own and does not, by itself, fail the check.
+			// with a value we never actually observed), so this is counted
+			// separately and called out on its own.
+			unverifiable++
 			logger.Warn("cross-check: movieFile.qualityCutoffNotMet missing from /movie data; cannot verify wanted-set agreement for this movie",
 				"instance", inst.Name, "id", id, "title", d.title)
 			continue
 		}
 
+		verified++
 		if inWantedSet != *d.qualityCutoffNotMet {
-			passed = false
+			disagreementFound = true
 			logger.Error("cross-check disagreement: wanted-set membership does not match movieFile.qualityCutoffNotMet",
 				"instance", inst.Name, "id", id, "title", d.title,
 				"inWantedSet", inWantedSet, "qualityCutoffNotMet", *d.qualityCutoffNotMet)
 		}
 	}
 
-	return passed, len(sampled)
+	switch {
+	case disagreementFound:
+		status = crossCheckStatusFailed
+	case len(sampled) > 0 && verified == 0:
+		status = crossCheckStatusInconclusive
+		logger.Warn("cross-check: every sampled item was unverifiable (movieFile.qualityCutoffNotMet missing); cannot determine pass or fail",
+			"instance", inst.Name, "unverifiable", unverifiable)
+	default:
+		status = crossCheckStatusPassed
+	}
+
+	return status, verified, unverifiable
 }
 
 // selectMovieFile picks the movieFileDetail this movie's file actually

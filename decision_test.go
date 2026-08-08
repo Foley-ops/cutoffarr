@@ -958,6 +958,20 @@ func TestSampleEveryKth_MoreThanN_ReturnsExactlyNDeterministically(t *testing.T)
 }
 
 // --- runCrossCheck -----------------------------------------------------
+//
+// FIX 1 (controller-mandated correction, applied after the initial Phase 3
+// review): runCrossCheck's return signature changed from (passed bool,
+// checked int) to (status string, verified int, unverifiable int). The old
+// shape let an item with qualityCutoffNotMet == nil count toward "checked"
+// while being excluded from the agree/disagree comparison, so the summary
+// could read e.g. "passed (20 items)" when zero items were actually
+// verified — dishonest on any future Radarr response shape where the field
+// is absent (confirmed live on Radarr 6.3.0, 2026-08-07, that the field IS
+// present today: 3 samples read false, 146 true library-wide — this fix
+// guards against a future/different version, not today's observed
+// behavior). status is one of crossCheckStatusPassed/Failed/Inconclusive;
+// "inconclusive" fires when every sampled item was unverifiable, so an
+// all-unverifiable run can never silently read as a pass.
 
 func agreeTrue() *bool  { return boolPtr(true) }
 func agreeFalse() *bool { return boolPtr(false) }
@@ -966,9 +980,9 @@ func TestRunCrossCheck_ZeroCandidates_PassesWithZeroItems(t *testing.T) {
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	inst := Instance{Name: "radarr-main", Type: "radarr"}
 
-	passed, checked := runCrossCheck(logger, inst, nil, map[int]bool{})
-	if !passed || checked != 0 {
-		t.Errorf("runCrossCheck = (%v, %d), want (true, 0) for zero candidates", passed, checked)
+	status, verified, unverifiable := runCrossCheck(logger, inst, nil, map[int]bool{})
+	if status != crossCheckStatusPassed || verified != 0 || unverifiable != 0 {
+		t.Errorf("runCrossCheck = (%q, %d, %d), want (%q, 0, 0) for zero candidates", status, verified, unverifiable, crossCheckStatusPassed)
 	}
 	if strings.Contains(buf.String(), "level=ERROR") {
 		t.Errorf("no candidates should never error:\n%s", buf.String())
@@ -991,12 +1005,12 @@ func TestRunCrossCheck_AgreeingSamples_PassesAndLogsBothCategories(t *testing.T)
 	}
 	wantedIDs := map[int]bool{2: true} // id 1 not in set (agrees with false); id 2 in set (agrees with true)
 
-	passed, checked := runCrossCheck(logger, inst, decisions, wantedIDs)
-	if !passed {
-		t.Errorf("passed = false, want true:\n%s", buf.String())
+	status, verified, unverifiable := runCrossCheck(logger, inst, decisions, wantedIDs)
+	if status != crossCheckStatusPassed {
+		t.Errorf("status = %q, want %q:\n%s", status, crossCheckStatusPassed, buf.String())
 	}
-	if checked != 2 {
-		t.Errorf("checked = %d, want 2", checked)
+	if verified != 2 || unverifiable != 0 {
+		t.Errorf("verified/unverifiable = %d/%d, want 2/0", verified, unverifiable)
 	}
 	out := buf.String()
 	if strings.Contains(out, "level=ERROR") {
@@ -1031,12 +1045,14 @@ func TestRunCrossCheck_Disagreement_FailsWithErrorLog(t *testing.T) {
 	}
 	wantedIDs := map[int]bool{1: true}
 
-	passed, checked := runCrossCheck(logger, inst, decisions, wantedIDs)
-	if passed {
-		t.Error("passed = true, want false for a disagreement")
+	status, verified, unverifiable := runCrossCheck(logger, inst, decisions, wantedIDs)
+	if status != crossCheckStatusFailed {
+		t.Errorf("status = %q, want %q for a disagreement", status, crossCheckStatusFailed)
 	}
-	if checked != 1 {
-		t.Errorf("checked = %d, want 1", checked)
+	// The disagreeing item was compared (it has a non-nil qualityCutoffNotMet),
+	// so it counts as verified, not unverifiable.
+	if verified != 1 || unverifiable != 0 {
+		t.Errorf("verified/unverifiable = %d/%d, want 1/0", verified, unverifiable)
 	}
 	out := buf.String()
 	if !strings.Contains(out, "level=ERROR") {
@@ -1052,7 +1068,7 @@ func TestRunCrossCheck_Disagreement_FailsWithErrorLog(t *testing.T) {
 
 // TestRunCrossCheck_SamplesUpToTenPerCategory pins the up-to-10-per-
 // category sampling cap: 15 would-unmonitor candidates (all agreeing) plus
-// 15 skip candidates (all agreeing) must be capped at 10 + 10 = 20 checked
+// 15 skip candidates (all agreeing) must be capped at 10 + 10 = 20 verified
 // items, not 30.
 func TestRunCrossCheck_SamplesUpToTenPerCategory(t *testing.T) {
 	logger, _ := newDecisionTestLogger(slog.LevelInfo)
@@ -1068,41 +1084,64 @@ func TestRunCrossCheck_SamplesUpToTenPerCategory(t *testing.T) {
 		wantedIDs[i] = false
 	}
 
-	passed, checked := runCrossCheck(logger, inst, decisions, wantedIDs)
-	if !passed {
-		t.Error("passed = false, want true (all candidates agree)")
+	status, verified, unverifiable := runCrossCheck(logger, inst, decisions, wantedIDs)
+	if status != crossCheckStatusPassed {
+		t.Errorf("status = %q, want %q (all candidates agree)", status, crossCheckStatusPassed)
 	}
-	if checked != 20 {
-		t.Errorf("checked = %d, want 20 (10 would-unmonitor + 10 skip)", checked)
+	if verified != 20 || unverifiable != 0 {
+		t.Errorf("verified/unverifiable = %d/%d, want 20/0 (10 would-unmonitor + 10 skip)", verified, unverifiable)
 	}
 }
 
-// TestRunCrossCheck_QualityCutoffNotMetAbsent_WarnsButDoesNotFailTheCheck
-// pins a defensive edge case: if movieFile.qualityCutoffNotMet is entirely
-// absent from the /movie data for a sampled candidate (e.g. an older Radarr
-// response shape), silently treating that as "false" could mask a genuine
-// disagreement. It must instead warn distinctly and not, on its own,
-// contribute to a FAILED verdict.
-func TestRunCrossCheck_QualityCutoffNotMetAbsent_WarnsButDoesNotFailTheCheck(t *testing.T) {
+// TestRunCrossCheck_AllUnverifiable_ReturnsInconclusiveAndWarns pins FIX 1's
+// core honesty requirement: if movieFile.qualityCutoffNotMet is entirely
+// absent from the /movie data for every sampled candidate (e.g. an
+// older/different Radarr response shape than the one confirmed live on
+// 6.3.0), the result must NOT read as a pass — status is "inconclusive",
+// verified=0, and a warning fires, distinct from a genuine "passed" outcome
+// which requires at least one item to have actually been compared.
+func TestRunCrossCheck_AllUnverifiable_ReturnsInconclusiveAndWarns(t *testing.T) {
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	inst := Instance{Name: "radarr-main", Type: "radarr"}
 
 	decisions := []movieDecision{
 		{id: 1, title: "Missing Field Movie", wouldUnmonitor: true, hasFile: true, qualityCutoffNotMet: nil, cfScore: intPtr(200), cfThreshold: 100},
 	}
-	passed, checked := runCrossCheck(logger, inst, decisions, map[int]bool{})
-	if !passed {
-		t.Error("passed = false, want true: an absent field alone must not fail the check")
+	status, verified, unverifiable := runCrossCheck(logger, inst, decisions, map[int]bool{})
+	if status != crossCheckStatusInconclusive {
+		t.Errorf("status = %q, want %q: an all-unverifiable sample must not read as passed", status, crossCheckStatusInconclusive)
 	}
-	if checked != 1 {
-		t.Errorf("checked = %d, want 1", checked)
+	if verified != 0 || unverifiable != 1 {
+		t.Errorf("verified/unverifiable = %d/%d, want 0/1", verified, unverifiable)
 	}
 	out := buf.String()
 	if strings.Contains(out, "level=ERROR") {
 		t.Errorf("an absent field must warn, not error:\n%s", out)
 	}
 	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "Missing Field Movie") {
-		t.Errorf("expected a warning naming the movie with the absent field:\n%s", out)
+		t.Errorf("expected a per-item warning naming the movie with the absent field:\n%s", out)
+	}
+}
+
+// TestRunCrossCheck_MixedVerifiedAndUnverifiable_PassesWithBothCountsSeparate
+// is FIX 1's other mandated case: a mix of verified-agreeing and
+// unverifiable candidates must report both counts honestly and still pass
+// overall (at least one item was actually verified and none disagreed).
+func TestRunCrossCheck_MixedVerifiedAndUnverifiable_PassesWithBothCountsSeparate(t *testing.T) {
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr"}
+
+	decisions := []movieDecision{
+		{id: 1, title: "Verified Movie A", wouldUnmonitor: true, hasFile: true, qualityCutoffNotMet: agreeFalse()},
+		{id: 2, title: "Verified Movie B", wouldUnmonitor: true, hasFile: true, qualityCutoffNotMet: agreeFalse()},
+		{id: 3, title: "Unverifiable Movie", wouldUnmonitor: true, hasFile: true, qualityCutoffNotMet: nil},
+	}
+	status, verified, unverifiable := runCrossCheck(logger, inst, decisions, map[int]bool{})
+	if status != crossCheckStatusPassed {
+		t.Errorf("status = %q, want %q:\n%s", status, crossCheckStatusPassed, buf.String())
+	}
+	if verified != 2 || unverifiable != 1 {
+		t.Errorf("verified/unverifiable = %d/%d, want 2/1", verified, unverifiable)
 	}
 }
 
@@ -1117,9 +1156,9 @@ func TestRunCrossCheck_HasFileFalseSkip_ExcludedFromCandidates(t *testing.T) {
 	decisions := []movieDecision{
 		{id: 1, title: "No File Movie", wouldUnmonitor: false, hasFile: false, reason: "no file"},
 	}
-	_, checked := runCrossCheck(logger, inst, decisions, map[int]bool{})
-	if checked != 0 {
-		t.Errorf("checked = %d, want 0 (hasFile=false skip must not be a cross-check candidate)", checked)
+	_, verified, unverifiable := runCrossCheck(logger, inst, decisions, map[int]bool{})
+	if verified != 0 || unverifiable != 0 {
+		t.Errorf("verified/unverifiable = %d/%d, want 0/0 (hasFile=false skip must not be a cross-check candidate)", verified, unverifiable)
 	}
 }
 
@@ -1152,8 +1191,43 @@ func TestRunRadarrDecisionEngine_CrossCheckPassed_SummaryStatesPassedWithCount(t
 	if strings.Contains(out, "level=ERROR") {
 		t.Errorf("agreeing cross-check must not error:\n%s", out)
 	}
-	if !strings.Contains(out, `crossCheck="passed (1 items)"`) {
-		t.Errorf("expected the summary to state the cross-check passed with its item count:\n%s", out)
+	if !strings.Contains(out, `crossCheck="passed (1 verified, 0 unverifiable)"`) {
+		t.Errorf("expected the summary to state the cross-check passed with verified/unverifiable counts:\n%s", out)
+	}
+}
+
+// TestRunRadarrDecisionEngine_CrossCheckAllUnverifiable_SummaryStatesInconclusive
+// is FIX 1's end-to-end pin: when the /movie data for every sampled
+// candidate is missing movieFile.qualityCutoffNotMet, the summary must read
+// "inconclusive", never "passed" — through the real orchestrator, not just
+// the runCrossCheck unit.
+func TestRunRadarrDecisionEngine_CrossCheckAllUnverifiable_SummaryStatesInconclusive(t *testing.T) {
+	var gotMoviefileRequests []string
+	moviefileHandler := func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[{"id": 1, "customFormatScore": 200}]`))
+	}
+	srv := decisionEngineTestServer(t, decisionEngineProfilesJSON, decisionEngineNoTagsJSON, moviefileHandler, &gotMoviefileRequests)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	// QualityCutoffNotMet left nil: movieFile present, but this field absent.
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("Would Unmonitor Movie"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
+			MovieFile: &movieFileElement{ID: intPtr(1)}},
+	}
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude")
+
+	out := buf.String()
+	if strings.Contains(out, "level=ERROR") {
+		t.Errorf("an unverifiable-only cross-check must not error:\n%s", out)
+	}
+	if !strings.Contains(out, `crossCheck="inconclusive (0 verified, 1 unverifiable)"`) {
+		t.Errorf("expected the summary to state the cross-check inconclusive, not passed:\n%s", out)
+	}
+	if strings.Contains(out, `crossCheck="passed`) {
+		t.Errorf("an all-unverifiable cross-check must never render as passed:\n%s", out)
 	}
 }
 
