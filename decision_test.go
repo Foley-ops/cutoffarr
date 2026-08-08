@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -626,6 +627,240 @@ func TestEvaluateMovie_CFEqualToThreshold_PassesRuleSix(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// --- runRadarrDecisionEngine: orchestrator --------------------------------
+
+// decisionEngineTestServer wires a mux serving profilesJSON at
+// /api/v3/qualityprofile, tagsJSON at /api/v3/tag, and moviefileHandler at
+// /api/v3/moviefile, recording every /api/v3/moviefile request's raw query
+// into gotMoviefileRequests.
+func decisionEngineTestServer(t *testing.T, profilesJSON, tagsJSON string, moviefileHandler http.HandlerFunc, gotMoviefileRequests *[]string) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(profilesJSON))
+	})
+	mux.HandleFunc("/api/v3/tag", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(tagsJSON))
+	})
+	mux.HandleFunc("/api/v3/moviefile", func(w http.ResponseWriter, r *http.Request) {
+		*gotMoviefileRequests = append(*gotMoviefileRequests, r.URL.RawQuery)
+		moviefileHandler(w, r)
+	})
+	return httptest.NewServer(mux)
+}
+
+const decisionEngineProfilesJSON = `[{"id": 1, "name": "HD-1080p", "upgradeAllowed": true, "cutoffFormatScore": 100}]`
+const decisionEngineNoTagsJSON = `[]`
+
+func staticMoviefileHandler(customFormatScore int) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[{"id": 1, "customFormatScore": ` + strconv.Itoa(customFormatScore) + `}]`))
+	}
+}
+
+func TestRunRadarrDecisionEngine_UnmonitoredMovies_ExcludedFromReportEntirely(t *testing.T) {
+	var gotMoviefileRequests []string
+	srv := decisionEngineTestServer(t, decisionEngineProfilesJSON, decisionEngineNoTagsJSON, staticMoviefileHandler(200), &gotMoviefileRequests)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("Unmonitored Movie"), Monitored: boolPtr(false), HasFile: boolPtr(true), QualityProfileID: intPtr(1)},
+	}
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude")
+
+	out := buf.String()
+	if strings.Contains(out, "Unmonitored Movie") {
+		t.Errorf("unmonitored movie must produce no report line at all:\n%s", out)
+	}
+	if len(gotMoviefileRequests) != 0 {
+		t.Errorf("expected zero /moviefile requests for an unmonitored movie, got %d", len(gotMoviefileRequests))
+	}
+	if !strings.Contains(out, "totalMonitored=0") {
+		t.Errorf("expected totalMonitored=0 in the summary:\n%s", out)
+	}
+}
+
+func TestRunRadarrDecisionEngine_LogsWouldUnmonitorAndSkipLinesWithMandatedAttrs(t *testing.T) {
+	var gotMoviefileRequests []string
+	srv := decisionEngineTestServer(t, decisionEngineProfilesJSON, decisionEngineNoTagsJSON, staticMoviefileHandler(200), &gotMoviefileRequests)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("Would Unmonitor Movie"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
+			MovieFile: &movieFileElement{ID: intPtr(1)}},
+		{ID: intPtr(2), Title: strPtr("No File Movie"), Monitored: boolPtr(true), HasFile: boolPtr(false), QualityProfileID: intPtr(1)},
+	}
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude")
+
+	out := buf.String()
+	if !strings.Contains(out, `msg=would-unmonitor`) {
+		t.Errorf("expected a would-unmonitor log line:\n%s", out)
+	}
+	for _, want := range []string{`title="Would Unmonitor Movie"`, `reason="cutoff met"`, `profile=HD-1080p`, "instance=radarr-main"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected would-unmonitor line to contain %q:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, `msg=skip`) {
+		t.Errorf("expected a skip log line:\n%s", out)
+	}
+	for _, want := range []string{`title="No File Movie"`, `reason="no file"`, "instance=radarr-main"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected skip line to contain %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestRunRadarrDecisionEngine_MoviefileFetchedOnlyForMoviesPassingRulesOneThroughFive
+// is the self-review-mandated request-count assertion at the orchestrator
+// level: across a mix of movies failing at every earlier rule plus one that
+// reaches rule 6, exactly one /moviefile request must be made.
+func TestRunRadarrDecisionEngine_MoviefileFetchedOnlyForMoviesPassingRulesOneThroughFive(t *testing.T) {
+	var gotMoviefileRequests []string
+	srv := decisionEngineTestServer(t, decisionEngineProfilesJSON, decisionEngineNoTagsJSON, staticMoviefileHandler(200), &gotMoviefileRequests)
+	defer srv.Close()
+
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("Unmonitored"), Monitored: boolPtr(false), HasFile: boolPtr(true), QualityProfileID: intPtr(1)},
+		{ID: intPtr(2), Title: strPtr("No File"), Monitored: boolPtr(true), HasFile: boolPtr(false), QualityProfileID: intPtr(1)},
+		{ID: intPtr(3), Title: strPtr("Unknown Profile"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(999)},
+		{ID: intPtr(4), Title: strPtr("In Wanted Set"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1)},
+		{ID: intPtr(5), Title: strPtr("Reaches Rule Six"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
+			MovieFile: &movieFileElement{ID: intPtr(1)}},
+	}
+	wantedIDs := map[int]bool{4: true}
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, wantedIDs, "cutoffarr-exclude")
+
+	if len(gotMoviefileRequests) != 1 {
+		t.Errorf("expected exactly 1 /moviefile request, got %d: %v", len(gotMoviefileRequests), gotMoviefileRequests)
+	}
+	if len(gotMoviefileRequests) == 1 && gotMoviefileRequests[0] != "movieId=5" {
+		t.Errorf("the single /moviefile request = %q, want movieId=5", gotMoviefileRequests[0])
+	}
+}
+
+func TestRunRadarrDecisionEngine_ProfileFetchFailure_NoReportLinesAtAll(t *testing.T) {
+	var gotMoviefileRequests []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-broken", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("Some Movie"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1)},
+	}
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude")
+
+	out := buf.String()
+	if strings.Contains(out, "msg=would-unmonitor") || strings.Contains(out, "msg=skip") {
+		t.Errorf("a failed profile fetch must skip the whole instance: no report lines at all:\n%s", out)
+	}
+	if !strings.Contains(out, "level=WARN") {
+		t.Errorf("expected a warning:\n%s", out)
+	}
+	if len(gotMoviefileRequests) != 0 {
+		t.Errorf("expected zero /moviefile requests, got %d", len(gotMoviefileRequests))
+	}
+}
+
+func TestRunRadarrDecisionEngine_TagFetchFailure_NoReportLinesAtAll(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(decisionEngineProfilesJSON))
+	})
+	mux.HandleFunc("/api/v3/tag", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-broken", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("Some Movie"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1)},
+	}
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude")
+
+	out := buf.String()
+	if strings.Contains(out, "msg=would-unmonitor") || strings.Contains(out, "msg=skip") {
+		t.Errorf("a failed tag fetch must skip the whole instance: no report lines at all:\n%s", out)
+	}
+}
+
+func TestRunRadarrDecisionEngine_SummaryCountsCorrect(t *testing.T) {
+	var gotMoviefileRequests []string
+	srv := decisionEngineTestServer(t, decisionEngineProfilesJSON, decisionEngineNoTagsJSON, staticMoviefileHandler(200), &gotMoviefileRequests)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("Unmonitored"), Monitored: boolPtr(false), HasFile: boolPtr(true), QualityProfileID: intPtr(1)},
+		{ID: intPtr(2), Title: strPtr("No File A"), Monitored: boolPtr(true), HasFile: boolPtr(false), QualityProfileID: intPtr(1)},
+		{ID: intPtr(3), Title: strPtr("No File B"), Monitored: boolPtr(true), HasFile: boolPtr(false), QualityProfileID: intPtr(1)},
+		{ID: intPtr(4), Title: strPtr("Would Unmonitor"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
+			MovieFile: &movieFileElement{ID: intPtr(1)}},
+	}
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude")
+
+	out := buf.String()
+	if !strings.Contains(out, "totalMonitored=3") {
+		t.Errorf("expected totalMonitored=3 (excludes the unmonitored movie):\n%s", out)
+	}
+	if !strings.Contains(out, "wouldUnmonitor=1") {
+		t.Errorf("expected wouldUnmonitor=1:\n%s", out)
+	}
+	if !strings.Contains(out, "no file=2") {
+		t.Errorf("expected the skip-reason count 'no file=2' in the summary:\n%s", out)
+	}
+}
+
+// TestRunRadarrDecisionEngine_MovieMissingID_WarnsAndExcludedFromReport is a
+// defensive-coding test: a monitored movie missing its id field cannot be
+// evaluated against rules 5/6 (no id to look up) or safely reported, so it
+// is warned about and excluded from the report/counts rather than crashing
+// or producing a misleading line.
+func TestRunRadarrDecisionEngine_MovieMissingID_WarnsAndExcludedFromReport(t *testing.T) {
+	var gotMoviefileRequests []string
+	srv := decisionEngineTestServer(t, decisionEngineProfilesJSON, decisionEngineNoTagsJSON, staticMoviefileHandler(200), &gotMoviefileRequests)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	movies := []movieListElement{
+		{Title: strPtr("No Id Movie"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1)},
+	}
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude")
+
+	out := buf.String()
+	if strings.Contains(out, "msg=would-unmonitor") || strings.Contains(out, "msg=skip") {
+		t.Errorf("a movie missing its id must not produce a decision report line:\n%s", out)
+	}
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "No Id Movie") {
+		t.Errorf("expected a warning naming the movie missing its id:\n%s", out)
+	}
+	if !strings.Contains(out, "totalMonitored=0") {
+		t.Errorf("expected the movie missing id to not be counted:\n%s", out)
+	}
+}
 
 func TestFetchQualityProfiles_MalformedJSON_SkipsInstance(t *testing.T) {
 	mux := http.NewServeMux()

@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -294,6 +296,107 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 	d.wouldUnmonitor = true
 	d.reason = "cutoff met"
 	return d
+}
+
+// runRadarrDecisionEngine is the Phase 3 entry point for a single radarr
+// instance: it fetches the two additional data sources the STRICT decision
+// rule needs beyond what inspectRadarrLibrary (Phase 2) already gathered —
+// quality profiles (refactor c) and the exclusion tag id (tag-resolution
+// rules) — then evaluates every monitored movie in movies, in library
+// order, logging a "would-unmonitor" or "skip" report line for each
+// (msg="would-unmonitor" / msg=skip, per the plan), runs the cross-check,
+// and logs an end-of-instance summary. It is called only for a radarr
+// instance whose connectivity check and inspectRadarrLibrary fetch both
+// already succeeded (main.go's responsibility); it never returns anything
+// because, like checkInstanceConnectivity and inspectRadarrLibrary, the
+// binding error-handling rule (§2.6) is "skip that instance for the cycle
+// and log a warning" with no further work for a caller to gate on.
+func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, movies []movieListElement, wantedIDs map[int]bool, exclusionTagLabel string) {
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	profiles, ok := fetchQualityProfiles(ctx, logger, client, inst)
+	if !ok {
+		return
+	}
+
+	exclusionTagID, tagActive, ok := resolveExclusionTagID(ctx, logger, client, inst, exclusionTagLabel)
+	if !ok {
+		return
+	}
+
+	var decisions []movieDecision
+	totalMonitored := 0
+	wouldUnmonitorCount := 0
+	skipCounts := make(map[string]int)
+
+	for _, m := range movies {
+		if m.Monitored == nil || !*m.Monitored {
+			// Rule 1: excluded from the report entirely, per the plan.
+			continue
+		}
+		if m.ID == nil {
+			// Defensive: without an id this movie can't be checked against
+			// the wanted/cutoff set or queried at /moviefile, and can't be
+			// safely reported. Real Radarr responses always include id;
+			// this mirrors how fetchWantedCutoff treats a record missing
+			// its id (warn, exclude, continue).
+			logger.Warn("skipping movie: missing id field",
+				"instance", inst.Name, "type", inst.Type, "title", titleOrAbsent(m.Title))
+			continue
+		}
+		totalMonitored++
+
+		d := evaluateMovie(ctx, logger, client, inst, m, profiles, exclusionTagID, tagActive, wantedIDs)
+		decisions = append(decisions, d)
+
+		if d.wouldUnmonitor {
+			wouldUnmonitorCount++
+			logger.Info("would-unmonitor",
+				"title", d.title, "reason", d.reason, "profile", d.profileName, "instance", inst.Name)
+		} else {
+			skipCounts[d.reason]++
+			logger.Info("skip",
+				"title", d.title, "reason", d.reason, "profile", d.profileName, "instance", inst.Name)
+		}
+	}
+
+	crossCheckPassed, crossCheckCount := runCrossCheck(logger, inst, decisions, wantedIDs)
+	crossCheckSummary := fmt.Sprintf("passed (%d items)", crossCheckCount)
+	if !crossCheckPassed {
+		crossCheckSummary = "FAILED"
+	}
+
+	logger.Info("radarr decision summary",
+		"instance", inst.Name, "type", inst.Type,
+		"totalMonitored", totalMonitored, "wouldUnmonitor", wouldUnmonitorCount,
+		"skipReasons", formatSkipCounts(skipCounts), "crossCheck", crossCheckSummary)
+}
+
+// formatSkipCounts renders a skip-reason -> count map as a single
+// deterministic (alphabetically sorted, so log output and tests are stable
+// across runs) "reason=count, reason=count" string for the summary line.
+func formatSkipCounts(counts map[string]int) string {
+	if len(counts) == 0 {
+		return "none"
+	}
+	reasons := make([]string, 0, len(counts))
+	for r := range counts {
+		reasons = append(reasons, r)
+	}
+	sort.Strings(reasons)
+	parts := make([]string, 0, len(reasons))
+	for _, r := range reasons {
+		parts = append(parts, fmt.Sprintf("%s=%d", r, counts[r]))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// runCrossCheck is a placeholder pending the dedicated cross-check
+// implementation (plan §6, adapted to the STRICT rule): it currently
+// treats every call as passed with zero items checked. TODO: replace with
+// the real deterministic sampling + agree/disagree logic.
+func runCrossCheck(logger *slog.Logger, inst Instance, decisions []movieDecision, wantedIDs map[int]bool) (passed bool, checked int) {
+	return true, 0
 }
 
 // selectMovieFile picks the movieFileDetail this movie's file actually
