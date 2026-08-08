@@ -1413,6 +1413,54 @@ func TestRunCrossCheck_HasFileFalseSkip_ExcludedFromCandidates(t *testing.T) {
 	}
 }
 
+// --- renderCrossCheckSummary -----------------------------------------------
+//
+// FIX 2 (Minor, controller-mandated correction after the whole-branch
+// review): the crossCheck summary rendering previously fell through to a
+// bare `default:` case that rendered the "passed" format — meaning any
+// future new/unrecognized status value (a typo in a new status constant, a
+// forgotten case after adding a fourth state, etc.) would silently render
+// as a pass instead of failing loudly. renderCrossCheckSummary now makes
+// crossCheckStatusPassed its own explicit case, and default renders the
+// raw, unrecognized status string plus counts — something that can never
+// be mistaken for "passed (...)" — so a truly unrecognized status is loud
+// and debuggable rather than falsely reassuring.
+
+func TestRenderCrossCheckSummary_Passed(t *testing.T) {
+	got := renderCrossCheckSummary(crossCheckStatusPassed, 5, 1)
+	if got != "passed (5 verified, 1 unverifiable)" {
+		t.Errorf("renderCrossCheckSummary(passed) = %q, want %q", got, "passed (5 verified, 1 unverifiable)")
+	}
+}
+
+func TestRenderCrossCheckSummary_Failed(t *testing.T) {
+	got := renderCrossCheckSummary(crossCheckStatusFailed, 5, 1)
+	if got != "FAILED" {
+		t.Errorf("renderCrossCheckSummary(failed) = %q, want %q", got, "FAILED")
+	}
+}
+
+func TestRenderCrossCheckSummary_Inconclusive(t *testing.T) {
+	got := renderCrossCheckSummary(crossCheckStatusInconclusive, 0, 3)
+	if got != "inconclusive (0 verified, 3 unverifiable)" {
+		t.Errorf("renderCrossCheckSummary(inconclusive) = %q, want %q", got, "inconclusive (0 verified, 3 unverifiable)")
+	}
+}
+
+// TestRenderCrossCheckSummary_UnrecognizedStatus_NeverReadsAsPassed is
+// FIX 2's core pin: feed an unrecognized status through the renderer and
+// assert the output does not contain "passed" — the exact hazard the old
+// bare `default:` case created.
+func TestRenderCrossCheckSummary_UnrecognizedStatus_NeverReadsAsPassed(t *testing.T) {
+	got := renderCrossCheckSummary("some-future-status-nobody-added-a-case-for", 5, 1)
+	if strings.Contains(got, "passed") {
+		t.Errorf("renderCrossCheckSummary(unrecognized) = %q, must never contain \"passed\"", got)
+	}
+	if !strings.Contains(got, "some-future-status-nobody-added-a-case-for") {
+		t.Errorf("renderCrossCheckSummary(unrecognized) = %q, expected it to surface the raw unrecognized status", got)
+	}
+}
+
 // TestRunRadarrDecisionEngine_CrossCheckPassed_SummaryStatesPassedWithCount
 // and TestRunRadarrDecisionEngine_CrossCheckDisagreement_SummaryStatesFailed
 // pin the full pipeline's cross-check integration end to end: the

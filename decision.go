@@ -429,23 +429,40 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	}
 
 	status, verified, unverifiable := runCrossCheck(logger, inst, decisions, wantedIDs)
-	var crossCheckSummary string
-	switch status {
-	case crossCheckStatusFailed:
-		// Deliberately no counts here: this is the human-gate signal (plan:
-		// "disagreement must stop the project before writes"), kept as the
-		// single unmistakable token it always was.
-		crossCheckSummary = "FAILED"
-	case crossCheckStatusInconclusive:
-		crossCheckSummary = fmt.Sprintf("inconclusive (%d verified, %d unverifiable)", verified, unverifiable)
-	default:
-		crossCheckSummary = fmt.Sprintf("passed (%d verified, %d unverifiable)", verified, unverifiable)
-	}
+	crossCheckSummary := renderCrossCheckSummary(status, verified, unverifiable)
 
 	logger.Info("radarr decision summary",
 		"instance", inst.Name, "type", inst.Type,
 		"totalMonitored", totalMonitored, "wouldUnmonitor", wouldUnmonitorCount,
 		"skipReasons", formatSkipCounts(skipCounts), "crossCheck", crossCheckSummary)
+}
+
+// renderCrossCheckSummary formats the "radarr decision summary" line's
+// crossCheck attr from runCrossCheck's result.
+//
+// FIX 2 (controller-mandated correction after the whole-branch review):
+// crossCheckStatusPassed is its own explicit case here, not the switch's
+// default — a bare default rendering the "passed" format meant any future
+// or unrecognized status value (a typo in a new status constant, a
+// forgotten case after adding a fourth state) would have silently rendered
+// as a pass. default now renders the raw, unrecognized status string plus
+// counts instead: something that can never be mistaken for "passed (...)",
+// so an unrecognized status is loud and debuggable rather than falsely
+// reassuring.
+func renderCrossCheckSummary(status string, verified, unverifiable int) string {
+	switch status {
+	case crossCheckStatusPassed:
+		return fmt.Sprintf("passed (%d verified, %d unverifiable)", verified, unverifiable)
+	case crossCheckStatusFailed:
+		// Deliberately no counts here: this is the human-gate signal (plan:
+		// "disagreement must stop the project before writes"), kept as the
+		// single unmistakable token it always was.
+		return "FAILED"
+	case crossCheckStatusInconclusive:
+		return fmt.Sprintf("inconclusive (%d verified, %d unverifiable)", verified, unverifiable)
+	default:
+		return fmt.Sprintf("UNRECOGNIZED CROSS-CHECK STATUS %q (%d verified, %d unverifiable)", status, verified, unverifiable)
+	}
 }
 
 // formatSkipCounts renders a skip-reason -> count map as a single
