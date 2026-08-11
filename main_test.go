@@ -330,9 +330,19 @@ instances: []
 // TestRun_OnlyIDWithoutOnce_WarnsThatItHasNoEffect: the flag scopes a
 // single pass, and daemon mode does not run one yet. Ignoring it silently
 // would let someone believe a run was scoped when it was not.
+//
+// The config names a radarr (it is never contacted — without --once nothing
+// is) so this test exercises the one thing it is about. An empty instance
+// list would now be refused earlier and for a different reason: a --only-id
+// that no configured radarr could apply to is a fatal flag error in its own
+// right, which is a separate pin (writer_test.go's --only-id scope tests).
 func TestRun_OnlyIDWithoutOnce_WarnsThatItHasNoEffect(t *testing.T) {
 	path := writeMainTestConfig(t, `
-instances: []
+instances:
+  - name: radarr-main
+    type: radarr
+    url: http://radarr.invalid:7878
+    api_key: key1
 `)
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"--config", path, "--only-id", "42"}, &stdout, &stderr)

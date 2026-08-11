@@ -94,6 +94,30 @@ func run(args []string, stdout, stderr io.Writer) int {
 				*onlyID, len(inScope), strings.Join(inScope, ", "))
 			return 2
 		}
+		// The opposite failure, and the more insidious one: no radarr is in
+		// scope at all, so the id names nothing this run could act on. Left
+		// alone, the flag would simply evaporate — the ambiguity guard above
+		// does not fire (one is not more than one), the loop does whatever
+		// connectivity work the remaining instances warrant, and the process
+		// exits 0 having never mentioned the movie the human explicitly
+		// named. That is precisely the outcome the --instance check above
+		// refuses to allow ("a run that silently does nothing... is
+		// indistinguishable from a run that found nothing to do"), so it is
+		// refused here on the same terms and with the same exit code. Two
+		// causes reach this point — a config with no radarr in it, and an
+		// --instance that names the sonarr beside one — and the message says
+		// which, because the remedies are different.
+		if len(inScope) == 0 {
+			configured := radarrInstancesInScope(*cfg, "")
+			if instanceSet {
+				fmt.Fprintf(stderr, "cutoffarr: fatal: --only-id %d is a radarr movie id, but --instance %q scopes this run to an instance that is not a radarr, so the id could not be applied to anything (radarr instances configured: %s)\n",
+					*onlyID, *instanceName, joinOrNone(configured))
+			} else {
+				fmt.Fprintf(stderr, "cutoffarr: fatal: --only-id %d is a radarr movie id, but no radarr instance is configured, so the id could not be applied to anything (configured instances: %s)\n",
+					*onlyID, joinOrNone(instanceNames(*cfg)))
+			}
+			return 2
+		}
 	}
 
 	logger := slog.New(slog.NewTextHandler(stdout, &slog.HandlerOptions{Level: slogLevel(cfg.LogLevel)}))
@@ -188,6 +212,17 @@ func instanceNames(cfg Config) []string {
 		names = append(names, inst.Name)
 	}
 	return names
+}
+
+// joinOrNone renders a list of instance names for an error message, saying
+// "none" rather than printing an empty parenthesis when the list is empty —
+// "radarr instances configured: " followed by nothing reads like a truncated
+// message, when in fact "there are none" is the whole explanation.
+func joinOrNone(names []string) string {
+	if len(names) == 0 {
+		return "none"
+	}
+	return strings.Join(names, ", ")
 }
 
 // radarrInstancesInScope names the radarr instances a run would actually
