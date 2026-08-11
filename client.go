@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -56,6 +57,32 @@ func (c *APIClient) Do(ctx context.Context, method, path string, body io.Reader)
 // query via url.Values.Encode() on the parsed result. A nil or empty query
 // attaches no "?" at all, matching Do's existing behavior exactly.
 func (c *APIClient) DoQuery(ctx context.Context, method, path string, query url.Values, body io.Reader) (*http.Response, error) {
+	return c.do(ctx, method, path, query, body, "")
+}
+
+// DoJSON issues a request carrying a JSON request body, setting
+// Content-Type: application/json alongside the usual X-Api-Key. It exists
+// as the single entry point for the project's only write request (PUT
+// /api/v3/movie/{id}, writer.go): Do and DoQuery deliberately set no
+// Content-Type at all, which is correct for every bodyless read but not for
+// a request with a body — Radarr's ASP.NET Core stack rejects a body whose
+// content type it does not recognize (415 Unsupported Media Type). Putting
+// the header here rather than at the call site means a future write path
+// cannot forget it.
+//
+// The body is taken as []byte rather than an io.Reader because every caller
+// has already marshaled the payload in full (and must, to compare it
+// against what was fetched), and because a []byte lets net/http set an
+// exact Content-Length instead of falling back to chunked encoding.
+func (c *APIClient) DoJSON(ctx context.Context, method, path string, body []byte) (*http.Response, error) {
+	return c.do(ctx, method, path, nil, bytes.NewReader(body), "application/json")
+}
+
+// do is the single implementation behind Do, DoQuery, and DoJSON: it joins
+// path onto the base URL, attaches query (if any), sets X-Api-Key plus
+// contentType (when non-empty), issues the request, and treats any non-2xx
+// response as an error carrying a bounded snippet of the response body.
+func (c *APIClient) do(ctx context.Context, method, path string, query url.Values, body io.Reader, contentType string) (*http.Response, error) {
 	joined, err := url.JoinPath(c.baseURL, path)
 	if err != nil {
 		return nil, fmt.Errorf("client: building request url from base %q and path %q: %w", c.baseURL, path, err)
@@ -76,6 +103,9 @@ func (c *APIClient) DoQuery(ctx context.Context, method, path string, query url.
 		return nil, fmt.Errorf("client: building request: %w", err)
 	}
 	req.Header.Set("X-Api-Key", c.apiKey)
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

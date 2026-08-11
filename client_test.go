@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -217,5 +218,96 @@ func TestAPIClient_Do_SuccessReturnsResponse(t *testing.T) {
 
 	if resp.StatusCode != http.StatusCreated {
 		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+}
+
+// --- DoJSON -------------------------------------------------------------
+//
+// Phase 4 introduces the project's first and only write request (PUT
+// /api/v3/movie/{id}). Do/DoQuery set only X-Api-Key, which is enough for
+// every read endpoint but not for a request that carries a body: Radarr's
+// ASP.NET Core stack rejects a body without a Content-Type it recognizes
+// (415 Unsupported Media Type). DoJSON is the one entry point that sends a
+// JSON body, so the header is set in exactly one place rather than being
+// left to each caller to remember.
+
+func TestAPIClient_DoJSON_SendsBodyMethodAndJSONContentType(t *testing.T) {
+	var gotMethod, gotPath, gotContentType, gotAPIKey string
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotContentType = r.Header.Get("Content-Type")
+		gotAPIKey = r.Header.Get("X-Api-Key")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL, "my-secret-key")
+	body := []byte(`{"id":7,"monitored":false}`)
+	resp, err := c.DoJSON(context.Background(), http.MethodPut, "/api/v3/movie/7", body)
+	if err != nil {
+		t.Fatalf("DoJSON returned error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if gotMethod != http.MethodPut {
+		t.Errorf("method = %q, want PUT", gotMethod)
+	}
+	if gotPath != "/api/v3/movie/7" {
+		t.Errorf("path = %q, want /api/v3/movie/7", gotPath)
+	}
+	if gotContentType != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", gotContentType)
+	}
+	if gotAPIKey != "my-secret-key" {
+		t.Errorf("X-Api-Key = %q, want my-secret-key", gotAPIKey)
+	}
+	if string(gotBody) != string(body) {
+		t.Errorf("request body = %q, want %q", gotBody, body)
+	}
+	if resp.StatusCode != http.StatusAccepted {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusAccepted)
+	}
+}
+
+func TestAPIClient_DoJSON_NonTwoxxIsErrorWithBodySnippet(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"message":"movie not found"}`))
+	}))
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL, "key")
+	_, err := c.DoJSON(context.Background(), http.MethodPut, "/api/v3/movie/7", []byte(`{}`))
+	if err == nil {
+		t.Fatal("DoJSON returned nil error, want error for 400 response")
+	}
+	if !strings.Contains(err.Error(), "400") || !strings.Contains(err.Error(), "movie not found") {
+		t.Errorf("error %q does not carry the status and body snippet", err.Error())
+	}
+}
+
+// TestAPIClient_Do_SetsNoContentTypeHeader pins that the read path is
+// unchanged: only DoJSON sets Content-Type, so a bodyless GET never starts
+// advertising a body content type it does not have.
+func TestAPIClient_Do_SetsNoContentTypeHeader(t *testing.T) {
+	var gotContentType string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotContentType = r.Header.Get("Content-Type")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL, "key")
+	resp, err := c.Do(context.Background(), http.MethodGet, "/api/v3/movie", nil)
+	if err != nil {
+		t.Fatalf("Do returned error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if gotContentType != "" {
+		t.Errorf("Content-Type = %q, want empty for a bodyless GET", gotContentType)
 	}
 }
