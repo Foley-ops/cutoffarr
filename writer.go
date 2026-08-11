@@ -65,12 +65,26 @@ func moviePath(movieID int) string {
 //     precisely the mistake this project must never make). §2.6: never
 //     guess.
 //
-//  4. Skip the write entirely if the fresh object is already unmonitored.
+//  4. Re-check the exclusion tag against this SAME fresh object (Phase 5,
+//     mandated write-path safety fix). exclusionTagID/tagActive are the
+//     same values the decision engine resolved once per instance and used
+//     to evaluate this movie originally, but the scan that produced that
+//     decision may be minutes old, and §2.5 says the exclusion tag always
+//     wins, in every mode. A tag added to this movie between the scan and
+//     the write pass must still stop the write here — the decision that
+//     said would-unmonitor was correct when it was made; it is this
+//     re-check, not that decision, that is responsible for catching a tag
+//     added since. Consistent with decision.go rule 4's own handling of the
+//     same field: "tags" entirely absent from the fresh object (as opposed
+//     to present-but-empty) is untrusted input, not evidence the tag is
+//     absent, and refuses the write with a warning rather than guessing.
+//
+//  5. Skip the write entirely if the fresh object is already unmonitored.
 //     This is the scan-to-write race (something else unmonitored it in the
 //     meantime), and §2.4's spirit is to change exactly one thing, only
 //     when it needs changing.
 //
-//  5. Check dryRun as the LAST thing before the HTTP call (§2.1: "Every
+//  6. Check dryRun as the LAST thing before the HTTP call (§2.1: "Every
 //     write code path must check the dry-run flag immediately before the
 //     HTTP write call, not just at startup"). Everything above this line
 //     runs identically in both modes, which is what makes a dry-run a real
@@ -78,7 +92,7 @@ func moviePath(movieID int) string {
 //     claims to be one. It also means the steps above can fail in dry-run;
 //     the caller reports those as rehearsal failures, never as write ones.
 //
-//  6. Believe the server, not the status code: the returned object must
+//  7. Believe the server, not the status code: the returned object must
 //     itself say monitored is false before the write counts as done. A 2xx
 //     alone is not proof — see verifyWriteEcho. When the server accepts the
 //     write but says nothing that confirms it, the error wraps
@@ -89,7 +103,7 @@ func moviePath(movieID int) string {
 // Errors are returned, never retried (§2.6: "Never retry writes
 // automatically within a cycle"); the caller logs them and moves to the
 // next item.
-func unmonitorMovie(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, movieID int, dryRun bool) (written bool, err error) {
+func unmonitorMovie(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, movieID, exclusionTagID int, tagActive bool, dryRun bool) (written bool, err error) {
 	path := moviePath(movieID)
 
 	body, err := fetchBody(ctx, client, path, nil)
@@ -106,6 +120,33 @@ func unmonitorMovie(ctx context.Context, logger *slog.Logger, client *APIClient,
 		return false, err
 	}
 
+	title := titleFromPayload(payload)
+
+	// Step 4: the exclusion tag always wins, in every mode (§2.5) — checked
+	// here, against the FRESH payload's own tags, not against the decision
+	// made from the (possibly stale) library scan. Only evaluated when the
+	// tag is actually active in this instance; when it is not, rule 4 is
+	// vacuous regardless of tags, same as the decision engine's own rule 4.
+	if tagActive {
+		rawTags, tagsPresent := payload["tags"]
+		if !tagsPresent {
+			logger.Warn("movie tags absent from the pre-write fetch; cannot verify the exclusion tag is not present, refusing to write",
+				"instance", inst.Name, "type", inst.Type, "id", movieID, "title", title)
+			return false, nil
+		}
+		var tags []int
+		if err := json.Unmarshal(rawTags, &tags); err != nil {
+			logger.Warn("movie tags in the pre-write fetch are not a JSON array of ids; cannot verify the exclusion tag is not present, refusing to write",
+				"instance", inst.Name, "type", inst.Type, "id", movieID, "title", title, "error", err)
+			return false, nil
+		}
+		if containsIntID(tags, exclusionTagID) {
+			logger.Info("movie carries the exclusion tag as of the pre-write fetch, skipping write",
+				"instance", inst.Name, "type", inst.Type, "id", movieID, "title", title, "reason", ReasonExcludedByTag)
+			return false, nil
+		}
+	}
+
 	rawMonitored, present := payload[monitoredKey]
 	if !present {
 		return false, fmt.Errorf("movie %d: %q is absent from the pre-write fetch; refusing to write a field this Radarr may not have", movieID, monitoredKey)
@@ -116,7 +157,7 @@ func unmonitorMovie(ctx context.Context, logger *slog.Logger, client *APIClient,
 	}
 	if !monitored {
 		logger.Info("already unmonitored, skipping write",
-			"instance", inst.Name, "type", inst.Type, "id", movieID)
+			"instance", inst.Name, "type", inst.Type, "id", movieID, "title", title)
 		return false, nil
 	}
 
@@ -274,4 +315,37 @@ func verifyMovieIdentity(payload map[string]json.RawMessage, movieID int) error 
 		return fmt.Errorf("movie %d: the pre-write fetch returned movie %d instead; refusing to write to the wrong movie", movieID, gotID)
 	}
 	return nil
+}
+
+// titleFromPayload extracts "title" from the fresh pre-write fetch for use
+// in log lines, mirroring decision.go's titleOrAbsent "absent" convention so
+// a write-path log line reads the same way a report line does when the
+// field cannot be found. Unlike verifyMovieIdentity's id check, a missing or
+// malformed title is never fatal here — it is used only for a human-facing
+// log attribute, not to decide whether the write proceeds.
+func titleFromPayload(payload map[string]json.RawMessage) string {
+	raw, present := payload["title"]
+	if !present {
+		return "absent"
+	}
+	var title string
+	if err := json.Unmarshal(raw, &title); err != nil {
+		return "absent"
+	}
+	return title
+}
+
+// containsIntID reports whether id is present in ids. A small local helper
+// rather than decision.go's containsTag: that one takes a *[]int (to
+// distinguish "tags absent" from "tags present but empty" for the caller),
+// whereas the pre-write tag re-check above has already made that
+// distinction itself (payload["tags"] present/absent) before ever reaching
+// this call, so a plain []int is all that is needed here.
+func containsIntID(ids []int, id int) bool {
+	for _, i := range ids {
+		if i == id {
+			return true
+		}
+	}
+	return false
 }

@@ -124,7 +124,7 @@ func TestUnmonitorMovie_DryRun_MakesNoWriteRequest(t *testing.T) {
 	inst := writerTestInstance(srv.URL)
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, true)
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 0, false, true)
 	if err != nil {
 		t.Fatalf("unmonitorMovie returned error: %v\n%s", err, buf.String())
 	}
@@ -155,7 +155,7 @@ func TestUnmonitorMovie_WriteMode_PutsFullObjectWithOnlyMonitoredChanged(t *test
 	inst := writerTestInstance(srv.URL)
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, false)
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 0, false, false)
 	if err != nil {
 		t.Fatalf("unmonitorMovie returned error: %v\n%s", err, buf.String())
 	}
@@ -225,7 +225,7 @@ func TestUnmonitorMovie_WriteMode_SendsUnescapedBytesForHTMLSensitiveCharacters(
 	inst := writerTestInstance(srv.URL)
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	if _, err := unmonitorMovie(context.Background(), logger, client, inst, 7, false); err != nil {
+	if _, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 0, false, false); err != nil {
 		t.Fatalf("unmonitorMovie returned error: %v\n%s", err, buf.String())
 	}
 
@@ -285,7 +285,7 @@ func TestUnmonitorMovie_WriteMode_PreservesLargeIntegersExactly(t *testing.T) {
 	inst := writerTestInstance(srv.URL)
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	if _, err := unmonitorMovie(context.Background(), logger, client, inst, 7, false); err != nil {
+	if _, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 0, false, false); err != nil {
 		t.Fatalf("unmonitorMovie returned error: %v", err)
 	}
 
@@ -295,6 +295,105 @@ func TestUnmonitorMovie_WriteMode_PreservesLargeIntegersExactly(t *testing.T) {
 	}
 	if !strings.Contains(string(puts[0].body), "9007199254740993") {
 		t.Errorf("PUT body lost the exact large integer: %s", puts[0].body)
+	}
+}
+
+// --- pre-write exclusion-tag re-check (Phase 5, mandated write-path safety
+// fix) --------------------------------------------------------------------
+//
+// The scan that produced a would-unmonitor decision may be minutes old, and
+// §2.5 says the exclusion tag always wins, in every mode. These three tests
+// pin the write path's own re-check of the FRESH pre-write fetch's tags,
+// independent of whatever the scan-time decision believed.
+
+// TestUnmonitorMovie_FreshPayloadCarriesExclusionTag_RefusesToWriteWithDistinctReason
+// is the core case: the tag was added to this movie after the scan that
+// produced the would-unmonitor decision, but before the write pass reached
+// it. The write must be refused, and the reason must be distinguishable
+// from "already unmonitored" (a different race, caught by a different
+// check).
+func TestUnmonitorMovie_FreshPayloadCarriesExclusionTag_RefusesToWriteWithDistinctReason(t *testing.T) {
+	body := `{"id": 7, "title": "Newly Tagged Movie", "monitored": true, "tags": [3, 9]}`
+	srv, got := writerTestServer(t, body, http.StatusOK)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := writerTestInstance(srv.URL)
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 9, true, false)
+	if err != nil {
+		t.Fatalf("unmonitorMovie returned error: %v\n%s", err, buf.String())
+	}
+	if written {
+		t.Error("written = true, want false: the exclusion tag must always win, even when discovered at write time")
+	}
+	if len(filterRequests(*got, http.MethodPut)) != 0 {
+		t.Errorf("expected zero PUTs when the fresh payload carries the exclusion tag, got %+v", *got)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=INFO") || !strings.Contains(out, "exclusion tag") {
+		t.Errorf("expected an info log explaining the write was refused due to the exclusion tag:\n%s", out)
+	}
+	if strings.Contains(out, "already unmonitored") {
+		t.Errorf("the exclusion-tag skip must be distinguishable from the already-unmonitored skip:\n%s", out)
+	}
+	if !strings.Contains(out, `title="Newly Tagged Movie"`) {
+		t.Errorf("expected the log to name the movie:\n%s", out)
+	}
+}
+
+// TestUnmonitorMovie_FreshPayloadTagsAbsent_TagActive_RefusesToWriteWithWarn
+// is the untrusted-input half: "tags" entirely missing from the fresh
+// pre-write fetch (as opposed to present-but-empty) means our assumed field
+// name may not match this Radarr version, and — consistent with the
+// decision-side rule 4 treatment of the same absence (decision.go FIX 1) —
+// the write must be refused rather than risk writing over a movie the
+// exclusion tag actually covers.
+func TestUnmonitorMovie_FreshPayloadTagsAbsent_TagActive_RefusesToWriteWithWarn(t *testing.T) {
+	body := `{"id": 7, "title": "No Tags Key", "monitored": true}`
+	srv, got := writerTestServer(t, body, http.StatusOK)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := writerTestInstance(srv.URL)
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 9, true, false)
+	if err != nil {
+		t.Fatalf("unmonitorMovie returned error: %v\n%s", err, buf.String())
+	}
+	if written {
+		t.Error("written = true, want false")
+	}
+	if len(filterRequests(*got, http.MethodPut)) != 0 {
+		t.Errorf("expected zero PUTs when tags cannot be verified, got %+v", *got)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "tags") {
+		t.Errorf("expected a warning explaining the write was refused because tags could not be verified:\n%s", out)
+	}
+}
+
+// TestUnmonitorMovie_ExclusionTagInactive_TagsIgnored_WritesNormally pins
+// the other half: when the exclusion tag is not active in this instance
+// (rule 4 is vacuous, per the tag-resolution rules), the pre-write re-check
+// must not block anything, regardless of what tags the fresh payload
+// carries.
+func TestUnmonitorMovie_ExclusionTagInactive_TagsIgnored_WritesNormally(t *testing.T) {
+	srv, _ := writerTestServer(t, `{"id": 7, "title": "Tagged But Inactive", "monitored": true, "tags": [9]}`, http.StatusOK)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := writerTestInstance(srv.URL)
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 9, false, false)
+	if err != nil {
+		t.Fatalf("unmonitorMovie returned error: %v\n%s", err, buf.String())
+	}
+	if !written {
+		t.Errorf("written = false, want true: the exclusion tag is not active in this instance, so it must not block the write:\n%s", buf.String())
 	}
 }
 
@@ -311,7 +410,7 @@ func TestUnmonitorMovie_FreshGetShowsAlreadyUnmonitored_NoPut(t *testing.T) {
 	inst := writerTestInstance(srv.URL)
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, false)
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 0, false, false)
 	if err != nil {
 		t.Fatalf("unmonitorMovie returned error: %v", err)
 	}
@@ -343,7 +442,7 @@ func TestUnmonitorMovie_MonitoredFieldAbsent_RefusesToWrite(t *testing.T) {
 	inst := writerTestInstance(srv.URL)
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, false)
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 0, false, false)
 	if err == nil {
 		t.Fatal("unmonitorMovie returned nil error, want an error when monitored is absent")
 	}
@@ -371,7 +470,7 @@ func TestUnmonitorMovie_FreshGetIdMismatch_RefusesToWrite(t *testing.T) {
 	inst := writerTestInstance(srv.URL)
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, false)
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 0, false, false)
 	if err == nil {
 		t.Fatal("unmonitorMovie returned nil error, want an error when the fetched object's id does not match")
 	}
@@ -400,7 +499,7 @@ func TestUnmonitorMovie_GetFails_ReturnsErrorWithoutWriting(t *testing.T) {
 	inst := writerTestInstance(srv.URL)
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, false)
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 0, false, false)
 	if err == nil {
 		t.Fatal("unmonitorMovie returned nil error, want an error when the fresh GET fails")
 	}
@@ -420,7 +519,7 @@ func TestUnmonitorMovie_GetReturnsMalformedJSON_ReturnsErrorWithoutWriting(t *te
 	inst := writerTestInstance(srv.URL)
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	if _, err := unmonitorMovie(context.Background(), logger, client, inst, 7, false); err == nil {
+	if _, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 0, false, false); err == nil {
 		t.Fatal("unmonitorMovie returned nil error, want an error for a malformed fresh GET response")
 	}
 	if len(filterRequests(*got, http.MethodPut)) != 0 {
@@ -439,7 +538,7 @@ func TestUnmonitorMovie_PutNonTwoxx_ReturnsErrorAndNeverRetries(t *testing.T) {
 	inst := writerTestInstance(srv.URL)
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, false)
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 0, false, false)
 	if err == nil {
 		t.Fatal("unmonitorMovie returned nil error, want an error for a non-2xx PUT")
 	}
@@ -481,7 +580,7 @@ func TestUnmonitorMovie_PutRedirected_IsNotReportedAsAWrite(t *testing.T) {
 	inst := writerTestInstance(srv.URL)
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, false)
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 0, false, false)
 	if err == nil {
 		t.Fatal("unmonitorMovie returned nil error for a redirected PUT")
 	}
@@ -513,7 +612,7 @@ func TestUnmonitorMovie_PutEchoesStillMonitored_IsAnError(t *testing.T) {
 	inst := writerTestInstance(srv.URL)
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, false)
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 0, false, false)
 	if err == nil {
 		t.Fatal("unmonitorMovie returned nil error when the response said the movie was still monitored")
 	}
@@ -539,7 +638,7 @@ func TestUnmonitorMovie_PutEchoesUnmonitored_IsAWrite(t *testing.T) {
 	inst := writerTestInstance(srv.URL)
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, false)
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 0, false, false)
 	if err != nil {
 		t.Fatalf("unmonitorMovie returned error: %v\n%s", err, buf.String())
 	}
@@ -579,7 +678,7 @@ func TestUnmonitorMovie_PutReturnsEmptyBodyOn2xx_IsUnconfirmedNotAWrite(t *testi
 	inst := writerTestInstance(srv.URL)
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, false)
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 0, false, false)
 	if err == nil {
 		t.Fatal("unmonitorMovie returned nil error for a 2xx with an empty body: nothing confirmed the change")
 	}
@@ -643,7 +742,7 @@ func TestUnmonitorMovie_NeverTouchesAnyOtherEndpoint(t *testing.T) {
 	inst := writerTestInstance(srv.URL)
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	if _, err := unmonitorMovie(context.Background(), logger, client, inst, 7, false); err != nil {
+	if _, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 0, false, false); err != nil {
 		t.Fatalf("unmonitorMovie returned error: %v", err)
 	}
 

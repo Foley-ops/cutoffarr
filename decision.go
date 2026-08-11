@@ -429,6 +429,7 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	var reported []movieDecision
 	totalMonitored := 0
 	wouldUnmonitorCount := 0
+	alreadyUnmonitoredCount := 0
 	skipCounts := make(map[string]int)
 
 	for _, m := range movies {
@@ -443,7 +444,21 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		// safe direction), just no longer silent about why.
 		warnIfFieldAbsent(logger, inst, "movie", "monitored", m.Monitored == nil)
 		if m.Monitored == nil || !*m.Monitored {
-			// Rule 1: excluded from the report entirely, per the plan.
+			// Rule 1: excluded from the report entirely, per the plan. A
+			// movie whose monitored field is genuinely present and false
+			// (as opposed to absent — a different, already-warned-about
+			// case) is also Phase 5's no-op contract in miniature: this is
+			// exactly what a movie this project unmonitored on an earlier
+			// cycle looks like on every cycle after. The plan says such
+			// movies are "skipped silently at info, logged at debug" — so
+			// at info they stay as invisible as before, but the debug line
+			// and the counter make a second, no-op run of this project
+			// provable rather than merely quiet.
+			if m.Monitored != nil && !*m.Monitored {
+				alreadyUnmonitoredCount++
+				logger.Debug("already unmonitored",
+					"id", derefOrAbsent(m.ID), "title", titleOrAbsent(m.Title), "instance", inst.Name)
+			}
 			continue
 		}
 		if m.ID == nil {
@@ -495,13 +510,13 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	cc := runCrossCheck(logger, inst, decisions, wantedIDs)
 	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
 
-	unmonitoredCount, writeErrorCount, echoUnverifiedCount := runWritePass(ctx, logger, client, inst, reported, cc, dryRun)
+	unmonitoredCount, writeErrorCount, echoUnverifiedCount := runWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun)
 
 	attrs := []any{"instance", inst.Name, "type", inst.Type}
 	if onlyID != 0 {
 		attrs = append(attrs, "onlyId", onlyID)
 	}
-	attrs = append(attrs, "totalMonitored", totalMonitored, "wouldUnmonitor", wouldUnmonitorCount, "unmonitored", unmonitoredCount)
+	attrs = append(attrs, "totalMonitored", totalMonitored, "wouldUnmonitor", wouldUnmonitorCount, "unmonitored", unmonitoredCount, "alreadyUnmonitored", alreadyUnmonitoredCount)
 
 	// writeErrors counts failed WRITES, so in dry-run it is unconditionally
 	// 0: no write was attempted, so none can have failed. That is not the
@@ -586,7 +601,14 @@ func libraryContainsID(movies []movieListElement, id int) bool {
 //     settle the question — empty, not an object, no "monitored" key. The
 //     change probably DID happen and cannot be proven, which is neither of
 //     the above and must not be reported as either.
-func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, decisions []movieDecision, cc crossCheckResult, dryRun bool) (unmonitored, writeErrors, echoUnverified int) {
+//
+// exclusionTagID and tagActive are threaded straight through to
+// unmonitorMovie's own pre-write re-check (Phase 5, mandated write-path
+// safety fix): the scan that produced these decisions may be minutes old,
+// and §2.5 says the exclusion tag always wins, in every mode — including a
+// tag added to a movie after it was evaluated but before the write pass
+// reached it.
+func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, decisions []movieDecision, cc crossCheckResult, exclusionTagID int, tagActive bool, dryRun bool) (unmonitored, writeErrors, echoUnverified int) {
 	// The count is what makes the warnings below actionable: "the gate
 	// blocked 12 writes" and "the gate blocked, but there was nothing to
 	// write anyway" are very different situations, and without a number they
@@ -603,7 +625,18 @@ func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, i
 		attrs := []any{"instance", inst.Name, "type", inst.Type, "crossCheck", cc.status}
 		attrs = append(attrs, cc.logAttrs()...)
 		attrs = append(attrs, "withheldWrites", pending, "dryRun", dryRun)
-		logger.Warn("writes withheld for this instance: "+reason, attrs...)
+		msg := "writes withheld for this instance: " + reason
+		// Phase 5 noise-budget fix (mandated): blocking a pass that had
+		// nothing to write anyway is a health signal, not an alarm — WARN
+		// every cycle a benign, nothing-pending instance's cross-check comes
+		// back inconclusive trains a human running this in a daemon loop to
+		// ignore the WARN that actually matters (one that blocked real
+		// writes). Only a pass that actually withheld something stays WARN.
+		if pending > 0 {
+			logger.Warn(msg, attrs...)
+		} else {
+			logger.Info(msg, attrs...)
+		}
 		return 0, 0, 0
 	}
 
@@ -618,7 +651,18 @@ func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, i
 		attrs := []any{"instance", inst.Name, "type", inst.Type}
 		attrs = append(attrs, cc.logAttrs()...)
 		attrs = append(attrs, "pendingWrites", pending, "dryRun", dryRun)
-		logger.Warn("writes proceeding on a partially verified cross-check: some sampled movies could not be verified", attrs...)
+		// Phase 5 noise-budget fix (mandated): this same code path runs in
+		// dry-run too (the write pass is a rehearsal all the way up to the
+		// per-item dry-run gate), so the old wording — "writes proceeding" —
+		// was stated as fact in a mode where no write is ever sent. The
+		// dryRun=true attr was already there, but a human scanning log text
+		// should not have to notice an attr to avoid reading a rehearsal as a
+		// write.
+		msg := "writes proceeding on a partially verified cross-check: some sampled movies could not be verified"
+		if dryRun {
+			msg = "dry-run: write rehearsal proceeding on a partially verified cross-check: some sampled movies could not be verified (no write is sent; this is a rehearsal)"
+		}
+		logger.Warn(msg, attrs...)
 	}
 
 	for _, d := range decisions {
@@ -626,7 +670,7 @@ func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, i
 			continue
 		}
 
-		written, err := unmonitorMovie(ctx, logger, client, inst, d.id, dryRun)
+		written, err := unmonitorMovie(ctx, logger, client, inst, d.id, exclusionTagID, tagActive, dryRun)
 		if errors.Is(err, errWriteUnverified) {
 			// The server took the write and told us nothing useful about it.
 			// Calling this a failed write would state two things that are
