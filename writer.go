@@ -32,8 +32,9 @@ func moviePath(movieID int) string {
 
 // unmonitorMovie performs the project's first and only write operation:
 // GET /api/v3/movie/{id}, set monitored to false, PUT the same object back
-// (plan §2.2, §2.4). It returns written=true only when a PUT actually
-// succeeded, so callers can count real writes rather than intentions.
+// (plan §2.2, §2.4). It returns written=true only when a PUT succeeded AND
+// the object the server returned confirms the change, so callers count
+// verified writes rather than intentions or assumptions.
 //
 // The sequence, and why each step exists:
 //
@@ -73,7 +74,12 @@ func moviePath(movieID int) string {
 //     HTTP write call, not just at startup"). Everything above this line
 //     runs identically in both modes, which is what makes a dry-run a real
 //     rehearsal of the write rather than a different code path that merely
-//     claims to be one.
+//     claims to be one. It also means the steps above can fail in dry-run;
+//     the caller reports those as rehearsal failures, never as write ones.
+//
+//  6. Believe the server, not the status code: the returned object must
+//     itself say monitored is false before the write counts as done. A 2xx
+//     alone is not proof — see verifyWriteEcho.
 //
 // Errors are returned, never retried (§2.6: "Never retry writes
 // automatically within a cycle"); the caller logs them and moves to the
