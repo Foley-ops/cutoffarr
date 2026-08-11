@@ -1710,6 +1710,27 @@ func TestRunRadarrDecisionEngine_DryRun_WouldUnmonitorItemsProduceZeroWrites(t *
 	if !strings.Contains(out, "writeErrors=0") {
 		t.Errorf("expected writeErrors=0 in the dry-run summary:\n%s", out)
 	}
+
+	// Every assertion above also holds for a run whose write pass was never
+	// entered — a blocked gate produces zero writes, an unchanged report, and
+	// zero counters too. These three are what distinguish "dry-run walked the
+	// write path and stopped at the gate" from "nothing ever tried to write".
+	if !strings.Contains(out, `crossCheck="passed`) {
+		t.Errorf("the cross-check must PASS here, or the write pass was never entered and this test proves nothing:\n%s", out)
+	}
+	if strings.Contains(out, "writes withheld") {
+		t.Errorf("the write gate blocked this run, so zero writes says nothing about dry-run:\n%s", out)
+	}
+	sawPreWriteGet := false
+	for _, r := range fake.all() {
+		if r.method == http.MethodGet && r.path == "/api/v3/movie/1" {
+			sawPreWriteGet = true
+			break
+		}
+	}
+	if !sawPreWriteGet {
+		t.Errorf("no pre-write GET /api/v3/movie/1: the write path was not walked up to the dry-run gate:\n%+v", fake.all())
+	}
 }
 
 // TestRunRadarrDecisionEngine_WriteMode_UnmonitorsOnlyWouldUnmonitorItems is

@@ -954,6 +954,37 @@ func TestRun_DryRun_MakesZeroWriteRequestsAcrossTheEntireRun(t *testing.T) {
 	if !strings.Contains(out, "writeErrors=0") || !strings.Contains(out, "writeRehearsalErrors=0") {
 		t.Errorf("expected writeErrors=0 and writeRehearsalErrors=0 in the dry-run summary:\n%s", out)
 	}
+
+	// Everything above this line is equally true of a run that never reached
+	// the write pass at all: zero writes, both report lines, all three
+	// counters zero. So a fixture drifting (losing qualityCutoffNotMet, say)
+	// would quietly downgrade the project's most important test to "a run
+	// that never tried to write made no writes" — still green, and no longer
+	// testing anything. The three assertions below are what make the claim
+	// "the gate opened and the write path was walked" part of the test.
+	if !strings.Contains(out, `crossCheck="passed`) {
+		t.Errorf("the cross-check must PASS here, or the write pass was never entered and this test proves nothing:\n%s", out)
+	}
+	if strings.Contains(out, "writes withheld") {
+		t.Errorf("the write gate blocked this run, so zero writes says nothing about dry-run:\n%s", out)
+	}
+	// The pre-write fetch is the write path's own first step, and it runs on
+	// both sides of the dry-run gate (§2.1: the gate is immediately before
+	// the PUT, not at the top of the function). Seeing one per would-unmonitor
+	// movie is the evidence that dry-run rehearsed the write rather than
+	// skipping it.
+	for _, want := range []string{"/api/v3/movie/1", "/api/v3/movie/2"} {
+		found := false
+		for _, r := range fake.all() {
+			if r.method == http.MethodGet && r.path == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("no pre-write GET %s: the write pass did not reach the dry-run gate for this movie:\n%+v", want, fake.all())
+		}
+	}
 }
 
 // TestRun_DryRunForcedByFlag_MakesZeroWriteRequests pins the interaction
