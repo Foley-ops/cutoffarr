@@ -24,8 +24,28 @@ func run(args []string, stdout, stderr io.Writer) int {
 	once := fs.Bool("once", false, "run a single pass and exit (daemon mode arrives in a later phase)")
 	forceDryRun := fs.Bool("dry-run", false, "force dry-run mode on; cannot be used to disable dry-run set by config")
 	samplesFlag := fs.String("samples", "", "comma-separated movie titles to dump full detail for during Radarr library inspection (--once only)")
+	onlyID := fs.Int("only-id", 0, "process only the radarr movie with this id: evaluate, report, and (outside dry-run) write just that one movie (--once only)")
 
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	// A movie id is always a positive integer, so 0 and negatives are user
+	// error rather than something to interpret. Zero matters most: it is
+	// also this flag's absent-value sentinel, so accepting "--only-id 0"
+	// would silently widen a run the human meant to scope to one movie into
+	// a full-library run — in a phase whose entire point is that writes stay
+	// narrow. fs.Visit distinguishes "explicitly passed 0" from "not passed
+	// at all"; a non-integer value never reaches here, since fs.Parse
+	// rejects it above.
+	onlyIDSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "only-id" {
+			onlyIDSet = true
+		}
+	})
+	if onlyIDSet && *onlyID <= 0 {
+		fmt.Fprintf(stderr, "cutoffarr: fatal: --only-id must be a positive radarr movie id, got %d\n", *onlyID)
 		return 2
 	}
 
@@ -74,17 +94,28 @@ func run(args []string, stdout, stderr io.Writer) int {
 		// decision engine, since absence-from-set means "would-unmonitor"
 		// and a partial set would manufacture false positives in that
 		// dangerous direction.
+		//
+		// Phase 4: the decision engine also runs the write pass, gated on
+		// cfg.DryRun (which --dry-run can force on but never off) and
+		// scoped by --only-id. Both are passed down rather than consulted
+		// at this level: §2.1 requires the dry-run flag to be checked
+		// immediately before each HTTP write call, not just at startup, so
+		// the value has to travel all the way to the write site.
 		samples := parseSamples(*samplesFlag)
 		for _, inst := range cfg.Instances {
 			ok := checkInstanceConnectivity(context.Background(), logger, inst)
 			if ok && inst.Type == "radarr" {
 				movies, wantedIDs, dataOK := inspectRadarrLibrary(context.Background(), logger, inst, samples)
 				if dataOK {
-					runRadarrDecisionEngine(context.Background(), logger, inst, movies, wantedIDs, cfg.ExclusionTag)
+					runRadarrDecisionEngine(context.Background(), logger, inst, movies, wantedIDs, cfg.ExclusionTag, *onlyID, cfg.DryRun)
 				}
 			}
 		}
 	} else {
+		if onlyIDSet {
+			logger.Warn("--only-id has no effect without --once: it scopes a single pass, and daemon mode does not run one yet",
+				"onlyId", *onlyID)
+		}
 		logger.Info("daemon mode is not implemented yet; it arrives in a later phase")
 	}
 

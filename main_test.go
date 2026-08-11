@@ -273,3 +273,75 @@ instances: []
 		t.Errorf("expected the redacted config printout (at %d) to appear before the no-instances warning (at %d):\n%s", configIdx, warnIdx, out)
 	}
 }
+
+// --- --only-id flag validation (Phase 4) ----------------------------------
+
+// TestRun_OnlyIDZero_IsFatalFlagError and its sibling below pin the flag's
+// validation: a movie id is always a positive integer, so 0 and negatives
+// are user error rather than something to silently interpret. 0 matters
+// especially: it is also the flag's absent-value sentinel, so accepting it
+// would turn "--only-id 0" into a silent full-library run — the exact
+// widening of scope this phase must never do by accident.
+func TestRun_OnlyIDZero_IsFatalFlagError(t *testing.T) {
+	path := writeMainTestConfig(t, `
+instances: []
+`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once", "--only-id", "0"}, &stdout, &stderr)
+
+	if code == 0 {
+		t.Fatal("exit code = 0, want non-zero for --only-id 0")
+	}
+	if !strings.Contains(stderr.String(), "only-id") {
+		t.Errorf("stderr does not explain the invalid flag:\n%s", stderr.String())
+	}
+}
+
+func TestRun_OnlyIDNegative_IsFatalFlagError(t *testing.T) {
+	path := writeMainTestConfig(t, `
+instances: []
+`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once", "--only-id", "-3"}, &stdout, &stderr)
+
+	if code == 0 {
+		t.Fatal("exit code = 0, want non-zero for a negative --only-id")
+	}
+	if !strings.Contains(stderr.String(), "only-id") {
+		t.Errorf("stderr does not explain the invalid flag:\n%s", stderr.String())
+	}
+}
+
+func TestRun_OnlyIDNonInteger_IsFatalFlagError(t *testing.T) {
+	path := writeMainTestConfig(t, `
+instances: []
+`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once", "--only-id", "not-a-number"}, &stdout, &stderr)
+
+	if code == 0 {
+		t.Fatal("exit code = 0, want non-zero for a non-integer --only-id")
+	}
+	if stderr.String() == "" {
+		t.Error("stderr is empty, want a flag parse error message")
+	}
+}
+
+// TestRun_OnlyIDWithoutOnce_WarnsThatItHasNoEffect: the flag scopes a
+// single pass, and daemon mode does not run one yet. Ignoring it silently
+// would let someone believe a run was scoped when it was not.
+func TestRun_OnlyIDWithoutOnce_WarnsThatItHasNoEffect(t *testing.T) {
+	path := writeMainTestConfig(t, `
+instances: []
+`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--only-id", "42"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "only-id") {
+		t.Errorf("expected a warning that --only-id has no effect without --once:\n%s", out)
+	}
+}

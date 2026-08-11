@@ -356,21 +356,49 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 	return d
 }
 
-// runRadarrDecisionEngine is the Phase 3 entry point for a single radarr
-// instance: it fetches the two additional data sources the STRICT decision
-// rule needs beyond what inspectRadarrLibrary (Phase 2) already gathered —
-// quality profiles (refactor c) and the exclusion tag id (tag-resolution
-// rules) — then evaluates every monitored movie in movies, in library
-// order, logging a "would-unmonitor" or "skip" report line for each
-// (msg="would-unmonitor" / msg=skip, per the plan), runs the cross-check,
-// and logs an end-of-instance summary. It is called only for a radarr
-// instance whose connectivity check and inspectRadarrLibrary fetch both
-// already succeeded (main.go's responsibility); it never returns anything
-// because, like checkInstanceConnectivity and inspectRadarrLibrary, the
-// binding error-handling rule (§2.6) is "skip that instance for the cycle
-// and log a warning" with no further work for a caller to gate on.
-func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, movies []movieListElement, wantedIDs map[int]bool, exclusionTagLabel string) {
+// runRadarrDecisionEngine is the entry point for a single radarr instance.
+// It fetches the two additional data sources the STRICT decision rule needs
+// beyond what inspectRadarrLibrary (Phase 2) already gathered — quality
+// profiles (refactor c) and the exclusion tag id (tag-resolution rules) —
+// and then runs three distinct passes, in order:
+//
+//  1. EVALUATE every monitored movie in movies, in library order, logging a
+//     "would-unmonitor" or "skip" report line for each (msg="would-unmonitor"
+//     / msg=skip, per the plan). No writes, no decisions acted on.
+//  2. CROSS-CHECK the resulting decisions against Radarr's own
+//     qualityCutoffNotMet data (plan §6).
+//  3. WRITE (Phase 4) — but only if the cross-check explicitly PASSED.
+//
+// Keeping the write pass separate from evaluation is deliberate rather than
+// stylistic: a write may only happen once the cross-check has had the
+// complete picture and approved it, which is impossible if writes are
+// interleaved with the evaluation that produces the cross-check's input.
+//
+// onlyID (the --only-id flag, 0 when absent) narrows what is REPORTED and
+// WRITTEN to the single movie with that id. It deliberately does not narrow
+// what is evaluated: the cross-check validates the data the decision rests
+// on, not the target, so it still samples the whole library (see
+// runWritePass and the plan's Phase 4 acceptance criteria).
+//
+// It is called only for a radarr instance whose connectivity check and
+// inspectRadarrLibrary fetch both already succeeded (main.go's
+// responsibility); it never returns anything because, like
+// checkInstanceConnectivity and inspectRadarrLibrary, the binding
+// error-handling rule (§2.6) is "skip that instance for the cycle and log a
+// warning" with no further work for a caller to gate on.
+func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, movies []movieListElement, wantedIDs map[int]bool, exclusionTagLabel string, onlyID int, dryRun bool) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	// An --only-id naming a movie this instance's library does not contain
+	// is checked before anything else is fetched: there is nothing to decide
+	// or write, so there is no reason to make further API calls. It is not
+	// an error — with multiple radarr instances configured, only one of them
+	// holds any given movie id — so it warns and leaves this instance alone.
+	if onlyID != 0 && !libraryContainsID(movies, onlyID) {
+		logger.Warn("--only-id movie not found in this instance's library; no decisions for this instance",
+			"instance", inst.Name, "type", inst.Type, "onlyId", onlyID)
+		return
+	}
 
 	profiles, ok := fetchQualityProfiles(ctx, logger, client, inst)
 	if !ok {
@@ -382,7 +410,12 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		return
 	}
 
+	// decisions holds every evaluated movie and feeds the cross-check;
+	// reported holds the subset that is in scope for the report, the
+	// summary counts, and the write pass. The two are the same slice unless
+	// --only-id narrowed the scope.
 	var decisions []movieDecision
+	var reported []movieDecision
 	totalMonitored := 0
 	wouldUnmonitorCount := 0
 	skipCounts := make(map[string]int)
@@ -412,29 +445,120 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 				"instance", inst.Name, "type", inst.Type, "title", titleOrAbsent(m.Title))
 			continue
 		}
-		totalMonitored++
-
 		d := evaluateMovie(ctx, logger, client, inst, m, profiles, exclusionTagID, tagActive, wantedIDs)
 		decisions = append(decisions, d)
+
+		// --only-id scoping happens here and nowhere else: every movie is
+		// still evaluated above (the cross-check needs the full candidate
+		// pools), but only the named movie is reported, counted, or written.
+		if onlyID != 0 && d.id != onlyID {
+			continue
+		}
+		reported = append(reported, d)
+		totalMonitored++
 
 		if d.wouldUnmonitor {
 			wouldUnmonitorCount++
 			logger.Info("would-unmonitor",
-				"title", d.title, "reason", d.reason, "profile", d.profileName, "instance", inst.Name)
+				"id", d.id, "title", d.title, "reason", d.reason, "profile", d.profileName, "instance", inst.Name)
 		} else {
 			skipCounts[d.reason]++
 			logger.Info("skip",
-				"title", d.title, "reason", d.reason, "profile", d.profileName, "instance", inst.Name)
+				"id", d.id, "title", d.title, "reason", d.reason, "profile", d.profileName, "instance", inst.Name)
 		}
+	}
+
+	// The movie is in the library (checked above) but produced no decision:
+	// rule 1 excluded it (monitored is false or absent) or it had no id.
+	// Without this, --only-id on such a movie would print nothing at all
+	// about the one movie the human explicitly named.
+	if onlyID != 0 && len(reported) == 0 {
+		logger.Info("--only-id movie produced no decision: it is not monitored, or its id field was absent",
+			"instance", inst.Name, "type", inst.Type, "onlyId", onlyID)
 	}
 
 	status, verified, unverifiable := runCrossCheck(logger, inst, decisions, wantedIDs)
 	crossCheckSummary := renderCrossCheckSummary(status, verified, unverifiable)
 
-	logger.Info("radarr decision summary",
-		"instance", inst.Name, "type", inst.Type,
+	unmonitoredCount, writeErrorCount := runWritePass(ctx, logger, client, inst, reported, status, dryRun)
+
+	attrs := []any{"instance", inst.Name, "type", inst.Type}
+	if onlyID != 0 {
+		attrs = append(attrs, "onlyId", onlyID)
+	}
+	attrs = append(attrs,
 		"totalMonitored", totalMonitored, "wouldUnmonitor", wouldUnmonitorCount,
+		"unmonitored", unmonitoredCount, "writeErrors", writeErrorCount,
 		"skipReasons", formatSkipCounts(skipCounts), "crossCheck", crossCheckSummary)
+	logger.Info("radarr decision summary", attrs...)
+}
+
+// libraryContainsID reports whether any movie in the library carries id.
+// Used only to tell "--only-id names a movie this instance does not have"
+// (a warning, not an error) apart from a target that exists but is filtered
+// out by the decision rules.
+func libraryContainsID(movies []movieListElement, id int) bool {
+	for _, m := range movies {
+		if m.ID != nil && *m.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// runWritePass is the third and final pass: it acts on the decisions the
+// first two passes produced. It returns the number of movies actually
+// written (always 0 in dry-run, since no PUT is ever issued there) and the
+// number of write failures.
+//
+// Two gates stand in front of every write:
+//
+//   - The cross-check must have explicitly PASSED. "failed" and
+//     "inconclusive" — and any status value a future change might add —
+//     block the entire pass, because the cross-check is what establishes
+//     that the data the decisions rest on is trustworthy at all. An
+//     inconclusive result is not a weaker pass; it means nothing was
+//     verified, which is no basis for a write. Blocking is loud (warn), not
+//     silent: "nothing was written" and "nothing needed writing" must never
+//     look the same in the log.
+//   - The decision's wouldUnmonitor bool. Never its reason text: reason is
+//     a human-facing string, and gating a write on string comparison would
+//     make a copy-edit to a message a functional change to the write path.
+//
+// Per §2.6 a failed write is logged, counted, and abandoned for the cycle —
+// the pass moves to the next item and never retries.
+func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, decisions []movieDecision, crossCheckStatus string, dryRun bool) (unmonitored, writeErrors int) {
+	if crossCheckStatus != crossCheckStatusPassed {
+		logger.Warn("writes withheld for this instance: the cross-check did not pass",
+			"instance", inst.Name, "type", inst.Type, "crossCheck", crossCheckStatus, "dryRun", dryRun)
+		return 0, 0
+	}
+
+	for _, d := range decisions {
+		if !d.wouldUnmonitor {
+			continue
+		}
+
+		written, err := unmonitorMovie(ctx, logger, client, inst, d.id, dryRun)
+		if err != nil {
+			writeErrors++
+			logger.Error("unmonitor write failed; skipping this movie for the cycle",
+				"instance", inst.Name, "type", inst.Type, "id", d.id, "title", d.title, "error", err)
+			continue
+		}
+		if !written {
+			// Dry-run, or the movie was already unmonitored by the time the
+			// write pass reached it; unmonitorMovie has already accounted
+			// for both. Nothing was changed, so nothing is counted.
+			continue
+		}
+
+		unmonitored++
+		logger.Info("unmonitor",
+			"id", d.id, "title", d.title, "reason", d.reason, "profile", d.profileName, "instance", inst.Name)
+	}
+
+	return unmonitored, writeErrors
 }
 
 // renderCrossCheckSummary formats the "radarr decision summary" line's

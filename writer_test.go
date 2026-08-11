@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -406,4 +409,151 @@ func TestUnmonitorMovie_NeverTouchesAnyOtherEndpoint(t *testing.T) {
 			t.Errorf("request body mentions deleteFiles, which must never be sent: %s", r.body)
 		}
 	}
+}
+
+// --- radarrFake: a whole-pipeline recording fake --------------------------
+//
+// The write-path tests need something the read-only phases never did: a
+// fake that serves EVERY endpoint a full run touches while recording every
+// request it receives, of any method, to any path. Only a whole-server
+// recorder can support the project's most important assertion — that a
+// dry-run makes zero write requests — because that claim is about requests
+// the code did not make, to endpoints nobody thought to stub.
+
+type radarrFake struct {
+	srv *httptest.Server
+
+	mu       sync.Mutex
+	requests []recordedRequest
+
+	// Fixtures. Set directly by a test after construction and before the
+	// run under test starts; the handlers read them under the same mutex.
+	moviesJSON   string
+	wantedJSON   string
+	tagsJSON     string
+	profilesJSON string
+	cfScore      int
+	detail       map[int]string // GET /api/v3/movie/{id} bodies, by id
+	putStatus    map[int]int    // PUT /api/v3/movie/{id} status, by id (default 200)
+}
+
+// newRadarrFake starts a fake Radarr serving moviesJSON as the library and
+// detail as the per-movie objects the write path re-fetches. Everything
+// else defaults to the standard fixtures used across the decision-engine
+// tests: one profile (id 1, HD-1080p, upgradeAllowed, cutoffFormatScore
+// 100), no tags, an empty wanted/cutoff set, and a custom format score of
+// 200 (comfortably above the cutoff, so rule 6 passes).
+func newRadarrFake(t *testing.T, moviesJSON string, detail map[int]string) *radarrFake {
+	t.Helper()
+	f := &radarrFake{
+		moviesJSON:   moviesJSON,
+		wantedJSON:   emptyWantedCutoffJSON,
+		tagsJSON:     decisionEngineNoTagsJSON,
+		profilesJSON: decisionEngineProfilesJSON,
+		cfScore:      200,
+		detail:       detail,
+		putStatus:    map[int]int{},
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/system/status", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"appName": "Radarr", "version": "5.14.0.9383"}`))
+	}))
+	mux.HandleFunc("/api/v3/qualityprofile", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(f.profilesJSON))
+	}))
+	mux.HandleFunc("/api/v3/tag", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(f.tagsJSON))
+	}))
+	mux.HandleFunc("/api/v3/wanted/cutoff", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(f.wantedJSON))
+	}))
+	mux.HandleFunc("/api/v3/moviefile", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `[{"id": 1, "customFormatScore": %d}]`, f.cfScore)
+	}))
+	mux.HandleFunc("/api/v3/movie", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(f.moviesJSON))
+	}))
+	mux.HandleFunc("/api/v3/movie/", f.handle(f.serveMovieDetail))
+	f.srv = httptest.NewServer(mux)
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+// handle wraps a handler so every request — method, path, and exact body
+// bytes — is recorded before it is served.
+func (f *radarrFake) handle(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		f.mu.Lock()
+		f.requests = append(f.requests, recordedRequest{method: r.Method, path: r.URL.Path, body: body})
+		f.mu.Unlock()
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		next(w, r)
+	}
+}
+
+func (f *radarrFake) serveMovieDetail(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/api/v3/movie/"))
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		body, found := f.detail[id]
+		if !found {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Write([]byte(body))
+	case http.MethodPut:
+		status := http.StatusOK
+		if s, found := f.putStatus[id]; found {
+			status = s
+		}
+		w.WriteHeader(status)
+		if status >= 400 {
+			w.Write([]byte(`{"message":"write rejected by fake"}`))
+		}
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// writes returns every non-read request the fake received. Anything that is
+// not a GET counts: the dry-run guarantee is "zero write requests", not
+// "zero PUTs to the endpoint we expected".
+func (f *radarrFake) writes() []recordedRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []recordedRequest
+	for _, r := range f.requests {
+		if r.method != http.MethodGet {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func (f *radarrFake) puts() []recordedRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return filterRequests(f.requests, http.MethodPut)
+}
+
+func (f *radarrFake) instance() Instance {
+	return Instance{Name: "radarr-main", Type: "radarr", URL: f.srv.URL, APIKey: "key"}
+}
+
+// monitoredMovieDetail is a full-object fixture for GET /api/v3/movie/{id},
+// carrying a field this codebase does not model so round-trip preservation
+// is exercised through the engine too, not only in the unit tests.
+func monitoredMovieDetail(id int, title string) string {
+	return fmt.Sprintf(`{"id": %d, "title": %q, "monitored": true, "hasFile": true, "qualityProfileId": 1, "tags": [], "someFutureField": {"keep": "me"}}`, id, title)
+}
+
+// libraryMovie is one element of the fake's GET /api/v3/movie response.
+func libraryMovie(id int, title string, monitored, hasFile bool) string {
+	return fmt.Sprintf(`{"id": %d, "title": %q, "monitored": %t, "hasFile": %t, "qualityProfileId": 1, "tags": [], "movieFile": {"id": 1, "qualityCutoffNotMet": false}}`,
+		id, title, monitored, hasFile)
 }
