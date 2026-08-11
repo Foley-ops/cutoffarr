@@ -1636,3 +1636,427 @@ instances:
 		t.Errorf("a refused run must write nothing anywhere, got %+v", writes)
 	}
 }
+
+// --- statefulRadarrFake: the Phase 5 no-op contract, machine-verified -----
+//
+// Every fake above this point is stateless: newRadarrFake's GET /movie and
+// GET /movie/{id} answer from fixed fixtures for the life of the server, so
+// a PUT that changes a movie's monitored flag is never reflected back by a
+// later GET against the same fake. That is fine for Phase 4's tests (each
+// one runs the pipeline once), but Phase 5's core acceptance criterion is
+// specifically about what a SECOND run sees after a first run wrote
+// something — "already unmonitored" items skipped silently at info, logged
+// at debug — and that can only be proven against a fake whose GET responses
+// actually reflect its own PUT history. statefulRadarrFake is that fake:
+// its /movie, /movie/{id}, /moviefile, and /wanted/cutoff endpoints are all
+// generated from a single map of live per-movie state, and its one write
+// operation (PUT /movie/{id}) mutates that same state before echoing it
+// back, exactly as unmonitorMovie expects Radarr to behave.
+
+// statefulRadarrMovie is one movie's mutable state in the fake's small
+// world. hasFile/qualityProfileID/tags/movieFileID/cfScore are fixed for
+// the life of the fake (nothing in this project ever writes them); monitored
+// is the one field cutoffarr's write path ever changes, and inWantedSet /
+// qualityCutoffNotMet are set once at construction to make the movie a
+// clean would-unmonitor candidate whose cross-check agrees.
+type statefulRadarrMovie struct {
+	id                  int
+	title               string
+	monitored           bool
+	hasFile             bool
+	qualityProfileID    int
+	tags                []int
+	movieFileID         int
+	cfScore             int
+	qualityCutoffNotMet bool
+	inWantedSet         bool
+}
+
+// wouldUnmonitorStatefulMovie builds a statefulRadarrMovie shaped to pass
+// every rule of the STRICT decision rule against decisionEngineProfilesJSON
+// (id 1, cutoffFormatScore 100, upgradeAllowed) and to be verified (not
+// merely sampled) by the cross-check: monitored, hasFile, no tags, absent
+// from the wanted set, cfScore above the profile's cutoff, and
+// qualityCutoffNotMet agreeing with wanted-set absence (false).
+func wouldUnmonitorStatefulMovie(id int, title string) *statefulRadarrMovie {
+	return &statefulRadarrMovie{
+		id: id, title: title, monitored: true, hasFile: true,
+		qualityProfileID: 1, tags: []int{}, movieFileID: id, cfScore: 200,
+		qualityCutoffNotMet: false, inWantedSet: false,
+	}
+}
+
+type statefulRadarrFake struct {
+	srv *httptest.Server
+
+	mu       sync.Mutex
+	movies   map[int]*statefulRadarrMovie
+	order    []int
+	requests []recordedRequest
+
+	profilesJSON string
+	tagsJSON     string
+}
+
+// newStatefulRadarrFake starts a fake Radarr backed by movies. Order is
+// preserved (the fake's /movie array and /wanted/cutoff records are built by
+// iterating movies in the order given), which is what lets the no-op tests
+// below make deterministic, line-for-line assertions about report ordering
+// across repeated runs.
+func newStatefulRadarrFake(t *testing.T, movies []*statefulRadarrMovie) *statefulRadarrFake {
+	t.Helper()
+	f := &statefulRadarrFake{
+		movies:       make(map[int]*statefulRadarrMovie, len(movies)),
+		profilesJSON: decisionEngineProfilesJSON,
+		tagsJSON:     decisionEngineNoTagsJSON,
+	}
+	for _, m := range movies {
+		f.movies[m.id] = m
+		f.order = append(f.order, m.id)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/system/status", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"appName": "Radarr", "version": "5.14.0.9383"}`))
+	}))
+	mux.HandleFunc("/api/v3/qualityprofile", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(f.profilesJSON))
+	}))
+	mux.HandleFunc("/api/v3/tag", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(f.tagsJSON))
+	}))
+	mux.HandleFunc("/api/v3/wanted/cutoff", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(f.wantedJSON()))
+	}))
+	mux.HandleFunc("/api/v3/moviefile", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		id, _ := strconv.Atoi(r.URL.Query().Get("movieId"))
+		w.Write([]byte(f.moviefileJSON(id)))
+	}))
+	mux.HandleFunc("/api/v3/movie", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(f.libraryJSON()))
+	}))
+	mux.HandleFunc("/api/v3/movie/", f.handle(f.serveMovieDetail))
+	// Same rationale as radarrFake's catch-all: recording every request to
+	// every path, stubbed or not, is what makes "zero PUTs on run 2" an
+	// assertion about requests nobody thought to make, not just about the
+	// ones this fake happens to answer.
+	mux.HandleFunc("/", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	f.srv = httptest.NewServer(mux)
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+func (f *statefulRadarrFake) handle(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		f.mu.Lock()
+		f.requests = append(f.requests, recordedRequest{method: r.Method, path: r.URL.Path, body: body, contentType: r.Header.Get("Content-Type")})
+		f.mu.Unlock()
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		next(w, r)
+	}
+}
+
+// libraryElementJSON renders one movie exactly as GET /api/v3/movie's array
+// elements need to decode: id, title, monitored (the ONLY field this
+// project's write path ever changes, and therefore the only one that can
+// differ between a fake's first and second run), hasFile, qualityProfileId,
+// tags, and the movieFile subset the decision engine and cross-check need.
+func libraryElementJSON(m *statefulRadarrMovie) string {
+	tagsJSON, _ := json.Marshal(m.tags)
+	return fmt.Sprintf(`{"id":%d,"title":%q,"monitored":%t,"hasFile":%t,"qualityProfileId":%d,"tags":%s,"movieFile":{"id":%d,"qualityCutoffNotMet":%t}}`,
+		m.id, m.title, m.monitored, m.hasFile, m.qualityProfileID, tagsJSON, m.movieFileID, m.qualityCutoffNotMet)
+}
+
+func (f *statefulRadarrFake) libraryJSON() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	elems := make([]string, 0, len(f.order))
+	for _, id := range f.order {
+		elems = append(elems, libraryElementJSON(f.movies[id]))
+	}
+	return "[" + strings.Join(elems, ",") + "]"
+}
+
+// detailJSON renders the same movie for GET /api/v3/movie/{id} — the
+// pre-write fetch unmonitorMovie re-reads fresh on every write pass. It
+// carries the same fields as the library element (this fake's movies have no
+// fields beyond what the decision engine and write path use) plus
+// customFormatScore, which only the /moviefile-equivalent detail needs.
+func (f *statefulRadarrFake) detailJSON(id int) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m, found := f.movies[id]
+	if !found {
+		return "", false
+	}
+	tagsJSON, _ := json.Marshal(m.tags)
+	body := fmt.Sprintf(`{"id":%d,"title":%q,"monitored":%t,"hasFile":%t,"qualityProfileId":%d,"tags":%s,"movieFile":{"id":%d,"customFormatScore":%d,"qualityCutoffNotMet":%t}}`,
+		m.id, m.title, m.monitored, m.hasFile, m.qualityProfileID, tagsJSON, m.movieFileID, m.cfScore, m.qualityCutoffNotMet)
+	return body, true
+}
+
+func (f *statefulRadarrFake) moviefileJSON(id int) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m, found := f.movies[id]
+	if !found {
+		return "[]"
+	}
+	return fmt.Sprintf(`[{"id": %d, "customFormatScore": %d}]`, m.movieFileID, m.cfScore)
+}
+
+// wantedJSON renders the whole /api/v3/wanted/cutoff envelope on a single
+// page: every configured movie here has inWantedSet=false (a deliberate
+// choice — see wouldUnmonitorStatefulMovie), and fetchWantedCutoff stops
+// paging as soon as one page accounts for the full totalRecords, so a
+// single response is a faithful, complete fake regardless of query params.
+func (f *statefulRadarrFake) wantedJSON() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var recs []string
+	for _, id := range f.order {
+		if m := f.movies[id]; m.inWantedSet {
+			recs = append(recs, fmt.Sprintf(`{"id":%d,"title":%q}`, m.id, m.title))
+		}
+	}
+	return fmt.Sprintf(`{"page":1,"pageSize":100,"totalRecords":%d,"records":[%s]}`, len(recs), strings.Join(recs, ","))
+}
+
+// serveMovieDetail is GET/PUT /api/v3/movie/{id}. The PUT handler is the
+// one place in this fake that mutates state: it decodes the body's
+// "monitored" key and stores it, then echoes the exact bytes it received —
+// same as real Radarr, and same as radarrFake's default PUT behavior — so
+// the movie's monitored field really is whatever the write path last sent,
+// for every GET (library, detail, or otherwise) from this point on.
+func (f *statefulRadarrFake) serveMovieDetail(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/api/v3/movie/"))
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		body, found := f.detailJSON(id)
+		if !found {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Write([]byte(body))
+	case http.MethodPut:
+		body, _ := io.ReadAll(r.Body)
+		var payload map[string]json.RawMessage
+		if err := json.Unmarshal(body, &payload); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var monitored bool
+		if raw, ok := payload["monitored"]; ok {
+			json.Unmarshal(raw, &monitored)
+		}
+		f.mu.Lock()
+		if m, found := f.movies[id]; found {
+			m.monitored = monitored
+		}
+		f.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		w.Write(body)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (f *statefulRadarrFake) writes() []recordedRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []recordedRequest
+	for _, r := range f.requests {
+		if r.method != http.MethodGet {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func (f *statefulRadarrFake) puts() []recordedRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return filterRequests(f.requests, http.MethodPut)
+}
+
+func (f *statefulRadarrFake) instance() Instance {
+	return Instance{Name: "radarr-main", Type: "radarr", URL: f.srv.URL, APIKey: "key"}
+}
+
+// writeNoOpTestConfig writes a config with the given dry_run and log_level,
+// pointed at url. log_level is explicit (rather than reusing writeTestConfig,
+// which always defaults to info) because the no-op test needs debug to
+// observe the mandated "already unmonitored" debug line.
+func writeNoOpTestConfig(t *testing.T, url string, dryRun bool, logLevel string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := fmt.Sprintf(`
+dry_run: %t
+log_level: %s
+instances:
+  - name: radarr-main
+    type: radarr
+    url: %s
+    api_key: key1
+`, dryRun, logLevel, url)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+	return path
+}
+
+// TestRun_WriteMode_SecondRun_IsANoOp is the plan's Phase 5 acceptance
+// criterion, machine-verified: "second run is a no-op ('already unmonitored'
+// items are skipped silently at info, logged at debug)". Run 1 against a
+// stateful fake really does write N movies (N PUTs, unmonitored=N). Run 2,
+// against the SAME fake — now reflecting run 1's writes — must make ZERO
+// PUTs and report wouldUnmonitor=0 unmonitored=0 alreadyUnmonitored=N, with
+// the N movies visible only as debug-level "already unmonitored" lines.
+func TestRun_WriteMode_SecondRun_IsANoOp(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		wouldUnmonitorStatefulMovie(1, "Would Unmonitor A"),
+		wouldUnmonitorStatefulMovie(2, "Would Unmonitor B"),
+		wouldUnmonitorStatefulMovie(3, "Would Unmonitor C"),
+	})
+	configPath := writeNoOpTestConfig(t, fake.srv.URL, false, "debug")
+
+	// --- Run 1: the first cycle actually writes the three candidates. ---
+	var stdout1, stderr1 bytes.Buffer
+	code := run([]string{"--config", configPath, "--once"}, &stdout1, &stderr1)
+	if code != 0 {
+		t.Fatalf("run 1: exit code = %d, want 0; stderr=%s", code, stderr1.String())
+	}
+	puts1 := fake.puts()
+	if len(puts1) != 3 {
+		t.Fatalf("run 1: expected 3 PUTs, got %d: %+v", len(puts1), puts1)
+	}
+	out1 := stdout1.String()
+	if !strings.Contains(out1, "wouldUnmonitor=3") || !strings.Contains(out1, "unmonitored=3") {
+		t.Errorf("run 1: expected wouldUnmonitor=3 unmonitored=3 in the summary:\n%s", out1)
+	}
+	if !strings.Contains(out1, "alreadyUnmonitored=0") {
+		t.Errorf("run 1: expected alreadyUnmonitored=0 (nothing was already unmonitored yet):\n%s", out1)
+	}
+
+	// --- Run 2: same fake, now mutated by run 1's writes. ---
+	var stdout2, stderr2 bytes.Buffer
+	code = run([]string{"--config", configPath, "--once"}, &stdout2, &stderr2)
+	if code != 0 {
+		t.Fatalf("run 2: exit code = %d, want 0; stderr=%s", code, stderr2.String())
+	}
+
+	// The no-op's central claim: NOT ONE additional write request of any
+	// method, to any path, was made — same standard as the dry-run
+	// guarantee, applied to a second write-mode run that has nothing left to
+	// do.
+	if puts2 := fake.puts(); len(puts2) != len(puts1) {
+		t.Fatalf("run 2: made %d additional write request(s), want ZERO (no-op): %+v", len(puts2)-len(puts1), puts2[len(puts1):])
+	}
+
+	out2 := stdout2.String()
+	if strings.Contains(out2, "msg=would-unmonitor") {
+		t.Errorf("run 2: a no-op cycle must produce no would-unmonitor lines at all:\n%s", out2)
+	}
+	if !strings.Contains(out2, "wouldUnmonitor=0") {
+		t.Errorf("run 2: expected wouldUnmonitor=0:\n%s", out2)
+	}
+	if !strings.Contains(out2, "unmonitored=0") {
+		t.Errorf("run 2: expected unmonitored=0:\n%s", out2)
+	}
+	if !strings.Contains(out2, "alreadyUnmonitored=3") {
+		t.Errorf("run 2: expected alreadyUnmonitored=3 (all three movies run 1 wrote are now already unmonitored):\n%s", out2)
+	}
+	// Skipped silently at info, logged at debug (plan's exact words): the
+	// three movies must be individually visible at debug, each with the
+	// mandated id/title/instance attrs, and nowhere at all in the report at
+	// a level above it.
+	for _, want := range []string{
+		`msg="already unmonitored" id=1 title="Would Unmonitor A" instance=radarr-main`,
+		`msg="already unmonitored" id=2 title="Would Unmonitor B" instance=radarr-main`,
+		`msg="already unmonitored" id=3 title="Would Unmonitor C" instance=radarr-main`,
+	} {
+		if !strings.Contains(out2, want) {
+			t.Errorf("run 2: expected the debug line %q:\n%s", want, out2)
+		}
+	}
+}
+
+// TestRun_DryRun_TwoRuns_NeverConverges is the dry-run regression the phase
+// mandates alongside the no-op test: against the SAME stateful fake, two
+// dry-run passes must both make zero write requests and must produce
+// IDENTICAL would-unmonitor reports — dry-run changes nothing, so nothing
+// ever converges to a no-op the way write mode's run 2 does. Any drift
+// between the two reports (a movie disappearing, a count changing) would
+// mean the fake's state was mutated somewhere it should not have been.
+func TestRun_DryRun_TwoRuns_NeverConverges(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		wouldUnmonitorStatefulMovie(1, "Would Unmonitor A"),
+		wouldUnmonitorStatefulMovie(2, "Would Unmonitor B"),
+	})
+	configPath := writeNoOpTestConfig(t, fake.srv.URL, true, "info")
+
+	var stdout1, stderr1 bytes.Buffer
+	code := run([]string{"--config", configPath, "--once"}, &stdout1, &stderr1)
+	if code != 0 {
+		t.Fatalf("run 1: exit code = %d, want 0; stderr=%s", code, stderr1.String())
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("run 1: dry-run made %d write request(s), want ZERO: %+v", len(writes), writes)
+	}
+
+	var stdout2, stderr2 bytes.Buffer
+	code = run([]string{"--config", configPath, "--once"}, &stdout2, &stderr2)
+	if code != 0 {
+		t.Fatalf("run 2: exit code = %d, want 0; stderr=%s", code, stderr2.String())
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("run 2: dry-run made %d write request(s) across both runs, want ZERO: %+v", len(writes), writes)
+	}
+
+	report1 := reportLines(stdout1.String())
+	report2 := reportLines(stdout2.String())
+	if strings.Join(report1, "\n") != strings.Join(report2, "\n") {
+		t.Errorf("dry-run reports differ between run 1 and run 2 (dry-run must never converge):\nrun1:\n%s\n\nrun2:\n%s",
+			strings.Join(report1, "\n"), strings.Join(report2, "\n"))
+	}
+	// A regression that made both runs converge to an EMPTY report would
+	// still pass a raw string-equality check; guard against that separately.
+	if len(report1) == 0 {
+		t.Fatal("expected a non-empty report to compare; the test proves nothing otherwise")
+	}
+	if !strings.Contains(strings.Join(report1, "\n"), "msg=would-unmonitor") {
+		t.Errorf("expected would-unmonitor lines in the report:\n%s", strings.Join(report1, "\n"))
+	}
+}
+
+// reportLines extracts the would-unmonitor/skip/summary lines from a run's
+// stdout, with the leading time= attribute stripped (slog's TextHandler
+// puts it first on every line): two runs of an unchanged fake produce
+// identical report content but necessarily different timestamps, so the
+// timestamp must be removed before two reports can be compared for equality.
+func reportLines(output string) []string {
+	var lines []string
+	for _, line := range strings.Split(output, "\n") {
+		if !strings.Contains(line, "msg=would-unmonitor") && !strings.Contains(line, "msg=skip") && !strings.Contains(line, "radarr decision summary") {
+			continue
+		}
+		lines = append(lines, stripTimeAttr(line))
+	}
+	return lines
+}
+
+func stripTimeAttr(line string) string {
+	fields := strings.Fields(line)
+	if len(fields) > 0 && strings.HasPrefix(fields[0], "time=") {
+		fields = fields[1:]
+	}
+	return strings.Join(fields, " ")
+}
