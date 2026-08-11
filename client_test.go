@@ -311,3 +311,73 @@ func TestAPIClient_Do_SetsNoContentTypeHeader(t *testing.T) {
 		t.Errorf("Content-Type = %q, want empty for a bodyless GET", gotContentType)
 	}
 }
+
+// TestAPIClient_DoJSON_RedirectIsAnErrorNotASilentlyDowngradedRequest is a
+// write-safety pin, not a protocol nicety. net/http's default redirect
+// policy preserves the method and body only on 307/308; on 301, 302 and 303
+// it re-issues the request as a bodyless GET. A reverse proxy in front of
+// Radarr answering the PUT with a 302 (http->https, a trailing-slash
+// canonicalisation, a login portal) would therefore turn the project's only
+// write into a read, and the follow-up 200 would be indistinguishable from a
+// completed write — the caller would log "unmonitor", count it, and the
+// movie would still be monitored. Refusing to follow redirects surfaces the
+// 302 as the non-2xx it is.
+func TestAPIClient_DoJSON_RedirectIsAnErrorNotASilentlyDowngradedRequest(t *testing.T) {
+	var followed []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		followed = append(followed, r.Method+" "+r.URL.Path)
+		if r.URL.Path == "/api/v3/movie/7" {
+			http.Redirect(w, r, "/elsewhere", http.StatusFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok": true}`))
+	}))
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL, "key")
+	resp, err := c.DoJSON(context.Background(), http.MethodPut, "/api/v3/movie/7", []byte(`{"id":7,"monitored":false}`))
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("DoJSON returned nil error for a 302; a redirected write must never look like a completed one")
+	}
+	if !strings.Contains(err.Error(), "302") {
+		t.Errorf("error %q does not state the redirect status that was received", err.Error())
+	}
+	if len(followed) != 1 {
+		t.Errorf("the client followed the redirect (requests: %v); it must stop at the 3xx", followed)
+	}
+}
+
+// TestAPIClient_Do_RedirectOnReadIsAlsoNotFollowed pins the same policy on
+// the read path. Following a redirect there is less dangerous, but it would
+// re-send X-Api-Key to whatever host the Location header names (net/http
+// strips only Authorization, Cookie and WWW-Authenticate on a cross-host
+// redirect, never a custom header), so the credential would leak to anything
+// that can answer with a 3xx.
+func TestAPIClient_Do_RedirectOnReadIsAlsoNotFollowed(t *testing.T) {
+	var gotKeyAt []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Api-Key") != "" {
+			gotKeyAt = append(gotKeyAt, r.URL.Path)
+		}
+		if r.URL.Path == "/api/v3/movie" {
+			http.Redirect(w, r, "/attacker-controlled", http.StatusMovedPermanently)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL, "my-secret-key")
+	resp, err := c.Do(context.Background(), http.MethodGet, "/api/v3/movie", nil)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("Do returned nil error for a 301, want the 3xx surfaced as a non-2xx error")
+	}
+	for _, path := range gotKeyAt {
+		if path != "/api/v3/movie" {
+			t.Errorf("the API key was sent to %q, a redirect target; only the configured base URL may receive it", path)
+		}
+	}
+}

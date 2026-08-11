@@ -32,11 +32,34 @@ type APIClient struct {
 }
 
 // NewAPIClient builds a client for a single instance's base URL and API key.
+//
+// Redirects are deliberately not followed (CheckRedirect returns
+// http.ErrUseLastResponse, which hands the 3xx back as the response instead
+// of chasing it), for two reasons that both matter more here than the
+// convenience of following them:
+//
+//   - Write safety. net/http preserves the method and body only on 307 and
+//     308; on 301, 302 and 303 it re-issues the request as a bodyless GET.
+//     A proxy in front of Radarr answering PUT /api/v3/movie/{id} with a
+//     302 (an http->https upgrade, a trailing-slash canonicalisation, a
+//     login portal) would therefore silently downgrade the project's only
+//     write into a read, and the follow-up 200 would be indistinguishable
+//     from a completed write. Surfacing the 3xx as a non-2xx error — do
+//     already treats it as one — makes that visible instead.
+//   - Credential containment. X-Api-Key is a custom header, and net/http
+//     strips only Authorization, Cookie and WWW-Authenticate when a
+//     redirect crosses to another host. Following one would hand this
+//     instance's API key to whatever host the Location header names.
 func NewAPIClient(baseURL, apiKey string) *APIClient {
 	return &APIClient{
-		baseURL:    baseURL,
-		apiKey:     apiKey,
-		httpClient: &http.Client{Timeout: apiClientTimeout},
+		baseURL: baseURL,
+		apiKey:  apiKey,
+		httpClient: &http.Client{
+			Timeout: apiClientTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -112,7 +113,7 @@ func unmonitorMovie(ctx context.Context, logger *slog.Logger, client *APIClient,
 	// bytes Radarr sent.
 	payload[monitoredKey] = unmonitoredValue
 
-	encoded, err := json.Marshal(payload)
+	encoded, err := encodePayload(payload)
 	if err != nil {
 		return false, fmt.Errorf("movie %d: re-encoding the fetched object for write: %w", movieID, err)
 	}
@@ -130,12 +131,93 @@ func unmonitorMovie(ctx context.Context, logger *slog.Logger, client *APIClient,
 		return false, fmt.Errorf("writing movie %d: %w", movieID, err)
 	}
 	defer resp.Body.Close()
-	// Radarr echoes the updated object back. We have no use for it, but the
-	// body is drained (bounded) so the connection can be reused rather than
-	// abandoned mid-response.
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBodyBytes))
+
+	// Radarr echoes the updated object back, and that echo is the only
+	// evidence that the write took effect. Discarding it and reporting
+	// success from the status code alone would mean trusting a 2xx to mean
+	// something it does not always mean: a cache or proxy answering the
+	// write, a replayed old object, or (before the client stopped following
+	// redirects) a PUT silently downgraded to a GET would all produce a
+	// perfectly good 200 while the movie stayed monitored. Since the whole
+	// project reports "unmonitored=N" from this return value — and Phase 5's
+	// no-op contract reads that count — an unconfirmed write is treated as a
+	// failure, never as a success. §2.6 still applies: it is reported once
+	// and never retried.
+	echo, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
+	if err != nil {
+		return false, fmt.Errorf("movie %d: the write returned %d but its body could not be read, so the change is unconfirmed: %w", movieID, resp.StatusCode, err)
+	}
+	if err := verifyWriteEcho(echo, movieID, resp.StatusCode); err != nil {
+		return false, err
+	}
 
 	return true, nil
+}
+
+// verifyWriteEcho confirms the object the server returned from the PUT
+// really does carry monitored:false. Anything else — a body that is not a
+// JSON object, no monitored key, a non-boolean value, or true — means the
+// write is unconfirmed, and the error carries the status plus a bounded
+// snippet of what actually came back so the log says what was seen rather
+// than only what was expected.
+func verifyWriteEcho(echo []byte, movieID, status int) error {
+	var confirmed map[string]json.RawMessage
+	if err := json.Unmarshal(echo, &confirmed); err != nil {
+		return fmt.Errorf("movie %d: the write returned %d but the response is not a JSON object, so %q is unconfirmed: %s", movieID, status, monitoredKey, bodySnippet(echo))
+	}
+	raw, present := confirmed[monitoredKey]
+	if !present {
+		return fmt.Errorf("movie %d: the write returned %d but the returned object has no %q key, so the change is unconfirmed: %s", movieID, status, monitoredKey, bodySnippet(echo))
+	}
+	var stillMonitored bool
+	if err := json.Unmarshal(raw, &stillMonitored); err != nil {
+		return fmt.Errorf("movie %d: the write returned %d but %q came back as %s, which is not a boolean: %s", movieID, status, monitoredKey, raw, bodySnippet(echo))
+	}
+	if stillMonitored {
+		return fmt.Errorf("movie %d: the write returned %d but the returned object still has %q: true; the movie was NOT unmonitored: %s", movieID, status, monitoredKey, bodySnippet(echo))
+	}
+	return nil
+}
+
+// bodySnippet bounds a response body for inclusion in an error message,
+// mirroring the client's errorBodySnippetLimit so a large or unexpected
+// response (an HTML error page from a reverse proxy, say) cannot bloat a log
+// line.
+func bodySnippet(body []byte) string {
+	if len(body) > errorBodySnippetLimit {
+		return string(body[:errorBodySnippetLimit]) + "..."
+	}
+	return string(body)
+}
+
+// encodePayload serializes the patched object for the PUT body with HTML
+// escaping switched OFF, which json.Marshal does not allow.
+//
+// This is not cosmetic. Marshal (and every helper built on it) rewrites
+// "&", "<" and ">" into their six-character unicode escapes inside every
+// string it encodes — including the ones inside a json.RawMessage, which it
+// re-scans rather than copying verbatim. A movie titled "Mr. & Mrs. Smith"
+// would therefore be PUT back with bytes Radarr never sent, and a real
+// library is full of such titles ("Cheech & Chong", "Fast & Furious", any
+// <angle-bracketed> edition suffix). The escaped form decodes to the same
+// string,
+// so nothing is lost semantically, but §2.4 says the object goes back
+// "otherwise unmodified" and the binding mandate is byte-for-byte on every
+// key except monitored — a guarantee that would otherwise hold only for
+// movies whose metadata happens to avoid three very common characters.
+// json.Encoder is the only encoder in the standard library that exposes
+// SetEscapeHTML, hence the buffer.
+//
+// Encode always appends a newline; it is trimmed so the body is exactly the
+// object and nothing else.
+func encodePayload(payload map[string]json.RawMessage) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(payload); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 // verifyMovieIdentity confirms the object returned by the pre-write fetch

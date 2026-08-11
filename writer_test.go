@@ -63,16 +63,24 @@ func writerTestServer(t *testing.T, movieJSON string, putStatus int) (*httptest.
 // this codebase has no knowledge of at all, standing in for any field a
 // future Radarr version adds. §2.4 ("send the object back otherwise
 // unmodified") is only meaningfully tested if such a key is present.
+//
+// The title and overview deliberately contain "&", "<" and ">". Those three
+// characters are the ones encoding/json's default HTML escaping rewrites
+// into unicode escapes inside every string it encodes, so without them in
+// the fixture the byte-for-byte assertion below would pass while being false
+// for a large share of a real library ("Cheech & Chong", "Fast & Furious",
+// any title with an <angle-bracketed> edition suffix).
 const writerTestMovieJSON = `{
 	"id": 7,
-	"title": "Round Trip Movie",
+	"title": "Mr. & Mrs. Smith <Special Edition>",
 	"monitored": true,
 	"hasFile": true,
 	"qualityProfileId": 1,
 	"tags": [3, 9],
 	"sizeOnDisk": 9876543210123,
+	"overview": "Cheech & Chong: 4 < 5 > 3",
 	"ratings": {"imdb": {"votes": 1234, "value": 7.4}},
-	"movieFile": {"id": 42, "customFormatScore": 200, "relativePath": "Round Trip Movie.mkv"},
+	"movieFile": {"id": 42, "customFormatScore": 200, "relativePath": "Mr. & Mrs. Smith <Special Edition>.mkv"},
 	"someFutureField": {"nested": ["a", "b"], "flag": true}
 }`
 
@@ -181,6 +189,51 @@ func TestUnmonitorMovie_WriteMode_PutsFullObjectWithOnlyMonitoredChanged(t *test
 		if !jsonBytesEqual(t, gotVal, want) {
 			t.Errorf("key %q changed: PUT body has %s, fetched object had %s", key, gotVal, want)
 		}
+	}
+}
+
+// TestUnmonitorMovie_WriteMode_SendsUnescapedBytesForHTMLSensitiveCharacters
+// pins the round-trip claim at the byte level rather than the value level.
+// encoding/json's Marshal escapes "&", "<" and ">" inside every string it
+// encodes, so a movie titled "Mr. & Mrs. Smith" would be PUT back with those
+// characters replaced by unicode escapes — a different byte sequence from
+// the one Radarr sent, even though it decodes to the same string. §2.4 says
+// the object goes
+// back "otherwise unmodified", and the binding mandate says byte-for-byte on
+// every other key, so the encoder must have HTML escaping switched off.
+func TestUnmonitorMovie_WriteMode_SendsUnescapedBytesForHTMLSensitiveCharacters(t *testing.T) {
+	srv, got := writerTestServer(t, writerTestMovieJSON, http.StatusOK)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+	inst := writerTestInstance(srv.URL)
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	if _, err := unmonitorMovie(context.Background(), logger, client, inst, 7, false); err != nil {
+		t.Fatalf("unmonitorMovie returned error: %v\n%s", err, buf.String())
+	}
+
+	puts := filterRequests(*got, http.MethodPut)
+	if len(puts) != 1 {
+		t.Fatalf("expected exactly 1 PUT, got %d", len(puts))
+	}
+	body := string(puts[0].body)
+	// The escape sequences are built rather than written out, so the
+	// assertion cannot be defeated by the test source itself being edited
+	// into the very characters it is looking for.
+	for _, r := range []rune{'&', '<', '>'} {
+		escaped := fmt.Sprintf("\\u%04x", r)
+		if strings.Contains(body, escaped) {
+			t.Errorf("PUT body contains the HTML-escaped sequence %s for %q; the fetched bytes must go back unmodified:\n%s", escaped, r, body)
+		}
+	}
+	for _, literal := range []string{"Mr. & Mrs. Smith <Special Edition>", "Cheech & Chong: 4 < 5 > 3"} {
+		if !strings.Contains(body, literal) {
+			t.Errorf("PUT body does not carry %q verbatim:\n%s", literal, body)
+		}
+	}
+	if strings.HasSuffix(body, "\n") {
+		t.Errorf("PUT body has a trailing newline the fetched object did not have:\n%q", body)
 	}
 }
 
@@ -385,6 +438,100 @@ func TestUnmonitorMovie_PutNonTwoxx_ReturnsErrorAndNeverRetries(t *testing.T) {
 	}
 }
 
+// TestUnmonitorMovie_PutRedirected_IsNotReportedAsAWrite is the end of the
+// redirect story at the write site: whatever the transport does, a write may
+// only be reported as performed when the server actually confirmed it. A 302
+// on the PUT must surface as an error, never as written=true.
+func TestUnmonitorMovie_PutRedirected_IsNotReportedAsAWrite(t *testing.T) {
+	var got []recordedRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		got = append(got, recordedRequest{method: r.Method, path: r.URL.Path, body: body})
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/movie/7":
+			w.Write([]byte(writerTestMovieJSON))
+		case r.Method == http.MethodPut:
+			// The classic reverse-proxy answer: "the resource lives over
+			// there". net/http's default policy would re-issue this as a
+			// GET, and that GET would succeed.
+			http.Redirect(w, r, "/api/v3/movie/7", http.StatusFound)
+		default:
+			w.Write([]byte(writerTestMovieJSON))
+		}
+	}))
+	defer srv.Close()
+
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := writerTestInstance(srv.URL)
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, false)
+	if err == nil {
+		t.Fatal("unmonitorMovie returned nil error for a redirected PUT")
+	}
+	if written {
+		t.Error("written = true for a redirected PUT: the movie is still monitored, so this would be a false success")
+	}
+	if n := len(filterRequests(got, http.MethodGet)); n != 1 {
+		t.Errorf("saw %d GETs, want exactly 1 (the pre-write fetch); a followed redirect would add another: %+v", n, got)
+	}
+}
+
+// TestUnmonitorMovie_PutEchoesStillMonitored_IsAnError pins the last check
+// in the chain: Radarr echoes the updated object back, and that echo is the
+// only evidence the write actually took effect. A 2xx whose body still says
+// monitored:true (a cache answering the write, a proxy replaying the old
+// object, a Radarr that rejected the change without saying so) must not be
+// counted as a write — Phase 5's no-op contract reads that count.
+func TestUnmonitorMovie_PutEchoesStillMonitored_IsAnError(t *testing.T) {
+	var got []recordedRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		got = append(got, recordedRequest{method: r.Method, path: r.URL.Path, body: body})
+		// Both the GET and the PUT answer with a still-monitored object.
+		w.Write([]byte(`{"id": 7, "title": "Stubborn Movie", "monitored": true}`))
+	}))
+	defer srv.Close()
+
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := writerTestInstance(srv.URL)
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, false)
+	if err == nil {
+		t.Fatal("unmonitorMovie returned nil error when the response said the movie was still monitored")
+	}
+	if written {
+		t.Error("written = true when the server's own echo says monitored is still true")
+	}
+	if !strings.Contains(err.Error(), monitoredKey) {
+		t.Errorf("error %q does not name the field that failed to change", err.Error())
+	}
+	if n := len(filterRequests(got, http.MethodPut)); n != 1 {
+		t.Errorf("made %d PUT attempts, want exactly 1 (an unconfirmed write is never retried)", n)
+	}
+}
+
+// TestUnmonitorMovie_PutEchoesUnmonitored_IsAWrite is the positive half of
+// the same check: the ordinary Radarr response — the updated object, with
+// monitored now false — is what a confirmed write looks like.
+func TestUnmonitorMovie_PutEchoesUnmonitored_IsAWrite(t *testing.T) {
+	srv, _ := writerTestServer(t, writerTestMovieJSON, http.StatusOK)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := writerTestInstance(srv.URL)
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, false)
+	if err != nil {
+		t.Fatalf("unmonitorMovie returned error: %v\n%s", err, buf.String())
+	}
+	if !written {
+		t.Error("written = false after a PUT the server confirmed with monitored:false")
+	}
+}
+
 // TestUnmonitorMovie_NeverTouchesAnyOtherEndpoint pins §2.3: the write path
 // talks to /api/v3/movie/{id} and nothing else — never /api/v3/command,
 // never a delete, never a search trigger.
@@ -476,6 +623,16 @@ func newRadarrFake(t *testing.T, moviesJSON string, detail map[int]string) *rada
 		w.Write([]byte(f.moviesJSON))
 	}))
 	mux.HandleFunc("/api/v3/movie/", f.handle(f.serveMovieDetail))
+	// The catch-all is what makes "zero write requests of any method to any
+	// path" an assertion rather than a hope. Without it, every request to a
+	// path this fake does not stub would be answered by http.ServeMux's
+	// built-in NotFound handler, which records nothing — so a POST to
+	// /api/v3/command during a dry-run would 404 silently and leave every
+	// zero-write test green. Recording happens first; the 404 (what a real
+	// Radarr would return for an endpoint that does not exist) happens after.
+	mux.HandleFunc("/", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)
 	return f
@@ -516,7 +673,14 @@ func (f *radarrFake) serveMovieDetail(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(status)
 		if status >= 400 {
 			w.Write([]byte(`{"message":"write rejected by fake"}`))
+			return
 		}
+		// Radarr answers a successful PUT with the updated object. The
+		// writer verifies that echo before it will report a write as
+		// performed, so a fake that stayed silent here would be a fake of
+		// something Radarr never does.
+		body, _ := io.ReadAll(r.Body)
+		w.Write(body)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -547,11 +711,58 @@ func (f *radarrFake) instance() Instance {
 	return Instance{Name: "radarr-main", Type: "radarr", URL: f.srv.URL, APIKey: "key"}
 }
 
+// TestRadarrFake_RecordsRequestsToPathsItDoesNotStub is a test OF the test
+// fake, and it earns its place: every zero-write assertion in this project
+// is only as strong as the fake's recording. Registering handlers for the
+// seven endpoints a run is expected to touch would leave http.ServeMux's
+// built-in NotFound handler answering everything else — recording nothing —
+// so a future change that fired POST /api/v3/command or a DELETE at some
+// unstubbed path during a dry-run would 404 silently and the "ZERO write
+// requests" assertions would stay green. The claim those tests make is about
+// requests to endpoints nobody thought to stub, so those are exactly the
+// ones that must be recorded.
+func TestRadarrFake_RecordsRequestsToPathsItDoesNotStub(t *testing.T) {
+	fake := newRadarrFake(t, "[]", nil)
+
+	unstubbed := []struct{ method, path, body string }{
+		{http.MethodPost, "/api/v3/command", `{"name":"MoviesSearch"}`},
+		{http.MethodDelete, "/api/v3/queue/12", ""},
+		{http.MethodPut, "/api/v3/config/naming", `{}`},
+	}
+	for _, u := range unstubbed {
+		req, err := http.NewRequest(u.method, fake.srv.URL+u.path, strings.NewReader(u.body))
+		if err != nil {
+			t.Fatalf("building %s %s: %v", u.method, u.path, err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", u.method, u.path, err)
+		}
+		resp.Body.Close()
+	}
+
+	writes := fake.writes()
+	if len(writes) != len(unstubbed) {
+		t.Fatalf("the fake recorded %d of %d requests to unstubbed paths; anything it does not record cannot be asserted on: %+v", len(writes), len(unstubbed), writes)
+	}
+	for i, u := range unstubbed {
+		if writes[i].method != u.method || writes[i].path != u.path {
+			t.Errorf("recorded %s %s, want %s %s", writes[i].method, writes[i].path, u.method, u.path)
+		}
+	}
+	if string(writes[0].body) != `{"name":"MoviesSearch"}` {
+		t.Errorf("recorded body = %q, want the bytes that were actually sent", writes[0].body)
+	}
+}
+
 // monitoredMovieDetail is a full-object fixture for GET /api/v3/movie/{id},
 // carrying a field this codebase does not model so round-trip preservation
-// is exercised through the engine too, not only in the unit tests.
+// is exercised through the engine too, not only in the unit tests. The
+// overview carries "&" and "<": encoding/json escapes those by default, so
+// their presence here is what makes the whole-run assertions capable of
+// catching an escaping regression rather than only a dropped-key one.
 func monitoredMovieDetail(id int, title string) string {
-	return fmt.Sprintf(`{"id": %d, "title": %q, "monitored": true, "hasFile": true, "qualityProfileId": 1, "tags": [], "someFutureField": {"keep": "me"}}`, id, title)
+	return fmt.Sprintf(`{"id": %d, "title": %q, "monitored": true, "hasFile": true, "qualityProfileId": 1, "tags": [], "overview": "Cheech & Chong <uncut>", "someFutureField": {"keep": "me"}}`, id, title)
 }
 
 // libraryMovie is one element of the fake's GET /api/v3/movie response.
@@ -679,6 +890,12 @@ func TestRun_WriteMode_OnlyID_MakesExactlyOnePutForTheNamedMovie(t *testing.T) {
 	}
 	if _, present := sent["someFutureField"]; !present {
 		t.Error("the PUT body dropped a field this codebase does not model; the fetched object must go back otherwise unmodified")
+	}
+	// Byte-level, not value-level: decoding the body (as the assertions
+	// above do) cannot see HTML escaping, because the escaped and unescaped
+	// forms decode to the same string.
+	if !strings.Contains(string(writes[0].body), "Cheech & Chong <uncut>") {
+		t.Errorf("the PUT body re-encoded characters the fetched object sent literally:\n%s", writes[0].body)
 	}
 
 	out := stdout.String()
