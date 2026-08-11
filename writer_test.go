@@ -828,6 +828,12 @@ func TestRun_DryRun_MakesZeroWriteRequestsAcrossTheEntireRun(t *testing.T) {
 	if !strings.Contains(out, "unmonitored=0") {
 		t.Errorf("expected unmonitored=0 in the dry-run summary:\n%s", out)
 	}
+	// A healthy dry-run reports no write errors and no rehearsal errors. The
+	// second counter is always present in dry-run so its absence can never
+	// be mistaken for "no rehearsal failures happened".
+	if !strings.Contains(out, "writeErrors=0") || !strings.Contains(out, "writeRehearsalErrors=0") {
+		t.Errorf("expected writeErrors=0 and writeRehearsalErrors=0 in the dry-run summary:\n%s", out)
+	}
 }
 
 // TestRun_DryRunForcedByFlag_MakesZeroWriteRequests pins the interaction
@@ -947,6 +953,42 @@ func TestRun_WriteMode_CrossCheckFailure_MakesZeroWriteRequests(t *testing.T) {
 	}
 	if !strings.Contains(out, "withheld") {
 		t.Errorf("expected a warning explaining writes were withheld:\n%s", out)
+	}
+}
+
+// TestRun_WriteMode_CrossCheckInconclusive_MakesZeroWriteRequests is the
+// other half of the mandated scenario: "inconclusive" blocks the write pass
+// exactly as hard as "failed" does, through the real main.go wiring. A
+// cross-check that verified nothing is not a weaker pass — it is no evidence
+// at all, and no evidence is not permission to write.
+func TestRun_WriteMode_CrossCheckInconclusive_MakesZeroWriteRequests(t *testing.T) {
+	// movieFile is present (so the movie is a cross-check candidate) but
+	// carries no qualityCutoffNotMet, so there is nothing to compare the
+	// wanted-set membership against and the cross-check can reach no verdict.
+	unverifiable := `{"id": 1, "title": "Unverifiable Movie", "monitored": true, "hasFile": true, "qualityProfileId": 1, "tags": [], "movieFile": {"id": 1}}`
+	fake := newRadarrFake(t, "["+unverifiable+"]", map[int]string{1: monitoredMovieDetail(1, "Unverifiable Movie")})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeTestConfig(t, fake.srv.URL, false), "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("an inconclusive cross-check must stop every write end to end, got %+v", writes)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "crossCheck=inconclusive") {
+		t.Errorf("expected the summary to state the cross-check was inconclusive:\n%s", out)
+	}
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "withheld") {
+		t.Errorf("expected a warning explaining writes were withheld:\n%s", out)
+	}
+	if !strings.Contains(out, "withheldWrites=1") {
+		t.Errorf("expected the withheld warning to state how many writes it blocked:\n%s", out)
+	}
+	if !strings.Contains(out, "unmonitored=0") {
+		t.Errorf("expected unmonitored=0 in the summary:\n%s", out)
 	}
 }
 

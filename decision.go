@@ -490,10 +490,25 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	if onlyID != 0 {
 		attrs = append(attrs, "onlyId", onlyID)
 	}
-	attrs = append(attrs,
-		"totalMonitored", totalMonitored, "wouldUnmonitor", wouldUnmonitorCount,
-		"unmonitored", unmonitoredCount, "writeErrors", writeErrorCount,
-		"skipReasons", formatSkipCounts(skipCounts), "crossCheck", crossCheckSummary)
+	attrs = append(attrs, "totalMonitored", totalMonitored, "wouldUnmonitor", wouldUnmonitorCount, "unmonitored", unmonitoredCount)
+
+	// writeErrors counts failed WRITES, so in dry-run it is unconditionally
+	// 0: no write was attempted, so none can have failed. That is not the
+	// same as saying nothing went wrong. The write pass runs in dry-run too
+	// (that is what makes it a rehearsal rather than a different code path),
+	// and its pre-write GET, decode, and identity check can all fail. Those
+	// failures are real, are logged at ERROR, and are counted — under their
+	// own name, so that a report the human reads as "nothing was attempted"
+	// never carries a number that reads as "N writes failed". Phase 5's
+	// no-op contract reads unmonitored and writeErrors; neither is ever
+	// inflated by a dry-run.
+	if dryRun {
+		attrs = append(attrs, "writeErrors", 0, "writeRehearsalErrors", writeErrorCount)
+	} else {
+		attrs = append(attrs, "writeErrors", writeErrorCount)
+	}
+
+	attrs = append(attrs, "skipReasons", formatSkipCounts(skipCounts), "crossCheck", crossCheckSummary)
 	logger.Info("radarr decision summary", attrs...)
 }
 
@@ -513,7 +528,13 @@ func libraryContainsID(movies []movieListElement, id int) bool {
 // runWritePass is the third and final pass: it acts on the decisions the
 // first two passes produced. It returns the number of movies actually
 // written (always 0 in dry-run, since no PUT is ever issued there) and the
-// number of write failures.
+// number of failures.
+//
+// In write mode a failure is a failed write. In dry-run it can only be a
+// failed REHEARSAL of the write — the fresh GET, the decode, or the identity
+// check, all of which run before the dry-run gate — because no write is ever
+// attempted. The caller reports the two under different names for that
+// reason; see the summary in runRadarrDecisionEngine.
 //
 // Two gates stand in front of every write:
 //
@@ -557,7 +578,19 @@ func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, i
 		written, err := unmonitorMovie(ctx, logger, client, inst, d.id, dryRun)
 		if err != nil {
 			writeErrors++
-			logger.Error("unmonitor write failed; skipping this movie for the cycle",
+			// The wording is mode-specific because the two failures are
+			// different events. In write mode a PUT was attempted and did
+			// not take. In dry-run nothing was ever sent, so the only thing
+			// that can have failed is the rehearsal of the write path (its
+			// fresh GET, decode, or identity check) — still worth an ERROR,
+			// since a broken write path must be visible in the one mode
+			// allowed to exercise it, but "write failed" would be a false
+			// statement about a run that wrote nothing.
+			msg := "unmonitor write failed; skipping this movie for the cycle"
+			if dryRun {
+				msg = "unmonitor write rehearsal failed; no write was attempted (dry-run), and this movie is skipped for the cycle"
+			}
+			logger.Error(msg,
 				"instance", inst.Name, "type", inst.Type, "id", d.id, "title", d.title, "error", err)
 			continue
 		}

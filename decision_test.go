@@ -1826,6 +1826,74 @@ func TestRunRadarrDecisionEngine_AlreadyUnmonitoredAtWriteTime_NoPut(t *testing.
 	}
 }
 
+// TestRunRadarrDecisionEngine_DryRun_PreWriteFetchFailure_IsARehearsalFailureNotAWriteError
+// covers the one path that can fail during a dry-run, and the reason it
+// needs its own name in the report.
+//
+// Because the write pass runs in dry-run too (that is what makes a dry-run a
+// real rehearsal), every would-unmonitor movie still gets a fresh GET
+// /api/v3/movie/{id}. That GET can fail — a movie deleted between the
+// library scan and the write pass 404s, a restarting Radarr 502s — and the
+// failure is real and worth an ERROR line. What it is not is a write error:
+// no write was attempted, and none could have been. Counting it as
+// writeErrors=N would put a number the human reads as "N writes failed" in
+// the report of a run during which nothing was ever written, so the two are
+// reported under separate names.
+func TestRunRadarrDecisionEngine_DryRun_PreWriteFetchFailure_IsARehearsalFailureNotAWriteError(t *testing.T) {
+	// The detail map has no entry for movie 1, so the fake answers the
+	// pre-write GET with a 404: the movie vanished between the scan and the
+	// write pass.
+	fake := newRadarrFake(t, "", map[int]string{})
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	movies := []movieListElement{wouldUnmonitorMovie(1, "Vanished Movie")}
+
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("a dry-run must make zero write requests even when the pre-write fetch fails, got %+v", writes)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=ERROR") || !strings.Contains(out, "Vanished Movie") {
+		t.Errorf("a failed pre-write fetch must still be reported at error level, naming the movie:\n%s", out)
+	}
+	if !strings.Contains(out, "rehearsal") {
+		t.Errorf("the dry-run failure must not be worded as a failed write; no write was attempted:\n%s", out)
+	}
+	if !strings.Contains(out, "writeRehearsalErrors=1") {
+		t.Errorf("expected writeRehearsalErrors=1 in the dry-run summary:\n%s", out)
+	}
+	if !strings.Contains(out, "writeErrors=0") {
+		t.Errorf("writeErrors must stay 0 in dry-run: no write was attempted, so none can have failed:\n%s", out)
+	}
+	if !strings.Contains(out, "unmonitored=0") {
+		t.Errorf("expected unmonitored=0:\n%s", out)
+	}
+}
+
+// TestRunRadarrDecisionEngine_WriteMode_HasNoRehearsalCounter pins the other
+// half: outside dry-run there is no rehearsal, so a failure is a write
+// failure and is reported as one, with no second counter to read past.
+func TestRunRadarrDecisionEngine_WriteMode_HasNoRehearsalCounter(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{})
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	movies := []movieListElement{wouldUnmonitorMovie(1, "Vanished Movie")}
+
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, false)
+
+	out := buf.String()
+	if !strings.Contains(out, "writeErrors=1") {
+		t.Errorf("expected writeErrors=1 in the write-mode summary:\n%s", out)
+	}
+	if strings.Contains(out, "writeRehearsalErrors") {
+		t.Errorf("writeRehearsalErrors has no meaning outside dry-run and must not appear:\n%s", out)
+	}
+	if strings.Contains(out, "rehearsal") {
+		t.Errorf("a failure in write mode is a write failure, not a rehearsal failure:\n%s", out)
+	}
+}
+
 // TestRunRadarrDecisionEngine_ReportLinesCarryMovieId pins the mandated new
 // attr: the human picks --only-id values straight out of these lines, so
 // both would-unmonitor and skip lines must carry the movie id.
