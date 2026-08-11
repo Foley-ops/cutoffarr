@@ -701,6 +701,14 @@ func (f *radarrFake) writes() []recordedRequest {
 	return out
 }
 
+// all returns every request the fake received, of any method, copied under
+// the mutex so a test can read it without racing the server's goroutines.
+func (f *radarrFake) all() []recordedRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]recordedRequest(nil), f.requests...)
+}
+
 func (f *radarrFake) puts() []recordedRequest {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1041,6 +1049,190 @@ func TestRun_OnlyID_UnknownMovie_WarnsAndWritesNothing(t *testing.T) {
 	}
 	if strings.Contains(out, "msg=would-unmonitor") || strings.Contains(out, "msg=skip") {
 		t.Errorf("an unknown --only-id must produce no decisions:\n%s", out)
+	}
+}
+
+// --- --only-id across multiple radarr instances ---------------------------
+//
+// Radarr movie ids are per-instance: each instance numbers its own library
+// from 1, so id 2 in radarr-hd and id 2 in radarr-4k are two entirely
+// different films. A paired HD + 4K setup is explicitly supported, which
+// makes an unqualified --only-id ambiguous rather than precise — the exact
+// opposite of what this phase's contract ("first write, single item,
+// explicitly named") promises.
+
+// writeTwoRadarrConfig writes a config with two radarr instances, the paired
+// setup the plan mandates supporting.
+func writeTwoRadarrConfig(t *testing.T, hdURL, fourKURL string, dryRun bool) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := fmt.Sprintf(`
+dry_run: %t
+instances:
+  - name: radarr-hd
+    type: radarr
+    url: %s
+    api_key: key1
+  - name: radarr-4k
+    type: radarr
+    url: %s
+    api_key: key2
+`, dryRun, hdURL, fourKURL)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+	return path
+}
+
+// TestRun_OnlyID_AmbiguousAcrossTwoRadarrInstances_IsFatalBeforeAnyRequest
+// is the safety pin: with two radarr instances configured and no instance
+// named, "--only-id 2" identifies two different movies, and the phase's
+// promise is that exactly one explicitly named item is written. Guessing —
+// or writing both — is not an option, so the run refuses before it opens a
+// single connection.
+func TestRun_OnlyID_AmbiguousAcrossTwoRadarrInstances_IsFatalBeforeAnyRequest(t *testing.T) {
+	hd := newRadarrFake(t,
+		"["+libraryMovie(2, "HD Movie", true, true)+"]",
+		map[int]string{2: monitoredMovieDetail(2, "HD Movie")})
+	fourK := newRadarrFake(t,
+		"["+libraryMovie(2, "A Completely Different 4K Movie", true, true)+"]",
+		map[int]string{2: monitoredMovieDetail(2, "A Completely Different 4K Movie")})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeTwoRadarrConfig(t, hd.srv.URL, fourK.srv.URL, false), "--once", "--only-id", "2"}, &stdout, &stderr)
+
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2: an ambiguous --only-id must be a fatal flag error\nstdout=%s\nstderr=%s", code, stdout.String(), stderr.String())
+	}
+	if writes := hd.writes(); len(writes) != 0 {
+		t.Errorf("radarr-hd was written despite the ambiguity: %+v", writes)
+	}
+	if writes := fourK.writes(); len(writes) != 0 {
+		t.Errorf("radarr-4k was written despite the ambiguity: %+v", writes)
+	}
+	if len(hd.all()) != 0 || len(fourK.all()) != 0 {
+		t.Errorf("the run contacted an instance before refusing: hd=%d 4k=%d requests", len(hd.all()), len(fourK.all()))
+	}
+	msg := stderr.String()
+	if !strings.Contains(msg, "--only-id") || !strings.Contains(msg, "--instance") {
+		t.Errorf("the error must name the flag that is ambiguous and the flag that resolves it:\n%s", msg)
+	}
+}
+
+// TestRun_OnlyID_WithInstanceFlag_WritesOnlyTheNamedInstance is the resolved
+// form: --instance names which library the id belongs to, and every other
+// instance is left entirely alone — not merely unwritten, but untouched.
+func TestRun_OnlyID_WithInstanceFlag_WritesOnlyTheNamedInstance(t *testing.T) {
+	hd := newRadarrFake(t,
+		"["+libraryMovie(2, "HD Movie", true, true)+"]",
+		map[int]string{2: monitoredMovieDetail(2, "HD Movie")})
+	fourK := newRadarrFake(t,
+		"["+libraryMovie(2, "A Completely Different 4K Movie", true, true)+"]",
+		map[int]string{2: monitoredMovieDetail(2, "A Completely Different 4K Movie")})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeTwoRadarrConfig(t, hd.srv.URL, fourK.srv.URL, false), "--once", "--only-id", "2", "--instance", "radarr-4k"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	if got := hd.all(); len(got) != 0 {
+		t.Errorf("radarr-hd received %d request(s); an instance the human did not name must not be contacted at all: %+v", len(got), got)
+	}
+	writes := fourK.writes()
+	if len(writes) != 1 {
+		t.Fatalf("expected exactly 1 write to the named instance, got %d: %+v", len(writes), writes)
+	}
+	if writes[0].method != http.MethodPut || writes[0].path != "/api/v3/movie/2" {
+		t.Fatalf("write was %s %s, want PUT /api/v3/movie/2", writes[0].method, writes[0].path)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, `title="A Completely Different 4K Movie"`) {
+		t.Errorf("expected the 4K movie to be the one written:\n%s", out)
+	}
+	if strings.Contains(out, "HD Movie") {
+		t.Errorf("the unnamed instance's library must not appear anywhere in the report:\n%s", out)
+	}
+}
+
+// TestRun_InstanceFlag_UnknownName_IsFatal covers the typo. Skipping every
+// instance because none matched would be a silent no-op, and a run that
+// quietly does nothing is indistinguishable from one that found nothing to
+// do.
+func TestRun_InstanceFlag_UnknownName_IsFatal(t *testing.T) {
+	fake := newRadarrFake(t,
+		"["+libraryMovie(1, "The Only Movie", true, true)+"]",
+		map[int]string{1: monitoredMovieDetail(1, "The Only Movie")})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeTestConfig(t, fake.srv.URL, false), "--once", "--instance", "radarr-typo"}, &stdout, &stderr)
+
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 for an --instance name that is not configured\nstderr=%s", code, stderr.String())
+	}
+	if got := fake.all(); len(got) != 0 {
+		t.Errorf("the run contacted an instance before refusing: %+v", got)
+	}
+	if !strings.Contains(stderr.String(), "radarr-typo") {
+		t.Errorf("the error must name the instance that was not found:\n%s", stderr.String())
+	}
+}
+
+// TestRun_OnlyID_SingleRadarrInstance_NeedsNoInstanceFlag is the regression
+// guard on the common case: one radarr configured means --only-id is
+// unambiguous on its own, and adding a required flag there would be a
+// gratuitous break.
+func TestRun_OnlyID_SingleRadarrInstance_NeedsNoInstanceFlag(t *testing.T) {
+	fake := newRadarrFake(t,
+		"["+libraryMovie(1, "The Only Movie", true, true)+"]",
+		map[int]string{1: monitoredMovieDetail(1, "The Only Movie")})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeTestConfig(t, fake.srv.URL, false), "--once", "--only-id", "1"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if n := len(fake.puts()); n != 1 {
+		t.Errorf("expected the single configured radarr to still be written without --instance, got %d PUTs", n)
+	}
+}
+
+// TestRun_OnlyID_OneRadarrAlongsideSonarr_NeedsNoInstanceFlag pins that the
+// ambiguity is about radarr instances specifically: --only-id is a radarr
+// movie id in this phase, so a sonarr instance sharing the config does not
+// make it ambiguous.
+func TestRun_OnlyID_OneRadarrAlongsideSonarr_NeedsNoInstanceFlag(t *testing.T) {
+	fake := newRadarrFake(t,
+		"["+libraryMovie(1, "The Only Movie", true, true)+"]",
+		map[int]string{1: monitoredMovieDetail(1, "The Only Movie")})
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := fmt.Sprintf(`
+dry_run: false
+instances:
+  - name: radarr-main
+    type: radarr
+    url: %s
+    api_key: key1
+  - name: sonarr-main
+    type: sonarr
+    url: %s
+    api_key: key2
+`, fake.srv.URL, fake.srv.URL)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once", "--only-id", "1"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if n := len(fake.puts()); n != 1 {
+		t.Errorf("expected exactly 1 PUT (one radarr in scope), got %d", n)
 	}
 }
 

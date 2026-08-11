@@ -345,3 +345,67 @@ instances: []
 		t.Errorf("expected a warning that --only-id has no effect without --once:\n%s", out)
 	}
 }
+
+// TestRun_InstanceWithoutOnce_WarnsThatItHasNoEffect is the same courtesy
+// for --instance: a scoping flag that is silently ignored is worse than one
+// that is rejected, because the human believes the run was narrowed.
+func TestRun_InstanceWithoutOnce_WarnsThatItHasNoEffect(t *testing.T) {
+	path := writeMainTestConfig(t, `
+instances:
+  - name: radarr-main
+    type: radarr
+    url: http://radarr:7878
+    api_key: key1
+`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--instance", "radarr-main"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "instance") {
+		t.Errorf("expected a warning that --instance has no effect without --once:\n%s", out)
+	}
+}
+
+// TestRun_InstanceFlag_NamesASonarrInstance_ScopesToIt pins that --instance
+// is a general instance selector, not a radarr-only one: it names which
+// configured instance a pass runs against, whatever its type.
+func TestRun_InstanceFlag_NamesASonarrInstance_ScopesToIt(t *testing.T) {
+	var radarrHits, sonarrHits int
+	radarrSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		radarrHits++
+		w.Write([]byte(`{"appName": "Radarr", "version": "5.14.0.9383"}`))
+	}))
+	defer radarrSrv.Close()
+	sonarrSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sonarrHits++
+		w.Write([]byte(`{"appName": "Sonarr", "version": "4.0.0.0"}`))
+	}))
+	defer sonarrSrv.Close()
+
+	path := writeMainTestConfig(t, `
+instances:
+  - name: radarr-main
+    type: radarr
+    url: `+radarrSrv.URL+`
+    api_key: key1
+  - name: sonarr-main
+    type: sonarr
+    url: `+sonarrSrv.URL+`
+    api_key: key2
+`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once", "--instance", "sonarr-main"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if radarrHits != 0 {
+		t.Errorf("the radarr instance was contacted %d time(s) despite --instance sonarr-main", radarrHits)
+	}
+	if sonarrHits == 0 {
+		t.Error("the named sonarr instance was never contacted")
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 )
 
 func main() {
@@ -25,6 +26,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	forceDryRun := fs.Bool("dry-run", false, "force dry-run mode on; cannot be used to disable dry-run set by config")
 	samplesFlag := fs.String("samples", "", "comma-separated movie titles to dump full detail for during Radarr library inspection (--once only)")
 	onlyID := fs.Int("only-id", 0, "process only the radarr movie with this id: evaluate, report, and (outside dry-run) write just that one movie (--once only)")
+	instanceName := fs.String("instance", "", "process only the configured instance with this name; required alongside --only-id when more than one radarr instance is configured (--once only)")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -38,10 +40,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// narrow. fs.Visit distinguishes "explicitly passed 0" from "not passed
 	// at all"; a non-integer value never reaches here, since fs.Parse
 	// rejects it above.
-	onlyIDSet := false
+	onlyIDSet, instanceSet := false, false
 	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "only-id" {
+		switch f.Name {
+		case "only-id":
 			onlyIDSet = true
+		case "instance":
+			instanceSet = true
 		}
 	})
 	if onlyIDSet && *onlyID <= 0 {
@@ -59,6 +64,36 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// never turns it off. Config governs otherwise.
 	if *forceDryRun {
 		cfg.DryRun = true
+	}
+
+	// --instance narrows the run to one configured instance. An unknown name
+	// is fatal rather than "no instances matched": a typo would otherwise
+	// produce a run that silently does nothing, which is indistinguishable
+	// from a run that found nothing to do — and this flag exists precisely
+	// to make the target unambiguous.
+	if instanceSet {
+		if !configContainsInstance(*cfg, *instanceName) {
+			fmt.Fprintf(stderr, "cutoffarr: fatal: --instance %q does not name any configured instance (configured: %s)\n",
+				*instanceName, strings.Join(instanceNames(*cfg), ", "))
+			return 2
+		}
+	}
+
+	// A radarr movie id is per-instance: every Radarr numbers its own
+	// library from 1, so id 2 in radarr-hd and id 2 in radarr-4k are two
+	// entirely different films. Paired HD + 4K instances are an explicitly
+	// supported setup, which means an unqualified --only-id names one movie
+	// per radarr rather than one movie — and acting on all of them is the
+	// precise opposite of this phase's contract, "a single item, explicitly
+	// named". There is no safe way to guess which library the human meant,
+	// so the run refuses before contacting anything and says how to say it.
+	if onlyIDSet {
+		inScope := radarrInstancesInScope(*cfg, *instanceName)
+		if len(inScope) > 1 {
+			fmt.Fprintf(stderr, "cutoffarr: fatal: --only-id %d is ambiguous: %d radarr instances are configured (%s) and movie ids are per-instance, so the same id names a different movie in each. Add --instance <name> to say which one.\n",
+				*onlyID, len(inScope), strings.Join(inScope, ", "))
+			return 2
+		}
 	}
 
 	logger := slog.New(slog.NewTextHandler(stdout, &slog.HandlerOptions{Level: slogLevel(cfg.LogLevel)}))
@@ -103,6 +138,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 		// the value has to travel all the way to the write site.
 		samples := parseSamples(*samplesFlag)
 		for _, inst := range cfg.Instances {
+			// An instance the human did not name is not merely left
+			// unwritten: it is not contacted at all. "--instance radarr-4k"
+			// has to mean the run touches radarr-4k and nothing else, or it
+			// would be a weaker statement than it looks.
+			if instanceSet && inst.Name != *instanceName {
+				continue
+			}
 			ok := checkInstanceConnectivity(context.Background(), logger, inst)
 			if ok && inst.Type == "radarr" {
 				movies, wantedIDs, dataOK := inspectRadarrLibrary(context.Background(), logger, inst, samples)
@@ -116,10 +158,55 @@ func run(args []string, stdout, stderr io.Writer) int {
 			logger.Warn("--only-id has no effect without --once: it scopes a single pass, and daemon mode does not run one yet",
 				"onlyId", *onlyID)
 		}
+		if instanceSet {
+			logger.Warn("--instance has no effect without --once: it scopes a single pass, and daemon mode does not run one yet",
+				"instance", *instanceName)
+		}
 		logger.Info("daemon mode is not implemented yet; it arrives in a later phase")
 	}
 
 	return 0
+}
+
+// configContainsInstance reports whether name matches a configured
+// instance. Config validation already guarantees names are unique and
+// non-empty, so an exact match is the whole test.
+func configContainsInstance(cfg Config, name string) bool {
+	for _, inst := range cfg.Instances {
+		if inst.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// instanceNames lists every configured instance name, for the error message
+// that tells a human who mistyped --instance what the real names are.
+func instanceNames(cfg Config) []string {
+	names := make([]string, 0, len(cfg.Instances))
+	for _, inst := range cfg.Instances {
+		names = append(names, inst.Name)
+	}
+	return names
+}
+
+// radarrInstancesInScope names the radarr instances a run would actually
+// process, honoring --instance. It underpins the --only-id ambiguity check,
+// which is about radarr instances specifically: --only-id is a radarr movie
+// id in this phase (Sonarr gets its own meaning in Phase 7), so a sonarr
+// instance sharing the config makes nothing ambiguous.
+func radarrInstancesInScope(cfg Config, instanceName string) []string {
+	var names []string
+	for _, inst := range cfg.Instances {
+		if inst.Type != "radarr" {
+			continue
+		}
+		if instanceName != "" && inst.Name != instanceName {
+			continue
+		}
+		names = append(names, inst.Name)
+	}
+	return names
 }
 
 // slogLevel maps a validated log_level string to its slog.Level. Config

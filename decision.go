@@ -391,9 +391,19 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 
 	// An --only-id naming a movie this instance's library does not contain
 	// is checked before anything else is fetched: there is nothing to decide
-	// or write, so there is no reason to make further API calls. It is not
-	// an error — with multiple radarr instances configured, only one of them
-	// holds any given movie id — so it warns and leaves this instance alone.
+	// or write, so there is no reason to make further API calls. A mistyped
+	// id is the ordinary cause, and it is a warning rather than an error
+	// because this function has no standing to fail the process — §2.6's
+	// house rule for an instance that cannot be processed is "warn and skip
+	// the instance for the cycle".
+	//
+	// This is NOT the guard against --only-id hitting the wrong instance.
+	// Radarr movie ids are per-instance (each library is numbered from 1),
+	// so id 2 exists in radarr-hd AND radarr-4k as two different films, and
+	// the wrong-instance case is a MATCH here, not a miss — nothing in this
+	// function could detect it. run() refuses ambiguous --only-id runs up
+	// front, before any instance is contacted, by requiring --instance when
+	// more than one radarr is in scope.
 	if onlyID != 0 && !libraryContainsID(movies, onlyID) {
 		logger.Warn("--only-id movie not found in this instance's library; no decisions for this instance",
 			"instance", inst.Name, "type", inst.Type, "onlyId", onlyID)
