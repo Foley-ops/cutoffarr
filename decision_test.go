@@ -1766,6 +1766,72 @@ func TestRunRadarrDecisionEngine_CrossCheckInconclusive_WritePassBlocked(t *test
 	}
 }
 
+// TestRunWritePass_UnrecognizedCrossCheckStatus_WritePassBlocked pins the
+// half of binding mandate 1 that the "failed" and "inconclusive" tests
+// cannot reach: "(and any other status)". Those two tests are equally green
+// against the correct gate (crossCheckStatus != crossCheckStatusPassed) and
+// against a narrowed one that enumerates the two known blocking values, so
+// on their own they permit a future fourth status to fall THROUGH the gate
+// and write. That is not a hypothetical defect class in this repo — it is
+// the same one phase-3 FIX 2 had to correct in renderCrossCheckSummary,
+// where a bare `default:` rendered an unrecognized status as "passed" (see
+// the comment above that function).
+//
+// The gate is therefore stated positively: only the exact string
+// crossCheckStatusPassed opens it, and every other value — a typo in a new
+// constant, a status a later phase adds and forgets to wire in here, the
+// zero value of an unset field — blocks the pass and says so. This calls
+// runWritePass directly because that is the only way to feed it a status
+// runCrossCheck cannot currently produce.
+func TestRunWritePass_UnrecognizedCrossCheckStatus_WritePassBlocked(t *testing.T) {
+	statuses := []struct{ name, status string }{
+		{"future fourth state", "partially-verified"},
+		{"typo or case drift in a new constant", "Passed"},
+		{"zero value of an unset status field", ""},
+	}
+	for _, tc := range statuses {
+		t.Run(tc.name, func(t *testing.T) {
+			// The detail fixture matters: movie 1 is fully serveable, so a
+			// gate that let this status through would complete a real PUT
+			// and be recorded, rather than failing the fresh GET and
+			// passing this test for the wrong reason.
+			fake := newRadarrFake(t, "", map[int]string{1: monitoredMovieDetail(1, "Ungated Movie")})
+			client := NewAPIClient(fake.instance().URL, fake.instance().APIKey)
+			logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+			decisions := []movieDecision{{id: 1, title: "Ungated Movie", wouldUnmonitor: true, reason: ReasonCutoffMet, profileName: "HD-1080p"}}
+			unmonitored, writeErrors := runWritePass(context.Background(), logger, client, fake.instance(), decisions, tc.status, false)
+
+			if writes := fake.writes(); len(writes) != 0 {
+				t.Fatalf("cross-check status %q is not %q and must block every write, got %d: %+v",
+					tc.status, crossCheckStatusPassed, len(writes), writes)
+			}
+			if unmonitored != 0 || writeErrors != 0 {
+				t.Errorf("a blocked pass wrote nothing and failed at nothing; got unmonitored=%d writeErrors=%d", unmonitored, writeErrors)
+			}
+
+			out := buf.String()
+			// Blocking must be loud, and it must carry the count: an
+			// unrecognized status silently withholding writes looks exactly
+			// like a run with nothing to write.
+			if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "withheld") {
+				t.Errorf("expected a warning explaining that writes were withheld:\n%s", out)
+			}
+			if !strings.Contains(out, "withheldWrites=1") {
+				t.Errorf("expected the withheld warning to state how many writes it blocked:\n%s", out)
+			}
+			// The unrecognized status itself has to reach the log, or the
+			// operator has no way to tell which value blocked the pass.
+			if !strings.Contains(out, "crossCheck="+strconv.Quote(tc.status)) && !strings.Contains(out, "crossCheck="+tc.status) {
+				t.Errorf("expected the warning to name the status %q that blocked the pass:\n%s", tc.status, out)
+			}
+			if strings.Contains(out, "msg=unmonitor ") {
+				t.Errorf("a blocked pass must never log a completed unmonitor:\n%s", out)
+			}
+		})
+	}
+}
+
 // TestRunRadarrDecisionEngine_WriteFailure_CountedAndRunContinues pins §2.6
 // at the pass level: a rejected PUT is logged at error level, counted, and
 // never retried, and the next item is still attempted.
