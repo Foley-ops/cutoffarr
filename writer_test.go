@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -556,4 +558,262 @@ func monitoredMovieDetail(id int, title string) string {
 func libraryMovie(id int, title string, monitored, hasFile bool) string {
 	return fmt.Sprintf(`{"id": %d, "title": %q, "monitored": %t, "hasFile": %t, "qualityProfileId": 1, "tags": [], "movieFile": {"id": 1, "qualityCutoffNotMet": false}}`,
 		id, title, monitored, hasFile)
+}
+
+// --- end-to-end write behaviour through run() -----------------------------
+
+// writeTestConfig writes a config pointing at url, with dry_run set
+// explicitly (never left to the default, so each test states which mode it
+// is exercising).
+func writeTestConfig(t *testing.T, url string, dryRun bool) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := fmt.Sprintf(`
+dry_run: %t
+instances:
+  - name: radarr-main
+    type: radarr
+    url: %s
+    api_key: key1
+`, dryRun, url)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+	return path
+}
+
+// TestRun_DryRun_MakesZeroWriteRequestsAcrossTheEntireRun is the single most
+// important test in this project. It is not "no PUT was sent to the endpoint
+// we expected": the fake records every request of every method to every
+// path, and the assertion is that across a complete run — one in which the
+// decision engine really does fire, the cross-check passes, and the write
+// pass is entered and walks the full write path for two separate movies —
+// not one non-GET request was made. The would-unmonitor report lines must
+// still be there, because a dry-run whose report went quiet would be
+// indistinguishable from a run that found nothing to do.
+func TestRun_DryRun_MakesZeroWriteRequestsAcrossTheEntireRun(t *testing.T) {
+	fake := newRadarrFake(t,
+		"["+libraryMovie(1, "Would Unmonitor A", true, true)+","+libraryMovie(2, "Would Unmonitor B", true, true)+"]",
+		map[int]string{
+			1: monitoredMovieDetail(1, "Would Unmonitor A"),
+			2: monitoredMovieDetail(2, "Would Unmonitor B"),
+		})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeTestConfig(t, fake.srv.URL, true), "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("dry-run made %d write request(s) across the run, want ZERO: %+v", len(writes), writes)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, `title="Would Unmonitor A"`) || !strings.Contains(out, `title="Would Unmonitor B"`) {
+		t.Errorf("expected both would-unmonitor report lines in dry-run:\n%s", out)
+	}
+	if !strings.Contains(out, "unmonitored=0") {
+		t.Errorf("expected unmonitored=0 in the dry-run summary:\n%s", out)
+	}
+}
+
+// TestRun_DryRunForcedByFlag_MakesZeroWriteRequests pins the interaction
+// between the two switches that matter here: config says dry_run: false,
+// --dry-run forces it back on, and the run must then write nothing.
+func TestRun_DryRunForcedByFlag_MakesZeroWriteRequests(t *testing.T) {
+	fake := newRadarrFake(t,
+		"["+libraryMovie(1, "Would Unmonitor A", true, true)+"]",
+		map[int]string{1: monitoredMovieDetail(1, "Would Unmonitor A")})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeTestConfig(t, fake.srv.URL, false), "--once", "--dry-run"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("--dry-run must force zero writes even when the config disables dry-run, got %+v", writes)
+	}
+	if !strings.Contains(stdout.String(), "dry_run=true") {
+		t.Errorf("expected the startup printout to show dry-run forced on:\n%s", stdout.String())
+	}
+}
+
+// TestRun_WriteMode_OnlyID_MakesExactlyOnePutForTheNamedMovie is the Phase 4
+// acceptance criterion, run against a fake: `--once --only-id N` with
+// dry_run false writes exactly one movie — the named one — and the PUT
+// carries the fetched object back with only monitored changed.
+func TestRun_WriteMode_OnlyID_MakesExactlyOnePutForTheNamedMovie(t *testing.T) {
+	fake := newRadarrFake(t,
+		"["+libraryMovie(1, "Bystander Movie", true, true)+","+libraryMovie(2, "Chosen Movie", true, true)+"]",
+		map[int]string{
+			1: monitoredMovieDetail(1, "Bystander Movie"),
+			2: monitoredMovieDetail(2, "Chosen Movie"),
+		})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeTestConfig(t, fake.srv.URL, false), "--once", "--only-id", "2"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	writes := fake.writes()
+	if len(writes) != 1 {
+		t.Fatalf("expected exactly 1 write request across the run, got %d: %+v", len(writes), writes)
+	}
+	if writes[0].method != http.MethodPut || writes[0].path != "/api/v3/movie/2" {
+		t.Fatalf("write was %s %s, want PUT /api/v3/movie/2", writes[0].method, writes[0].path)
+	}
+
+	var sent map[string]json.RawMessage
+	if err := json.Unmarshal(writes[0].body, &sent); err != nil {
+		t.Fatalf("PUT body is not a JSON object: %v", err)
+	}
+	if string(sent["monitored"]) != "false" {
+		t.Errorf("monitored = %s in the PUT body, want false", sent["monitored"])
+	}
+	if string(sent["title"]) != `"Chosen Movie"` {
+		t.Errorf("title = %s in the PUT body, want the fetched movie's own title", sent["title"])
+	}
+	if _, present := sent["someFutureField"]; !present {
+		t.Error("the PUT body dropped a field this codebase does not model; the fetched object must go back otherwise unmodified")
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "msg=unmonitor ") || !strings.Contains(out, `title="Chosen Movie"`) {
+		t.Errorf("expected an unmonitor log line for the written movie:\n%s", out)
+	}
+	if !strings.Contains(out, "unmonitored=1") {
+		t.Errorf("expected unmonitored=1 in the summary:\n%s", out)
+	}
+	// No REPORT line may mention any other movie. Cross-check lines are a
+	// deliberate exception and are asserted on separately: --only-id scopes
+	// what is reported and written, not what is validated.
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, "msg=would-unmonitor") && !strings.Contains(line, "msg=skip") && !strings.Contains(line, "msg=unmonitor ") {
+			continue
+		}
+		if strings.Contains(line, "Bystander Movie") {
+			t.Errorf("--only-id mode produced a report line for another movie: %s", line)
+		}
+	}
+	if !strings.Contains(out, `msg=cross-check instance=radarr-main id=1 title="Bystander Movie"`) {
+		t.Errorf("expected the cross-check to still have validated the whole library, not just the target:\n%s", out)
+	}
+}
+
+// TestRun_WriteMode_CrossCheckFailure_MakesZeroWriteRequests is the
+// end-to-end version of the cross-check gate: bad data in the library stops
+// the write from ever being attempted, through the real main.go wiring, and
+// the run still exits 0.
+func TestRun_WriteMode_CrossCheckFailure_MakesZeroWriteRequests(t *testing.T) {
+	// The library says this movie's own qualityCutoffNotMet is true while
+	// the wanted/cutoff set (empty) says it is not below cutoff: a
+	// disagreement between two Radarr code paths.
+	disagreeing := `{"id": 1, "title": "Disagreeing Movie", "monitored": true, "hasFile": true, "qualityProfileId": 1, "tags": [], "movieFile": {"id": 1, "qualityCutoffNotMet": true}}`
+	fake := newRadarrFake(t, "["+disagreeing+"]", map[int]string{1: monitoredMovieDetail(1, "Disagreeing Movie")})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeTestConfig(t, fake.srv.URL, false), "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("a failed cross-check must stop every write end to end, got %+v", writes)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "crossCheck=FAILED") {
+		t.Errorf("expected the summary to state the cross-check FAILED:\n%s", out)
+	}
+	if !strings.Contains(out, "withheld") {
+		t.Errorf("expected a warning explaining writes were withheld:\n%s", out)
+	}
+}
+
+// TestRun_WriteMode_PutRejected_LogsErrorCountsItAndStillExitsZero pins
+// §2.6 end to end: a rejected write is reported and counted, the run
+// continues, and a per-item API failure is not a process failure.
+func TestRun_WriteMode_PutRejected_LogsErrorCountsItAndStillExitsZero(t *testing.T) {
+	fake := newRadarrFake(t,
+		"["+libraryMovie(1, "Rejected Movie", true, true)+"]",
+		map[int]string{1: monitoredMovieDetail(1, "Rejected Movie")})
+	fake.putStatus[1] = http.StatusConflict
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeTestConfig(t, fake.srv.URL, false), "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 even when a write is rejected; stderr=%s", code, stderr.String())
+	}
+
+	if n := len(fake.puts()); n != 1 {
+		t.Errorf("made %d PUT attempts, want exactly 1 (no retries within a cycle)", n)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "level=ERROR") || !strings.Contains(out, "Rejected Movie") {
+		t.Errorf("expected an error-level log naming the rejected write:\n%s", out)
+	}
+	if !strings.Contains(out, "writeErrors=1") || !strings.Contains(out, "unmonitored=0") {
+		t.Errorf("expected writeErrors=1 and unmonitored=0 in the summary:\n%s", out)
+	}
+}
+
+// TestRun_OnlyID_UnknownMovie_WarnsAndWritesNothing covers the id the human
+// mistypes: nothing is written, the id is named, and the run still exits 0.
+func TestRun_OnlyID_UnknownMovie_WarnsAndWritesNothing(t *testing.T) {
+	fake := newRadarrFake(t,
+		"["+libraryMovie(1, "The Only Movie", true, true)+"]",
+		map[int]string{1: monitoredMovieDetail(1, "The Only Movie")})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeTestConfig(t, fake.srv.URL, false), "--once", "--only-id", "4242"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("an unknown --only-id must write nothing, got %+v", writes)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "4242") {
+		t.Errorf("expected a warning naming the id that was not found:\n%s", out)
+	}
+	if strings.Contains(out, "msg=would-unmonitor") || strings.Contains(out, "msg=skip") {
+		t.Errorf("an unknown --only-id must produce no decisions:\n%s", out)
+	}
+}
+
+// TestRun_WriteMode_SonarrInstanceIsNeverWritten pins the phase boundary:
+// Sonarr writes arrive in Phase 7, so a sonarr instance must still be
+// connectivity-only even with dry_run false and a movie id named.
+func TestRun_WriteMode_SonarrInstanceIsNeverWritten(t *testing.T) {
+	fake := newRadarrFake(t,
+		"["+libraryMovie(1, "Some Movie", true, true)+"]",
+		map[int]string{1: monitoredMovieDetail(1, "Some Movie")})
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := fmt.Sprintf(`
+dry_run: false
+instances:
+  - name: sonarr-main
+    type: sonarr
+    url: %s
+    api_key: key1
+`, fake.srv.URL)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once", "--only-id", "1"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("a sonarr instance must never be written in this phase, got %+v", writes)
+	}
 }
