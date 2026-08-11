@@ -1722,6 +1722,13 @@ func TestRunRadarrDecisionEngine_CrossCheckFailed_WritePassBlocked(t *testing.T)
 	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "withheld") {
 		t.Errorf("expected a warning explaining that writes were withheld:\n%s", out)
 	}
+	// The count makes the warning unambiguous: "the gate blocked 1 write"
+	// reads very differently from "the gate blocked, but there was nothing
+	// to write anyway", and the human deciding whether to investigate needs
+	// to know which one happened.
+	if !strings.Contains(out, "withheldWrites=1") {
+		t.Errorf("expected the withheld warning to state how many writes it blocked:\n%s", out)
+	}
 	if !strings.Contains(out, "unmonitored=0") {
 		t.Errorf("expected unmonitored=0:\n%s", out)
 	}
@@ -2036,5 +2043,55 @@ func TestRunRadarrDecisionEngine_OnlyID_SummaryNamesTheScope(t *testing.T) {
 	}
 	if !strings.Contains(out, "totalMonitored=1") {
 		t.Errorf("expected totalMonitored=1 (only the target was reported):\n%s", out)
+	}
+}
+
+// TestRunRadarrDecisionEngine_CrossCheckBlockedWithNothingToWrite_SaysSoPlainly
+// is the other half of that: when the gate blocks a pass that had no
+// candidates anyway, the warning must say zero rather than leave the reader
+// to assume writes were lost.
+func TestRunRadarrDecisionEngine_CrossCheckBlockedWithNothingToWrite_SaysSoPlainly(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{})
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	// A skip decision whose qualityCutoffNotMet is absent: it is a
+	// cross-check candidate (monitored + hasFile), so the cross-check is
+	// inconclusive, but it is not a would-unmonitor item.
+	movies := []movieListElement{{
+		ID: intPtr(1), Title: strPtr("In Wanted Set Movie"), Monitored: boolPtr(true), HasFile: boolPtr(true),
+		QualityProfileID: intPtr(1), Tags: &noTags,
+		MovieFile: &movieFileElement{ID: intPtr(1)},
+	}}
+
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{1: true}, "cutoffarr-exclude", 0, false)
+
+	out := buf.String()
+	if !strings.Contains(out, "withheldWrites=0") {
+		t.Errorf("expected the withheld warning to state that it blocked zero writes:\n%s", out)
+	}
+}
+
+// TestRunRadarrDecisionEngine_OnlyID_TargetNotMonitored_MessageNamesTheActualCause
+// keeps the no-op explanation accurate: reaching it means the target was
+// found in the library, so the only thing that can have excluded it is rule
+// 1. Naming a cause that cannot apply would send the reader looking for a
+// data problem that is not there.
+func TestRunRadarrDecisionEngine_OnlyID_TargetNotMonitored_MessageNamesTheActualCause(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{})
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	movies := []movieListElement{
+		{ID: intPtr(2), Title: strPtr("Unmonitored Target"), Monitored: boolPtr(false), HasFile: boolPtr(true),
+			QualityProfileID: intPtr(1), Tags: &noTags},
+	}
+
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 2, false)
+
+	out := buf.String()
+	if !strings.Contains(out, "not monitored") {
+		t.Errorf("expected the no-op explanation to name rule 1 as the cause:\n%s", out)
+	}
+	if strings.Contains(out, "id field was absent") {
+		t.Errorf("the message names a cause that cannot apply here (the target was found by id):\n%s", out)
 	}
 }

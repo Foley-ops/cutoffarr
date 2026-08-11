@@ -468,12 +468,16 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		}
 	}
 
-	// The movie is in the library (checked above) but produced no decision:
-	// rule 1 excluded it (monitored is false or absent) or it had no id.
-	// Without this, --only-id on such a movie would print nothing at all
-	// about the one movie the human explicitly named.
+	// The movie is in the library — that was established before any of this
+	// ran, and matching it there required a non-nil id — so the only thing
+	// that can have kept it out of the report is rule 1: monitored is false,
+	// or the key was absent entirely (warned about separately above). Naming
+	// any other cause here would send the reader hunting for a data problem
+	// that cannot be the explanation. Without this line, --only-id on such a
+	// movie would say nothing whatsoever about the one movie the human
+	// explicitly named.
 	if onlyID != 0 && len(reported) == 0 {
-		logger.Info("--only-id movie produced no decision: it is not monitored, or its id field was absent",
+		logger.Info("--only-id movie produced no decision: it is not monitored, so rule 1 excludes it from the report",
 			"instance", inst.Name, "type", inst.Type, "onlyId", onlyID)
 	}
 
@@ -529,8 +533,19 @@ func libraryContainsID(movies []movieListElement, id int) bool {
 // the pass moves to the next item and never retries.
 func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, decisions []movieDecision, crossCheckStatus string, dryRun bool) (unmonitored, writeErrors int) {
 	if crossCheckStatus != crossCheckStatusPassed {
+		// The count is what makes this warning actionable: "the gate blocked
+		// 12 writes" and "the gate blocked, but there was nothing to write
+		// anyway" are very different situations, and without a number they
+		// produce identical log lines.
+		withheld := 0
+		for _, d := range decisions {
+			if d.wouldUnmonitor {
+				withheld++
+			}
+		}
 		logger.Warn("writes withheld for this instance: the cross-check did not pass",
-			"instance", inst.Name, "type", inst.Type, "crossCheck", crossCheckStatus, "dryRun", dryRun)
+			"instance", inst.Name, "type", inst.Type, "crossCheck", crossCheckStatus,
+			"withheldWrites", withheld, "dryRun", dryRun)
 		return 0, 0
 	}
 
