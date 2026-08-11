@@ -454,7 +454,17 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 			// at info they stay as invisible as before, but the debug line
 			// and the counter make a second, no-op run of this project
 			// provable rather than merely quiet.
-			if m.Monitored != nil && !*m.Monitored {
+			//
+			// REVIEW FIX (Phase 5 round 2): the onlyID scope test mirrors
+			// the one the --only-id narrowing block below applies to every
+			// other counter (totalMonitored, wouldUnmonitor, unmonitored).
+			// Without it, this counter and its debug line were populated
+			// library-wide even during a --only-id run — the summary's one
+			// remaining number not scoped to the movie the human named —
+			// and a targeted run against a large library would additionally
+			// emit one debug line per already-unmonitored movie in the
+			// entire library, not just the target.
+			if m.Monitored != nil && !*m.Monitored && (onlyID == 0 || (m.ID != nil && *m.ID == onlyID)) {
 				alreadyUnmonitoredCount++
 				logger.Debug("already unmonitored",
 					"id", derefOrAbsent(m.ID), "title", titleOrAbsent(m.Title), "instance", inst.Name)
@@ -510,7 +520,7 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	cc := runCrossCheck(logger, inst, decisions, wantedIDs)
 	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
 
-	unmonitoredCount, writeErrorCount, echoUnverifiedCount := runWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun)
+	unmonitoredCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount := runWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun)
 
 	attrs := []any{"instance", inst.Name, "type", inst.Type}
 	if onlyID != 0 {
@@ -541,6 +551,18 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	} else {
 		attrs = append(attrs, "writeErrors", writeErrorCount, "writeEchoUnverified", echoUnverifiedCount)
 	}
+
+	// writesRefused counts a fourth, mode-independent outcome (see
+	// runWritePass's doc comment): would-unmonitor decisions the pre-write
+	// exclusion-tag re-check refused before any request could fail or
+	// succeed. Unlike writeErrors/writeEchoUnverified it is not split by
+	// dryRun — the re-check runs identically in both modes, well before the
+	// dry-run gate, so "this write would be refused" is exactly as true and
+	// exactly as worth reporting during a rehearsal as during a real write.
+	// Always present, including as 0, for the same reason writeEchoUnverified
+	// is always present in write mode: its absence must never be mistaken for
+	// "nothing to refuse".
+	attrs = append(attrs, "writesRefused", writesRefusedCount)
 
 	attrs = append(attrs, "skipReasons", formatSkipCounts(skipCounts), "crossCheck", crossCheckSummary)
 	logger.Info("radarr decision summary", attrs...)
@@ -589,7 +611,7 @@ func libraryContainsID(movies []movieListElement, id int) bool {
 // Per §2.6 a failed write is logged, counted, and abandoned for the cycle —
 // the pass moves to the next item and never retries.
 //
-// Three outcomes are counted, not two, because a PUT has three meaningfully
+// Four outcomes are counted, not two, because a PUT has four meaningfully
 // different endings and only two of them are the ones people expect:
 //
 //   - confirmed (unmonitored): the server accepted the write AND its echo
@@ -601,6 +623,20 @@ func libraryContainsID(movies []movieListElement, id int) bool {
 //     settle the question — empty, not an object, no "monitored" key. The
 //     change probably DID happen and cannot be proven, which is neither of
 //     the above and must not be reported as either.
+//   - refused before any request was sent (writesRefused): unmonitorMovie's
+//     own pre-write exclusion-tag re-check refused to proceed — either
+//     because the fresh payload confirms the exclusion tag is now present
+//     (errExcludedAtWrite), or because its tags could not be trusted at all
+//     (errTagsUnverifiable). REVIEW FIX (Phase 5 round 2): these three
+//     refusal branches used to return (false, nil) and go completely
+//     uncounted, so an instance where the exclusion tag is active and every
+//     fresh fetch is refused could report wouldUnmonitor=N against
+//     unmonitored=0, writeErrors=0, writeEchoUnverified=0 — every counter on
+//     the summary line zero, with nothing explaining where N promised writes
+//     went. It is neither a failed write (no PUT was ever sent, so nothing
+//     Radarr did can have failed) nor a no-op (a no-op is "nothing needed
+//     doing"; this is "something needed doing and the safety check said no")
+//     and so gets its own name rather than being folded into either.
 //
 // exclusionTagID and tagActive are threaded straight through to
 // unmonitorMovie's own pre-write re-check (Phase 5, mandated write-path
@@ -608,7 +644,7 @@ func libraryContainsID(movies []movieListElement, id int) bool {
 // and §2.5 says the exclusion tag always wins, in every mode — including a
 // tag added to a movie after it was evaluated but before the write pass
 // reached it.
-func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, decisions []movieDecision, cc crossCheckResult, exclusionTagID int, tagActive bool, dryRun bool) (unmonitored, writeErrors, echoUnverified int) {
+func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, decisions []movieDecision, cc crossCheckResult, exclusionTagID int, tagActive bool, dryRun bool) (unmonitored, writeErrors, echoUnverified, writesRefused int) {
 	// The count is what makes the warnings below actionable: "the gate
 	// blocked 12 writes" and "the gate blocked, but there was nothing to
 	// write anyway" are very different situations, and without a number they
@@ -637,7 +673,7 @@ func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, i
 		} else {
 			logger.Info(msg, attrs...)
 		}
-		return 0, 0, 0
+		return 0, 0, 0, 0
 	}
 
 	// The gate opened, but "opened" is not the same as "the sample was
@@ -671,6 +707,19 @@ func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, i
 		}
 
 		written, err := unmonitorMovie(ctx, logger, client, inst, d.id, exclusionTagID, tagActive, dryRun)
+		if errors.Is(err, errExcludedAtWrite) || errors.Is(err, errTagsUnverifiable) {
+			// unmonitorMovie already logged the specific reason (the
+			// exclusion tag is now present, or its tags could not be
+			// trusted) at the point it refused; nothing more to log here.
+			// This is not a write failure (no PUT was ever sent — the
+			// re-check runs before that, in both modes) and not a no-op
+			// (unlike the already-unmonitored and dry-run-withheld cases,
+			// something DID need doing here), so it gets counted under its
+			// own name instead of falling into writeErrors or vanishing
+			// through the `!written` no-op branch below.
+			writesRefused++
+			continue
+		}
 		if errors.Is(err, errWriteUnverified) {
 			// The server took the write and told us nothing useful about it.
 			// Calling this a failed write would state two things that are
@@ -717,7 +766,7 @@ func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, i
 			"id", d.id, "title", d.title, "reason", d.reason, "profile", d.profileName, "instance", inst.Name)
 	}
 
-	return unmonitored, writeErrors, echoUnverified
+	return unmonitored, writeErrors, echoUnverified, writesRefused
 }
 
 // writeGateBlockReason decides whether the cross-check authorizes this

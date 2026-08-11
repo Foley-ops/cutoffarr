@@ -302,9 +302,19 @@ func TestUnmonitorMovie_WriteMode_PreservesLargeIntegersExactly(t *testing.T) {
 // fix) --------------------------------------------------------------------
 //
 // The scan that produced a would-unmonitor decision may be minutes old, and
-// §2.5 says the exclusion tag always wins, in every mode. These three tests
-// pin the write path's own re-check of the FRESH pre-write fetch's tags,
+// §2.5 says the exclusion tag always wins, in every mode. These tests pin
+// the write path's own re-check of the FRESH pre-write fetch's tags,
 // independent of whatever the scan-time decision believed.
+//
+// Every refusal branch below returns a non-nil error wrapping a sentinel
+// (errExcludedAtWrite or errTagsUnverifiable, both declared in writer.go) —
+// not (false, nil) — precisely so runWritePass can tell a pre-write tag
+// refusal apart from every other reason a would-unmonitor decision produced
+// no write, and count it (REVIEW FIX, Phase 5 round 2: the three refusals
+// below used to be invisible in the "radarr decision summary" line; see
+// TestRunRadarrDecisionEngine_ExclusionTagAddedBetweenScanAndWrite_RefusesTheWrite
+// and the writesRefused tests in decision_test.go for the counted,
+// end-to-end half of this fix).
 
 // TestUnmonitorMovie_FreshPayloadCarriesExclusionTag_RefusesToWriteWithDistinctReason
 // is the core case: the tag was added to this movie after the scan that
@@ -322,8 +332,8 @@ func TestUnmonitorMovie_FreshPayloadCarriesExclusionTag_RefusesToWriteWithDistin
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 9, true, false)
-	if err != nil {
-		t.Fatalf("unmonitorMovie returned error: %v\n%s", err, buf.String())
+	if !errors.Is(err, errExcludedAtWrite) {
+		t.Fatalf("unmonitorMovie error = %v, want errExcludedAtWrite so runWritePass can count this refusal:\n%s", err, buf.String())
 	}
 	if written {
 		t.Error("written = true, want false: the exclusion tag must always win, even when discovered at write time")
@@ -344,7 +354,7 @@ func TestUnmonitorMovie_FreshPayloadCarriesExclusionTag_RefusesToWriteWithDistin
 }
 
 // TestUnmonitorMovie_FreshPayloadTagsAbsent_TagActive_RefusesToWriteWithWarn
-// is the untrusted-input half: "tags" entirely missing from the fresh
+// is the first untrusted-input case: "tags" entirely missing from the fresh
 // pre-write fetch (as opposed to present-but-empty) means our assumed field
 // name may not match this Radarr version, and — consistent with the
 // decision-side rule 4 treatment of the same absence (decision.go FIX 1) —
@@ -360,8 +370,8 @@ func TestUnmonitorMovie_FreshPayloadTagsAbsent_TagActive_RefusesToWriteWithWarn(
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 9, true, false)
-	if err != nil {
-		t.Fatalf("unmonitorMovie returned error: %v\n%s", err, buf.String())
+	if !errors.Is(err, errTagsUnverifiable) {
+		t.Fatalf("unmonitorMovie error = %v, want errTagsUnverifiable so runWritePass can count this refusal:\n%s", err, buf.String())
 	}
 	if written {
 		t.Error("written = true, want false")
@@ -372,6 +382,105 @@ func TestUnmonitorMovie_FreshPayloadTagsAbsent_TagActive_RefusesToWriteWithWarn(
 	out := buf.String()
 	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "tags") {
 		t.Errorf("expected a warning explaining the write was refused because tags could not be verified:\n%s", out)
+	}
+}
+
+// TestUnmonitorMovie_FreshPayloadTagsNull_TagActive_RefusesToWriteWithWarn is
+// the second untrusted-input case, and the one the review round found this
+// re-check originally got wrong: "tags": null decodes successfully (nil
+// error) into a nil []int with NO error, so a check that only asked "did the
+// key decode without error" would treat null as "present and empty" and let
+// the write proceed. The decision side treats the identical wire shape as
+// untrusted input — movieListElement.Tags is *[]int (radarr.go), so "tags":
+// null leaves m.Tags == nil and decision.go rule 4 returns ReasonTagsUnknown
+// — so this re-check must refuse here too, exactly like the tags-absent case
+// above, not silently fall through to "no exclusion tag found".
+func TestUnmonitorMovie_FreshPayloadTagsNull_TagActive_RefusesToWriteWithWarn(t *testing.T) {
+	body := `{"id": 7, "title": "Null Tags", "monitored": true, "tags": null}`
+	srv, got := writerTestServer(t, body, http.StatusOK)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := writerTestInstance(srv.URL)
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 9, true, false)
+	if !errors.Is(err, errTagsUnverifiable) {
+		t.Fatalf("unmonitorMovie error = %v, want errTagsUnverifiable: a JSON null tags value must be treated the same as an absent tags key, not as \"present and empty\":\n%s", err, buf.String())
+	}
+	if written {
+		t.Error("written = true, want false: a JSON null tags value must never authorize a write when the exclusion tag is active")
+	}
+	if len(filterRequests(*got, http.MethodPut)) != 0 {
+		t.Errorf("expected zero PUTs when tags is JSON null, got %+v", *got)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "tags") {
+		t.Errorf("expected a warning explaining the write was refused because tags could not be verified:\n%s", out)
+	}
+}
+
+// TestUnmonitorMovie_FreshPayloadTagsMalformed_TagActive_RefusesToWriteWithWarn
+// is the third untrusted-input case: "tags" present but not a JSON array of
+// ids at all (e.g. the field renamed to an object in some future Radarr
+// version). json.Unmarshal into []int fails outright here, unlike the null
+// case, but the outcome must be the same refusal, for the same reason.
+func TestUnmonitorMovie_FreshPayloadTagsMalformed_TagActive_RefusesToWriteWithWarn(t *testing.T) {
+	body := `{"id": 7, "title": "Malformed Tags", "monitored": true, "tags": {"unexpected": "shape"}}`
+	srv, got := writerTestServer(t, body, http.StatusOK)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := writerTestInstance(srv.URL)
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 9, true, false)
+	if !errors.Is(err, errTagsUnverifiable) {
+		t.Fatalf("unmonitorMovie error = %v, want errTagsUnverifiable:\n%s", err, buf.String())
+	}
+	if written {
+		t.Error("written = true, want false")
+	}
+	if len(filterRequests(*got, http.MethodPut)) != 0 {
+		t.Errorf("expected zero PUTs when tags is not a JSON array of ids, got %+v", *got)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "tags") {
+		t.Errorf("expected a warning explaining the write was refused because tags could not be verified:\n%s", out)
+	}
+}
+
+// TestUnmonitorMovie_TagActive_TagsPresentButNotExcluded_WritesNormally is
+// the mirror the review round found missing: every other tagActive=true test
+// in this suite proves a refusal, and none proves the re-check PERMITTING a
+// write. Without this, a bug that made the re-check refuse unconditionally
+// whenever tagActive is true (e.g. containsIntID inverted, or the
+// `if containsIntID(...)` block's early return escaping unconditionally)
+// would sail through every test in this file undetected, because nothing
+// here would ever expect a PUT while tagActive is true. This is the
+// production-shaped case: the exclusion tag IS defined and active in the
+// instance, the fresh payload DOES carry tags, and none of them is the
+// exclusion tag id — so the write must proceed exactly as if the tag were
+// inactive.
+func TestUnmonitorMovie_TagActive_TagsPresentButNotExcluded_WritesNormally(t *testing.T) {
+	body := `{"id": 7, "title": "Untagged", "monitored": true, "tags": [3]}`
+	srv, got := writerTestServer(t, body, http.StatusOK)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := writerTestInstance(srv.URL)
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 9, true, false)
+	if err != nil {
+		t.Fatalf("unmonitorMovie returned error: %v\n%s", err, buf.String())
+	}
+	if !written {
+		t.Errorf("written = false, want true: tags are present and verifiable and none of them is the exclusion tag, so the write must proceed:\n%s", buf.String())
+	}
+	puts := filterRequests(*got, http.MethodPut)
+	if len(puts) != 1 {
+		t.Fatalf("expected exactly 1 PUT, got %d: %+v", len(puts), *got)
 	}
 }
 
@@ -1926,6 +2035,18 @@ func TestRun_WriteMode_SecondRun_IsANoOp(t *testing.T) {
 		wouldUnmonitorStatefulMovie(2, "Would Unmonitor B"),
 		wouldUnmonitorStatefulMovie(3, "Would Unmonitor C"),
 	})
+	// REVIEW FIX (Phase 5 round 2): newStatefulRadarrFake defaults tagsJSON
+	// to decisionEngineNoTagsJSON ("[]"), which makes resolveExclusionTagID
+	// return tagActive=false — the mandated pre-write exclusion-tag re-check
+	// (writer.go's `if tagActive` block) is then dead code as far as this,
+	// the phase's own centerpiece acceptance test, is concerned. Defining
+	// the exclusion tag here (matching the config default this test relies
+	// on — writeNoOpTestConfig sets no exclusion_tag, so config.go defaults
+	// it to "cutoffarr-exclude") makes tagActive=true for real, exercising
+	// the production-shaped configuration. The 3 writes below must still
+	// happen: every movie's tags (empty, from wouldUnmonitorStatefulMovie)
+	// legitimately does not carry the exclusion tag.
+	fake.tagsJSON = `[{"id": 42, "label": "cutoffarr-exclude"}]`
 	configPath := writeNoOpTestConfig(t, fake.srv.URL, false, "debug")
 
 	// --- Run 1: the first cycle actually writes the three candidates. ---
