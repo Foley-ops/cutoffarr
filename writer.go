@@ -57,20 +57,54 @@ func moviePath(movieID int) string {
 //     on an object we are handing straight back to Radarr as authoritative.
 //
 //  3. Refuse to write anything we do not fully recognize: the "monitored"
-//     key must actually be present (otherwise our assumed field name may be
-//     wrong for this Radarr version, and setting it would ADD a key rather
-//     than change one), and the returned object's id must be the id we
-//     asked for (guarding against a proxy, redirect, or cache handing back
-//     a different movie — writing monitored:false onto the wrong movie is
-//     precisely the mistake this project must never make). §2.6: never
-//     guess.
+//     key must be present AND readable as a boolean (otherwise our assumed
+//     field name may be wrong for this Radarr version and setting it would
+//     ADD a key rather than change one — and a JSON null, which decodes into
+//     a plain bool as false with no error at all, would let step 5 below
+//     state an observation about the movie that was never made), and the
+//     returned object's id must be the id we asked for (guarding against a
+//     proxy, redirect, or cache handing back a different movie — writing
+//     monitored:false onto the wrong movie is precisely the mistake this
+//     project must never make). §2.6: never guess. The "monitored" branches
+//     wrap errMonitoredUnverifiable so the caller counts them as the
+//     refusals they are (writesRefused) rather than as failed writes; the
+//     identity check is fatal for this item on its own terms.
 //
-//  4. Skip the write entirely if the fresh object is already unmonitored.
+//  4. Re-check the exclusion tag against this SAME fresh object (Phase 5,
+//     mandated write-path safety fix). exclusionTagID/tagActive are the
+//     same values the decision engine resolved once per instance and used
+//     to evaluate this movie originally, but the scan that produced that
+//     decision may be minutes old, and §2.5 says the exclusion tag always
+//     wins, in every mode. A tag added to this movie between the scan and
+//     the write pass must still stop the write here — the decision that
+//     said would-unmonitor was correct when it was made; it is this
+//     re-check, not that decision, that is responsible for catching a tag
+//     added since. Consistent with decision.go rule 4's own handling of the
+//     same field: "tags" entirely absent from the fresh object, present but
+//     not a JSON array of ids, or present as the JSON literal null (which
+//     decodes to a nil slice with no decode error — the shape a check that
+//     only asked "did decoding succeed" would silently treat as "present and
+//     empty") are all untrusted input, not evidence the tag is absent, and
+//     refuse the write with a warning rather than guessing. Every refusal
+//     here — untrusted tags or a confirmed exclusion tag — returns a non-nil
+//     error wrapping errTagsUnverifiable or errExcludedAtWrite rather than
+//     (false, nil), so runWritePass can count it (writesRefused) instead of
+//     letting it vanish silently from the summary.
+//
+//  5. Skip the write entirely if the fresh object is already unmonitored.
 //     This is the scan-to-write race (something else unmonitored it in the
 //     meantime), and §2.4's spirit is to change exactly one thing, only
-//     when it needs changing.
+//     when it needs changing. The fresh payload's "monitored" value is
+//     decoded into a *bool, not a bool, for the same reason step 4's tags
+//     re-check is: json.Unmarshal("null", &aBool) succeeds with the field
+//     left false, indistinguishable from a genuine monitored:false, which
+//     would make this branch claim an observation ("already unmonitored")
+//     that was never actually made. Like step 4's refusals, this returns a
+//     non-nil error wrapping errAlreadyUnmonitoredAtWrite rather than
+//     (false, nil), so runWritePass can count the race (writesRefused)
+//     instead of it vanishing into an unexplained gap in the summary.
 //
-//  5. Check dryRun as the LAST thing before the HTTP call (§2.1: "Every
+//  6. Check dryRun as the LAST thing before the HTTP call (§2.1: "Every
 //     write code path must check the dry-run flag immediately before the
 //     HTTP write call, not just at startup"). Everything above this line
 //     runs identically in both modes, which is what makes a dry-run a real
@@ -78,10 +112,12 @@ func moviePath(movieID int) string {
 //     claims to be one. It also means the steps above can fail in dry-run;
 //     the caller reports those as rehearsal failures, never as write ones.
 //
-//  6. Believe the server, not the status code: the returned object must
-//     itself say monitored is false before the write counts as done. A 2xx
-//     alone is not proof — see verifyWriteEcho. When the server accepts the
-//     write but says nothing that confirms it, the error wraps
+//  7. Believe the server, not the status code: the returned object must be
+//     this movie and must itself say monitored is false before the write
+//     counts as done. A 2xx alone is not proof — see verifyWriteEcho, which
+//     applies step 3's identity check to the echo for the same reason it
+//     exists on the fetch. When the server accepts the write but says
+//     nothing that confirms it, the error wraps
 //     errWriteUnverified so the caller can report "accepted, unconfirmed"
 //     rather than "failed"; written is false either way, because only a
 //     confirmed change may be counted as one.
@@ -89,7 +125,7 @@ func moviePath(movieID int) string {
 // Errors are returned, never retried (§2.6: "Never retry writes
 // automatically within a cycle"); the caller logs them and moves to the
 // next item.
-func unmonitorMovie(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, movieID int, dryRun bool) (written bool, err error) {
+func unmonitorMovie(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, movieID, exclusionTagID int, tagActive bool, dryRun bool) (written bool, err error) {
 	path := moviePath(movieID)
 
 	body, err := fetchBody(ctx, client, path, nil)
@@ -106,18 +142,110 @@ func unmonitorMovie(ctx context.Context, logger *slog.Logger, client *APIClient,
 		return false, err
 	}
 
+	title := titleFromPayload(payload)
+
+	// Step 4: the exclusion tag always wins, in every mode (§2.5) — checked
+	// here, against the FRESH payload's own tags, not against the decision
+	// made from the (possibly stale) library scan. Only evaluated when the
+	// tag is actually active in this instance; when it is not, rule 4 is
+	// vacuous regardless of tags, same as the decision engine's own rule 4.
+	//
+	// Every branch below returns a non-nil error wrapping a sentinel
+	// (errTagsUnverifiable for the two untrusted-input shapes, or
+	// errExcludedAtWrite for a confirmed exclusion tag) rather than (false,
+	// nil) — REVIEW FIX, Phase 5 round 2: runWritePass needs to tell "this
+	// would-unmonitor decision produced no write because the pre-write tag
+	// re-check refused it" apart from every other reason, and count it in
+	// the summary (writesRefused), the same way it already distinguishes an
+	// unverified echo from a rejected write. A plain (false, nil) here was
+	// indistinguishable, in the summary, from a run that fetched nothing at
+	// all.
+	if tagActive {
+		rawTags, tagsPresent := payload["tags"]
+		if !tagsPresent {
+			logger.Warn("movie tags absent from the pre-write fetch; cannot verify the exclusion tag is not present, refusing to write",
+				"instance", inst.Name, "type", inst.Type, "id", movieID, "title", title)
+			return false, fmt.Errorf("movie %d: %w: %q key absent from the pre-write fetch", movieID, errTagsUnverifiable, "tags")
+		}
+		var tags []int
+		if err := json.Unmarshal(rawTags, &tags); err != nil {
+			logger.Warn("movie tags in the pre-write fetch are not a JSON array of ids; cannot verify the exclusion tag is not present, refusing to write",
+				"instance", inst.Name, "type", inst.Type, "id", movieID, "title", title, "error", err)
+			return false, fmt.Errorf("movie %d: %w: %q is not a JSON array of ids in the pre-write fetch: %v", movieID, errTagsUnverifiable, "tags", err)
+		}
+		// tags == nil here means the fresh payload's "tags" key held the
+		// JSON literal null: json.Unmarshal decodes that into a nil []int
+		// with NO error (distinct from "[]", which decodes to a non-nil,
+		// empty slice), so the tagsPresent/decode-error guards above do not
+		// catch it. Left unchecked, containsIntID(nil, exclusionTagID) is
+		// simply false and the write proceeds with the exclusion tag's
+		// status genuinely unknown — the exact outcome this whole re-check
+		// exists to prevent. The decision side treats the identical wire
+		// shape as untrusted input for the same reason: movieListElement.Tags
+		// is *[]int (radarr.go), so "tags": null leaves m.Tags == nil and
+		// decision.go rule 4 returns ReasonTagsUnknown rather than passing.
+		if tags == nil {
+			logger.Warn("movie tags in the pre-write fetch is JSON null; cannot verify the exclusion tag is not present, refusing to write",
+				"instance", inst.Name, "type", inst.Type, "id", movieID, "title", title)
+			return false, fmt.Errorf("movie %d: %w: %q is JSON null in the pre-write fetch", movieID, errTagsUnverifiable, "tags")
+		}
+		if containsIntID(tags, exclusionTagID) {
+			logger.Info("movie carries the exclusion tag as of the pre-write fetch, skipping write",
+				"instance", inst.Name, "type", inst.Type, "id", movieID, "title", title, "reason", ReasonExcludedByTag)
+			return false, fmt.Errorf("movie %d: %w", movieID, errExcludedAtWrite)
+		}
+	}
+
+	// The three branches below are one class: the fresh payload's own
+	// "monitored" could not be read, so nothing is known about the field this
+	// write path exists to change. Each warns in its own words and each returns
+	// an error wrapping errMonitoredUnverifiable — REVIEW FIX (Phase 5 final
+	// round): they used to be bare errors, which runWritePass could only
+	// classify as failed WRITES, printing "unmonitor write failed" at ERROR and
+	// writeErrors=N about a movie no PUT was ever sent for. They are refusals,
+	// the same class as the untrusted-input "tags" branches above, and are
+	// counted as such (writesRefused).
 	rawMonitored, present := payload[monitoredKey]
 	if !present {
-		return false, fmt.Errorf("movie %d: %q is absent from the pre-write fetch; refusing to write a field this Radarr may not have", movieID, monitoredKey)
+		logger.Warn("movie monitored field absent from the pre-write fetch; this Radarr may not have the field at all, refusing to write",
+			"instance", inst.Name, "type", inst.Type, "id", movieID, "title", title)
+		return false, fmt.Errorf("movie %d: %w: %q key absent from the pre-write fetch; refusing to write a field this Radarr may not have", movieID, errMonitoredUnverifiable, monitoredKey)
 	}
-	var monitored bool
-	if err := json.Unmarshal(rawMonitored, &monitored); err != nil {
-		return false, fmt.Errorf("movie %d: %q is not a boolean in the pre-write fetch (%s): %w", movieID, monitoredKey, rawMonitored, err)
+	// Decode into *bool, not bool: this is the same JSON-null trap the fresh
+	// payload's "tags" field has above, landing on the one field the entire
+	// write path pivots on. json.Unmarshal([]byte("null"), &monitored) (a
+	// plain bool) returns a NIL error and leaves monitored == false — visually
+	// identical to a genuine monitored:false — so the "already unmonitored,
+	// skip" branch immediately below would make a factual claim about the
+	// movie's state ("it is unmonitored") that was never actually observed,
+	// and the movie would never be unmonitored on any future cycle either. A
+	// *bool round-trips null to a nil pointer, with no decode error, so it can
+	// be told apart from both "false" (a non-nil pointer to false) and a
+	// genuinely non-boolean value (a decode error, unchanged from before).
+	var monitoredPtr *bool
+	if err := json.Unmarshal(rawMonitored, &monitoredPtr); err != nil {
+		logger.Warn("movie monitored field in the pre-write fetch is not a boolean; cannot tell whether the movie is monitored, refusing to write",
+			"instance", inst.Name, "type", inst.Type, "id", movieID, "title", title, "error", err)
+		return false, fmt.Errorf("movie %d: %w: %q is not a boolean in the pre-write fetch (%s): %v", movieID, errMonitoredUnverifiable, monitoredKey, rawMonitored, err)
 	}
-	if !monitored {
+	if monitoredPtr == nil {
+		logger.Warn("movie monitored field in the pre-write fetch is JSON null; cannot tell whether the movie is monitored, refusing to write",
+			"instance", inst.Name, "type", inst.Type, "id", movieID, "title", title)
+		return false, fmt.Errorf("movie %d: %w: %q is JSON null in the pre-write fetch; refusing to write a field whose value cannot be trusted", movieID, errMonitoredUnverifiable, monitoredKey)
+	}
+	if !*monitoredPtr {
 		logger.Info("already unmonitored, skipping write",
-			"instance", inst.Name, "type", inst.Type, "id", movieID)
-		return false, nil
+			"instance", inst.Name, "type", inst.Type, "id", movieID, "title", title)
+		// REVIEW FIX (Phase 5 round 4): this used to be (false, nil), the same
+		// shape as "nothing needed doing" everywhere else in this function —
+		// but runWritePass's `if !written { continue }` branch counts nothing
+		// for that shape, so an instance where every candidate loses this race
+		// reported every counter on the summary line as zero, with nothing
+		// explaining where the promised writes went (the same gap
+		// errExcludedAtWrite/errTagsUnverifiable/writesRefused closed for the
+		// pre-write tag re-check, one review round earlier). Wrapping a
+		// sentinel here lets runWritePass count this race as the refusal it is.
+		return false, fmt.Errorf("movie %d: %w", movieID, errAlreadyUnmonitoredAtWrite)
 	}
 
 	// The single mutation. Every other key in payload still holds the exact
@@ -186,14 +314,109 @@ func unmonitorMovie(ctx context.Context, logger *slog.Logger, client *APIClient,
 // us the movie is still monitored — and it stays a write error.
 var errWriteUnverified = errors.New("the server accepted the write but did not confirm the change")
 
-// verifyWriteEcho confirms the object the server returned from the PUT
-// really does carry monitored:false. Anything else — a body that is not a
-// JSON object, no monitored key, a non-boolean value, or true — means the
-// write is unconfirmed, and the error carries the status plus a bounded
-// snippet of what actually came back so the log says what was seen rather
-// than only what was expected.
+// errExcludedAtWrite marks the pre-write exclusion-tag re-check finding the
+// exclusion tag actually present on the fresh payload (Phase 5, mandated
+// write-path safety fix): §2.5 says the tag always wins, in every mode, so
+// this is a confirmed, correct refusal to write — not a failure of anything
+// — but it must still be distinguishable from every other reason a
+// would-unmonitor decision produced no write, so runWritePass can count it
+// (writesRefused) rather than let it vanish into an unexplained gap between
+// wouldUnmonitor and unmonitored+writeErrors+writeEchoUnverified.
+var errExcludedAtWrite = errors.New("movie carries the exclusion tag as of the pre-write fetch")
+
+// errTagsUnverifiable marks the pre-write exclusion-tag re-check refusing to
+// write because the fresh payload's own tags could not be trusted: the
+// "tags" key was absent, present but not a JSON array of ids, or present as
+// the JSON literal null (which decodes to a nil []int with no error — the
+// one shape a check that only asked "did decoding succeed" would silently
+// treat as "present and empty" and let through; see the null-specific
+// comment where this is returned). Same class of untrusted input as
+// "monitored" being absent from the fetch — §2.6: never guess — and the
+// same reason it must be counted (writesRefused) rather than silently
+// swallowed: an instance where the exclusion tag is active and every fresh
+// fetch is refused this way would otherwise report unmonitored=0 with every
+// other counter also at zero, leaving no number in the summary that explains
+// where the promised writes went.
+var errTagsUnverifiable = errors.New("movie tags in the pre-write fetch could not be verified against the exclusion tag")
+
+// errAlreadyUnmonitoredAtWrite marks the scan-to-write race: the fresh
+// pre-write fetch shows the movie is already unmonitored, so
+// unmonitorMovie's step 5 skips the write — correctly, §2.4's spirit is to
+// change exactly one thing, and only when it needs changing. This used to be
+// reported as (false, nil), the same shape runWritePass treats as "nothing
+// to count" for the dry-run-withheld case, so an instance where every
+// would-unmonitor candidate lost this race between the scan and the write
+// pass reported wouldUnmonitor=N against every other counter — unmonitored,
+// writeErrors, writeEchoUnverified, writesRefused — at zero, with nothing on
+// the summary line explaining where the N promised writes went. Wrapping a
+// sentinel here, instead, lets runWritePass count it (writesRefused), exactly
+// as errExcludedAtWrite and errTagsUnverifiable already do for the pre-write
+// tag re-check's refusals.
 //
-// The four "cannot tell" cases wrap errWriteUnverified; the one "told us it
+// It is deliberately NOT folded into the scan-time alreadyUnmonitored count
+// (decision.go): that one counts movies rule 1 excluded from the report before
+// they ever reached the write pass; this one counts a would-unmonitor decision
+// that reached the write pass and lost a race there. Conflating them would
+// make the report's own decision (wouldUnmonitor=N) look inconsistent with a
+// scan-time count that never promised anything about those N movies. It is
+// equally deliberately not given a THIRD summary attr of its own (as review
+// round 4 first did, alreadyUnmonitoredAtWrite): a second counter one
+// character away from alreadyUnmonitored on the same line trades one confusion
+// for another, and the summary's question is "did every promised write end
+// somewhere countable", which one refusal counter answers. The distinct causes
+// live where a human actually diagnoses them — the per-movie log line each
+// branch writes at the moment it refuses.
+var errAlreadyUnmonitoredAtWrite = errors.New("movie is already unmonitored as of the pre-write fetch")
+
+// errMonitoredUnverifiable marks the pre-write fetch's own "monitored" field
+// being unreadable: the key absent (this Radarr version may not have the field
+// at all, and setting it would ADD a key rather than change one), present but
+// not a boolean, or present as the JSON literal null — which a plain `var b
+// bool` decode turns into false with NO error, indistinguishable from a
+// genuine monitored:false and therefore able to make the already-unmonitored
+// branch state an observation about the movie that was never made.
+//
+// Same class of untrusted input as errTagsUnverifiable, and counted the same
+// way (writesRefused) for the same reason: no PUT was ever sent, so nothing
+// Radarr did can have failed, and reporting these as writeErrors would tell a
+// human that N writes were rejected by a server that never saw them.
+var errMonitoredUnverifiable = errors.New("the movie's monitored field in the pre-write fetch could not be verified")
+
+// isWriteRefusal reports whether err is one of unmonitorMovie's refusals: a
+// would-unmonitor decision the write path declined to act on before any PUT
+// was sent. Every such branch logs its own specific reason at the moment it
+// refuses, so the caller counts them under one name (writesRefused) without
+// losing any of the causes; see runWritePass's reconciliation identity for why
+// they must be counted at all. Stated as one function rather than a chain of
+// errors.Is at the call site so a future refusal added to unmonitorMovie has
+// exactly one place to be registered.
+func isWriteRefusal(err error) bool {
+	return errors.Is(err, errExcludedAtWrite) ||
+		errors.Is(err, errTagsUnverifiable) ||
+		errors.Is(err, errMonitoredUnverifiable) ||
+		errors.Is(err, errAlreadyUnmonitoredAtWrite)
+}
+
+// verifyWriteEcho confirms the object the server returned from the PUT really
+// is this movie and really does carry monitored:false. Anything else — a body
+// that is not a JSON object, one describing a different movie, no monitored
+// key, a non-boolean value, JSON null, or true — means the write is
+// unconfirmed, and the error carries the status plus a bounded snippet of what
+// actually came back so the log says what was seen rather than only what was
+// expected.
+//
+// The identity check is the same guard the pre-write GET has carried since
+// Phase 4 (verifyMovieIdentity), applied to the other end of the exchange —
+// REVIEW FIX (Phase 5 final round). It was missing here, and this echo is the
+// ONLY evidence this project accepts that a write landed: a proxy, redirect,
+// or cache answering the PUT with some other movie's object would have been
+// read as movie N's confirmed write, incrementing unmonitored and logging
+// msg=unmonitor id=N on the strength of a document about a different film.
+// Absence or mismatch is "cannot tell", not "did not happen" — a real Radarr
+// may well have applied the write — so it joins the unverifiable class rather
+// than the failure one.
+//
+// The six "cannot tell" cases wrap errWriteUnverified; the one "told us it
 // did not happen" case does not. See errWriteUnverified for why that line is
 // drawn where it is.
 func verifyWriteEcho(echo []byte, movieID, status int) error {
@@ -201,14 +424,29 @@ func verifyWriteEcho(echo []byte, movieID, status int) error {
 	if err := json.Unmarshal(echo, &confirmed); err != nil {
 		return fmt.Errorf("movie %d: the write returned %d but the response is not a JSON object, so %q is unconfirmed (%w): %s", movieID, status, monitoredKey, errWriteUnverified, bodySnippet(echo))
 	}
+	if err := verifyMovieIdentity(confirmed, movieID); err != nil {
+		return fmt.Errorf("movie %d: the write returned %d but the returned object cannot be confirmed to be this movie, so the change is unconfirmed (%w): %v: %s", movieID, status, errWriteUnverified, err, bodySnippet(echo))
+	}
 	raw, present := confirmed[monitoredKey]
 	if !present {
 		return fmt.Errorf("movie %d: the write returned %d but the returned object has no %q key, so the change is unconfirmed (%w): %s", movieID, status, monitoredKey, errWriteUnverified, bodySnippet(echo))
 	}
-	var stillMonitored bool
-	if err := json.Unmarshal(raw, &stillMonitored); err != nil {
+	// *bool, not bool: the same null trap the pre-write fetch's own
+	// "monitored" decode has above, now on the echo. A plain
+	// `var stillMonitored bool; json.Unmarshal(raw, &stillMonitored)` decodes
+	// the JSON literal null into stillMonitored == false with NO error — a
+	// write whose echo says "monitored": null would then read as a CONFIRMED
+	// success (stillMonitored is false, so the function returns nil below),
+	// when the server has told us nothing about the field at all. A *bool
+	// keeps null (nil pointer) distinguishable from a genuine false.
+	var stillMonitoredPtr *bool
+	if err := json.Unmarshal(raw, &stillMonitoredPtr); err != nil {
 		return fmt.Errorf("movie %d: the write returned %d but %q came back as %s, which is not a boolean (%w): %s", movieID, status, monitoredKey, raw, errWriteUnverified, bodySnippet(echo))
 	}
+	if stillMonitoredPtr == nil {
+		return fmt.Errorf("movie %d: the write returned %d but %q came back as JSON null, which does not confirm the change (%w): %s", movieID, status, monitoredKey, errWriteUnverified, bodySnippet(echo))
+	}
+	stillMonitored := *stillMonitoredPtr
 	if stillMonitored {
 		return fmt.Errorf("movie %d: the write returned %d but the returned object still has %q: true; the movie was NOT unmonitored: %s", movieID, status, monitoredKey, bodySnippet(echo))
 	}
@@ -274,4 +512,37 @@ func verifyMovieIdentity(payload map[string]json.RawMessage, movieID int) error 
 		return fmt.Errorf("movie %d: the pre-write fetch returned movie %d instead; refusing to write to the wrong movie", movieID, gotID)
 	}
 	return nil
+}
+
+// titleFromPayload extracts "title" from the fresh pre-write fetch for use
+// in log lines, mirroring decision.go's titleOrAbsent "absent" convention so
+// a write-path log line reads the same way a report line does when the
+// field cannot be found. Unlike verifyMovieIdentity's id check, a missing or
+// malformed title is never fatal here — it is used only for a human-facing
+// log attribute, not to decide whether the write proceeds.
+func titleFromPayload(payload map[string]json.RawMessage) string {
+	raw, present := payload["title"]
+	if !present {
+		return "absent"
+	}
+	var title string
+	if err := json.Unmarshal(raw, &title); err != nil {
+		return "absent"
+	}
+	return title
+}
+
+// containsIntID reports whether id is present in ids. A small local helper
+// rather than decision.go's containsTag: that one takes a *[]int (to
+// distinguish "tags absent" from "tags present but empty" for the caller),
+// whereas the pre-write tag re-check above has already made that
+// distinction itself (payload["tags"] present/absent) before ever reaching
+// this call, so a plain []int is all that is needed here.
+func containsIntID(ids []int, id int) bool {
+	for _, i := range ids {
+		if i == id {
+			return true
+		}
+	}
+	return false
 }
