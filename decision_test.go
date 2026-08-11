@@ -830,10 +830,22 @@ func strPtr(s string) *string { return &s }
 // on write behaviour itself use radarrFake (writer_test.go), which records
 // requests; this handler exists only so the read-only tests stay read-only
 // in what they need to know about.
+//
+// GET, and ONLY GET. This fake records nothing, so a write that reached it
+// would leave no trace: every one of its callers passes dryRun=true today,
+// but a future engine test written against it with dryRun=false would issue
+// real PUTs, get a cheerful 200 back, and pass — the precise failure this
+// phase exists to make impossible. Answering 405 means such a test fails
+// loudly and its author reaches for radarrFake, which is the fake that can
+// actually see writes.
 func decisionEngineTestServer(t *testing.T, profilesJSON, tagsJSON string, moviefileHandler http.HandlerFunc, gotMoviefileRequests *[]string) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v3/movie/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		id := strings.TrimPrefix(r.URL.Path, "/api/v3/movie/")
 		fmt.Fprintf(w, `{"id": %s, "monitored": true}`, id)
 	})
@@ -848,6 +860,45 @@ func decisionEngineTestServer(t *testing.T, profilesJSON, tagsJSON string, movie
 		moviefileHandler(w, r)
 	})
 	return httptest.NewServer(mux)
+}
+
+// TestDecisionEngineTestServer_RefusesWrites is a test OF the shared
+// read-only fake, and it earns its place for the same reason
+// TestRadarrFake_RecordsRequestsToPathsItDoesNotStub does: this fake records
+// nothing, so any write that it answers with a 200 is a write no assertion
+// in this file can see. Every current caller passes dryRun=true, which is
+// what makes the hole invisible — and temporary. The guard has to be pinned,
+// or removing it silently restores a fake that green-lights real PUTs.
+func TestDecisionEngineTestServer_RefusesWrites(t *testing.T) {
+	var gotMoviefileRequests []string
+	srv := decisionEngineTestServer(t, decisionEngineProfilesJSON, decisionEngineNoTagsJSON, staticMoviefileHandler(200), &gotMoviefileRequests)
+	defer srv.Close()
+
+	for _, method := range []string{http.MethodPut, http.MethodPost, http.MethodDelete, http.MethodPatch} {
+		req, err := http.NewRequest(method, srv.URL+"/api/v3/movie/1", strings.NewReader(`{"id": 1, "monitored": false}`))
+		if err != nil {
+			t.Fatalf("building %s request: %v", method, err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s /api/v3/movie/1: %v", method, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("%s /api/v3/movie/1 answered %d; a fake that records nothing must never accept a write, or a dryRun=false test written against it would pass while writing",
+				method, resp.StatusCode)
+		}
+	}
+
+	// The read it does exist for must still work.
+	resp, err := http.Get(srv.URL + "/api/v3/movie/1")
+	if err != nil {
+		t.Fatalf("GET /api/v3/movie/1: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /api/v3/movie/1 answered %d, want 200: the write pass's pre-write fetch runs in dry-run too", resp.StatusCode)
+	}
 }
 
 const decisionEngineProfilesJSON = `[{"id": 1, "name": "HD-1080p", "upgradeAllowed": true, "cutoffFormatScore": 100}]`
