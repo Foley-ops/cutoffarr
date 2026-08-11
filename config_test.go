@@ -273,6 +273,86 @@ instances: []
 	}
 }
 
+// TestLoadConfig_EmptyExclusionTagFatal is FIX 8 (controller-mandated
+// correction after the initial Phase 3 review): exclusion_tag is now
+// load-bearing (Phase 3's decision engine rule 4 resolves it to a tag id),
+// and an explicit empty string silently disables that rule for every movie
+// without any indication that happened — an empty label matches no real
+// Radarr tag, so resolveExclusionTagID's "exclusion tag not defined"
+// outcome would be indistinguishable from a deliberately-omitted config
+// key. An absent exclusion_tag key still defaults to "cutoffarr-exclude"
+// (toConfig's default only applies when the *string pointer itself is nil,
+// i.e. the key was never in the YAML at all), so this check unambiguously
+// means "explicitly set to empty in the file".
+func TestLoadConfig_EmptyExclusionTagFatal(t *testing.T) {
+	path := writeConfig(t, `
+exclusion_tag: ""
+instances: []
+`)
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("LoadConfig returned nil error, want error for an empty exclusion_tag")
+	}
+	if !strings.Contains(err.Error(), "exclusion_tag") {
+		t.Errorf("error %q does not mention exclusion_tag", err.Error())
+	}
+}
+
+func TestLoadConfig_AbsentExclusionTagStillDefaultsAndIsValid(t *testing.T) {
+	path := writeConfig(t, `
+instances: []
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	if cfg.ExclusionTag != "cutoffarr-exclude" {
+		t.Errorf("ExclusionTag = %q, want the default %q when the key is absent entirely", cfg.ExclusionTag, "cutoffarr-exclude")
+	}
+}
+
+// TestLoadConfig_WhitespaceOnlyExclusionTagFatal is FIX 3 (controller-
+// mandated correction after the whole-branch review): FIX 8's emptiness
+// check compared cfg.ExclusionTag directly against "", so a whitespace-
+// only value like "  " passed it untouched — reproducing exactly the
+// silent-disable FIX 8 was meant to close, since a value that is all
+// whitespace can no more match a real Radarr tag label than an empty
+// string can. Trimming before the check catches this.
+func TestLoadConfig_WhitespaceOnlyExclusionTagFatal(t *testing.T) {
+	path := writeConfig(t, `
+exclusion_tag: "  "
+instances: []
+`)
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("LoadConfig returned nil error, want error for a whitespace-only exclusion_tag")
+	}
+	if !strings.Contains(err.Error(), "exclusion_tag") {
+		t.Errorf("error %q does not mention exclusion_tag", err.Error())
+	}
+}
+
+// TestLoadConfig_ExclusionTagWithSurroundingWhitespaceIsTrimmed pins the
+// other half of FIX 3: a legitimate label with accidental surrounding
+// whitespace is trimmed and stored trimmed, rather than being passed
+// through verbatim to the decision engine's case-insensitive tag-label
+// match (resolveExclusionTagID uses strings.EqualFold, which does not
+// itself strip whitespace) where the padding would silently prevent it
+// from ever matching the real Radarr tag's label.
+func TestLoadConfig_ExclusionTagWithSurroundingWhitespaceIsTrimmed(t *testing.T) {
+	path := writeConfig(t, `
+exclusion_tag: "  my-tag  "
+instances: []
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	if cfg.ExclusionTag != "my-tag" {
+		t.Errorf("ExclusionTag = %q, want the trimmed value %q", cfg.ExclusionTag, "my-tag")
+	}
+}
+
 func TestLoadConfig_PollIntervalZeroDisablesSweepAndIsValid(t *testing.T) {
 	path := writeConfig(t, `
 poll_interval: 0

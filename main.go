@@ -66,11 +66,22 @@ func run(args []string, stdout, stderr io.Writer) int {
 		// only if connectivity actually succeeded; an instance already
 		// declared skipped for the cycle must not go on to further calls.
 		// Sonarr instances are connectivity-only until Phase 6.
+		//
+		// Phase 3: feed inspectRadarrLibrary's returned movies/wantedIDs
+		// into the decision engine — but only if that fetch itself
+		// succeeded and produced a complete (non-partial) result; a
+		// partial wanted/cutoff id set (refactor a) must never reach the
+		// decision engine, since absence-from-set means "would-unmonitor"
+		// and a partial set would manufacture false positives in that
+		// dangerous direction.
 		samples := parseSamples(*samplesFlag)
 		for _, inst := range cfg.Instances {
 			ok := checkInstanceConnectivity(context.Background(), logger, inst)
 			if ok && inst.Type == "radarr" {
-				inspectRadarrLibrary(context.Background(), logger, inst, samples)
+				movies, wantedIDs, dataOK := inspectRadarrLibrary(context.Background(), logger, inst, samples)
+				if dataOK {
+					runRadarrDecisionEngine(context.Background(), logger, inst, movies, wantedIDs, cfg.ExclusionTag)
+				}
 			}
 		}
 	} else {

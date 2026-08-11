@@ -54,9 +54,25 @@ type movieListElement struct {
 // this phase cares about. It is only expected to be present at all when the
 // movie actually has a file (hasFile == true); its absence is normal and
 // must never warn.
+//
+// ID and QualityCutoffNotMet are used by the Phase 3 decision engine, not
+// by Phase 2's --samples logging (which continues to warn only on Quality
+// and CustomFormatScore per the existing convention — see logSampleMovies):
+//   - ID correlates this movie's file against the array GET
+//     /api/v3/moviefile?movieId=<id> returns (per the STRICT decision
+//     rule's tie-break: "take the element whose id matches the movie's
+//     movieFile.id, or the single element").
+//   - QualityCutoffNotMet is Radarr's own quality-cutoff determination for
+//     this file, used only by the decision engine's cross-check to
+//     independently verify the /wanted/cutoff-derived id set against data
+//     computed by a different Radarr code path (never used to *decide*
+//     would-unmonitor/skip, per the STRICT rule §5 which is wanted/cutoff
+//     set membership only).
 type movieFileElement struct {
-	Quality           *movieFileQualityElement `json:"quality"`
-	CustomFormatScore *int                     `json:"customFormatScore"`
+	ID                  *int                     `json:"id"`
+	Quality             *movieFileQualityElement `json:"quality"`
+	CustomFormatScore   *int                     `json:"customFormatScore"`
+	QualityCutoffNotMet *bool                    `json:"qualityCutoffNotMet"`
 }
 
 // movieFileQualityElement mirrors the expected movieFile.quality.quality.name
@@ -115,13 +131,17 @@ type sampleMovieMatch struct {
 // never returns an error: the binding error-handling rule (plan §2.6) is
 // "skip that instance for the cycle and log a warning", so callers loop
 // over every configured radarr instance regardless of what happened to any
-// previous one.
-func inspectRadarrLibrary(ctx context.Context, logger *slog.Logger, inst Instance, samples []string) {
+// previous one. It returns every decoded movie (refactor b) and the
+// wanted/cutoff id set so a caller (the Phase 3 decision engine) can
+// evaluate the whole library without re-fetching either endpoint; ok=false
+// means either fetch failed or produced an unusable (partial) result, and
+// movies/wantedIDs are both nil in that case — callers must not proceed.
+func inspectRadarrLibrary(ctx context.Context, logger *slog.Logger, inst Instance, samples []string) ([]movieListElement, map[int]bool, bool) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	counts, matches, ok := fetchMovies(ctx, logger, client, inst, samples)
+	counts, movies, matches, ok := fetchMovies(ctx, logger, client, inst, samples)
 	if !ok {
-		return
+		return nil, nil, false
 	}
 
 	logger.Info("movie library",
@@ -132,29 +152,46 @@ func inspectRadarrLibrary(ctx context.Context, logger *slog.Logger, inst Instanc
 
 	wantedIDs, ok := fetchWantedCutoff(ctx, logger, client, inst)
 	if !ok {
-		return
+		return nil, nil, false
 	}
 
 	logSampleCutoffStatus(logger, inst, samples, matches, wantedIDs)
+
+	return movies, wantedIDs, true
 }
 
-// fetchMovies streams GET /api/v3/movie, tallying library-wide counts and
+// fetchMovies streams GET /api/v3/movie, tallying library-wide counts,
 // capturing the decoded fields plus raw JSON for any movie whose title
-// matches a configured sample. Decoding is streaming (json.Decoder reading
-// one array element into a json.RawMessage at a time) rather than
-// json.Unmarshal-ing the whole body, so peak memory is bounded by a single
-// movie's size rather than the entire library — required because /movie
-// can exceed the 4 MB cap used for the connectivity endpoints.
-func fetchMovies(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, samples []string) (movieCounts, map[string]sampleMovieMatch, bool) {
+// matches a configured sample, and (refactor b) collecting every decoded
+// movie into a returned slice so the decision engine can evaluate the
+// whole library from this single fetch.
+//
+// FIX 7 (controller-mandated correction after the initial Phase 3 review):
+// decoding is streaming (json.Decoder reading one array element into a
+// json.RawMessage at a time) rather than json.Unmarshal-ing the whole body
+// at once, so the raw response is never buffered in full — required
+// because /movie can exceed the 4 MB cap used for the connectivity
+// endpoints. This bounds the memory cost of the *raw JSON* to roughly one
+// element at a time, same as before refactor (b). It does NOT bound the
+// function's overall peak memory to a single movie's size any more: every
+// decoded movieListElement is now retained in the returned movies slice
+// for the whole call (that is refactor (b)'s entire purpose — the decision
+// engine needs every movie), so overall memory is O(number of movies) —
+// the size of one decoded struct times the library size, which is far
+// smaller than the raw JSON per movie would be, but is no longer O(1).
+// sampleMovieMatch.raw (the exact bytes for --samples output) is retained
+// only for movies matching a configured sample, unchanged from before.
+func fetchMovies(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, samples []string) (movieCounts, []movieListElement, map[string]sampleMovieMatch, bool) {
 	var counts movieCounts
 	wanted := sampleLookupSet(samples)
 	matches := make(map[string]sampleMovieMatch, len(wanted))
+	var movies []movieListElement
 
 	resp, err := client.Do(ctx, http.MethodGet, "/api/v3/movie", nil)
 	if err != nil {
 		logger.Warn("skipping instance: movie request failed",
 			"instance", inst.Name, "type", inst.Type, "error", err)
-		return counts, nil, false
+		return counts, nil, nil, false
 	}
 	defer resp.Body.Close()
 
@@ -164,12 +201,12 @@ func fetchMovies(ctx context.Context, logger *slog.Logger, client *APIClient, in
 	if err != nil {
 		logger.Warn("skipping instance: movie response is not valid JSON",
 			"instance", inst.Name, "type", inst.Type, "error", err)
-		return counts, nil, false
+		return counts, nil, nil, false
 	}
 	if delim, isDelim := tok.(json.Delim); !isDelim || delim != '[' {
 		logger.Warn("skipping instance: movie response is not a JSON array",
 			"instance", inst.Name, "type", inst.Type)
-		return counts, nil, false
+		return counts, nil, nil, false
 	}
 
 	for dec.More() {
@@ -177,14 +214,14 @@ func fetchMovies(ctx context.Context, logger *slog.Logger, client *APIClient, in
 		if err := dec.Decode(&raw); err != nil {
 			logger.Warn("skipping instance: movie response element is not valid JSON",
 				"instance", inst.Name, "type", inst.Type, "error", err)
-			return counts, nil, false
+			return counts, nil, nil, false
 		}
 
 		var m movieListElement
 		if err := json.Unmarshal(raw, &m); err != nil {
 			logger.Warn("skipping instance: movie response element is not valid JSON",
 				"instance", inst.Name, "type", inst.Type, "error", err)
-			return counts, nil, false
+			return counts, nil, nil, false
 		}
 
 		counts.total++
@@ -194,6 +231,8 @@ func fetchMovies(ctx context.Context, logger *slog.Logger, client *APIClient, in
 		if m.HasFile != nil && *m.HasFile {
 			counts.hasFile++
 		}
+
+		movies = append(movies, m)
 
 		if m.Title != nil {
 			key := normalizeTitle(*m.Title)
@@ -223,10 +262,10 @@ func fetchMovies(ctx context.Context, logger *slog.Logger, client *APIClient, in
 	if err != nil || closeTok != json.Delim(']') {
 		logger.Warn("skipping instance: movie response is not a well-formed JSON array (missing closing bracket)",
 			"instance", inst.Name, "type", inst.Type, "error", err)
-		return counts, nil, false
+		return counts, nil, nil, false
 	}
 
-	return counts, matches, true
+	return counts, movies, matches, true
 }
 
 // logSampleMovies logs, for each configured sample title (in the order
@@ -280,15 +319,34 @@ func logSampleMovies(logger *slog.Logger, inst Instance, samples []string, match
 //     cannot be done safely; warn and skip the instance for the cycle
 //     (ok=false), same as any other malformed response.
 //   - a page returning 0 records ends paging; if fewer records were fetched
-//     than totalRecords claimed, warn (but this is not a skip: whatever was
-//     fetched is still returned).
-//   - a hard cap of maxWantedCutoffPages bounds the loop; hitting it also
-//     warns without being a skip.
+//     than totalRecords claimed, the resulting id set is only partial.
+//   - a hard cap of maxWantedCutoffPages bounds the loop; hitting it without
+//     reaching totalRecords also leaves the id set partial.
+//   - any record missing its id can never be added to the set and can never
+//     be reconstructed, so the set is not authoritative from that point on.
+//
+// completeness contract (mandated refactor, extended by a controller-
+// mandated fix to also cover the third case above): an incomplete or
+// untrustworthy id set — any of the three cases above — must return
+// ok=false (warn + instance skipped), never a partial map with ok=true.
+// The decision engine (Phase 3)
+// treats absence from this set as "would-unmonitor"; a partial set would
+// silently manufacture false positives in that dangerous direction (a
+// movie merely missing from an incomplete fetch would look exactly like
+// one whose quality cutoff is genuinely met), so it must never be handed
+// off as if it were the whole truth.
 func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance) (map[int]bool, bool) {
 	ids := make(map[int]bool)
 	var totalRecords int
 	fetched := 0
 	completed := false
+	// endedEarly distinguishes, for the post-loop incomplete-set warning,
+	// "stopped because a page returned 0 records before totalRecords was
+	// reached" (already warned about specifically inside the loop above)
+	// from "ran out of the maxWantedCutoffPages budget" (warned about
+	// below, only in the latter case, so the message accurately says what
+	// actually happened).
+	endedEarly := false
 
 	for page := 1; page <= maxWantedCutoffPages; page++ {
 		query := url.Values{
@@ -334,10 +392,16 @@ func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClie
 
 		if len(records) == 0 {
 			if fetched != totalRecords {
+				// Leave completed=false: fewer records were fetched than
+				// totalRecords claimed, so the id set below is only
+				// partial. Per the completeness contract this must not be
+				// returned as ok=true; the check after the loop handles it.
 				logger.Warn("wanted/cutoff paging stopped: page returned 0 records before totalRecords was reached",
 					"instance", inst.Name, "type", inst.Type, "page", page, "fetched", fetched, "totalRecords", totalRecords)
+				endedEarly = true
+			} else {
+				completed = true
 			}
-			completed = true
 			break
 		}
 
@@ -346,10 +410,18 @@ func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClie
 				// Without an id this record can't be cross-referenced
 				// against the /movie library at all; title is the only
 				// other identifying information the envelope carries, so
-				// it is the natural context to report here.
-				logger.Warn("wanted/cutoff record missing id field; excluded from the cutoff set",
+				// it is the natural context to report here. This makes the
+				// whole id set non-authoritative — there is no way to
+				// recover which movie this record meant, so its true
+				// cutoff-not-met membership can never be reconstructed —
+				// which is the same "partial set masquerading as complete"
+				// hazard refactor (a) guards against for the
+				// empty-page-early and page-cap cases: warn and skip the
+				// instance for the cycle instead of silently returning an
+				// incomplete set as if it were the whole truth.
+				logger.Warn("skipping instance: wanted/cutoff record missing id field; id set cannot be trusted",
 					"instance", inst.Name, "type", inst.Type, "page", page, "title", derefOrAbsent(r.Title))
-				continue
+				return nil, false
 			}
 			ids[*r.ID] = true
 		}
@@ -362,8 +434,13 @@ func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClie
 	}
 
 	if !completed {
-		logger.Warn("wanted/cutoff paging hit the page cap without completing",
-			"instance", inst.Name, "type", inst.Type, "pageCap", maxWantedCutoffPages, "fetched", fetched, "totalRecords", totalRecords)
+		if !endedEarly {
+			logger.Warn("wanted/cutoff paging hit the page cap without completing",
+				"instance", inst.Name, "type", inst.Type, "pageCap", maxWantedCutoffPages, "fetched", fetched, "totalRecords", totalRecords)
+		}
+		logger.Warn("skipping instance: wanted/cutoff id set is incomplete",
+			"instance", inst.Name, "type", inst.Type, "fetched", fetched, "totalRecords", totalRecords)
+		return nil, false
 	}
 
 	logger.Info("wanted/cutoff",
@@ -390,17 +467,15 @@ func logSampleCutoffStatus(logger *slog.Logger, inst Instance, samples []string,
 }
 
 // fetchLargeBody issues a GET request against path with the given query
-// parameters and returns the full response body, capped at
-// movieStreamSanityLimit. It mirrors fetchBody in connectivity.go (same
-// cap-reached-means-malformed treatment) but is kept as separate code here
-// rather than sharing that function, for two reasons: it uses a different,
-// much larger cap required by this phase's binding large-response handling
-// (the 4 MB connectivity cap is too small for /wanted/cutoff's use of
-// fetchLargeBody as well, even though individual pages are small), and it
-// needs to attach query parameters, which APIClient.Do cannot do (see
-// doGet below).
+// parameters (via APIClient.DoQuery) and returns the full response body,
+// capped at movieStreamSanityLimit. It mirrors fetchBody in connectivity.go
+// (same cap-reached-means-malformed treatment, same DoQuery plumbing) but
+// is kept as separate code here rather than sharing that function, because
+// it uses a different, much larger cap required by this phase's binding
+// large-response handling (the 4 MB connectivity cap is too small for
+// /wanted/cutoff, even though individual pages are small).
 func fetchLargeBody(ctx context.Context, client *APIClient, path string, query url.Values) ([]byte, error) {
-	resp, err := doGet(ctx, client, path, query)
+	resp, err := client.DoQuery(ctx, http.MethodGet, path, query, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -414,47 +489,6 @@ func fetchLargeBody(ctx context.Context, client *APIClient, path string, query u
 		return nil, fmt.Errorf("reading response body from %s: response reached the %d byte limit (possibly truncated)", path, movieStreamSanityLimit)
 	}
 	return body, nil
-}
-
-// doGet issues a GET request against path with query attached, using
-// client's base URL, API key, and http.Client (same package, so its
-// unexported fields are reachable directly rather than duplicating
-// NewAPIClient's construction). It exists because APIClient.Do joins its
-// path argument with url.JoinPath, which treats "?" as a literal path
-// character and percent-encodes it (confirmed empirically) — embedding a
-// query string in the path passed to Do would corrupt it. doGet instead
-// joins only the path, then attaches the query via url.Values.Encode.
-// Request construction and non-2xx handling (with the same
-// errorBodySnippetLimit-bounded body snippet) otherwise match APIClient.Do.
-func doGet(ctx context.Context, client *APIClient, path string, query url.Values) (*http.Response, error) {
-	joined, err := url.JoinPath(client.baseURL, path)
-	if err != nil {
-		return nil, fmt.Errorf("radarr: building request url from base %q and path %q: %w", client.baseURL, path, err)
-	}
-	reqURL, err := url.Parse(joined)
-	if err != nil {
-		return nil, fmt.Errorf("radarr: parsing joined url %q: %w", joined, err)
-	}
-	reqURL.RawQuery = query.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("radarr: building request: %w", err)
-	}
-	req.Header.Set("X-Api-Key", client.apiKey)
-
-	resp, err := client.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("radarr: GET %s: %w", reqURL.String(), err)
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		defer resp.Body.Close()
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodySnippetLimit))
-		return nil, fmt.Errorf("radarr: GET %s: unexpected status %d: %s", reqURL.String(), resp.StatusCode, snippet)
-	}
-
-	return resp, nil
 }
 
 // normalizeTitle folds a title to a comparison key: trimmed of surrounding
