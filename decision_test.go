@@ -1257,6 +1257,49 @@ func TestRunRadarrDecisionEngine_MonitoredFieldAbsent_WarnsButStillExcluded(t *t
 	if len(gotMoviefileRequests) != 0 {
 		t.Errorf("expected zero /moviefile requests, got %d", len(gotMoviefileRequests))
 	}
+	// REVIEW FIX (Phase 5 round 4): monitored ABSENT is untrusted input (the
+	// warning above), not evidence the movie is already unmonitored — it must
+	// never be counted by, or logged through, the alreadyUnmonitored
+	// no-op-visibility machinery that legitimately covers monitored: false.
+	// The `m.Monitored != nil` half of decision.go's guard
+	// (`m.Monitored != nil && !*m.Monitored && ...`) is what keeps the two
+	// apart; on its own it reads as dead redundancy (the outer branch is
+	// already `m.Monitored == nil || !*m.Monitored`), which is exactly what a
+	// future "simplification" would delete. Pinning alreadyUnmonitored=0 here
+	// fails the whole suite the moment that guard stops doing its job.
+	if !strings.Contains(out, "alreadyUnmonitored=0") {
+		t.Errorf("a monitored-absent movie must not be counted as already unmonitored — that would report a fact about its state the code explicitly refused to trust:\n%s", out)
+	}
+}
+
+// TestRunRadarrDecisionEngine_MonitoredFieldAbsent_NoAlreadyUnmonitoredDebugLine
+// is the debug-level half of the same pin: even with the debug line visible,
+// a monitored-absent movie must never be reported through it. Without this,
+// a library whose /movie payloads lack "monitored" entirely (an older Radarr
+// version, a proxy stripping fields) would converge to a report that reads
+// totalMonitored=0 wouldUnmonitor=0 alreadyUnmonitored=N plus N debug lines
+// each claiming a movie is "already unmonitored" — state the code explicitly
+// refused to trust, presented as an observed fact.
+func TestRunRadarrDecisionEngine_MonitoredFieldAbsent_NoAlreadyUnmonitoredDebugLine(t *testing.T) {
+	var gotMoviefileRequests []string
+	srv := decisionEngineTestServer(t, decisionEngineProfilesJSON, decisionEngineNoTagsJSON, staticMoviefileHandler(200), &gotMoviefileRequests)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("No Monitored Field Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1)}, // Monitored left nil
+	}
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+
+	out := buf.String()
+	if strings.Contains(out, `msg="already unmonitored"`) {
+		t.Errorf("a monitored-absent movie must never be reported through the already-unmonitored debug line; its state was never observed:\n%s", out)
+	}
+	if !strings.Contains(out, "alreadyUnmonitored=0") {
+		t.Errorf("expected alreadyUnmonitored=0:\n%s", out)
+	}
 }
 
 // TestRunRadarrDecisionEngine_MonitoredFalse_PresentValue_NoWarn pins the
@@ -1941,7 +1984,7 @@ func TestRunWritePass_UnrecognizedCrossCheckStatus_WritePassBlocked(t *testing.T
 			// — so the status really is the only thing keeping this pass
 			// shut, and a gate that stopped consulting it would write.
 			cc := crossCheckResult{status: tc.status, verified: 1, writeVerified: 1}
-			unmonitored, writeErrors, echoUnverified, writesRefused := runWritePass(context.Background(), logger, client, fake.instance(), decisions, cc, 0, false, false)
+			unmonitored, writeErrors, echoUnverified, writesRefused, _ := runWritePass(context.Background(), logger, client, fake.instance(), decisions, cc, 0, false, false)
 
 			if writes := fake.writes(); len(writes) != 0 {
 				t.Fatalf("cross-check status %q is not %q and must block every write, got %d: %+v",
@@ -2100,7 +2143,18 @@ func TestRunRadarrDecisionEngine_EchoSaysStillMonitored_IsAWriteFailure(t *testi
 // TestRunRadarrDecisionEngine_AlreadyUnmonitoredAtWriteTime_NoPut covers the
 // scan-to-write race through the pass: the item was monitored during the
 // scan but is already unmonitored by the time the write pass reaches it, so
-// nothing is written and nothing is counted.
+// nothing is written.
+//
+// REVIEW FIX (Phase 5 round 4): this race used to leave EVERY counter on the
+// summary line at zero — wouldUnmonitor=1 unmonitored=0 writeErrors=0
+// writesRefused=0 alreadyUnmonitored=0 — with nothing at all explaining
+// where the one promised write went; an instance where all N candidates hit
+// this race would report the identical, fully-zeroed line regardless of N.
+// It must now be counted under its own name, alreadyUnmonitoredAtWrite, and
+// that name must be distinct from alreadyUnmonitored (decision.go's
+// scan-time counter for rule-1 exclusions, which is unrelated and must stay
+// 0 here: this movie was monitored:true at scan time, so rule 1 never
+// touched it).
 func TestRunRadarrDecisionEngine_AlreadyUnmonitoredAtWriteTime_NoPut(t *testing.T) {
 	fake := newRadarrFake(t, "", map[int]string{
 		1: `{"id": 1, "title": "Raced Movie", "monitored": false}`,
@@ -2118,8 +2172,10 @@ func TestRunRadarrDecisionEngine_AlreadyUnmonitoredAtWriteTime_NoPut(t *testing.
 	if !strings.Contains(out, "already unmonitored") {
 		t.Errorf("expected an info log explaining the write was unnecessary:\n%s", out)
 	}
-	if !strings.Contains(out, "unmonitored=0") || !strings.Contains(out, "writeErrors=0") {
-		t.Errorf("an already-unmonitored item is neither a write nor an error:\n%s", out)
+	for _, want := range []string{"wouldUnmonitor=1", "unmonitored=0", "writeErrors=0", "writesRefused=0", "alreadyUnmonitored=0", "alreadyUnmonitoredAtWrite=1"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in the summary — alreadyUnmonitoredAtWrite is the only number that accounts for the 1 promised write when every other counter (including the unrelated scan-time alreadyUnmonitored) is 0:\n%s", want, out)
+		}
 	}
 }
 
@@ -2808,7 +2864,7 @@ func TestRunWritePass_PassedButNoWouldUnmonitorItemVerified_BlocksAndNamesTheRat
 	// The pass the old gate saw: "passed", one item verified. That item was
 	// a skip.
 	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 1, unverifiable: 1, writeVerified: 0, writeUnverifiable: 1}
-	unmonitored, writeErrors, echoUnverified, writesRefused := runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, 0, false, false)
+	unmonitored, writeErrors, echoUnverified, writesRefused, _ := runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, 0, false, false)
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("a pass that verified no would-unmonitor decision must authorize no write, got %+v", writes)
@@ -2859,7 +2915,7 @@ func TestRunWritePass_MinorityUnverifiable_WritesButWarnsAtTheGate(t *testing.T)
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 9, unverifiable: 1, writeVerified: 9, writeUnverifiable: 1}
-	unmonitored, writeErrors, echoUnverified, writesRefused := runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, 0, false, false)
+	unmonitored, writeErrors, echoUnverified, writesRefused, _ := runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, 0, false, false)
 
 	if n := len(fake.puts()); n != 1 {
 		t.Fatalf("expected the write to proceed on a well-verified sample, got %d PUT(s)", n)
@@ -2891,7 +2947,7 @@ func TestRunWritePass_MinorityUnverifiable_DryRun_WordingDoesNotClaimWritesHappe
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 9, unverifiable: 1, writeVerified: 9, writeUnverifiable: 1}
-	unmonitored, writeErrors, echoUnverified, writesRefused := runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, 0, false, true)
+	unmonitored, writeErrors, echoUnverified, writesRefused, _ := runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, 0, false, true)
 
 	if n := len(fake.writes()); n != 0 {
 		t.Fatalf("dry-run must make zero write requests, got %d: %+v", n, fake.writes())
@@ -2944,7 +3000,7 @@ func TestRunWritePass_NothingToWrite_UnverifiedPoolIsNotAnAlarm(t *testing.T) {
 
 	decisions := []movieDecision{{id: 1, title: "Skipped Movie", wouldUnmonitor: false, reason: ReasonNoFile}}
 	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 3, unverifiable: 1, writeVerified: 0, writeUnverifiable: 0}
-	unmonitored, writeErrors, echoUnverified, writesRefused := runWritePass(context.Background(), logger, client, fake.instance(), decisions, cc, 0, false, false)
+	unmonitored, writeErrors, echoUnverified, writesRefused, _ := runWritePass(context.Background(), logger, client, fake.instance(), decisions, cc, 0, false, false)
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("a pass with no would-unmonitor decisions must write nothing, got %+v", writes)

@@ -511,6 +511,14 @@ func TestUnmonitorMovie_ExclusionTagInactive_TagsIgnored_WritesNormally(t *testi
 // but is monitored:false by the time the write pass reaches it. Changing
 // nothing is then the correct action (§2.4's spirit: change exactly one
 // thing, and only when it needs changing).
+//
+// REVIEW FIX (Phase 5 round 4): this race used to return (false, nil), the
+// same shape runWritePass treats as "nothing to count" for the dry-run-
+// withheld case, so it went completely uncounted in the summary. It now
+// wraps errAlreadyUnmonitoredAtWrite so runWritePass can count it under its
+// own name — exactly as errExcludedAtWrite/errTagsUnverifiable already do for
+// the pre-write tag re-check's refusals — instead of a (false, nil) return
+// that could not be told apart from a run that made no decision at all.
 func TestUnmonitorMovie_FreshGetShowsAlreadyUnmonitored_NoPut(t *testing.T) {
 	srv, got := writerTestServer(t, `{"id": 7, "title": "Already Done", "monitored": false}`, http.StatusOK)
 	defer srv.Close()
@@ -520,8 +528,8 @@ func TestUnmonitorMovie_FreshGetShowsAlreadyUnmonitored_NoPut(t *testing.T) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 0, false, false)
-	if err != nil {
-		t.Fatalf("unmonitorMovie returned error: %v", err)
+	if !errors.Is(err, errAlreadyUnmonitoredAtWrite) {
+		t.Fatalf("unmonitorMovie error = %v, want errAlreadyUnmonitoredAtWrite so runWritePass can count this race:\n%s", err, buf.String())
 	}
 	if written {
 		t.Error("written = true, want false: nothing was changed")
@@ -563,6 +571,42 @@ func TestUnmonitorMovie_MonitoredFieldAbsent_RefusesToWrite(t *testing.T) {
 	}
 	if len(filterRequests(*got, http.MethodPut)) != 0 {
 		t.Errorf("expected zero PUTs, got %+v", *got)
+	}
+}
+
+// TestUnmonitorMovie_FreshPayloadMonitoredNull_RefusesToWrite is the
+// JSON-null trap on "monitored" itself — the one field the entire write
+// path pivots on — mirroring
+// TestUnmonitorMovie_FreshPayloadTagsNull_TagActive_RefusesToWriteWithWarn's
+// coverage of the identical wire shape on "tags". A plain
+// `var monitored bool; json.Unmarshal(rawMonitored, &monitored)` decodes the
+// JSON literal null into monitored == false with NO decode error —
+// indistinguishable from a genuine monitored:false — which would make the
+// very next branch (the already-unmonitored skip) log "already unmonitored,
+// skipping write" about a movie whose state was never actually observed, and
+// leave it permanently unmonitorable on every future cycle too. §2.6: never
+// guess — refuse the write instead, the same class of refusal as "monitored"
+// being entirely absent from the fetch.
+func TestUnmonitorMovie_FreshPayloadMonitoredNull_RefusesToWrite(t *testing.T) {
+	srv, got := writerTestServer(t, `{"id": 7, "title": "Null Monitored", "monitored": null}`, http.StatusOK)
+	defer srv.Close()
+
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := writerTestInstance(srv.URL)
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 0, false, false)
+	if err == nil {
+		t.Fatal("unmonitorMovie returned nil error, want an error when monitored is JSON null: its true state cannot be trusted")
+	}
+	if written {
+		t.Error("written = true, want false")
+	}
+	if !strings.Contains(err.Error(), "monitored") || !strings.Contains(err.Error(), "null") {
+		t.Errorf("error %q does not name the field and the null shape that made it unverifiable", err.Error())
+	}
+	if len(filterRequests(*got, http.MethodPut)) != 0 {
+		t.Errorf("expected zero PUTs when monitored is JSON null, got %+v", *got)
 	}
 }
 
@@ -818,6 +862,7 @@ func TestVerifyWriteEcho_SeparatesUnverifiableFromContradicted(t *testing.T) {
 		{"not a JSON object", `[{"id": 7}]`},
 		{"no monitored key", `{"id": 7, "title": "Silent"}`},
 		{"monitored is not a boolean", `{"id": 7, "monitored": "false"}`},
+		{"monitored is JSON null", `{"id": 7, "monitored": null}`},
 	}
 	for _, tc := range unverifiable {
 		t.Run(tc.name, func(t *testing.T) {
