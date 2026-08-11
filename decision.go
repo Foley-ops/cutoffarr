@@ -89,9 +89,23 @@ type tagElement struct {
 // evaluated without this data, so the whole instance is skipped for the
 // cycle. A successful fetch that simply does not contain label is NOT a
 // failure: found=false, ok=true, and rule 4 passes for every movie (logged
-// at info, per the plan). An individual tag record missing its id or label
-// is excluded from resolution with a warning but does not fail the whole
-// fetch, mirroring how fetchWantedCutoff treats a record missing its id.
+// at info, per the plan).
+//
+// A tag record missing its id or label is ALSO instance-fatal (REVIEW FIX,
+// Phase 5 round 2), not merely excluded-and-skip-past. Unlike a movie
+// record missing its id (fetchWantedCutoff's precedent, where skipping just
+// that one movie is safe because every other movie is still evaluated
+// correctly), a malformed tag record cannot be safely skipped past here:
+// its label may or may not be nil, but when it is nil the record cannot
+// even be compared against the configured label, so there is no way to
+// know whether the record we cannot read is the very definition of the
+// exclusion tag. Continuing the scan and falling through to "not defined"
+// when no other record matches would assert a false statement — the tag
+// may in fact be defined, just unreadably — and would silently disable
+// rule 4 for every movie in the instance (tagActive=false), which is
+// exactly the untrusted-input route to an unmonitor action §2.6 forbids.
+// So this mirrors the request/decode failures above: log what could not be
+// resolved and skip the whole instance rather than guess.
 func resolveExclusionTagID(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, label string) (id int, found bool, ok bool) {
 	body, err := fetchBody(ctx, client, "/api/v3/tag", nil)
 	if err != nil {
@@ -109,9 +123,9 @@ func resolveExclusionTagID(ctx context.Context, logger *slog.Logger, client *API
 
 	for _, tg := range tags {
 		if tg.ID == nil || tg.Label == nil {
-			logger.Warn("tag record missing id or label field; excluded from exclusion-tag resolution",
+			logger.Warn("skipping instance: a tag record could not be resolved, so the exclusion tag cannot be verified",
 				"instance", inst.Name, "type", inst.Type, "id", derefOrAbsent(tg.ID), "label", derefOrAbsent(tg.Label))
-			continue
+			return 0, false, false
 		}
 		if strings.EqualFold(*tg.Label, label) {
 			return *tg.ID, true, true

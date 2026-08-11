@@ -219,12 +219,20 @@ func TestResolveExclusionTagID_MalformedJSON_SkipsInstance(t *testing.T) {
 	}
 }
 
-// TestResolveExclusionTagID_RecordMissingIdOrLabel_SkipsRecordNotInstance
-// pins that an individual malformed tag record (missing id or label) is
-// excluded from resolution with a warning but is NOT instance-fatal — only
-// the whole /tag request failing is (§2.6), consistent with how
-// fetchWantedCutoff treats a wanted/cutoff record missing its id.
-func TestResolveExclusionTagID_RecordMissingIdOrLabel_SkipsRecordNotInstance(t *testing.T) {
+// TestResolveExclusionTagID_RecordMissingIdOrLabel_SkipsInstance pins the
+// REVIEW FIX (Phase 5 round 2) correction: an individual malformed tag
+// record (missing id or label) is instance-fatal, exactly like the whole
+// /tag request failing (§2.6), NOT merely excluded-and-skip-past. A record
+// with a nil label cannot be compared against the configured label, so
+// there is no way to tell whether the unreadable record is in fact the
+// exclusion tag's own definition; continuing the scan and falling through
+// to "not defined" when nothing else matches would risk asserting a false
+// statement and silently disabling rule 4 for the whole instance. This
+// intentionally diverges from fetchWantedCutoff's per-record skip for
+// movies, where skipping one bad movie record cannot corrupt the
+// evaluation of any other movie — the tag list has no such independence
+// property when the very record in question might be the one that matters.
+func TestResolveExclusionTagID_RecordMissingIdOrLabel_SkipsInstance(t *testing.T) {
 	tagsJSON := `[{"label": "no-id"}, {"id": 9, "label": "cutoffarr-exclude"}]` // first record missing id
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v3/tag", func(w http.ResponseWriter, r *http.Request) {
@@ -237,15 +245,19 @@ func TestResolveExclusionTagID_RecordMissingIdOrLabel_SkipsRecordNotInstance(t *
 	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	id, found, ok := resolveExclusionTagID(context.Background(), logger, client, inst, "cutoffarr-exclude")
-	if !ok {
-		t.Fatalf("resolveExclusionTagID returned ok=false, want true:\n%s", buf.String())
+	_, found, ok := resolveExclusionTagID(context.Background(), logger, client, inst, "cutoffarr-exclude")
+	if ok {
+		t.Fatalf("resolveExclusionTagID returned ok=true, want false: a malformed tag record must skip the whole instance, not just itself:\n%s", buf.String())
 	}
-	if !found || id != 9 {
-		t.Errorf("expected the second, well-formed record to still resolve: found=%v id=%d", found, id)
+	if found {
+		t.Error("found = true, want false when the instance was skipped")
 	}
-	if !strings.Contains(buf.String(), "level=WARN") {
-		t.Errorf("expected a warning about the malformed record:\n%s", buf.String())
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "radarr-main") {
+		t.Errorf("expected a warning naming the instance:\n%s", out)
+	}
+	if strings.Contains(out, "exclusion tag not defined in this instance") {
+		t.Errorf("must not claim the tag is undefined — its status could not be verified, which is a different, stronger fact:\n%s", out)
 	}
 }
 
@@ -2154,6 +2166,48 @@ func TestRunRadarrDecisionEngine_ExclusionTagAddedBetweenScanAndWrite_RefusesThe
 	// went.
 	if !strings.Contains(out, "writesRefused=1") {
 		t.Errorf("expected writesRefused=1: the pre-write tag re-check refused this write, and that must be counted:\n%s", out)
+	}
+}
+
+// TestRunRadarrDecisionEngine_DryRun_ExclusionTagAddedBetweenScanAndWrite_RefusesTheWrite
+// is the dry-run twin of
+// TestRunRadarrDecisionEngine_ExclusionTagAddedBetweenScanAndWrite_RefusesTheWrite
+// (REVIEW FIX, Phase 5 round 2): the pre-write exclusion-tag re-check must
+// run identically "in every mode" (§2.5, brief item 3) — writer.go's own
+// doc comment says the re-check sits above the dry-run gate at
+// writer.go:209, and decision.go deliberately emits writesRefused
+// unconditionally rather than inside the write-mode branch, on exactly that
+// claim. Before this test, every scenario that made tagActive true through
+// the real pipeline was write-mode only, so both claims were unpinned: a
+// future edit could move the re-check below the dry-run gate, or fold
+// writesRefused into the write-mode branch, and the whole suite would stay
+// green while a dry-run report promised writes a real run would refuse.
+func TestRunRadarrDecisionEngine_DryRun_ExclusionTagAddedBetweenScanAndWrite_RefusesTheWrite(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{
+		1: `{"id": 1, "title": "Tagged Since Scan", "monitored": true, "hasFile": true, "qualityProfileId": 1, "tags": [42]}`,
+	})
+	fake.tagsJSON = `[{"id": 42, "label": "cutoffarr-exclude"}]`
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	movies := []movieListElement{wouldUnmonitorMovie(1, "Tagged Since Scan")}
+
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+
+	if puts := fake.puts(); len(puts) != 0 {
+		t.Fatalf("expected zero PUTs even in dry-run: the fresh fetch shows the exclusion tag, which always wins, got %+v", puts)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "msg=would-unmonitor") {
+		t.Errorf("the scan-time report must be unaffected; the decision was correct when it was made:\n%s", out)
+	}
+	if !strings.Contains(out, "exclusion tag") {
+		t.Errorf("expected the write refusal to name the exclusion tag as the reason, in dry-run just as in write mode:\n%s", out)
+	}
+	if !strings.Contains(out, "unmonitored=0") {
+		t.Errorf("expected unmonitored=0:\n%s", out)
+	}
+	if !strings.Contains(out, "writesRefused=1") {
+		t.Errorf("expected writesRefused=1: the pre-write tag re-check runs identically in dry-run, before the dry-run gate, so the refusal must be counted here too:\n%s", out)
 	}
 }
 
