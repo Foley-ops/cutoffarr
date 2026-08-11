@@ -1245,7 +1245,8 @@ func TestRunCrossCheck_ZeroCandidates_PassesWithZeroItems(t *testing.T) {
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	inst := Instance{Name: "radarr-main", Type: "radarr"}
 
-	status, verified, unverifiable := runCrossCheck(logger, inst, nil, map[int]bool{})
+	cc := runCrossCheck(logger, inst, nil, map[int]bool{})
+	status, verified, unverifiable := cc.status, cc.verified, cc.unverifiable
 	if status != crossCheckStatusPassed || verified != 0 || unverifiable != 0 {
 		t.Errorf("runCrossCheck = (%q, %d, %d), want (%q, 0, 0) for zero candidates", status, verified, unverifiable, crossCheckStatusPassed)
 	}
@@ -1270,7 +1271,8 @@ func TestRunCrossCheck_AgreeingSamples_PassesAndLogsBothCategories(t *testing.T)
 	}
 	wantedIDs := map[int]bool{2: true} // id 1 not in set (agrees with false); id 2 in set (agrees with true)
 
-	status, verified, unverifiable := runCrossCheck(logger, inst, decisions, wantedIDs)
+	cc := runCrossCheck(logger, inst, decisions, wantedIDs)
+	status, verified, unverifiable := cc.status, cc.verified, cc.unverifiable
 	if status != crossCheckStatusPassed {
 		t.Errorf("status = %q, want %q:\n%s", status, crossCheckStatusPassed, buf.String())
 	}
@@ -1310,7 +1312,8 @@ func TestRunCrossCheck_Disagreement_FailsWithErrorLog(t *testing.T) {
 	}
 	wantedIDs := map[int]bool{1: true}
 
-	status, verified, unverifiable := runCrossCheck(logger, inst, decisions, wantedIDs)
+	cc := runCrossCheck(logger, inst, decisions, wantedIDs)
+	status, verified, unverifiable := cc.status, cc.verified, cc.unverifiable
 	if status != crossCheckStatusFailed {
 		t.Errorf("status = %q, want %q for a disagreement", status, crossCheckStatusFailed)
 	}
@@ -1349,7 +1352,8 @@ func TestRunCrossCheck_SamplesUpToTenPerCategory(t *testing.T) {
 		wantedIDs[i] = false
 	}
 
-	status, verified, unverifiable := runCrossCheck(logger, inst, decisions, wantedIDs)
+	cc := runCrossCheck(logger, inst, decisions, wantedIDs)
+	status, verified, unverifiable := cc.status, cc.verified, cc.unverifiable
 	if status != crossCheckStatusPassed {
 		t.Errorf("status = %q, want %q (all candidates agree)", status, crossCheckStatusPassed)
 	}
@@ -1372,7 +1376,8 @@ func TestRunCrossCheck_AllUnverifiable_ReturnsInconclusiveAndWarns(t *testing.T)
 	decisions := []movieDecision{
 		{id: 1, title: "Missing Field Movie", wouldUnmonitor: true, hasFile: true, qualityCutoffNotMet: nil, cfScore: intPtr(200), cfThreshold: 100},
 	}
-	status, verified, unverifiable := runCrossCheck(logger, inst, decisions, map[int]bool{})
+	cc := runCrossCheck(logger, inst, decisions, map[int]bool{})
+	status, verified, unverifiable := cc.status, cc.verified, cc.unverifiable
 	if status != crossCheckStatusInconclusive {
 		t.Errorf("status = %q, want %q: an all-unverifiable sample must not read as passed", status, crossCheckStatusInconclusive)
 	}
@@ -1401,7 +1406,8 @@ func TestRunCrossCheck_MixedVerifiedAndUnverifiable_PassesWithBothCountsSeparate
 		{id: 2, title: "Verified Movie B", wouldUnmonitor: true, hasFile: true, qualityCutoffNotMet: agreeFalse()},
 		{id: 3, title: "Unverifiable Movie", wouldUnmonitor: true, hasFile: true, qualityCutoffNotMet: nil},
 	}
-	status, verified, unverifiable := runCrossCheck(logger, inst, decisions, map[int]bool{})
+	cc := runCrossCheck(logger, inst, decisions, map[int]bool{})
+	status, verified, unverifiable := cc.status, cc.verified, cc.unverifiable
 	if status != crossCheckStatusPassed {
 		t.Errorf("status = %q, want %q:\n%s", status, crossCheckStatusPassed, buf.String())
 	}
@@ -1421,7 +1427,8 @@ func TestRunCrossCheck_HasFileFalseSkip_ExcludedFromCandidates(t *testing.T) {
 	decisions := []movieDecision{
 		{id: 1, title: "No File Movie", wouldUnmonitor: false, hasFile: false, reason: ReasonNoFile},
 	}
-	_, verified, unverifiable := runCrossCheck(logger, inst, decisions, map[int]bool{})
+	cc := runCrossCheck(logger, inst, decisions, map[int]bool{})
+	verified, unverifiable := cc.verified, cc.unverifiable
 	if verified != 0 || unverifiable != 0 {
 		t.Errorf("verified/unverifiable = %d/%d, want 0/0 (hasFile=false skip must not be a cross-check candidate)", verified, unverifiable)
 	}
@@ -1800,7 +1807,12 @@ func TestRunWritePass_UnrecognizedCrossCheckStatus_WritePassBlocked(t *testing.T
 			logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 			decisions := []movieDecision{{id: 1, title: "Ungated Movie", wouldUnmonitor: true, reason: ReasonCutoffMet, profileName: "HD-1080p"}}
-			unmonitored, writeErrors := runWritePass(context.Background(), logger, client, fake.instance(), decisions, tc.status, false)
+			// Everything except the status is what a healthy cross-check
+			// looks like — the would-unmonitor item was sampled and verified
+			// — so the status really is the only thing keeping this pass
+			// shut, and a gate that stopped consulting it would write.
+			cc := crossCheckResult{status: tc.status, verified: 1, writeVerified: 1}
+			unmonitored, writeErrors := runWritePass(context.Background(), logger, client, fake.instance(), decisions, cc, false)
 
 			if writes := fake.writes(); len(writes) != 0 {
 				t.Fatalf("cross-check status %q is not %q and must block every write, got %d: %+v",
@@ -2227,5 +2239,264 @@ func TestRunRadarrDecisionEngine_OnlyID_TargetNotMonitored_MessageNamesTheActual
 	}
 	if strings.Contains(out, "id field was absent") {
 		t.Errorf("the message names a cause that cannot apply here (the target was found by id):\n%s", out)
+	}
+}
+
+// --- the write gate needs more than a bare "passed" -------------------------
+//
+// REVIEW FIX (phase-4 round 2, IMPORTANT): the write gate consumed
+// runCrossCheck's status and nothing else, and that status is awarded on the
+// weakest possible evidence — "at least one sampled item was verified and
+// nothing disagreed". Two consequences, both of which end with real PUTs
+// authorized by data nobody checked:
+//
+//   - The two sampled pools are conflated. The cross-check samples up to 10
+//     would-unmonitor decisions AND up to 10 monitored+hasFile skip
+//     decisions, and a single verified SKIP item was enough to earn "passed"
+//     — opening the write pass even though not one would-unmonitor decision,
+//     the only kind that is ever written, had been verified at all.
+//   - The unverifiable count never reached the gate. 19 of 20 samples
+//     missing movieFile.qualityCutoffNotMet still rendered "passed (1
+//     verified, 19 unverifiable)" and authorized the whole library, with no
+//     gate-level warning: the aggregate warning fires only at verified == 0.
+//
+// The gate now requires evidence about the decisions it is actually about to
+// act on, and says out loud when it proceeds on a partially verified sample.
+
+// TestRunRadarrDecisionEngine_CrossCheckVerifiedNoWouldUnmonitorItem_WritePassBlocked
+// is the end-to-end pin, and it is the reviewer's exact scenario in
+// miniature: the one verified sample is a SKIP item, every would-unmonitor
+// item is unverifiable, the cross-check therefore still reads "passed" — and
+// the write pass must nevertheless write nothing.
+func TestRunRadarrDecisionEngine_CrossCheckVerifiedNoWouldUnmonitorItem_WritePassBlocked(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{1: monitoredMovieDetail(1, "Unverifiable Would-Unmonitor Movie")})
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	movies := []movieListElement{
+		// Would-unmonitor (not in the wanted set, CF score above the
+		// threshold) but its own movieFile.qualityCutoffNotMet is absent, so
+		// the cross-check cannot verify the decision that would be written.
+		{ID: intPtr(1), Title: strPtr("Unverifiable Would-Unmonitor Movie"), Monitored: boolPtr(true), HasFile: boolPtr(true),
+			QualityProfileID: intPtr(1), Tags: &noTags, MovieFile: &movieFileElement{ID: intPtr(1)}},
+		// A skip item that IS verifiable: in the wanted set, and its own
+		// qualityCutoffNotMet agrees. This is the single verified sample that
+		// used to be enough to open the gate for the movie above.
+		{ID: intPtr(2), Title: strPtr("Verified Skip Movie"), Monitored: boolPtr(true), HasFile: boolPtr(true),
+			QualityProfileID: intPtr(1), Tags: &noTags, MovieFile: &movieFileElement{ID: intPtr(1), QualityCutoffNotMet: boolPtr(true)}},
+	}
+
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{2: true}, "cutoffarr-exclude", 0, false)
+
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("a cross-check that verified only a skip item must authorize no write, got %d: %+v", len(writes), writes)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "withheld") {
+		t.Errorf("expected a warning explaining that writes were withheld:\n%s", out)
+	}
+	if !strings.Contains(out, "withheldWrites=1") {
+		t.Errorf("expected the withheld warning to state how many writes it blocked:\n%s", out)
+	}
+	if !strings.Contains(out, "unmonitored=0") {
+		t.Errorf("expected unmonitored=0:\n%s", out)
+	}
+	// The report is untouched: blocking writes never suppresses what the
+	// human gate reads.
+	if !strings.Contains(out, "msg=would-unmonitor") {
+		t.Errorf("blocking writes must not suppress the report:\n%s", out)
+	}
+}
+
+// TestRunCrossCheck_CountsTheWouldUnmonitorPoolSeparately is the unit under
+// the fix: the aggregate counts say the sample was half verified, and only
+// the per-pool counts reveal that the verified half was entirely skip items.
+func TestRunCrossCheck_CountsTheWouldUnmonitorPoolSeparately(t *testing.T) {
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr"}
+
+	decisions := []movieDecision{
+		{id: 1, title: "Unverifiable Would-Unmonitor", wouldUnmonitor: true, hasFile: true, qualityCutoffNotMet: nil},
+		{id: 2, title: "Verified Skip", wouldUnmonitor: false, hasFile: true, reason: ReasonQualityCutoffNotMet, qualityCutoffNotMet: agreeTrue()},
+	}
+
+	cc := runCrossCheck(logger, inst, decisions, map[int]bool{2: true})
+
+	if cc.status != crossCheckStatusPassed {
+		t.Fatalf("status = %q, want %q — this test is only meaningful while the aggregate verdict still reads as a pass", cc.status, crossCheckStatusPassed)
+	}
+	if cc.verified != 1 || cc.unverifiable != 1 {
+		t.Errorf("aggregate verified/unverifiable = %d/%d, want 1/1", cc.verified, cc.unverifiable)
+	}
+	if cc.writeVerified != 0 || cc.writeUnverifiable != 1 {
+		t.Errorf("would-unmonitor verified/unverifiable = %d/%d, want 0/1: a verified SKIP item is not evidence about a write",
+			cc.writeVerified, cc.writeUnverifiable)
+	}
+}
+
+// TestRunCrossCheck_MostlyUnverifiableSample_StillPassesButSaysSo is the
+// reviewer's headline arithmetic, at the unit: 20 sampled items, 19 of them
+// missing movieFile.qualityCutoffNotMet, one verified. The status is still
+// "passed" (that is what "at least one verified, nothing disagreed" means,
+// and changing the status vocabulary is not this fix), so the counts are the
+// only thing standing between that verdict and ~146 authorized PUTs — which
+// is why the gate now reads them.
+func TestRunCrossCheck_MostlyUnverifiableSample_StillPassesButSaysSo(t *testing.T) {
+	logger, _ := newDecisionTestLogger(slog.LevelWarn)
+	inst := Instance{Name: "radarr-main", Type: "radarr"}
+
+	var decisions []movieDecision
+	// One verifiable would-unmonitor item, nine unverifiable ones.
+	decisions = append(decisions, movieDecision{id: 1, title: "The One Verified Movie", wouldUnmonitor: true, hasFile: true, qualityCutoffNotMet: agreeFalse()})
+	for i := 2; i <= 10; i++ {
+		decisions = append(decisions, movieDecision{id: i, title: "Unverifiable WU", wouldUnmonitor: true, hasFile: true})
+	}
+	// Ten unverifiable skip items.
+	for i := 101; i <= 110; i++ {
+		decisions = append(decisions, movieDecision{id: i, title: "Unverifiable Skip", wouldUnmonitor: false, hasFile: true, reason: ReasonQualityCutoffNotMet})
+	}
+
+	cc := runCrossCheck(logger, inst, decisions, map[int]bool{})
+
+	if cc.status != crossCheckStatusPassed {
+		t.Fatalf("status = %q, want %q", cc.status, crossCheckStatusPassed)
+	}
+	if cc.verified != 1 || cc.unverifiable != 19 {
+		t.Errorf("aggregate verified/unverifiable = %d/%d, want 1/19", cc.verified, cc.unverifiable)
+	}
+	if cc.writeVerified != 1 || cc.writeUnverifiable != 9 {
+		t.Errorf("would-unmonitor verified/unverifiable = %d/%d, want 1/9", cc.writeVerified, cc.writeUnverifiable)
+	}
+	if reason := writeGateBlockReason(cc, 146); reason == "" {
+		t.Errorf("the gate opened on a sample that verified 1 of 20 items; it must not")
+	}
+}
+
+// --- the write gate reads the evidence, not just the verdict ----------------
+
+// gateTestDecision is a single would-unmonitor decision for movie 1, matched
+// by the fake's detail fixture below: everything about the pass is healthy
+// except the cross-check evidence each case supplies, so a gate that let the
+// case through would complete a real, recorded PUT rather than failing for
+// some incidental reason.
+func gateTestDecision() []movieDecision {
+	return []movieDecision{{id: 1, title: "Gated Movie", wouldUnmonitor: true, reason: ReasonCutoffMet, profileName: "HD-1080p"}}
+}
+
+func TestRunWritePass_PassedButNoWouldUnmonitorItemVerified_BlocksAndNamesTheRatio(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{1: monitoredMovieDetail(1, "Gated Movie")})
+	client := NewAPIClient(fake.instance().URL, fake.instance().APIKey)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	// The pass the old gate saw: "passed", one item verified. That item was
+	// a skip.
+	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 1, unverifiable: 1, writeVerified: 0, writeUnverifiable: 1}
+	unmonitored, writeErrors := runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, false)
+
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("a pass that verified no would-unmonitor decision must authorize no write, got %+v", writes)
+	}
+	if unmonitored != 0 || writeErrors != 0 {
+		t.Errorf("a blocked pass wrote nothing and failed at nothing; got unmonitored=%d writeErrors=%d", unmonitored, writeErrors)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "withheld") {
+		t.Errorf("expected a warning explaining that writes were withheld:\n%s", out)
+	}
+	// The gate must publish the numbers it judged on. A warning that says
+	// "the cross-check did not authorize this" without them leaves the human
+	// unable to tell a data problem from a bug in this rule.
+	for _, want := range []string{"wouldUnmonitorVerified=0", "wouldUnmonitorUnverifiable=1", "verified=1", "unverifiable=1", "withheldWrites=1"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected the withheld warning to state %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRunWritePass_MostWouldUnmonitorSamplesUnverifiable_Blocks(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{1: monitoredMovieDetail(1, "Gated Movie")})
+	client := NewAPIClient(fake.instance().URL, fake.instance().APIKey)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	// One verified would-unmonitor item out of ten sampled: verification
+	// happened, but not enough of it to speak for the pool.
+	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 1, unverifiable: 19, writeVerified: 1, writeUnverifiable: 9}
+	runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, false)
+
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("a sample where 9 of 10 would-unmonitor items were unverifiable must authorize no write, got %+v", writes)
+	}
+	if !strings.Contains(buf.String(), "withheld") {
+		t.Errorf("expected a warning explaining that writes were withheld:\n%s", buf.String())
+	}
+}
+
+// TestRunWritePass_MinorityUnverifiable_WritesButWarnsAtTheGate: verification
+// that covers most of the pool is still permission to write — the fix is
+// about evidence, not about refusing every imperfect sample — but the human
+// hears about the gap at the moment writes happen, not only in a summary
+// string read afterwards.
+func TestRunWritePass_MinorityUnverifiable_WritesButWarnsAtTheGate(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{1: monitoredMovieDetail(1, "Gated Movie")})
+	client := NewAPIClient(fake.instance().URL, fake.instance().APIKey)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 9, unverifiable: 1, writeVerified: 9, writeUnverifiable: 1}
+	unmonitored, writeErrors := runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, false)
+
+	if n := len(fake.puts()); n != 1 {
+		t.Fatalf("expected the write to proceed on a well-verified sample, got %d PUT(s)", n)
+	}
+	if unmonitored != 1 || writeErrors != 0 {
+		t.Errorf("unmonitored/writeErrors = %d/%d, want 1/0", unmonitored, writeErrors)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "partially verified") {
+		t.Errorf("expected a gate-level warning that writes proceeded on a partially verified cross-check:\n%s", out)
+	}
+	if !strings.Contains(out, "unverifiable=1") || !strings.Contains(out, "verified=9") {
+		t.Errorf("expected that warning to name the ratio:\n%s", out)
+	}
+}
+
+// TestRunWritePass_FullyVerified_WritesWithNoPartialVerificationWarning is
+// the noise guard on the warning above: a clean sample must not produce a
+// warning at all, or the warning stops meaning anything.
+func TestRunWritePass_FullyVerified_WritesWithNoPartialVerificationWarning(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{1: monitoredMovieDetail(1, "Gated Movie")})
+	client := NewAPIClient(fake.instance().URL, fake.instance().APIKey)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 4, unverifiable: 0, writeVerified: 4, writeUnverifiable: 0}
+	runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, false)
+
+	if n := len(fake.puts()); n != 1 {
+		t.Fatalf("expected exactly 1 PUT on a fully verified sample, got %d", n)
+	}
+	if strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("a fully verified cross-check must produce no gate warning at all:\n%s", buf.String())
+	}
+}
+
+// TestRunWritePass_NothingToWrite_UnverifiedPoolIsNotAnAlarm: with no
+// would-unmonitor decisions the would-unmonitor pool was never sampled, so
+// "nothing was verified about it" is trivially true and means nothing. A
+// gate that warned here would cry wolf on every clean report-only run.
+func TestRunWritePass_NothingToWrite_UnverifiedPoolIsNotAnAlarm(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{})
+	client := NewAPIClient(fake.instance().URL, fake.instance().APIKey)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	decisions := []movieDecision{{id: 1, title: "Skipped Movie", wouldUnmonitor: false, reason: ReasonNoFile}}
+	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 3, unverifiable: 1, writeVerified: 0, writeUnverifiable: 0}
+	unmonitored, writeErrors := runWritePass(context.Background(), logger, client, fake.instance(), decisions, cc, false)
+
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("a pass with no would-unmonitor decisions must write nothing, got %+v", writes)
+	}
+	if unmonitored != 0 || writeErrors != 0 {
+		t.Errorf("unmonitored/writeErrors = %d/%d, want 0/0", unmonitored, writeErrors)
+	}
+	if strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("nothing to write is not a reason to warn:\n%s", buf.String())
 	}
 }

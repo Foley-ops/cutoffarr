@@ -491,10 +491,10 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 			"instance", inst.Name, "type", inst.Type, "onlyId", onlyID)
 	}
 
-	status, verified, unverifiable := runCrossCheck(logger, inst, decisions, wantedIDs)
-	crossCheckSummary := renderCrossCheckSummary(status, verified, unverifiable)
+	cc := runCrossCheck(logger, inst, decisions, wantedIDs)
+	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
 
-	unmonitoredCount, writeErrorCount := runWritePass(ctx, logger, client, inst, reported, status, dryRun)
+	unmonitoredCount, writeErrorCount := runWritePass(ctx, logger, client, inst, reported, cc, dryRun)
 
 	attrs := []any{"instance", inst.Name, "type", inst.Type}
 	if onlyID != 0 {
@@ -548,7 +548,9 @@ func libraryContainsID(movies []movieListElement, id int) bool {
 //
 // Two gates stand in front of every write:
 //
-//   - The cross-check must have explicitly PASSED. "failed" and
+//   - The cross-check must have authorized writes: an explicit PASS, and
+//     evidence that the pass says something about the decisions this pass is
+//     about to act on (see writeGateBlockReason). "failed" and
 //     "inconclusive" — and any status value a future change might add —
 //     block the entire pass, because the cross-check is what establishes
 //     that the data the decisions rest on is trustworthy at all. An
@@ -562,22 +564,39 @@ func libraryContainsID(movies []movieListElement, id int) bool {
 //
 // Per §2.6 a failed write is logged, counted, and abandoned for the cycle —
 // the pass moves to the next item and never retries.
-func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, decisions []movieDecision, crossCheckStatus string, dryRun bool) (unmonitored, writeErrors int) {
-	if crossCheckStatus != crossCheckStatusPassed {
-		// The count is what makes this warning actionable: "the gate blocked
-		// 12 writes" and "the gate blocked, but there was nothing to write
-		// anyway" are very different situations, and without a number they
-		// produce identical log lines.
-		withheld := 0
-		for _, d := range decisions {
-			if d.wouldUnmonitor {
-				withheld++
-			}
+func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, decisions []movieDecision, cc crossCheckResult, dryRun bool) (unmonitored, writeErrors int) {
+	// The count is what makes the warnings below actionable: "the gate
+	// blocked 12 writes" and "the gate blocked, but there was nothing to
+	// write anyway" are very different situations, and without a number they
+	// produce identical log lines. It is also what tells the sample-quality
+	// rules whether they have anything to protect.
+	pending := 0
+	for _, d := range decisions {
+		if d.wouldUnmonitor {
+			pending++
 		}
-		logger.Warn("writes withheld for this instance: the cross-check did not pass",
-			"instance", inst.Name, "type", inst.Type, "crossCheck", crossCheckStatus,
-			"withheldWrites", withheld, "dryRun", dryRun)
+	}
+
+	if reason := writeGateBlockReason(cc, pending); reason != "" {
+		attrs := []any{"instance", inst.Name, "type", inst.Type, "crossCheck", cc.status}
+		attrs = append(attrs, cc.logAttrs()...)
+		attrs = append(attrs, "withheldWrites", pending, "dryRun", dryRun)
+		logger.Warn("writes withheld for this instance: "+reason, attrs...)
 		return 0, 0
+	}
+
+	// The gate opened, but "opened" is not the same as "the sample was
+	// clean". Anything the cross-check could not verify is named here, at the
+	// moment of consequence, with the ratio: the per-item warnings are
+	// scattered through the report and the summary's crossCheck string is
+	// read after the fact, so neither tells the human that writes went ahead
+	// on partially verified data. Only fires when there is actually something
+	// to write — a report-only run has no consequence to warn about.
+	if pending > 0 && cc.unverifiable > 0 {
+		attrs := []any{"instance", inst.Name, "type", inst.Type}
+		attrs = append(attrs, cc.logAttrs()...)
+		attrs = append(attrs, "pendingWrites", pending, "dryRun", dryRun)
+		logger.Warn("writes proceeding on a partially verified cross-check: some sampled movies could not be verified", attrs...)
 	}
 
 	for _, d := range decisions {
@@ -617,6 +636,56 @@ func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, i
 	}
 
 	return unmonitored, writeErrors
+}
+
+// writeGateBlockReason decides whether the cross-check authorizes this
+// instance's write pass, returning "" to open the gate or the reason it
+// stays shut. It is separate from runWritePass so the whole authorization
+// rule is one readable expression rather than three early returns tangled
+// with logging.
+//
+// REVIEW FIX (phase-4 round 2): the gate used to be `status ==
+// crossCheckStatusPassed` and nothing more, which turned out to be far
+// weaker than it reads. "passed" is awarded whenever at least one sampled
+// item was verified and nothing disagreed — so:
+//
+//   - A sample of 20 in which 19 items lacked movieFile.qualityCutoffNotMet
+//     still passed, and authorized writes across the entire library on the
+//     strength of one verified movie. Nothing at the gate even mentioned the
+//     19; the aggregate warning inside runCrossCheck fires only when the
+//     verified count is zero.
+//   - Worse, the cross-check samples TWO pools — would-unmonitor decisions
+//     and monitored+hasFile skip decisions — and "passed" pooled them. A run
+//     could earn its pass entirely from skip items, verifying not one of the
+//     would-unmonitor decisions that are the only thing a write pass ever
+//     acts on, and the gate could not tell the difference.
+//
+// So the rule is now about the evidence, not the verdict. Both extra
+// conditions are scoped to the would-unmonitor pool: verification of skip
+// decisions is worth having in the report, but it is not evidence about the
+// data behind a write, and treating it as such is exactly the conflation
+// above.
+//
+// The conditions apply only when the pass actually has writes to make.
+// pendingWrites == 0 means the would-unmonitor pool is empty, so it was
+// never sampled and "no would-unmonitor item was verified" is trivially true
+// — blocking a pass with nothing to block would be pure noise. The status
+// check is deliberately outside that guard: an unrecognized or failed status
+// is worth saying out loud either way.
+func writeGateBlockReason(cc crossCheckResult, pendingWrites int) string {
+	if cc.status != crossCheckStatusPassed {
+		return "the cross-check did not pass"
+	}
+	if pendingWrites == 0 {
+		return ""
+	}
+	if cc.writeVerified == 0 {
+		return "the cross-check verified no would-unmonitor decision, so nothing establishes that the data behind these writes is sound"
+	}
+	if cc.writeUnverifiable > cc.writeVerified {
+		return "most sampled would-unmonitor decisions could not be verified, so the data behind these writes is only partly trustworthy"
+	}
+	return ""
 }
 
 // renderCrossCheckSummary formats the "radarr decision summary" line's
@@ -709,6 +778,48 @@ const (
 	crossCheckStatusInconclusive = "inconclusive"
 )
 
+// crossCheckResult is everything the cross-check learned, not just its
+// verdict. It is a struct rather than a status string plus two counts
+// because the write gate needs the evidence behind the verdict and not only
+// the verdict itself (see writeGateBlockReason): a status alone cannot say
+// whether anything relevant to a write was ever verified, and the review
+// that found that hole showed how far apart those two things can be.
+//
+// The would-unmonitor counts are tracked separately from the aggregate for
+// exactly that reason. The cross-check samples two pools with different
+// meanings — decisions that would be WRITTEN, and skip decisions that would
+// not — and a count that adds them together answers a question nobody is
+// asking at the moment of a write.
+type crossCheckResult struct {
+	status string
+
+	// Aggregate across both sampled pools: what the summary line reports and
+	// what the "partially verified" warning quantifies.
+	verified     int
+	unverifiable int
+
+	// The would-unmonitor pool alone — the only decisions the write pass
+	// ever acts on. writeVerified counts sampled would-unmonitor decisions
+	// whose movieFile.qualityCutoffNotMet was present and could therefore be
+	// compared; writeUnverifiable counts those where it was absent.
+	writeVerified     int
+	writeUnverifiable int
+}
+
+// logAttrs renders the result as slog key/value pairs, so every place that
+// reports the gate's reasoning names the same numbers under the same keys.
+// The would-unmonitor pool is spelled out in full rather than summarized,
+// because "1 of 10 verified" and "1 of 1 verified" are the difference
+// between a run to investigate and a run to ignore.
+func (cc crossCheckResult) logAttrs() []any {
+	return []any{
+		"verified", cc.verified,
+		"unverifiable", cc.unverifiable,
+		"wouldUnmonitorVerified", cc.writeVerified,
+		"wouldUnmonitorUnverifiable", cc.writeUnverifiable,
+	}
+}
+
 // runCrossCheck implements plan §6's cross-check, adapted to the STRICT
 // rule (runs after decisions, read-only, no additional API calls: it
 // re-uses data already collected during evaluateMovie plus the same
@@ -735,7 +846,14 @@ const (
 // warning) rather than Passed: a sample that verified nothing must never
 // be indistinguishable from one that verified everything and found no
 // problems.
-func runCrossCheck(logger *slog.Logger, inst Instance, decisions []movieDecision, wantedIDs map[int]bool) (status string, verified int, unverifiable int) {
+//
+// The same two counts are also kept for the would-unmonitor pool on its own
+// (crossCheckResult.writeVerified / writeUnverifiable). The status is a
+// statement about the sample as a whole; the write gate has to ask a
+// narrower question — "was anything verified about the decisions I am about
+// to act on?" — and only a per-pool count can answer it. See
+// writeGateBlockReason.
+func runCrossCheck(logger *slog.Logger, inst Instance, decisions []movieDecision, wantedIDs map[int]bool) crossCheckResult {
 	byID := make(map[int]movieDecision, len(decisions))
 	var wouldUnmonitorIDs, skipIDs []int
 	for _, d := range decisions {
@@ -749,6 +867,7 @@ func runCrossCheck(logger *slog.Logger, inst Instance, decisions []movieDecision
 
 	sampled := append(sampleEveryKth(wouldUnmonitorIDs, crossCheckSampleSize), sampleEveryKth(skipIDs, crossCheckSampleSize)...)
 
+	var result crossCheckResult
 	disagreementFound := false
 	for _, id := range sampled {
 		d := byID[id]
@@ -770,13 +889,23 @@ func runCrossCheck(logger *slog.Logger, inst Instance, decisions []movieDecision
 			// disagreement (inWantedSet=false would then trivially "agree"
 			// with a value we never actually observed), so this is counted
 			// separately and called out on its own.
-			unverifiable++
+			//
+			// d.wouldUnmonitor is what put this id in one sampled pool
+			// rather than the other, so it is also the exact test for which
+			// pool's count this belongs to.
+			result.unverifiable++
+			if d.wouldUnmonitor {
+				result.writeUnverifiable++
+			}
 			logger.Warn("cross-check: movieFile.qualityCutoffNotMet missing from /movie data; cannot verify wanted-set agreement for this movie",
 				"instance", inst.Name, "id", id, "title", d.title)
 			continue
 		}
 
-		verified++
+		result.verified++
+		if d.wouldUnmonitor {
+			result.writeVerified++
+		}
 		if inWantedSet != *d.qualityCutoffNotMet {
 			disagreementFound = true
 			logger.Error("cross-check disagreement: wanted-set membership does not match movieFile.qualityCutoffNotMet",
@@ -787,16 +916,16 @@ func runCrossCheck(logger *slog.Logger, inst Instance, decisions []movieDecision
 
 	switch {
 	case disagreementFound:
-		status = crossCheckStatusFailed
-	case len(sampled) > 0 && verified == 0:
-		status = crossCheckStatusInconclusive
+		result.status = crossCheckStatusFailed
+	case len(sampled) > 0 && result.verified == 0:
+		result.status = crossCheckStatusInconclusive
 		logger.Warn("cross-check: every sampled item was unverifiable (movieFile.qualityCutoffNotMet missing); cannot determine pass or fail",
-			"instance", inst.Name, "unverifiable", unverifiable)
+			"instance", inst.Name, "unverifiable", result.unverifiable)
 	default:
-		status = crossCheckStatusPassed
+		result.status = crossCheckStatusPassed
 	}
 
-	return status, verified, unverifiable
+	return result
 }
 
 // selectMovieFile picks the movieFileDetail this movie's file actually
