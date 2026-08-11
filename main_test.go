@@ -273,3 +273,149 @@ instances: []
 		t.Errorf("expected the redacted config printout (at %d) to appear before the no-instances warning (at %d):\n%s", configIdx, warnIdx, out)
 	}
 }
+
+// --- --only-id flag validation (Phase 4) ----------------------------------
+
+// TestRun_OnlyIDZero_IsFatalFlagError and its sibling below pin the flag's
+// validation: a movie id is always a positive integer, so 0 and negatives
+// are user error rather than something to silently interpret. 0 matters
+// especially: it is also the flag's absent-value sentinel, so accepting it
+// would turn "--only-id 0" into a silent full-library run — the exact
+// widening of scope this phase must never do by accident.
+func TestRun_OnlyIDZero_IsFatalFlagError(t *testing.T) {
+	path := writeMainTestConfig(t, `
+instances: []
+`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once", "--only-id", "0"}, &stdout, &stderr)
+
+	if code == 0 {
+		t.Fatal("exit code = 0, want non-zero for --only-id 0")
+	}
+	if !strings.Contains(stderr.String(), "only-id") {
+		t.Errorf("stderr does not explain the invalid flag:\n%s", stderr.String())
+	}
+}
+
+func TestRun_OnlyIDNegative_IsFatalFlagError(t *testing.T) {
+	path := writeMainTestConfig(t, `
+instances: []
+`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once", "--only-id", "-3"}, &stdout, &stderr)
+
+	if code == 0 {
+		t.Fatal("exit code = 0, want non-zero for a negative --only-id")
+	}
+	if !strings.Contains(stderr.String(), "only-id") {
+		t.Errorf("stderr does not explain the invalid flag:\n%s", stderr.String())
+	}
+}
+
+func TestRun_OnlyIDNonInteger_IsFatalFlagError(t *testing.T) {
+	path := writeMainTestConfig(t, `
+instances: []
+`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once", "--only-id", "not-a-number"}, &stdout, &stderr)
+
+	if code == 0 {
+		t.Fatal("exit code = 0, want non-zero for a non-integer --only-id")
+	}
+	if stderr.String() == "" {
+		t.Error("stderr is empty, want a flag parse error message")
+	}
+}
+
+// TestRun_OnlyIDWithoutOnce_WarnsThatItHasNoEffect: the flag scopes a
+// single pass, and daemon mode does not run one yet. Ignoring it silently
+// would let someone believe a run was scoped when it was not.
+//
+// The config names a radarr (it is never contacted — without --once nothing
+// is) so this test exercises the one thing it is about. An empty instance
+// list would now be refused earlier and for a different reason: a --only-id
+// that no configured radarr could apply to is a fatal flag error in its own
+// right, which is a separate pin (writer_test.go's --only-id scope tests).
+func TestRun_OnlyIDWithoutOnce_WarnsThatItHasNoEffect(t *testing.T) {
+	path := writeMainTestConfig(t, `
+instances:
+  - name: radarr-main
+    type: radarr
+    url: http://radarr.invalid:7878
+    api_key: key1
+`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--only-id", "42"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "only-id") {
+		t.Errorf("expected a warning that --only-id has no effect without --once:\n%s", out)
+	}
+}
+
+// TestRun_InstanceWithoutOnce_WarnsThatItHasNoEffect is the same courtesy
+// for --instance: a scoping flag that is silently ignored is worse than one
+// that is rejected, because the human believes the run was narrowed.
+func TestRun_InstanceWithoutOnce_WarnsThatItHasNoEffect(t *testing.T) {
+	path := writeMainTestConfig(t, `
+instances:
+  - name: radarr-main
+    type: radarr
+    url: http://radarr:7878
+    api_key: key1
+`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--instance", "radarr-main"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "instance") {
+		t.Errorf("expected a warning that --instance has no effect without --once:\n%s", out)
+	}
+}
+
+// TestRun_InstanceFlag_NamesASonarrInstance_ScopesToIt pins that --instance
+// is a general instance selector, not a radarr-only one: it names which
+// configured instance a pass runs against, whatever its type.
+func TestRun_InstanceFlag_NamesASonarrInstance_ScopesToIt(t *testing.T) {
+	var radarrHits, sonarrHits int
+	radarrSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		radarrHits++
+		w.Write([]byte(`{"appName": "Radarr", "version": "5.14.0.9383"}`))
+	}))
+	defer radarrSrv.Close()
+	sonarrSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sonarrHits++
+		w.Write([]byte(`{"appName": "Sonarr", "version": "4.0.0.0"}`))
+	}))
+	defer sonarrSrv.Close()
+
+	path := writeMainTestConfig(t, `
+instances:
+  - name: radarr-main
+    type: radarr
+    url: `+radarrSrv.URL+`
+    api_key: key1
+  - name: sonarr-main
+    type: sonarr
+    url: `+sonarrSrv.URL+`
+    api_key: key2
+`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once", "--instance", "sonarr-main"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if radarrHits != 0 {
+		t.Errorf("the radarr instance was contacted %d time(s) despite --instance sonarr-main", radarrHits)
+	}
+	if sonarrHits == 0 {
+		t.Error("the named sonarr instance was never contacted")
+	}
+}

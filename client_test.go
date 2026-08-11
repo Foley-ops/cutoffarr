@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -217,5 +218,166 @@ func TestAPIClient_Do_SuccessReturnsResponse(t *testing.T) {
 
 	if resp.StatusCode != http.StatusCreated {
 		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+}
+
+// --- DoJSON -------------------------------------------------------------
+//
+// Phase 4 introduces the project's first and only write request (PUT
+// /api/v3/movie/{id}). Do/DoQuery set only X-Api-Key, which is enough for
+// every read endpoint but not for a request that carries a body: Radarr's
+// ASP.NET Core stack rejects a body without a Content-Type it recognizes
+// (415 Unsupported Media Type). DoJSON is the one entry point that sends a
+// JSON body, so the header is set in exactly one place rather than being
+// left to each caller to remember.
+
+func TestAPIClient_DoJSON_SendsBodyMethodAndJSONContentType(t *testing.T) {
+	var gotMethod, gotPath, gotContentType, gotAPIKey string
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotContentType = r.Header.Get("Content-Type")
+		gotAPIKey = r.Header.Get("X-Api-Key")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL, "my-secret-key")
+	body := []byte(`{"id":7,"monitored":false}`)
+	resp, err := c.DoJSON(context.Background(), http.MethodPut, "/api/v3/movie/7", body)
+	if err != nil {
+		t.Fatalf("DoJSON returned error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if gotMethod != http.MethodPut {
+		t.Errorf("method = %q, want PUT", gotMethod)
+	}
+	if gotPath != "/api/v3/movie/7" {
+		t.Errorf("path = %q, want /api/v3/movie/7", gotPath)
+	}
+	if gotContentType != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", gotContentType)
+	}
+	if gotAPIKey != "my-secret-key" {
+		t.Errorf("X-Api-Key = %q, want my-secret-key", gotAPIKey)
+	}
+	if string(gotBody) != string(body) {
+		t.Errorf("request body = %q, want %q", gotBody, body)
+	}
+	if resp.StatusCode != http.StatusAccepted {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusAccepted)
+	}
+}
+
+func TestAPIClient_DoJSON_NonTwoxxIsErrorWithBodySnippet(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"message":"movie not found"}`))
+	}))
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL, "key")
+	_, err := c.DoJSON(context.Background(), http.MethodPut, "/api/v3/movie/7", []byte(`{}`))
+	if err == nil {
+		t.Fatal("DoJSON returned nil error, want error for 400 response")
+	}
+	if !strings.Contains(err.Error(), "400") || !strings.Contains(err.Error(), "movie not found") {
+		t.Errorf("error %q does not carry the status and body snippet", err.Error())
+	}
+}
+
+// TestAPIClient_Do_SetsNoContentTypeHeader pins that the read path is
+// unchanged: only DoJSON sets Content-Type, so a bodyless GET never starts
+// advertising a body content type it does not have.
+func TestAPIClient_Do_SetsNoContentTypeHeader(t *testing.T) {
+	var gotContentType string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotContentType = r.Header.Get("Content-Type")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL, "key")
+	resp, err := c.Do(context.Background(), http.MethodGet, "/api/v3/movie", nil)
+	if err != nil {
+		t.Fatalf("Do returned error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if gotContentType != "" {
+		t.Errorf("Content-Type = %q, want empty for a bodyless GET", gotContentType)
+	}
+}
+
+// TestAPIClient_DoJSON_RedirectIsAnErrorNotASilentlyDowngradedRequest is a
+// write-safety pin, not a protocol nicety. net/http's default redirect
+// policy preserves the method and body only on 307/308; on 301, 302 and 303
+// it re-issues the request as a bodyless GET. A reverse proxy in front of
+// Radarr answering the PUT with a 302 (http->https, a trailing-slash
+// canonicalisation, a login portal) would therefore turn the project's only
+// write into a read, and the follow-up 200 would be indistinguishable from a
+// completed write — the caller would log "unmonitor", count it, and the
+// movie would still be monitored. Refusing to follow redirects surfaces the
+// 302 as the non-2xx it is.
+func TestAPIClient_DoJSON_RedirectIsAnErrorNotASilentlyDowngradedRequest(t *testing.T) {
+	var followed []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		followed = append(followed, r.Method+" "+r.URL.Path)
+		if r.URL.Path == "/api/v3/movie/7" {
+			http.Redirect(w, r, "/elsewhere", http.StatusFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok": true}`))
+	}))
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL, "key")
+	resp, err := c.DoJSON(context.Background(), http.MethodPut, "/api/v3/movie/7", []byte(`{"id":7,"monitored":false}`))
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("DoJSON returned nil error for a 302; a redirected write must never look like a completed one")
+	}
+	if !strings.Contains(err.Error(), "302") {
+		t.Errorf("error %q does not state the redirect status that was received", err.Error())
+	}
+	if len(followed) != 1 {
+		t.Errorf("the client followed the redirect (requests: %v); it must stop at the 3xx", followed)
+	}
+}
+
+// TestAPIClient_Do_RedirectOnReadIsAlsoNotFollowed pins the same policy on
+// the read path. Following a redirect there is less dangerous, but it would
+// re-send X-Api-Key to whatever host the Location header names (net/http
+// strips only Authorization, Cookie and WWW-Authenticate on a cross-host
+// redirect, never a custom header), so the credential would leak to anything
+// that can answer with a 3xx.
+func TestAPIClient_Do_RedirectOnReadIsAlsoNotFollowed(t *testing.T) {
+	var gotKeyAt []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Api-Key") != "" {
+			gotKeyAt = append(gotKeyAt, r.URL.Path)
+		}
+		if r.URL.Path == "/api/v3/movie" {
+			http.Redirect(w, r, "/attacker-controlled", http.StatusMovedPermanently)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL, "my-secret-key")
+	resp, err := c.Do(context.Background(), http.MethodGet, "/api/v3/movie", nil)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("Do returned nil error for a 301, want the 3xx surfaced as a non-2xx error")
+	}
+	for _, path := range gotKeyAt {
+		if path != "/api/v3/movie" {
+			t.Errorf("the API key was sent to %q, a redirect target; only the configured base URL may receive it", path)
+		}
 	}
 }

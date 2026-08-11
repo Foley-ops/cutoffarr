@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -356,21 +357,59 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 	return d
 }
 
-// runRadarrDecisionEngine is the Phase 3 entry point for a single radarr
-// instance: it fetches the two additional data sources the STRICT decision
-// rule needs beyond what inspectRadarrLibrary (Phase 2) already gathered —
-// quality profiles (refactor c) and the exclusion tag id (tag-resolution
-// rules) — then evaluates every monitored movie in movies, in library
-// order, logging a "would-unmonitor" or "skip" report line for each
-// (msg="would-unmonitor" / msg=skip, per the plan), runs the cross-check,
-// and logs an end-of-instance summary. It is called only for a radarr
-// instance whose connectivity check and inspectRadarrLibrary fetch both
-// already succeeded (main.go's responsibility); it never returns anything
-// because, like checkInstanceConnectivity and inspectRadarrLibrary, the
-// binding error-handling rule (§2.6) is "skip that instance for the cycle
-// and log a warning" with no further work for a caller to gate on.
-func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, movies []movieListElement, wantedIDs map[int]bool, exclusionTagLabel string) {
+// runRadarrDecisionEngine is the entry point for a single radarr instance.
+// It fetches the two additional data sources the STRICT decision rule needs
+// beyond what inspectRadarrLibrary (Phase 2) already gathered — quality
+// profiles (refactor c) and the exclusion tag id (tag-resolution rules) —
+// and then runs three distinct passes, in order:
+//
+//  1. EVALUATE every monitored movie in movies, in library order, logging a
+//     "would-unmonitor" or "skip" report line for each (msg="would-unmonitor"
+//     / msg=skip, per the plan). No writes, no decisions acted on.
+//  2. CROSS-CHECK the resulting decisions against Radarr's own
+//     qualityCutoffNotMet data (plan §6).
+//  3. WRITE (Phase 4) — but only if the cross-check explicitly PASSED.
+//
+// Keeping the write pass separate from evaluation is deliberate rather than
+// stylistic: a write may only happen once the cross-check has had the
+// complete picture and approved it, which is impossible if writes are
+// interleaved with the evaluation that produces the cross-check's input.
+//
+// onlyID (the --only-id flag, 0 when absent) narrows what is REPORTED and
+// WRITTEN to the single movie with that id. It deliberately does not narrow
+// what is evaluated: the cross-check validates the data the decision rests
+// on, not the target, so it still samples the whole library (see
+// runWritePass and the plan's Phase 4 acceptance criteria).
+//
+// It is called only for a radarr instance whose connectivity check and
+// inspectRadarrLibrary fetch both already succeeded (main.go's
+// responsibility); it never returns anything because, like
+// checkInstanceConnectivity and inspectRadarrLibrary, the binding
+// error-handling rule (§2.6) is "skip that instance for the cycle and log a
+// warning" with no further work for a caller to gate on.
+func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, movies []movieListElement, wantedIDs map[int]bool, exclusionTagLabel string, onlyID int, dryRun bool) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	// An --only-id naming a movie this instance's library does not contain
+	// is checked before anything else is fetched: there is nothing to decide
+	// or write, so there is no reason to make further API calls. A mistyped
+	// id is the ordinary cause, and it is a warning rather than an error
+	// because this function has no standing to fail the process — §2.6's
+	// house rule for an instance that cannot be processed is "warn and skip
+	// the instance for the cycle".
+	//
+	// This is NOT the guard against --only-id hitting the wrong instance.
+	// Radarr movie ids are per-instance (each library is numbered from 1),
+	// so id 2 exists in radarr-hd AND radarr-4k as two different films, and
+	// the wrong-instance case is a MATCH here, not a miss — nothing in this
+	// function could detect it. run() refuses ambiguous --only-id runs up
+	// front, before any instance is contacted, by requiring --instance when
+	// more than one radarr is in scope.
+	if onlyID != 0 && !libraryContainsID(movies, onlyID) {
+		logger.Warn("--only-id movie not found in this instance's library; no decisions for this instance",
+			"instance", inst.Name, "type", inst.Type, "onlyId", onlyID)
+		return
+	}
 
 	profiles, ok := fetchQualityProfiles(ctx, logger, client, inst)
 	if !ok {
@@ -382,7 +421,12 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		return
 	}
 
+	// decisions holds every evaluated movie and feeds the cross-check;
+	// reported holds the subset that is in scope for the report, the
+	// summary counts, and the write pass. The two are the same slice unless
+	// --only-id narrowed the scope.
 	var decisions []movieDecision
+	var reported []movieDecision
 	totalMonitored := 0
 	wouldUnmonitorCount := 0
 	skipCounts := make(map[string]int)
@@ -412,29 +456,274 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 				"instance", inst.Name, "type", inst.Type, "title", titleOrAbsent(m.Title))
 			continue
 		}
-		totalMonitored++
-
 		d := evaluateMovie(ctx, logger, client, inst, m, profiles, exclusionTagID, tagActive, wantedIDs)
 		decisions = append(decisions, d)
+
+		// --only-id scoping happens here and nowhere else: every movie is
+		// still evaluated above (the cross-check needs the full candidate
+		// pools), but only the named movie is reported, counted, or written.
+		if onlyID != 0 && d.id != onlyID {
+			continue
+		}
+		reported = append(reported, d)
+		totalMonitored++
 
 		if d.wouldUnmonitor {
 			wouldUnmonitorCount++
 			logger.Info("would-unmonitor",
-				"title", d.title, "reason", d.reason, "profile", d.profileName, "instance", inst.Name)
+				"id", d.id, "title", d.title, "reason", d.reason, "profile", d.profileName, "instance", inst.Name)
 		} else {
 			skipCounts[d.reason]++
 			logger.Info("skip",
-				"title", d.title, "reason", d.reason, "profile", d.profileName, "instance", inst.Name)
+				"id", d.id, "title", d.title, "reason", d.reason, "profile", d.profileName, "instance", inst.Name)
 		}
 	}
 
-	status, verified, unverifiable := runCrossCheck(logger, inst, decisions, wantedIDs)
-	crossCheckSummary := renderCrossCheckSummary(status, verified, unverifiable)
+	// The movie is in the library — that was established before any of this
+	// ran, and matching it there required a non-nil id — so the only thing
+	// that can have kept it out of the report is rule 1: monitored is false,
+	// or the key was absent entirely (warned about separately above). Naming
+	// any other cause here would send the reader hunting for a data problem
+	// that cannot be the explanation. Without this line, --only-id on such a
+	// movie would say nothing whatsoever about the one movie the human
+	// explicitly named.
+	if onlyID != 0 && len(reported) == 0 {
+		logger.Info("--only-id movie produced no decision: it is not monitored, so rule 1 excludes it from the report",
+			"instance", inst.Name, "type", inst.Type, "onlyId", onlyID)
+	}
 
-	logger.Info("radarr decision summary",
-		"instance", inst.Name, "type", inst.Type,
-		"totalMonitored", totalMonitored, "wouldUnmonitor", wouldUnmonitorCount,
-		"skipReasons", formatSkipCounts(skipCounts), "crossCheck", crossCheckSummary)
+	cc := runCrossCheck(logger, inst, decisions, wantedIDs)
+	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
+
+	unmonitoredCount, writeErrorCount, echoUnverifiedCount := runWritePass(ctx, logger, client, inst, reported, cc, dryRun)
+
+	attrs := []any{"instance", inst.Name, "type", inst.Type}
+	if onlyID != 0 {
+		attrs = append(attrs, "onlyId", onlyID)
+	}
+	attrs = append(attrs, "totalMonitored", totalMonitored, "wouldUnmonitor", wouldUnmonitorCount, "unmonitored", unmonitoredCount)
+
+	// writeErrors counts failed WRITES, so in dry-run it is unconditionally
+	// 0: no write was attempted, so none can have failed. That is not the
+	// same as saying nothing went wrong. The write pass runs in dry-run too
+	// (that is what makes it a rehearsal rather than a different code path),
+	// and its pre-write GET, decode, and identity check can all fail. Those
+	// failures are real, are logged at ERROR, and are counted — under their
+	// own name, so that a report the human reads as "nothing was attempted"
+	// never carries a number that reads as "N writes failed". Phase 5's
+	// no-op contract reads unmonitored and writeErrors; neither is ever
+	// inflated by a dry-run.
+	//
+	// writeEchoUnverified is the third outcome (see runWritePass): PUTs the
+	// server accepted without confirming. It is always present in write mode,
+	// including as 0, so its absence can never be read as "none happened";
+	// it cannot occur in dry-run, where no PUT is ever sent, so printing it
+	// there would be an invitation to wonder what it means. unmonitored +
+	// writeEchoUnverified is the number of writes the server took;
+	// unmonitored alone is the number it confirmed.
+	if dryRun {
+		attrs = append(attrs, "writeErrors", 0, "writeRehearsalErrors", writeErrorCount)
+	} else {
+		attrs = append(attrs, "writeErrors", writeErrorCount, "writeEchoUnverified", echoUnverifiedCount)
+	}
+
+	attrs = append(attrs, "skipReasons", formatSkipCounts(skipCounts), "crossCheck", crossCheckSummary)
+	logger.Info("radarr decision summary", attrs...)
+}
+
+// libraryContainsID reports whether any movie in the library carries id.
+// Used only to tell "--only-id names a movie this instance does not have"
+// (a warning, not an error) apart from a target that exists but is filtered
+// out by the decision rules.
+func libraryContainsID(movies []movieListElement, id int) bool {
+	for _, m := range movies {
+		if m.ID != nil && *m.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// runWritePass is the third and final pass: it acts on the decisions the
+// first two passes produced. It returns the number of movies actually
+// written (always 0 in dry-run, since no PUT is ever issued there) and the
+// number of failures.
+//
+// In write mode a failure is a failed write. In dry-run it can only be a
+// failed REHEARSAL of the write — the fresh GET, the decode, or the identity
+// check, all of which run before the dry-run gate — because no write is ever
+// attempted. The caller reports the two under different names for that
+// reason; see the summary in runRadarrDecisionEngine.
+//
+// Two gates stand in front of every write:
+//
+//   - The cross-check must have authorized writes: an explicit PASS, and
+//     evidence that the pass says something about the decisions this pass is
+//     about to act on (see writeGateBlockReason). "failed" and
+//     "inconclusive" — and any status value a future change might add —
+//     block the entire pass, because the cross-check is what establishes
+//     that the data the decisions rest on is trustworthy at all. An
+//     inconclusive result is not a weaker pass; it means nothing was
+//     verified, which is no basis for a write. Blocking is loud (warn), not
+//     silent: "nothing was written" and "nothing needed writing" must never
+//     look the same in the log.
+//   - The decision's wouldUnmonitor bool. Never its reason text: reason is
+//     a human-facing string, and gating a write on string comparison would
+//     make a copy-edit to a message a functional change to the write path.
+//
+// Per §2.6 a failed write is logged, counted, and abandoned for the cycle —
+// the pass moves to the next item and never retries.
+//
+// Three outcomes are counted, not two, because a PUT has three meaningfully
+// different endings and only two of them are the ones people expect:
+//
+//   - confirmed (unmonitored): the server accepted the write AND its echo
+//     says the movie is now unmonitored. The only outcome that logs
+//     msg=unmonitor and the only one Phase 5's no-op contract counts.
+//   - failed (writeErrors): the server rejected the write, or its echo says
+//     the movie is still monitored. The change did not happen.
+//   - accepted but unconfirmed (echoUnverified): a 2xx whose body cannot
+//     settle the question — empty, not an object, no "monitored" key. The
+//     change probably DID happen and cannot be proven, which is neither of
+//     the above and must not be reported as either.
+func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, decisions []movieDecision, cc crossCheckResult, dryRun bool) (unmonitored, writeErrors, echoUnverified int) {
+	// The count is what makes the warnings below actionable: "the gate
+	// blocked 12 writes" and "the gate blocked, but there was nothing to
+	// write anyway" are very different situations, and without a number they
+	// produce identical log lines. It is also what tells the sample-quality
+	// rules whether they have anything to protect.
+	pending := 0
+	for _, d := range decisions {
+		if d.wouldUnmonitor {
+			pending++
+		}
+	}
+
+	if reason := writeGateBlockReason(cc, pending); reason != "" {
+		attrs := []any{"instance", inst.Name, "type", inst.Type, "crossCheck", cc.status}
+		attrs = append(attrs, cc.logAttrs()...)
+		attrs = append(attrs, "withheldWrites", pending, "dryRun", dryRun)
+		logger.Warn("writes withheld for this instance: "+reason, attrs...)
+		return 0, 0, 0
+	}
+
+	// The gate opened, but "opened" is not the same as "the sample was
+	// clean". Anything the cross-check could not verify is named here, at the
+	// moment of consequence, with the ratio: the per-item warnings are
+	// scattered through the report and the summary's crossCheck string is
+	// read after the fact, so neither tells the human that writes went ahead
+	// on partially verified data. Only fires when there is actually something
+	// to write — a report-only run has no consequence to warn about.
+	if pending > 0 && cc.unverifiable > 0 {
+		attrs := []any{"instance", inst.Name, "type", inst.Type}
+		attrs = append(attrs, cc.logAttrs()...)
+		attrs = append(attrs, "pendingWrites", pending, "dryRun", dryRun)
+		logger.Warn("writes proceeding on a partially verified cross-check: some sampled movies could not be verified", attrs...)
+	}
+
+	for _, d := range decisions {
+		if !d.wouldUnmonitor {
+			continue
+		}
+
+		written, err := unmonitorMovie(ctx, logger, client, inst, d.id, dryRun)
+		if errors.Is(err, errWriteUnverified) {
+			// The server took the write and told us nothing useful about it.
+			// Calling this a failed write would state two things that are
+			// probably both false — that the write path is broken, and that
+			// the movie is still monitored — so it gets its own message, its
+			// own counter, and a WARN rather than an ERROR. It is not
+			// retried: §2.6 bars retries within a cycle, and a retry here
+			// would be a second write against a movie that has most likely
+			// already been changed. The next cycle settles it for free —
+			// either the movie reads unmonitored (nothing to do, rule 1
+			// excludes it) or it is a candidate again and gets written then.
+			echoUnverified++
+			logger.Warn("unmonitor write accepted but the response was unverifiable; treat it as applied and let the next cycle reconcile it",
+				"instance", inst.Name, "type", inst.Type, "id", d.id, "title", d.title, "error", err)
+			continue
+		}
+		if err != nil {
+			writeErrors++
+			// The wording is mode-specific because the two failures are
+			// different events. In write mode a PUT was attempted and did
+			// not take. In dry-run nothing was ever sent, so the only thing
+			// that can have failed is the rehearsal of the write path (its
+			// fresh GET, decode, or identity check) — still worth an ERROR,
+			// since a broken write path must be visible in the one mode
+			// allowed to exercise it, but "write failed" would be a false
+			// statement about a run that wrote nothing.
+			msg := "unmonitor write failed; skipping this movie for the cycle"
+			if dryRun {
+				msg = "unmonitor write rehearsal failed; no write was attempted (dry-run), and this movie is skipped for the cycle"
+			}
+			logger.Error(msg,
+				"instance", inst.Name, "type", inst.Type, "id", d.id, "title", d.title, "error", err)
+			continue
+		}
+		if !written {
+			// Dry-run, or the movie was already unmonitored by the time the
+			// write pass reached it; unmonitorMovie has already accounted
+			// for both. Nothing was changed, so nothing is counted.
+			continue
+		}
+
+		unmonitored++
+		logger.Info("unmonitor",
+			"id", d.id, "title", d.title, "reason", d.reason, "profile", d.profileName, "instance", inst.Name)
+	}
+
+	return unmonitored, writeErrors, echoUnverified
+}
+
+// writeGateBlockReason decides whether the cross-check authorizes this
+// instance's write pass, returning "" to open the gate or the reason it
+// stays shut. It is separate from runWritePass so the whole authorization
+// rule is one readable expression rather than three early returns tangled
+// with logging.
+//
+// REVIEW FIX (phase-4 round 2): the gate used to be `status ==
+// crossCheckStatusPassed` and nothing more, which turned out to be far
+// weaker than it reads. "passed" is awarded whenever at least one sampled
+// item was verified and nothing disagreed — so:
+//
+//   - A sample of 20 in which 19 items lacked movieFile.qualityCutoffNotMet
+//     still passed, and authorized writes across the entire library on the
+//     strength of one verified movie. Nothing at the gate even mentioned the
+//     19; the aggregate warning inside runCrossCheck fires only when the
+//     verified count is zero.
+//   - Worse, the cross-check samples TWO pools — would-unmonitor decisions
+//     and monitored+hasFile skip decisions — and "passed" pooled them. A run
+//     could earn its pass entirely from skip items, verifying not one of the
+//     would-unmonitor decisions that are the only thing a write pass ever
+//     acts on, and the gate could not tell the difference.
+//
+// So the rule is now about the evidence, not the verdict. Both extra
+// conditions are scoped to the would-unmonitor pool: verification of skip
+// decisions is worth having in the report, but it is not evidence about the
+// data behind a write, and treating it as such is exactly the conflation
+// above.
+//
+// The conditions apply only when the pass actually has writes to make.
+// pendingWrites == 0 means the would-unmonitor pool is empty, so it was
+// never sampled and "no would-unmonitor item was verified" is trivially true
+// — blocking a pass with nothing to block would be pure noise. The status
+// check is deliberately outside that guard: an unrecognized or failed status
+// is worth saying out loud either way.
+func writeGateBlockReason(cc crossCheckResult, pendingWrites int) string {
+	if cc.status != crossCheckStatusPassed {
+		return "the cross-check did not pass"
+	}
+	if pendingWrites == 0 {
+		return ""
+	}
+	if cc.writeVerified == 0 {
+		return "the cross-check verified no would-unmonitor decision, so nothing establishes that the data behind these writes is sound"
+	}
+	if cc.writeUnverifiable > cc.writeVerified {
+		return "most sampled would-unmonitor decisions could not be verified, so the data behind these writes is only partly trustworthy"
+	}
+	return ""
 }
 
 // renderCrossCheckSummary formats the "radarr decision summary" line's
@@ -527,6 +816,48 @@ const (
 	crossCheckStatusInconclusive = "inconclusive"
 )
 
+// crossCheckResult is everything the cross-check learned, not just its
+// verdict. It is a struct rather than a status string plus two counts
+// because the write gate needs the evidence behind the verdict and not only
+// the verdict itself (see writeGateBlockReason): a status alone cannot say
+// whether anything relevant to a write was ever verified, and the review
+// that found that hole showed how far apart those two things can be.
+//
+// The would-unmonitor counts are tracked separately from the aggregate for
+// exactly that reason. The cross-check samples two pools with different
+// meanings — decisions that would be WRITTEN, and skip decisions that would
+// not — and a count that adds them together answers a question nobody is
+// asking at the moment of a write.
+type crossCheckResult struct {
+	status string
+
+	// Aggregate across both sampled pools: what the summary line reports and
+	// what the "partially verified" warning quantifies.
+	verified     int
+	unverifiable int
+
+	// The would-unmonitor pool alone — the only decisions the write pass
+	// ever acts on. writeVerified counts sampled would-unmonitor decisions
+	// whose movieFile.qualityCutoffNotMet was present and could therefore be
+	// compared; writeUnverifiable counts those where it was absent.
+	writeVerified     int
+	writeUnverifiable int
+}
+
+// logAttrs renders the result as slog key/value pairs, so every place that
+// reports the gate's reasoning names the same numbers under the same keys.
+// The would-unmonitor pool is spelled out in full rather than summarized,
+// because "1 of 10 verified" and "1 of 1 verified" are the difference
+// between a run to investigate and a run to ignore.
+func (cc crossCheckResult) logAttrs() []any {
+	return []any{
+		"verified", cc.verified,
+		"unverifiable", cc.unverifiable,
+		"wouldUnmonitorVerified", cc.writeVerified,
+		"wouldUnmonitorUnverifiable", cc.writeUnverifiable,
+	}
+}
+
 // runCrossCheck implements plan §6's cross-check, adapted to the STRICT
 // rule (runs after decisions, read-only, no additional API calls: it
 // re-uses data already collected during evaluateMovie plus the same
@@ -553,7 +884,14 @@ const (
 // warning) rather than Passed: a sample that verified nothing must never
 // be indistinguishable from one that verified everything and found no
 // problems.
-func runCrossCheck(logger *slog.Logger, inst Instance, decisions []movieDecision, wantedIDs map[int]bool) (status string, verified int, unverifiable int) {
+//
+// The same two counts are also kept for the would-unmonitor pool on its own
+// (crossCheckResult.writeVerified / writeUnverifiable). The status is a
+// statement about the sample as a whole; the write gate has to ask a
+// narrower question — "was anything verified about the decisions I am about
+// to act on?" — and only a per-pool count can answer it. See
+// writeGateBlockReason.
+func runCrossCheck(logger *slog.Logger, inst Instance, decisions []movieDecision, wantedIDs map[int]bool) crossCheckResult {
 	byID := make(map[int]movieDecision, len(decisions))
 	var wouldUnmonitorIDs, skipIDs []int
 	for _, d := range decisions {
@@ -567,6 +905,7 @@ func runCrossCheck(logger *slog.Logger, inst Instance, decisions []movieDecision
 
 	sampled := append(sampleEveryKth(wouldUnmonitorIDs, crossCheckSampleSize), sampleEveryKth(skipIDs, crossCheckSampleSize)...)
 
+	var result crossCheckResult
 	disagreementFound := false
 	for _, id := range sampled {
 		d := byID[id]
@@ -588,13 +927,23 @@ func runCrossCheck(logger *slog.Logger, inst Instance, decisions []movieDecision
 			// disagreement (inWantedSet=false would then trivially "agree"
 			// with a value we never actually observed), so this is counted
 			// separately and called out on its own.
-			unverifiable++
+			//
+			// d.wouldUnmonitor is what put this id in one sampled pool
+			// rather than the other, so it is also the exact test for which
+			// pool's count this belongs to.
+			result.unverifiable++
+			if d.wouldUnmonitor {
+				result.writeUnverifiable++
+			}
 			logger.Warn("cross-check: movieFile.qualityCutoffNotMet missing from /movie data; cannot verify wanted-set agreement for this movie",
 				"instance", inst.Name, "id", id, "title", d.title)
 			continue
 		}
 
-		verified++
+		result.verified++
+		if d.wouldUnmonitor {
+			result.writeVerified++
+		}
 		if inWantedSet != *d.qualityCutoffNotMet {
 			disagreementFound = true
 			logger.Error("cross-check disagreement: wanted-set membership does not match movieFile.qualityCutoffNotMet",
@@ -605,16 +954,16 @@ func runCrossCheck(logger *slog.Logger, inst Instance, decisions []movieDecision
 
 	switch {
 	case disagreementFound:
-		status = crossCheckStatusFailed
-	case len(sampled) > 0 && verified == 0:
-		status = crossCheckStatusInconclusive
+		result.status = crossCheckStatusFailed
+	case len(sampled) > 0 && result.verified == 0:
+		result.status = crossCheckStatusInconclusive
 		logger.Warn("cross-check: every sampled item was unverifiable (movieFile.qualityCutoffNotMet missing); cannot determine pass or fail",
-			"instance", inst.Name, "unverifiable", unverifiable)
+			"instance", inst.Name, "unverifiable", result.unverifiable)
 	default:
-		status = crossCheckStatusPassed
+		result.status = crossCheckStatusPassed
 	}
 
-	return status, verified, unverifiable
+	return result
 }
 
 // selectMovieFile picks the movieFileDetail this movie's file actually
