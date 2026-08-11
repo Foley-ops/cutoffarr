@@ -1812,14 +1812,14 @@ func TestRunWritePass_UnrecognizedCrossCheckStatus_WritePassBlocked(t *testing.T
 			// — so the status really is the only thing keeping this pass
 			// shut, and a gate that stopped consulting it would write.
 			cc := crossCheckResult{status: tc.status, verified: 1, writeVerified: 1}
-			unmonitored, writeErrors := runWritePass(context.Background(), logger, client, fake.instance(), decisions, cc, false)
+			unmonitored, writeErrors, echoUnverified := runWritePass(context.Background(), logger, client, fake.instance(), decisions, cc, false)
 
 			if writes := fake.writes(); len(writes) != 0 {
 				t.Fatalf("cross-check status %q is not %q and must block every write, got %d: %+v",
 					tc.status, crossCheckStatusPassed, len(writes), writes)
 			}
-			if unmonitored != 0 || writeErrors != 0 {
-				t.Errorf("a blocked pass wrote nothing and failed at nothing; got unmonitored=%d writeErrors=%d", unmonitored, writeErrors)
+			if unmonitored != 0 || writeErrors != 0 || echoUnverified != 0 {
+				t.Errorf("a blocked pass wrote nothing, failed at nothing, and left nothing unconfirmed; got unmonitored=%d writeErrors=%d echoUnverified=%d", unmonitored, writeErrors, echoUnverified)
 			}
 
 			out := buf.String()
@@ -1875,6 +1875,96 @@ func TestRunRadarrDecisionEngine_WriteFailure_CountedAndRunContinues(t *testing.
 	}
 	if !strings.Contains(out, "unmonitored=1") {
 		t.Errorf("expected the later item to still be written (unmonitored=1):\n%s", out)
+	}
+}
+
+// TestRunRadarrDecisionEngine_WriteAcceptedButUnverifiable_IsNotAWriteFailure
+// pins the split the review demanded: a PUT the server ACCEPTED but did not
+// confirm is not the same event as a PUT the server rejected, and the run may
+// not report it with the same words or the same counter.
+//
+// The stakes are concrete. Radarr answers PUT /api/v3/movie/{id} with the
+// updated resource, but that is an observation about one version; if the
+// first live write ever comes back 202 with an empty body, the old wording
+// ("unmonitor write failed; skipping this movie for the cycle") would tell
+// the human two things at once, both of them probably false: that the write
+// path is broken, and that the movie is still monitored. The truth is that
+// the write was accepted and almost certainly applied — we simply cannot
+// prove it from the response.
+func TestRunRadarrDecisionEngine_WriteAcceptedButUnverifiable_IsNotAWriteFailure(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{1: monitoredMovieDetail(1, "Silently Accepted Movie")})
+	// Accepted, and utterly silent about what it did.
+	fake.putStatus[1] = http.StatusAccepted
+	fake.putEcho[1] = ""
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	movies := []movieListElement{wouldUnmonitorMovie(1, "Silently Accepted Movie")}
+
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, false)
+
+	// §2.6: reported once, never retried, even though the outcome is unknown.
+	if puts := fake.puts(); len(puts) != 1 {
+		t.Fatalf("expected exactly 1 PUT attempt (an unconfirmed write is never retried), got %d: %+v", len(puts), puts)
+	}
+
+	out := buf.String()
+	if strings.Contains(out, "unmonitor write failed") {
+		t.Errorf("an accepted-but-unconfirmed write must not be reported as a failed write:\n%s", out)
+	}
+	for _, want := range []string{"level=WARN", "accepted", "unverifiable", "reconcile"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected the unverified-write warning to contain %q:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, `title="Silently Accepted Movie"`) || !strings.Contains(out, "id=1") {
+		t.Errorf("expected the warning to name the movie it concerns:\n%s", out)
+	}
+	// The counters are the machine-readable half of the same statement, and
+	// Phase 5's no-op contract reads writeErrors: an unverifiable write must
+	// not inflate it.
+	if !strings.Contains(out, "writeErrors=0") {
+		t.Errorf("expected writeErrors=0: nothing was rejected:\n%s", out)
+	}
+	if !strings.Contains(out, "writeEchoUnverified=1") {
+		t.Errorf("expected writeEchoUnverified=1 in the summary:\n%s", out)
+	}
+	// unmonitored counts CONFIRMED writes and nothing else; the movie is
+	// treated as written only in the sense that it is not retried and not
+	// called a failure.
+	if !strings.Contains(out, "unmonitored=0") {
+		t.Errorf("expected unmonitored=0: no write was confirmed:\n%s", out)
+	}
+	if strings.Contains(out, "msg=unmonitor ") {
+		t.Errorf("an unconfirmed write must not log the completed-unmonitor line:\n%s", out)
+	}
+}
+
+// TestRunRadarrDecisionEngine_EchoSaysStillMonitored_IsAWriteFailure is the
+// other side of that line, and the reason it is drawn by errors.Is rather
+// than by "the PUT returned 2xx". An echo that says "monitored": true is not
+// a failure to confirm — it is a confirmed failure. The server told us the
+// movie is still monitored, so this stays an ERROR and stays in writeErrors.
+func TestRunRadarrDecisionEngine_EchoSaysStillMonitored_IsAWriteFailure(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{1: monitoredMovieDetail(1, "Stubborn Movie")})
+	fake.putEcho[1] = `{"id": 1, "title": "Stubborn Movie", "monitored": true}`
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	movies := []movieListElement{wouldUnmonitorMovie(1, "Stubborn Movie")}
+
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, false)
+
+	out := buf.String()
+	if !strings.Contains(out, "level=ERROR") || !strings.Contains(out, "unmonitor write failed") {
+		t.Errorf("an echo stating the movie is STILL monitored is a failed write:\n%s", out)
+	}
+	if !strings.Contains(out, "writeErrors=1") {
+		t.Errorf("expected writeErrors=1:\n%s", out)
+	}
+	if !strings.Contains(out, "writeEchoUnverified=0") {
+		t.Errorf("expected writeEchoUnverified=0: the response was perfectly verifiable, it just said no:\n%s", out)
+	}
+	if !strings.Contains(out, "unmonitored=0") {
+		t.Errorf("expected unmonitored=0:\n%s", out)
 	}
 }
 
@@ -2390,13 +2480,13 @@ func TestRunWritePass_PassedButNoWouldUnmonitorItemVerified_BlocksAndNamesTheRat
 	// The pass the old gate saw: "passed", one item verified. That item was
 	// a skip.
 	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 1, unverifiable: 1, writeVerified: 0, writeUnverifiable: 1}
-	unmonitored, writeErrors := runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, false)
+	unmonitored, writeErrors, echoUnverified := runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, false)
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("a pass that verified no would-unmonitor decision must authorize no write, got %+v", writes)
 	}
-	if unmonitored != 0 || writeErrors != 0 {
-		t.Errorf("a blocked pass wrote nothing and failed at nothing; got unmonitored=%d writeErrors=%d", unmonitored, writeErrors)
+	if unmonitored != 0 || writeErrors != 0 || echoUnverified != 0 {
+		t.Errorf("a blocked pass wrote nothing, failed at nothing, and left nothing unconfirmed; got unmonitored=%d writeErrors=%d echoUnverified=%d", unmonitored, writeErrors, echoUnverified)
 	}
 	out := buf.String()
 	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "withheld") {
@@ -2441,13 +2531,13 @@ func TestRunWritePass_MinorityUnverifiable_WritesButWarnsAtTheGate(t *testing.T)
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 9, unverifiable: 1, writeVerified: 9, writeUnverifiable: 1}
-	unmonitored, writeErrors := runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, false)
+	unmonitored, writeErrors, echoUnverified := runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, false)
 
 	if n := len(fake.puts()); n != 1 {
 		t.Fatalf("expected the write to proceed on a well-verified sample, got %d PUT(s)", n)
 	}
-	if unmonitored != 1 || writeErrors != 0 {
-		t.Errorf("unmonitored/writeErrors = %d/%d, want 1/0", unmonitored, writeErrors)
+	if unmonitored != 1 || writeErrors != 0 || echoUnverified != 0 {
+		t.Errorf("unmonitored/writeErrors/echoUnverified = %d/%d/%d, want 1/0/0", unmonitored, writeErrors, echoUnverified)
 	}
 	out := buf.String()
 	if !strings.Contains(out, "partially verified") {
@@ -2488,13 +2578,13 @@ func TestRunWritePass_NothingToWrite_UnverifiedPoolIsNotAnAlarm(t *testing.T) {
 
 	decisions := []movieDecision{{id: 1, title: "Skipped Movie", wouldUnmonitor: false, reason: ReasonNoFile}}
 	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 3, unverifiable: 1, writeVerified: 0, writeUnverifiable: 0}
-	unmonitored, writeErrors := runWritePass(context.Background(), logger, client, fake.instance(), decisions, cc, false)
+	unmonitored, writeErrors, echoUnverified := runWritePass(context.Background(), logger, client, fake.instance(), decisions, cc, false)
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("a pass with no would-unmonitor decisions must write nothing, got %+v", writes)
 	}
-	if unmonitored != 0 || writeErrors != 0 {
-		t.Errorf("unmonitored/writeErrors = %d/%d, want 0/0", unmonitored, writeErrors)
+	if unmonitored != 0 || writeErrors != 0 || echoUnverified != 0 {
+		t.Errorf("unmonitored/writeErrors/echoUnverified = %d/%d/%d, want 0/0/0", unmonitored, writeErrors, echoUnverified)
 	}
 	if strings.Contains(buf.String(), "level=WARN") {
 		t.Errorf("nothing to write is not a reason to warn:\n%s", buf.String())

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -494,7 +495,7 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	cc := runCrossCheck(logger, inst, decisions, wantedIDs)
 	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
 
-	unmonitoredCount, writeErrorCount := runWritePass(ctx, logger, client, inst, reported, cc, dryRun)
+	unmonitoredCount, writeErrorCount, echoUnverifiedCount := runWritePass(ctx, logger, client, inst, reported, cc, dryRun)
 
 	attrs := []any{"instance", inst.Name, "type", inst.Type}
 	if onlyID != 0 {
@@ -512,10 +513,18 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// never carries a number that reads as "N writes failed". Phase 5's
 	// no-op contract reads unmonitored and writeErrors; neither is ever
 	// inflated by a dry-run.
+	//
+	// writeEchoUnverified is the third outcome (see runWritePass): PUTs the
+	// server accepted without confirming. It is always present in write mode,
+	// including as 0, so its absence can never be read as "none happened";
+	// it cannot occur in dry-run, where no PUT is ever sent, so printing it
+	// there would be an invitation to wonder what it means. unmonitored +
+	// writeEchoUnverified is the number of writes the server took;
+	// unmonitored alone is the number it confirmed.
 	if dryRun {
 		attrs = append(attrs, "writeErrors", 0, "writeRehearsalErrors", writeErrorCount)
 	} else {
-		attrs = append(attrs, "writeErrors", writeErrorCount)
+		attrs = append(attrs, "writeErrors", writeErrorCount, "writeEchoUnverified", echoUnverifiedCount)
 	}
 
 	attrs = append(attrs, "skipReasons", formatSkipCounts(skipCounts), "crossCheck", crossCheckSummary)
@@ -564,7 +573,20 @@ func libraryContainsID(movies []movieListElement, id int) bool {
 //
 // Per §2.6 a failed write is logged, counted, and abandoned for the cycle —
 // the pass moves to the next item and never retries.
-func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, decisions []movieDecision, cc crossCheckResult, dryRun bool) (unmonitored, writeErrors int) {
+//
+// Three outcomes are counted, not two, because a PUT has three meaningfully
+// different endings and only two of them are the ones people expect:
+//
+//   - confirmed (unmonitored): the server accepted the write AND its echo
+//     says the movie is now unmonitored. The only outcome that logs
+//     msg=unmonitor and the only one Phase 5's no-op contract counts.
+//   - failed (writeErrors): the server rejected the write, or its echo says
+//     the movie is still monitored. The change did not happen.
+//   - accepted but unconfirmed (echoUnverified): a 2xx whose body cannot
+//     settle the question — empty, not an object, no "monitored" key. The
+//     change probably DID happen and cannot be proven, which is neither of
+//     the above and must not be reported as either.
+func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, decisions []movieDecision, cc crossCheckResult, dryRun bool) (unmonitored, writeErrors, echoUnverified int) {
 	// The count is what makes the warnings below actionable: "the gate
 	// blocked 12 writes" and "the gate blocked, but there was nothing to
 	// write anyway" are very different situations, and without a number they
@@ -582,7 +604,7 @@ func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, i
 		attrs = append(attrs, cc.logAttrs()...)
 		attrs = append(attrs, "withheldWrites", pending, "dryRun", dryRun)
 		logger.Warn("writes withheld for this instance: "+reason, attrs...)
-		return 0, 0
+		return 0, 0, 0
 	}
 
 	// The gate opened, but "opened" is not the same as "the sample was
@@ -605,6 +627,22 @@ func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, i
 		}
 
 		written, err := unmonitorMovie(ctx, logger, client, inst, d.id, dryRun)
+		if errors.Is(err, errWriteUnverified) {
+			// The server took the write and told us nothing useful about it.
+			// Calling this a failed write would state two things that are
+			// probably both false — that the write path is broken, and that
+			// the movie is still monitored — so it gets its own message, its
+			// own counter, and a WARN rather than an ERROR. It is not
+			// retried: §2.6 bars retries within a cycle, and a retry here
+			// would be a second write against a movie that has most likely
+			// already been changed. The next cycle settles it for free —
+			// either the movie reads unmonitored (nothing to do, rule 1
+			// excludes it) or it is a candidate again and gets written then.
+			echoUnverified++
+			logger.Warn("unmonitor write accepted but the response was unverifiable; treat it as applied and let the next cycle reconcile it",
+				"instance", inst.Name, "type", inst.Type, "id", d.id, "title", d.title, "error", err)
+			continue
+		}
 		if err != nil {
 			writeErrors++
 			// The wording is mode-specific because the two failures are
@@ -635,7 +673,7 @@ func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, i
 			"id", d.id, "title", d.title, "reason", d.reason, "profile", d.profileName, "instance", inst.Name)
 	}
 
-	return unmonitored, writeErrors
+	return unmonitored, writeErrors, echoUnverified
 }
 
 // writeGateBlockReason decides whether the cross-check authorizes this

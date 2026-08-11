@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -79,7 +80,11 @@ func moviePath(movieID int) string {
 //
 //  6. Believe the server, not the status code: the returned object must
 //     itself say monitored is false before the write counts as done. A 2xx
-//     alone is not proof — see verifyWriteEcho.
+//     alone is not proof — see verifyWriteEcho. When the server accepts the
+//     write but says nothing that confirms it, the error wraps
+//     errWriteUnverified so the caller can report "accepted, unconfirmed"
+//     rather than "failed"; written is false either way, because only a
+//     confirmed change may be counted as one.
 //
 // Errors are returned, never retried (§2.6: "Never retry writes
 // automatically within a cycle"); the caller logs them and moves to the
@@ -151,7 +156,9 @@ func unmonitorMovie(ctx context.Context, logger *slog.Logger, client *APIClient,
 	// and never retried.
 	echo, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 	if err != nil {
-		return false, fmt.Errorf("movie %d: the write returned %d but its body could not be read, so the change is unconfirmed: %w", movieID, resp.StatusCode, err)
+		// Same class as an unreadable echo below: the server took the write
+		// (2xx) and we simply cannot see what it said about it.
+		return false, fmt.Errorf("movie %d: the write returned %d but its body could not be read, so the change is unconfirmed (%w): %v", movieID, resp.StatusCode, errWriteUnverified, err)
 	}
 	if err := verifyWriteEcho(echo, movieID, resp.StatusCode); err != nil {
 		return false, err
@@ -160,24 +167,47 @@ func unmonitorMovie(ctx context.Context, logger *slog.Logger, client *APIClient,
 	return true, nil
 }
 
+// errWriteUnverified marks the outcomes where the server ACCEPTED the write
+// — a 2xx came back — but said nothing that confirms what it did with it.
+// An empty body, a body that is not a JSON object, one without "monitored",
+// or one whose "monitored" is not a boolean all land here.
+//
+// It exists because those outcomes are a different event from a rejected
+// write, and conflating them misinforms the human on both halves at once. A
+// non-2xx means the change did NOT happen and the movie is still monitored.
+// An unverifiable 2xx means the change probably DID happen and we merely
+// cannot prove it — reporting that as "unmonitor write failed" would tell
+// the human the write path is broken (it may be fine) and that the movie is
+// still monitored (it probably is not). Callers separate the two with
+// errors.Is; see runWritePass.
+//
+// Deliberately NOT in this class: an echo that says "monitored": true. That
+// is not a failure to confirm, it is a confirmed failure — the server told
+// us the movie is still monitored — and it stays a write error.
+var errWriteUnverified = errors.New("the server accepted the write but did not confirm the change")
+
 // verifyWriteEcho confirms the object the server returned from the PUT
 // really does carry monitored:false. Anything else — a body that is not a
 // JSON object, no monitored key, a non-boolean value, or true — means the
 // write is unconfirmed, and the error carries the status plus a bounded
 // snippet of what actually came back so the log says what was seen rather
 // than only what was expected.
+//
+// The four "cannot tell" cases wrap errWriteUnverified; the one "told us it
+// did not happen" case does not. See errWriteUnverified for why that line is
+// drawn where it is.
 func verifyWriteEcho(echo []byte, movieID, status int) error {
 	var confirmed map[string]json.RawMessage
 	if err := json.Unmarshal(echo, &confirmed); err != nil {
-		return fmt.Errorf("movie %d: the write returned %d but the response is not a JSON object, so %q is unconfirmed: %s", movieID, status, monitoredKey, bodySnippet(echo))
+		return fmt.Errorf("movie %d: the write returned %d but the response is not a JSON object, so %q is unconfirmed (%w): %s", movieID, status, monitoredKey, errWriteUnverified, bodySnippet(echo))
 	}
 	raw, present := confirmed[monitoredKey]
 	if !present {
-		return fmt.Errorf("movie %d: the write returned %d but the returned object has no %q key, so the change is unconfirmed: %s", movieID, status, monitoredKey, bodySnippet(echo))
+		return fmt.Errorf("movie %d: the write returned %d but the returned object has no %q key, so the change is unconfirmed (%w): %s", movieID, status, monitoredKey, errWriteUnverified, bodySnippet(echo))
 	}
 	var stillMonitored bool
 	if err := json.Unmarshal(raw, &stillMonitored); err != nil {
-		return fmt.Errorf("movie %d: the write returned %d but %q came back as %s, which is not a boolean: %s", movieID, status, monitoredKey, raw, bodySnippet(echo))
+		return fmt.Errorf("movie %d: the write returned %d but %q came back as %s, which is not a boolean (%w): %s", movieID, status, monitoredKey, raw, errWriteUnverified, bodySnippet(echo))
 	}
 	if stillMonitored {
 		return fmt.Errorf("movie %d: the write returned %d but the returned object still has %q: true; the movie was NOT unmonitored: %s", movieID, status, monitoredKey, bodySnippet(echo))

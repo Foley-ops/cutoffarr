@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -532,6 +533,90 @@ func TestUnmonitorMovie_PutEchoesUnmonitored_IsAWrite(t *testing.T) {
 	}
 }
 
+// TestUnmonitorMovie_PutReturnsEmptyBodyOn2xx_IsUnconfirmedNotAWrite covers
+// the branch of verifyWriteEcho that the live server is most likely to take
+// and that no test previously exercised: a 2xx with nothing in the body.
+// Radarr answers PUT /api/v3/movie/{id} with the updated resource, but that
+// is an observation about one version; a Radarr (or a proxy) answering 200
+// with an empty body would land here.
+//
+// The write must not be reported as done — nothing confirmed it — but it is
+// also NOT the same event as a rejected write: the server accepted it, and
+// the change may well have taken effect. errWriteUnverified is what carries
+// that distinction to the caller (see runWritePass); at this level the
+// contract is written=false, exactly one PUT, and an error naming the status
+// the server actually returned.
+func TestUnmonitorMovie_PutReturnsEmptyBodyOn2xx_IsUnconfirmedNotAWrite(t *testing.T) {
+	var got []recordedRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		got = append(got, recordedRequest{method: r.Method, path: r.URL.Path, body: body})
+		if r.Method == http.MethodPut {
+			// Accepted, and utterly silent about what happened.
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		w.Write([]byte(writerTestMovieJSON))
+	}))
+	defer srv.Close()
+
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := writerTestInstance(srv.URL)
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, false)
+	if err == nil {
+		t.Fatal("unmonitorMovie returned nil error for a 2xx with an empty body: nothing confirmed the change")
+	}
+	if written {
+		t.Error("written = true on an unconfirmed write: only the server's own echo may report a write as done")
+	}
+	if !errors.Is(err, errWriteUnverified) {
+		t.Errorf("error %q is not classified as unverifiable; the caller cannot tell it apart from a rejected write", err)
+	}
+	if !strings.Contains(err.Error(), strconv.Itoa(http.StatusAccepted)) {
+		t.Errorf("error %q does not name the status the server returned", err)
+	}
+	if n := len(filterRequests(got, http.MethodPut)); n != 1 {
+		t.Errorf("made %d PUT attempts, want exactly 1 (§2.6: never retried within a cycle)", n)
+	}
+}
+
+// TestVerifyWriteEcho_SeparatesUnverifiableFromContradicted is the whole
+// point of the split, stated at the unit: an echo that CONTRADICTS the write
+// ("monitored": true) is proof the movie is still monitored — a failed write.
+// An echo that merely fails to confirm it (empty, not an object, no key, not
+// a boolean) is proof of nothing; the write may well have landed. Both are
+// errors, but only the first may be reported as a write failure, so they must
+// be distinguishable by errors.Is rather than by reading the message.
+func TestVerifyWriteEcho_SeparatesUnverifiableFromContradicted(t *testing.T) {
+	unverifiable := []struct{ name, echo string }{
+		{"empty body", ""},
+		{"not a JSON object", `[{"id": 7}]`},
+		{"no monitored key", `{"id": 7, "title": "Silent"}`},
+		{"monitored is not a boolean", `{"id": 7, "monitored": "false"}`},
+	}
+	for _, tc := range unverifiable {
+		t.Run(tc.name, func(t *testing.T) {
+			err := verifyWriteEcho([]byte(tc.echo), 7, http.StatusOK)
+			if err == nil {
+				t.Fatal("verifyWriteEcho returned nil: an unconfirmed write must never pass")
+			}
+			if !errors.Is(err, errWriteUnverified) {
+				t.Errorf("error %q is not errWriteUnverified; it would be reported as a failed write", err)
+			}
+		})
+	}
+
+	err := verifyWriteEcho([]byte(`{"id": 7, "monitored": true}`), 7, http.StatusOK)
+	if err == nil {
+		t.Fatal("verifyWriteEcho returned nil for an echo that still says monitored:true")
+	}
+	if errors.Is(err, errWriteUnverified) {
+		t.Errorf("an echo that says the movie is STILL MONITORED is a failed write, not an unverifiable one: %q", err)
+	}
+}
+
 // TestUnmonitorMovie_NeverTouchesAnyOtherEndpoint pins §2.3: the write path
 // talks to /api/v3/movie/{id} and nothing else — never /api/v3/command,
 // never a delete, never a search trigger.
@@ -584,6 +669,13 @@ type radarrFake struct {
 	cfScore      int
 	detail       map[int]string // GET /api/v3/movie/{id} bodies, by id
 	putStatus    map[int]int    // PUT /api/v3/movie/{id} status, by id (default 200)
+
+	// putEcho overrides what a successful PUT answers with, by id. Unset
+	// means "behave like Radarr": echo the object that was sent. Set to ""
+	// for a server that accepts the write and says nothing at all, which is
+	// the response shape the write path can neither confirm nor call a
+	// failure.
+	putEcho map[int]string
 }
 
 // newRadarrFake starts a fake Radarr serving moviesJSON as the library and
@@ -602,6 +694,7 @@ func newRadarrFake(t *testing.T, moviesJSON string, detail map[int]string) *rada
 		cfScore:      200,
 		detail:       detail,
 		putStatus:    map[int]int{},
+		putEcho:      map[int]string{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v3/system/status", f.handle(func(w http.ResponseWriter, r *http.Request) {
@@ -673,6 +766,10 @@ func (f *radarrFake) serveMovieDetail(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(status)
 		if status >= 400 {
 			w.Write([]byte(`{"message":"write rejected by fake"}`))
+			return
+		}
+		if echo, overridden := f.putEcho[id]; overridden {
+			w.Write([]byte(echo))
 			return
 		}
 		// Radarr answers a successful PUT with the updated object. The
