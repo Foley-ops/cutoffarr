@@ -551,17 +551,28 @@ func TestUnmonitorMovie_FreshGetShowsAlreadyUnmonitored_NoPut(t *testing.T) {
 // no "monitored" key at all, our assumed field name may not match this
 // Radarr version, and setting it would ADD a key to the object rather than
 // change one. §2.6 says never guess: error out and write nothing.
+//
+// REVIEW FIX (Phase 5 final round): the refusal is now a WARN plus an error
+// wrapping errMonitoredUnverifiable, exactly like the "tags" untrusted-input
+// branches above it. It used to be a bare error, which runWritePass could only
+// classify as a failed WRITE — an ERROR line reading "unmonitor write failed"
+// about a movie no PUT was ever sent for, and a writeErrors count that says
+// Radarr rejected something it never saw. It is a refusal, in the same class
+// as an unverifiable "tags", and it is counted as one (writesRefused).
 func TestUnmonitorMovie_MonitoredFieldAbsent_RefusesToWrite(t *testing.T) {
 	srv, got := writerTestServer(t, `{"id": 7, "title": "No Monitored Key"}`, http.StatusOK)
 	defer srv.Close()
 
-	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	inst := writerTestInstance(srv.URL)
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 0, false, false)
 	if err == nil {
 		t.Fatal("unmonitorMovie returned nil error, want an error when monitored is absent")
+	}
+	if !errors.Is(err, errMonitoredUnverifiable) {
+		t.Fatalf("unmonitorMovie error = %v, want errMonitoredUnverifiable so runWritePass counts a refusal rather than a failed write:\n%s", err, buf.String())
 	}
 	if written {
 		t.Error("written = true, want false")
@@ -571,6 +582,10 @@ func TestUnmonitorMovie_MonitoredFieldAbsent_RefusesToWrite(t *testing.T) {
 	}
 	if len(filterRequests(*got, http.MethodPut)) != 0 {
 		t.Errorf("expected zero PUTs, got %+v", *got)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "monitored") {
+		t.Errorf("expected a warning naming the field that could not be verified:\n%s", out)
 	}
 }
 
@@ -591,13 +606,16 @@ func TestUnmonitorMovie_FreshPayloadMonitoredNull_RefusesToWrite(t *testing.T) {
 	srv, got := writerTestServer(t, `{"id": 7, "title": "Null Monitored", "monitored": null}`, http.StatusOK)
 	defer srv.Close()
 
-	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	inst := writerTestInstance(srv.URL)
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 0, false, false)
 	if err == nil {
 		t.Fatal("unmonitorMovie returned nil error, want an error when monitored is JSON null: its true state cannot be trusted")
+	}
+	if !errors.Is(err, errMonitoredUnverifiable) {
+		t.Fatalf("unmonitorMovie error = %v, want errMonitoredUnverifiable so runWritePass counts a refusal rather than a failed write:\n%s", err, buf.String())
 	}
 	if written {
 		t.Error("written = true, want false")
@@ -607,6 +625,42 @@ func TestUnmonitorMovie_FreshPayloadMonitoredNull_RefusesToWrite(t *testing.T) {
 	}
 	if len(filterRequests(*got, http.MethodPut)) != 0 {
 		t.Errorf("expected zero PUTs when monitored is JSON null, got %+v", *got)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "monitored") {
+		t.Errorf("expected a warning naming the field that could not be verified:\n%s", out)
+	}
+	if strings.Contains(out, "already unmonitored") {
+		t.Errorf("a null monitored value must never be reported as an observed already-unmonitored state:\n%s", out)
+	}
+}
+
+// TestUnmonitorMovie_FreshPayloadMonitoredNotBoolean_RefusesToWrite is the
+// third shape of the same untrusted-input class: "monitored" present but not
+// a boolean at all (a string, an object, a number). The decode fails outright
+// here, unlike the null case, but the outcome must be the same refusal — and,
+// like its two siblings, one runWritePass can count as a refusal rather than
+// misreport as a failed write.
+func TestUnmonitorMovie_FreshPayloadMonitoredNotBoolean_RefusesToWrite(t *testing.T) {
+	srv, got := writerTestServer(t, `{"id": 7, "title": "Stringly Monitored", "monitored": "true"}`, http.StatusOK)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := writerTestInstance(srv.URL)
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 0, false, false)
+	if !errors.Is(err, errMonitoredUnverifiable) {
+		t.Fatalf("unmonitorMovie error = %v, want errMonitoredUnverifiable:\n%s", err, buf.String())
+	}
+	if written {
+		t.Error("written = true, want false")
+	}
+	if len(filterRequests(*got, http.MethodPut)) != 0 {
+		t.Errorf("expected zero PUTs when monitored is not a boolean, got %+v", *got)
+	}
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("expected a warning explaining the refusal:\n%s", buf.String())
 	}
 }
 
@@ -856,6 +910,16 @@ func TestUnmonitorMovie_PutReturnsEmptyBodyOn2xx_IsUnconfirmedNotAWrite(t *testi
 // a boolean) is proof of nothing; the write may well have landed. Both are
 // errors, but only the first may be reported as a write failure, so they must
 // be distinguishable by errors.Is rather than by reading the message.
+// The echo's own identity is part of that: an echo carrying a DIFFERENT
+// movie's object (a proxy, redirect, or cache answering the write with
+// something else) says nothing whatsoever about the movie we asked to change,
+// so it belongs in the unverifiable class too — REVIEW FIX (Phase 5 final
+// round). Without the check, `{"id": 99, "monitored": false}` came back from a
+// PUT to /movie/7 and was accepted as movie 7's confirmed write: unmonitored++
+// and msg=unmonitor id=7, on the strength of an object about movie 99. The
+// pre-write GET has been guarded against exactly this since Phase 4
+// (verifyMovieIdentity); the echo is the ONLY evidence this project accepts
+// that a write landed, so it must clear the same bar.
 func TestVerifyWriteEcho_SeparatesUnverifiableFromContradicted(t *testing.T) {
 	unverifiable := []struct{ name, echo string }{
 		{"empty body", ""},
@@ -863,6 +927,9 @@ func TestVerifyWriteEcho_SeparatesUnverifiableFromContradicted(t *testing.T) {
 		{"no monitored key", `{"id": 7, "title": "Silent"}`},
 		{"monitored is not a boolean", `{"id": 7, "monitored": "false"}`},
 		{"monitored is JSON null", `{"id": 7, "monitored": null}`},
+		{"echo is a different movie", `{"id": 99, "title": "Wrong Movie", "monitored": false}`},
+		{"echo carries no id", `{"title": "Anonymous", "monitored": false}`},
+		{"echo id is not a number", `{"id": "seven", "monitored": false}`},
 	}
 	for _, tc := range unverifiable {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1791,6 +1858,136 @@ instances:
 	}
 }
 
+// --- per-instance write isolation, at run() level -------------------------
+//
+// §2.6's house rule is "skip that instance for the cycle": one instance's
+// trouble must never cost another instance its writes. The structure supports
+// it (runRadarrDecisionEngine returns nothing and main.go's instance loop
+// never breaks), and connectivity isolation is pinned in main_test.go, but
+// nothing proved it for the WRITE pass — the property Phase 8's daemon loop
+// depends on, since a permanently sick instance would otherwise silently
+// freeze every other library forever. Both realistic causes are covered: an
+// instance whose writes fail at the server, and one whose write pass never
+// opens because its own cross-check refused to authorize it.
+
+// countSummaries counts "radarr decision summary" lines naming the given
+// instance. Exactly one per processed instance is the contract (brief item 1),
+// so a test that only checked "the summary mentions radarr-4k" could not tell
+// one summary from three.
+func countSummaries(output, instance string) int {
+	n := 0
+	for _, line := range strings.Split(output, "\n") {
+		if strings.Contains(line, "radarr decision summary") && strings.Contains(line, "instance="+instance) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestRun_WriteMode_OneInstanceFailsItsWrites_TheOtherStillWrites: radarr-hd
+// (first in the config, so a loop that aborted would take radarr-4k with it)
+// answers every PUT with 500. radarr-4k must still make its own PUT, and both
+// instances must report their own summary line with their own counters.
+func TestRun_WriteMode_OneInstanceFailsItsWrites_TheOtherStillWrites(t *testing.T) {
+	hd := newRadarrFake(t,
+		"["+libraryMovie(1, "HD Movie", true, true)+"]",
+		map[int]string{1: monitoredMovieDetail(1, "HD Movie")})
+	hd.putStatus[1] = http.StatusInternalServerError
+	fourK := newRadarrFake(t,
+		"["+libraryMovie(1, "4K Movie", true, true)+"]",
+		map[int]string{1: monitoredMovieDetail(1, "4K Movie")})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeTwoRadarrConfig(t, hd.srv.URL, fourK.srv.URL, false), "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0: a per-instance write failure is not a process failure; stderr=%s", code, stderr.String())
+	}
+
+	if n := len(hd.puts()); n != 1 {
+		t.Errorf("radarr-hd: made %d PUT attempts, want exactly 1 (attempted once, never retried)", n)
+	}
+	writes := fourK.writes()
+	if len(writes) != 1 || writes[0].method != http.MethodPut || writes[0].path != "/api/v3/movie/1" {
+		t.Fatalf("radarr-4k must still write normally after radarr-hd's write failed, got %+v", writes)
+	}
+
+	out := stdout.String()
+	for _, inst := range []string{"radarr-hd", "radarr-4k"} {
+		if n := countSummaries(out, inst); n != 1 {
+			t.Errorf("expected exactly 1 radarr decision summary for %s, got %d:\n%s", inst, n, out)
+		}
+	}
+	// Each instance's counters must describe that instance and nothing else:
+	// a shared counter would show the failure on both lines, or the write on
+	// both.
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, "radarr decision summary") {
+			continue
+		}
+		switch {
+		case strings.Contains(line, "instance=radarr-hd"):
+			if !strings.Contains(line, "writeErrors=1") || !strings.Contains(line, "unmonitored=0") {
+				t.Errorf("radarr-hd's summary must carry its own failure: %s", line)
+			}
+		case strings.Contains(line, "instance=radarr-4k"):
+			if !strings.Contains(line, "writeErrors=0") || !strings.Contains(line, "unmonitored=1") {
+				t.Errorf("radarr-4k's summary must carry its own confirmed write, unaffected by radarr-hd: %s", line)
+			}
+		}
+	}
+}
+
+// TestRun_WriteMode_OneInstanceGateBlocked_TheOtherStillWrites is the second
+// cause, and the one a daemon loop is likeliest to meet: radarr-hd's library
+// carries a cross-check disagreement, so its write pass is blocked entirely.
+// That verdict is per-instance evidence about per-instance data and must not
+// travel: radarr-4k's cross-check passed, so radarr-4k writes.
+func TestRun_WriteMode_OneInstanceGateBlocked_TheOtherStillWrites(t *testing.T) {
+	// qualityCutoffNotMet: true while the (empty) wanted/cutoff set says the
+	// movie is not below cutoff — two Radarr code paths disagreeing.
+	disagreeing := `{"id": 1, "title": "Disagreeing HD Movie", "monitored": true, "hasFile": true, "qualityProfileId": 1, "tags": [], "movieFile": {"id": 1, "qualityCutoffNotMet": true}}`
+	hd := newRadarrFake(t, "["+disagreeing+"]", map[int]string{1: monitoredMovieDetail(1, "Disagreeing HD Movie")})
+	fourK := newRadarrFake(t,
+		"["+libraryMovie(1, "4K Movie", true, true)+"]",
+		map[int]string{1: monitoredMovieDetail(1, "4K Movie")})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeTwoRadarrConfig(t, hd.srv.URL, fourK.srv.URL, false), "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	if writes := hd.writes(); len(writes) != 0 {
+		t.Fatalf("radarr-hd's cross-check FAILED, so it must write nothing: %+v", writes)
+	}
+	writes := fourK.writes()
+	if len(writes) != 1 || writes[0].method != http.MethodPut {
+		t.Fatalf("radarr-4k's own cross-check passed, so its write must proceed; got %+v", writes)
+	}
+
+	out := stdout.String()
+	for _, inst := range []string{"radarr-hd", "radarr-4k"} {
+		if n := countSummaries(out, inst); n != 1 {
+			t.Errorf("expected exactly 1 radarr decision summary for %s, got %d:\n%s", inst, n, out)
+		}
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, "radarr decision summary") {
+			continue
+		}
+		switch {
+		case strings.Contains(line, "instance=radarr-hd"):
+			if !strings.Contains(line, "crossCheck=FAILED") || !strings.Contains(line, "unmonitored=0") {
+				t.Errorf("radarr-hd's summary must state its own blocked pass: %s", line)
+			}
+		case strings.Contains(line, "instance=radarr-4k"):
+			if !strings.Contains(line, `crossCheck="passed`) || !strings.Contains(line, "unmonitored=1") {
+				t.Errorf("radarr-4k's summary must state its own passed cross-check and confirmed write: %s", line)
+			}
+		}
+	}
+}
+
 // --- statefulRadarrFake: the Phase 5 no-op contract, machine-verified -----
 //
 // Every fake above this point is stateless: newRadarrFake's GET /movie and
@@ -1840,6 +2037,18 @@ func wouldUnmonitorStatefulMovie(id int, title string) *statefulRadarrMovie {
 	}
 }
 
+// statefulRadarrProfilesJSON is decisionEngineProfilesJSON plus the "cutoff"
+// field a real Radarr /api/v3/qualityprofile always returns (every other
+// profile fixture in this suite carries it; the shared decision-engine one
+// omits it because nothing that uses it looks at connectivity output).
+// connectivity.go warns on the absence — correctly, and on both runs — but
+// that WARN is a statement about this fake's fixture, not about the cycle, and
+// run 2 of the no-op test asserts the steady-state cycle is warning-free.
+// Making the fake faithful is the honest way to satisfy that: the decision
+// engine itself never reads cutoff (it uses cutoffFormatScore), so this
+// changes no decision, only the fidelity of what the fake answers with.
+const statefulRadarrProfilesJSON = `[{"id": 1, "name": "HD-1080p", "upgradeAllowed": true, "cutoff": 7, "cutoffFormatScore": 100}]`
+
 type statefulRadarrFake struct {
 	srv *httptest.Server
 
@@ -1861,7 +2070,7 @@ func newStatefulRadarrFake(t *testing.T, movies []*statefulRadarrMovie) *statefu
 	t.Helper()
 	f := &statefulRadarrFake{
 		movies:       make(map[int]*statefulRadarrMovie, len(movies)),
-		profilesJSON: decisionEngineProfilesJSON,
+		profilesJSON: statefulRadarrProfilesJSON,
 		tagsJSON:     decisionEngineNoTagsJSON,
 	}
 	for _, m := range movies {
@@ -2104,6 +2313,9 @@ func TestRun_WriteMode_SecondRun_IsANoOp(t *testing.T) {
 	if len(puts1) != 3 {
 		t.Fatalf("run 1: expected 3 PUTs, got %d: %+v", len(puts1), puts1)
 	}
+	// The run-1 baseline for the no-op assertion below is every non-GET
+	// request of any method to any path, not just the PUTs this run expected.
+	writes1 := len(fake.writes())
 	out1 := stdout1.String()
 	if !strings.Contains(out1, "wouldUnmonitor=3") || !strings.Contains(out1, "unmonitored=3") {
 		t.Errorf("run 1: expected wouldUnmonitor=3 unmonitored=3 in the summary:\n%s", out1)
@@ -2122,12 +2334,26 @@ func TestRun_WriteMode_SecondRun_IsANoOp(t *testing.T) {
 	// The no-op's central claim: NOT ONE additional write request of any
 	// method, to any path, was made — same standard as the dry-run
 	// guarantee, applied to a second write-mode run that has nothing left to
-	// do.
-	if puts2 := fake.puts(); len(puts2) != len(puts1) {
-		t.Fatalf("run 2: made %d additional write request(s), want ZERO (no-op): %+v", len(puts2)-len(puts1), puts2[len(puts1):])
+	// do. REVIEW FIX (Phase 5 final round): this compared fake.puts() (PUTs
+	// only) against the run-1 baseline while claiming "of any method, to any
+	// path" — a second-cycle POST /api/v3/command, or a DELETE at some path
+	// nobody stubbed, would have passed it. The fake's catch-all handler and
+	// fake.writes() exist for exactly this claim, and the dry-run twin below
+	// already used them.
+	if writes2 := fake.writes(); len(writes2) != writes1 {
+		t.Fatalf("run 2: made %d additional write request(s) of any method to any path, want ZERO (no-op): %+v", len(writes2)-writes1, writes2[writes1:])
 	}
 
 	out2 := stdout2.String()
+	// "no errors" is half the plan's Phase 5 acceptance sentence, and exit
+	// code 0 does not cover it: a warning exits 0, and so does a counted write
+	// error. A steady-state cycle that has nothing to do must be quiet, which
+	// is the whole point of this phase's mandated noise-budget fixes — the
+	// withheld-writes line is INFO here precisely because run 2 blocks a pass
+	// with nothing pending.
+	if strings.Contains(out2, "level=WARN") || strings.Contains(out2, "level=ERROR") {
+		t.Errorf("run 2: a no-op cycle must produce no WARN or ERROR at all; a daemon loop repeats this cycle forever:\n%s", out2)
+	}
 	if strings.Contains(out2, "msg=would-unmonitor") {
 		t.Errorf("run 2: a no-op cycle must produce no would-unmonitor lines at all:\n%s", out2)
 	}

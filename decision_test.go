@@ -219,21 +219,22 @@ func TestResolveExclusionTagID_MalformedJSON_SkipsInstance(t *testing.T) {
 	}
 }
 
-// TestResolveExclusionTagID_RecordMissingIdOrLabel_SkipsInstance pins the
+// TestResolveExclusionTagID_MalformedRecordAndNoMatch_SkipsInstance pins the
 // REVIEW FIX (Phase 5 round 2) correction: an individual malformed tag
 // record (missing id or label) is instance-fatal, exactly like the whole
-// /tag request failing (§2.6), NOT merely excluded-and-skip-past. A record
-// with a nil label cannot be compared against the configured label, so
-// there is no way to tell whether the unreadable record is in fact the
-// exclusion tag's own definition; continuing the scan and falling through
-// to "not defined" when nothing else matches would risk asserting a false
-// statement and silently disabling rule 4 for the whole instance. This
-// intentionally diverges from fetchWantedCutoff's per-record skip for
-// movies, where skipping one bad movie record cannot corrupt the
-// evaluation of any other movie — the tag list has no such independence
-// property when the very record in question might be the one that matters.
-func TestResolveExclusionTagID_RecordMissingIdOrLabel_SkipsInstance(t *testing.T) {
-	tagsJSON := `[{"label": "no-id"}, {"id": 9, "label": "cutoffarr-exclude"}]` // first record missing id
+// /tag request failing (§2.6), NOT merely excluded-and-skip-past — but only
+// when the exclusion tag was not found among the records that ARE readable.
+// A record with a nil label cannot be compared against the configured label,
+// so when nothing else matched there is no way to tell whether the unreadable
+// record is in fact the exclusion tag's own definition; falling through to
+// "not defined" would risk asserting a false statement and silently disabling
+// rule 4 for the whole instance. This intentionally diverges from
+// fetchWantedCutoff's per-record skip for movies, where skipping one bad movie
+// record cannot corrupt the evaluation of any other movie — the tag list has
+// no such independence property when the very record in question might be the
+// one that matters.
+func TestResolveExclusionTagID_MalformedRecordAndNoMatch_SkipsInstance(t *testing.T) {
+	tagsJSON := `[{"label": "no-id"}, {"id": 9, "label": "some-other-tag"}]` // first record missing id, and nothing matches
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v3/tag", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(tagsJSON))
@@ -247,7 +248,7 @@ func TestResolveExclusionTagID_RecordMissingIdOrLabel_SkipsInstance(t *testing.T
 
 	_, found, ok := resolveExclusionTagID(context.Background(), logger, client, inst, "cutoffarr-exclude")
 	if ok {
-		t.Fatalf("resolveExclusionTagID returned ok=true, want false: a malformed tag record must skip the whole instance, not just itself:\n%s", buf.String())
+		t.Fatalf("resolveExclusionTagID returned ok=true, want false: with the label unfound and a record unreadable, its status is genuinely unknowable:\n%s", buf.String())
 	}
 	if found {
 		t.Error("found = true, want false when the instance was skipped")
@@ -258,6 +259,58 @@ func TestResolveExclusionTagID_RecordMissingIdOrLabel_SkipsInstance(t *testing.T
 	}
 	if strings.Contains(out, "exclusion tag not defined in this instance") {
 		t.Errorf("must not claim the tag is undefined — its status could not be verified, which is a different, stronger fact:\n%s", out)
+	}
+}
+
+// TestResolveExclusionTagID_MalformedRecordButLabelMatches_ResolvesRegardlessOfOrder
+// is the REVIEW FIX (Phase 5 final round) on top of that rule: fail-closed was
+// right, failing EARLY was not. The round-3 implementation returned
+// instance-fatal at the first malformed record, so identical tag data resolved
+// or bricked the instance purely on array order — a malformed record listed
+// before the exclusion tag's own record skipped the instance on every cycle,
+// forever, while the same two records in the opposite order resolved fine and
+// ran. Radarr tag labels are unique, so a positive label match on a
+// well-formed record fully determines the id no matter what any other record
+// says; the unknowable case is only "the label was not found AND something was
+// unreadable". Both orderings are asserted here precisely because the defect
+// was invisible to a test that only ever fed one of them.
+func TestResolveExclusionTagID_MalformedRecordButLabelMatches_ResolvesRegardlessOfOrder(t *testing.T) {
+	orderings := []struct{ name, tagsJSON string }{
+		{"malformed record first", `[{"label": "no-id"}, {"id": 9, "label": "cutoffarr-exclude"}]`},
+		{"malformed record last", `[{"id": 9, "label": "cutoffarr-exclude"}, {"label": "no-id"}]`},
+		{"malformed records on both sides", `[{"id": 3}, {"id": 9, "label": "cutoffarr-exclude"}, {"label": "no-id"}]`},
+	}
+	for _, tc := range orderings {
+		t.Run(tc.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/api/v3/tag", func(w http.ResponseWriter, r *http.Request) {
+				w.Write([]byte(tc.tagsJSON))
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			logger, buf := newDecisionTestLogger(slog.LevelInfo)
+			inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+			client := NewAPIClient(inst.URL, inst.APIKey)
+
+			id, found, ok := resolveExclusionTagID(context.Background(), logger, client, inst, "cutoffarr-exclude")
+			if !ok {
+				t.Fatalf("resolveExclusionTagID returned ok=false: the label matched a well-formed record, so the answer is known regardless of unreadable neighbours:\n%s", buf.String())
+			}
+			if !found || id != 9 {
+				t.Errorf("id/found = %d/%v, want 9/true", id, found)
+			}
+			// The unreadable record is still worth saying out loud: it may be
+			// the first sign of a Radarr version whose /tag shape this code no
+			// longer understands.
+			out := buf.String()
+			if !strings.Contains(out, "level=WARN") {
+				t.Errorf("expected a warning about the record that could not be read:\n%s", out)
+			}
+			if strings.Contains(out, "skipping instance") {
+				t.Errorf("the instance must not be skipped when the exclusion tag was positively identified:\n%s", out)
+			}
+		})
 	}
 }
 
@@ -2150,11 +2203,18 @@ func TestRunRadarrDecisionEngine_EchoSaysStillMonitored_IsAWriteFailure(t *testi
 // writesRefused=0 alreadyUnmonitored=0 — with nothing at all explaining
 // where the one promised write went; an instance where all N candidates hit
 // this race would report the identical, fully-zeroed line regardless of N.
-// It must now be counted under its own name, alreadyUnmonitoredAtWrite, and
-// that name must be distinct from alreadyUnmonitored (decision.go's
-// scan-time counter for rule-1 exclusions, which is unrelated and must stay
-// 0 here: this movie was monitored:true at scan time, so rule 1 never
-// touched it).
+//
+// REVIEW FIX (Phase 5 final round): it is counted as writesRefused, the single
+// counter for every would-unmonitor decision the write pass declined to act on
+// (see runWritePass's reconciliation identity). The round-4 fix gave the race
+// its own attr, alreadyUnmonitoredAtWrite, which solved the accounting but
+// added a sixth number to a line that already carries five, one letter-for-
+// letter confusable with the unrelated scan-time alreadyUnmonitored beside it.
+// The causes stay distinguishable where a human actually reads them — each
+// refusal logs its own message — while the summary keeps ONE number for "a
+// promised write that did not happen and was not a failure". alreadyUnmonitored
+// (scan-time, rule-1 exclusions) must still read 0 here: this movie was
+// monitored:true when the library was scanned, so rule 1 never touched it.
 func TestRunRadarrDecisionEngine_AlreadyUnmonitoredAtWriteTime_NoPut(t *testing.T) {
 	fake := newRadarrFake(t, "", map[int]string{
 		1: `{"id": 1, "title": "Raced Movie", "monitored": false}`,
@@ -2165,17 +2225,20 @@ func TestRunRadarrDecisionEngine_AlreadyUnmonitoredAtWriteTime_NoPut(t *testing.
 
 	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, false)
 
-	if puts := fake.puts(); len(puts) != 0 {
-		t.Fatalf("expected zero PUTs for an already-unmonitored movie, got %+v", puts)
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("expected zero write requests of any method for an already-unmonitored movie, got %+v", writes)
 	}
 	out := buf.String()
 	if !strings.Contains(out, "already unmonitored") {
 		t.Errorf("expected an info log explaining the write was unnecessary:\n%s", out)
 	}
-	for _, want := range []string{"wouldUnmonitor=1", "unmonitored=0", "writeErrors=0", "writesRefused=0", "alreadyUnmonitored=0", "alreadyUnmonitoredAtWrite=1"} {
+	for _, want := range []string{"wouldUnmonitor=1", "unmonitored=0", "writeErrors=0", "writesRefused=1", "alreadyUnmonitored=0"} {
 		if !strings.Contains(out, want) {
-			t.Errorf("expected %q in the summary — alreadyUnmonitoredAtWrite is the only number that accounts for the 1 promised write when every other counter (including the unrelated scan-time alreadyUnmonitored) is 0:\n%s", want, out)
+			t.Errorf("expected %q in the summary — writesRefused is the only number that accounts for the 1 promised write when every other counter (including the unrelated scan-time alreadyUnmonitored) is 0:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "alreadyUnmonitoredAtWrite") {
+		t.Errorf("the summary must not carry a second already-unmonitored counter one character away from the scan-time one; the race is counted as a refusal:\n%s", out)
 	}
 }
 
@@ -2200,8 +2263,8 @@ func TestRunRadarrDecisionEngine_ExclusionTagAddedBetweenScanAndWrite_RefusesThe
 
 	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, false)
 
-	if puts := fake.puts(); len(puts) != 0 {
-		t.Fatalf("expected zero PUTs: the fresh fetch shows the exclusion tag, which always wins, got %+v", puts)
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("expected zero write requests of any method: the fresh fetch shows the exclusion tag, which always wins, got %+v", writes)
 	}
 	out := buf.String()
 	if !strings.Contains(out, "msg=would-unmonitor") {
@@ -2249,8 +2312,8 @@ func TestRunRadarrDecisionEngine_DryRun_ExclusionTagAddedBetweenScanAndWrite_Ref
 
 	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
 
-	if puts := fake.puts(); len(puts) != 0 {
-		t.Fatalf("expected zero PUTs even in dry-run: the fresh fetch shows the exclusion tag, which always wins, got %+v", puts)
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("expected zero write requests of any method even in dry-run: the fresh fetch shows the exclusion tag, which always wins, got %+v", writes)
 	}
 	out := buf.String()
 	if !strings.Contains(out, "msg=would-unmonitor") {
@@ -2299,6 +2362,219 @@ func TestRunRadarrDecisionEngine_AllPreWriteTagChecksRefused_SummaryAccountsForE
 		if !strings.Contains(out, want) {
 			t.Errorf("expected %q in the summary — writesRefused is the only number that accounts for the 2 pending writes when every other counter is 0:\n%s", want, out)
 		}
+	}
+}
+
+// --- every promised write is accounted for ---------------------------------
+//
+// REVIEW FIX (Phase 5 final round), and the reason the individual counters
+// above exist at all: the summary line's job is to leave no unexplained gap
+// between what the report promised (wouldUnmonitor=N) and what happened. Two
+// review rounds each found a different silent (false, nil) return that made N
+// writes evaporate with every counter reading zero, and each was closed by
+// adding a counter. The pattern is the bug: a THIRD such path would be found
+// the same way, by a human noticing numbers that do not add up, which is only
+// possible if they are supposed to add up in the first place.
+//
+// So the identity is now stated, and pinned:
+//
+//	wouldUnmonitor == unmonitored + writeEchoUnverified + writeErrors
+//	                  + writeRehearsalErrors + writesRefused + withheldWrites
+//
+// (writeErrors and writeRehearsalErrors are the same counter under two names —
+// only one of them is ever printed, decided by dry-run — so summing both is
+// exact in either mode.) Any future write outcome that does not increment one
+// of these terms fails this test on the first scenario that reaches it.
+
+// summaryCounters parses every integer attr off the run's single "radarr
+// decision summary" line. Non-integer attrs (level, msg, crossCheck,
+// skipReasons) are ignored rather than parsed, since nothing here asks about
+// them; splitting on whitespace is safe for exactly that reason — the values
+// that contain spaces are the ones this never looks up.
+func summaryCounters(t *testing.T, output string) map[string]int {
+	t.Helper()
+	var line string
+	for _, l := range strings.Split(output, "\n") {
+		if !strings.Contains(l, "radarr decision summary") {
+			continue
+		}
+		if line != "" {
+			t.Fatalf("expected exactly one summary line per instance:\n%s", output)
+		}
+		line = l
+	}
+	if line == "" {
+		t.Fatalf("no %q line in the output:\n%s", "radarr decision summary", output)
+	}
+	counters := make(map[string]int)
+	for _, field := range strings.Fields(line) {
+		key, value, found := strings.Cut(field, "=")
+		if !found {
+			continue
+		}
+		if n, err := strconv.Atoi(value); err == nil {
+			counters[key] = n
+		}
+	}
+	return counters
+}
+
+func TestRunRadarrDecisionEngine_EveryWouldUnmonitorDecisionIsAccountedForInTheSummary(t *testing.T) {
+	// Each case makes its single would-unmonitor decision end a different
+	// way. The named counter is the one that must absorb it; the identity
+	// check is what proves nothing fell between the counters.
+	cases := []struct {
+		name        string
+		detail      map[int]string
+		tagsJSON    string
+		putStatus   map[int]int
+		putEcho     map[string]string // by id, as a string key so the literal stays readable
+		dryRun      bool
+		wantCounter string
+	}{
+		{
+			name:        "confirmed write",
+			detail:      map[int]string{1: monitoredMovieDetail(1, "Accounted Movie")},
+			wantCounter: "unmonitored",
+		},
+		{
+			name:        "the server rejected the PUT",
+			detail:      map[int]string{1: monitoredMovieDetail(1, "Accounted Movie")},
+			putStatus:   map[int]int{1: http.StatusInternalServerError},
+			wantCounter: "writeErrors",
+		},
+		{
+			name:        "the PUT was accepted but the echo confirms nothing",
+			detail:      map[int]string{1: monitoredMovieDetail(1, "Accounted Movie")},
+			putEcho:     map[string]string{"1": ""},
+			wantCounter: "writeEchoUnverified",
+		},
+		{
+			name:        "the movie vanished before the pre-write fetch",
+			detail:      map[int]string{},
+			wantCounter: "writeErrors",
+		},
+		{
+			name:        "the exclusion tag was added between scan and write",
+			detail:      map[int]string{1: `{"id": 1, "title": "Accounted Movie", "monitored": true, "tags": [42]}`},
+			tagsJSON:    `[{"id": 42, "label": "cutoffarr-exclude"}]`,
+			wantCounter: "writesRefused",
+		},
+		{
+			name:        "the fresh payload's tags cannot be verified",
+			detail:      map[int]string{1: `{"id": 1, "title": "Accounted Movie", "monitored": true}`},
+			tagsJSON:    `[{"id": 42, "label": "cutoffarr-exclude"}]`,
+			wantCounter: "writesRefused",
+		},
+		{
+			name:        "something else unmonitored it first",
+			detail:      map[int]string{1: `{"id": 1, "title": "Accounted Movie", "monitored": false}`},
+			wantCounter: "writesRefused",
+		},
+		{
+			name:        "the fresh payload's monitored is JSON null",
+			detail:      map[int]string{1: `{"id": 1, "title": "Accounted Movie", "monitored": null}`},
+			wantCounter: "writesRefused",
+		},
+		{
+			name:        "the fresh payload has no monitored key",
+			detail:      map[int]string{1: `{"id": 1, "title": "Accounted Movie"}`},
+			wantCounter: "writesRefused",
+		},
+		{
+			name:        "dry-run withheld the write at the gate",
+			detail:      map[int]string{1: monitoredMovieDetail(1, "Accounted Movie")},
+			dryRun:      true,
+			wantCounter: "withheldWrites",
+		},
+		{
+			name:        "dry-run rehearsal failed before the gate",
+			detail:      map[int]string{},
+			dryRun:      true,
+			wantCounter: "writeRehearsalErrors",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newRadarrFake(t, "", tc.detail)
+			if tc.tagsJSON != "" {
+				fake.tagsJSON = tc.tagsJSON
+			}
+			for id, status := range tc.putStatus {
+				fake.putStatus[id] = status
+			}
+			for id, echo := range tc.putEcho {
+				n, err := strconv.Atoi(id)
+				if err != nil {
+					t.Fatalf("bad putEcho key %q: %v", id, err)
+				}
+				fake.putEcho[n] = echo
+			}
+
+			logger, buf := newDecisionTestLogger(slog.LevelInfo)
+			movies := []movieListElement{wouldUnmonitorMovie(1, "Accounted Movie")}
+			runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, tc.dryRun)
+
+			out := buf.String()
+			c := summaryCounters(t, out)
+			if c["wouldUnmonitor"] != 1 {
+				t.Fatalf("wouldUnmonitor = %d, want 1: this case must actually reach the write pass or it proves nothing:\n%s", c["wouldUnmonitor"], out)
+			}
+			if c[tc.wantCounter] != 1 {
+				t.Errorf("%s = %d, want 1: this outcome must be counted under that name:\n%s", tc.wantCounter, c[tc.wantCounter], out)
+			}
+			accounted := c["unmonitored"] + c["writeEchoUnverified"] + c["writeErrors"] + c["writeRehearsalErrors"] + c["writesRefused"] + c["withheldWrites"]
+			if accounted != c["wouldUnmonitor"] {
+				t.Errorf("the summary accounts for %d of %d promised writes; every would-unmonitor decision must end in exactly one counted outcome:\n%s", accounted, c["wouldUnmonitor"], out)
+			}
+			// Both mode-independent counters are always printed, including as
+			// 0: a reader must never have to wonder whether an absent number
+			// means "none" or "not reported".
+			for _, always := range []string{"writesRefused=", "withheldWrites="} {
+				if !strings.Contains(out, always) {
+					t.Errorf("the summary must always carry %s, including as 0:\n%s", always, out)
+				}
+			}
+		})
+	}
+}
+
+// TestRunRadarrDecisionEngine_GateBlocked_WithheldWritesAccountsForThePass is
+// the identity's remaining term, which no case above can reach: when the
+// cross-check refuses to authorize the pass, every pending write is withheld
+// before unmonitorMovie is called even once, so nothing else can count them.
+func TestRunRadarrDecisionEngine_GateBlocked_WithheldWritesAccountsForThePass(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{
+		1: monitoredMovieDetail(1, "Blocked Movie A"),
+		2: monitoredMovieDetail(2, "Blocked Movie B"),
+	})
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	// Both movies are would-unmonitor decisions whose own qualityCutoffNotMet
+	// disagrees with their absence from the wanted set: the cross-check FAILS
+	// and the gate blocks the whole pass.
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("Blocked Movie A"), Monitored: boolPtr(true), HasFile: boolPtr(true),
+			QualityProfileID: intPtr(1), Tags: &noTags, MovieFile: &movieFileElement{ID: intPtr(1), QualityCutoffNotMet: boolPtr(true)}},
+		{ID: intPtr(2), Title: strPtr("Blocked Movie B"), Monitored: boolPtr(true), HasFile: boolPtr(true),
+			QualityProfileID: intPtr(1), Tags: &noTags, MovieFile: &movieFileElement{ID: intPtr(1), QualityCutoffNotMet: boolPtr(true)}},
+	}
+
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, false)
+
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("a blocked pass must write nothing, got %+v", writes)
+	}
+	out := buf.String()
+	c := summaryCounters(t, out)
+	if c["wouldUnmonitor"] != 2 || c["withheldWrites"] != 2 {
+		t.Errorf("wouldUnmonitor=%d withheldWrites=%d, want 2 and 2: the summary itself must account for a blocked pass, not only the warning above it:\n%s",
+			c["wouldUnmonitor"], c["withheldWrites"], out)
+	}
+	accounted := c["unmonitored"] + c["writeEchoUnverified"] + c["writeErrors"] + c["writeRehearsalErrors"] + c["writesRefused"] + c["withheldWrites"]
+	if accounted != c["wouldUnmonitor"] {
+		t.Errorf("the summary accounts for %d of %d promised writes:\n%s", accounted, c["wouldUnmonitor"], out)
 	}
 }
 

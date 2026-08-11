@@ -91,21 +91,29 @@ type tagElement struct {
 // failure: found=false, ok=true, and rule 4 passes for every movie (logged
 // at info, per the plan).
 //
-// A tag record missing its id or label is ALSO instance-fatal (REVIEW FIX,
-// Phase 5 round 2), not merely excluded-and-skip-past. Unlike a movie
-// record missing its id (fetchWantedCutoff's precedent, where skipping just
-// that one movie is safe because every other movie is still evaluated
-// correctly), a malformed tag record cannot be safely skipped past here:
-// its label may or may not be nil, but when it is nil the record cannot
-// even be compared against the configured label, so there is no way to
-// know whether the record we cannot read is the very definition of the
-// exclusion tag. Continuing the scan and falling through to "not defined"
-// when no other record matches would assert a false statement — the tag
-// may in fact be defined, just unreadably — and would silently disable
-// rule 4 for every movie in the instance (tagActive=false), which is
-// exactly the untrusted-input route to an unmonitor action §2.6 forbids.
-// So this mirrors the request/decode failures above: log what could not be
-// resolved and skip the whole instance rather than guess.
+// A tag record missing its id or label makes the instance fatal ONLY when the
+// configured label was not found among the records that could be read (REVIEW
+// FIX, Phase 5 round 2, corrected in the final round). Unlike a movie record
+// missing its id (fetchWantedCutoff's precedent, where skipping just that one
+// movie is safe because every other movie is still evaluated correctly), a
+// malformed tag record cannot simply be skipped past: when its label is nil
+// the record cannot be compared against the configured label at all, so
+// falling through to "not defined" would assert a false statement — the tag
+// may in fact be defined, just unreadably — and would silently disable rule 4
+// for every movie in the instance (tagActive=false), which is exactly the
+// untrusted-input route to an unmonitor action §2.6 forbids.
+//
+// But that reasoning only holds while the answer is actually unknown. Radarr
+// tag labels are unique, so a positive, case-insensitive match against a
+// well-formed record fully determines the id no matter what any other record
+// says — which is why this scans EVERY record before deciding, rather than
+// returning at the first unreadable one. Returning early made the outcome
+// depend on array order: a malformed record listed before the exclusion tag's
+// own record bricked the instance on every cycle forever, while the identical
+// data in the opposite order resolved and ran. Unreadable records are always
+// warned about (they may be the first sign of a /tag shape this code no longer
+// understands); they are fatal only in combination with a label that was not
+// found, which is the one case where the honest answer is "unknowable".
 func resolveExclusionTagID(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, label string) (id int, found bool, ok bool) {
 	body, err := fetchBody(ctx, client, "/api/v3/tag", nil)
 	if err != nil {
@@ -121,15 +129,26 @@ func resolveExclusionTagID(ctx context.Context, logger *slog.Logger, client *API
 		return 0, false, false
 	}
 
+	matchedID, matched, sawUnresolvable := 0, false, false
 	for _, tg := range tags {
 		if tg.ID == nil || tg.Label == nil {
-			logger.Warn("skipping instance: a tag record could not be resolved, so the exclusion tag cannot be verified",
+			sawUnresolvable = true
+			logger.Warn("a tag record could not be resolved; it will be reported as fatal only if the exclusion tag is not found elsewhere in the list",
 				"instance", inst.Name, "type", inst.Type, "id", derefOrAbsent(tg.ID), "label", derefOrAbsent(tg.Label))
-			return 0, false, false
+			continue
 		}
-		if strings.EqualFold(*tg.Label, label) {
-			return *tg.ID, true, true
+		if !matched && strings.EqualFold(*tg.Label, label) {
+			matchedID, matched = *tg.ID, true
 		}
+	}
+
+	if matched {
+		return matchedID, true, true
+	}
+	if sawUnresolvable {
+		logger.Warn("skipping instance: the exclusion tag was not found among the readable tag records and at least one record could not be resolved, so whether the tag exists cannot be determined",
+			"instance", inst.Name, "type", inst.Type, "exclusionTag", label)
+		return 0, false, false
 	}
 
 	logger.Info("exclusion tag not defined in this instance; no movies excluded",
@@ -456,18 +475,40 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		// an inconsistency with that house convention. Still excluded
 		// either way (monitored can't be assumed true; excluding is the
 		// safe direction), just no longer silent about why.
+		//
+		// Rule 1 therefore excludes two different populations, and they are
+		// two branches rather than one because they are two different facts
+		// about the library — REVIEW FIX (Phase 5 final round). They used to
+		// share a branch (`m.Monitored == nil || !*m.Monitored`) whose body
+		// then re-tested `m.Monitored != nil` to tell them apart, which reads
+		// as dead redundancy and is exactly what a future simplification
+		// deletes; deleting it would have reported a movie whose state was
+		// never observed as "already unmonitored", both in the counter and in
+		// a debug line stating it as an observed fact. Split like this, the
+		// distinction is load-bearing rather than defensive: the second branch
+		// dereferences the pointer the first one just ruled out.
 		warnIfFieldAbsent(logger, inst, "movie", "monitored", m.Monitored == nil)
-		if m.Monitored == nil || !*m.Monitored {
-			// Rule 1: excluded from the report entirely, per the plan. A
-			// movie whose monitored field is genuinely present and false
-			// (as opposed to absent — a different, already-warned-about
-			// case) is also Phase 5's no-op contract in miniature: this is
-			// exactly what a movie this project unmonitored on an earlier
-			// cycle looks like on every cycle after. The plan says such
-			// movies are "skipped silently at info, logged at debug" — so
-			// at info they stay as invisible as before, but the debug line
-			// and the counter make a second, no-op run of this project
-			// provable rather than merely quiet.
+		if m.Monitored == nil {
+			// "monitored" entirely absent from the JSON: untrusted input, not
+			// a state. It is excluded (monitored cannot be assumed true, and
+			// excluding is the safe direction) and it is warned about, just
+			// above — but it is deliberately NOT counted as already
+			// unmonitored, because nobody knows whether it is. A library whose
+			// /movie payloads lack the field — an unexpected Radarr version, a
+			// proxy stripping fields — would otherwise converge on a report
+			// reading totalMonitored=0 alreadyUnmonitored=N: a confident
+			// no-op, asserted over exactly the data §2.6 says never to guess
+			// from.
+			continue
+		}
+		if !*m.Monitored {
+			// monitored is present and false. This is Phase 5's no-op contract
+			// in miniature: it is exactly what a movie this project
+			// unmonitored on an earlier cycle looks like on every cycle after.
+			// The plan says such movies are "skipped silently at info, logged
+			// at debug" — so at info they stay as invisible as before, but the
+			// debug line and the counter make a second, no-op run of this
+			// project provable rather than merely quiet.
 			//
 			// REVIEW FIX (Phase 5 round 2): the onlyID scope test mirrors
 			// the one the --only-id narrowing block below applies to every
@@ -478,7 +519,7 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 			// and a targeted run against a large library would additionally
 			// emit one debug line per already-unmonitored movie in the
 			// entire library, not just the target.
-			if m.Monitored != nil && !*m.Monitored && (onlyID == 0 || (m.ID != nil && *m.ID == onlyID)) {
+			if onlyID == 0 || (m.ID != nil && *m.ID == onlyID) {
 				alreadyUnmonitoredCount++
 				logger.Debug("already unmonitored",
 					"id", derefOrAbsent(m.ID), "title", titleOrAbsent(m.Title), "instance", inst.Name)
@@ -534,7 +575,7 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	cc := runCrossCheck(logger, inst, decisions, wantedIDs)
 	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
 
-	unmonitoredCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, alreadyUnmonitoredAtWriteCount := runWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun)
+	unmonitoredCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount := runWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun)
 
 	attrs := []any{"instance", inst.Name, "type", inst.Type}
 	if onlyID != 0 {
@@ -566,30 +607,30 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		attrs = append(attrs, "writeErrors", writeErrorCount, "writeEchoUnverified", echoUnverifiedCount)
 	}
 
-	// writesRefused counts a fourth, mode-independent outcome (see
-	// runWritePass's doc comment): would-unmonitor decisions the pre-write
-	// exclusion-tag re-check refused before any request could fail or
-	// succeed. Unlike writeErrors/writeEchoUnverified it is not split by
-	// dryRun — the re-check runs identically in both modes, well before the
-	// dry-run gate, so "this write would be refused" is exactly as true and
-	// exactly as worth reporting during a rehearsal as during a real write.
-	// Always present, including as 0, for the same reason writeEchoUnverified
-	// is always present in write mode: its absence must never be mistaken for
-	// "nothing to refuse".
-	attrs = append(attrs, "writesRefused", writesRefusedCount)
-
-	// alreadyUnmonitoredAtWrite (REVIEW FIX, Phase 5 round 4) is a fifth,
-	// also mode-independent outcome, and deliberately a distinct name from
-	// the scan-time alreadyUnmonitored attr above — the controller's
-	// explicit instruction is that the two must never be conflated. That one
-	// counts movies rule 1 excluded from the report before the write pass
-	// ever ran; this one counts a would-unmonitor decision that reached the
-	// write pass and then lost the scan-to-write race (something else
-	// unmonitored the movie in the meantime) before any PUT could be sent.
-	// Like writesRefused, it runs identically in dry-run and write mode (the
-	// check sits above the dry-run gate in unmonitorMovie), so it is always
-	// present, including as 0.
-	attrs = append(attrs, "alreadyUnmonitoredAtWrite", alreadyUnmonitoredAtWriteCount)
+	// The last two outcomes, both mode-independent (see runWritePass's doc
+	// comment for all five and for the identity they satisfy):
+	//
+	//   - writesRefused: would-unmonitor decisions the write path itself
+	//     declined — the exclusion tag reappeared, the fresh payload's tags or
+	//     "monitored" could not be read, or something else unmonitored the
+	//     movie between the scan and the write pass. Unlike
+	//     writeErrors/writeEchoUnverified this is not split by dryRun: every
+	//     refusal happens well before the dry-run gate, so "this write would be
+	//     refused" is exactly as true and exactly as worth reporting during a
+	//     rehearsal as during a real write.
+	//   - withheldWrites: writes that were never attempted at all, because the
+	//     cross-check gate blocked the pass or because a dry-run stopped at the
+	//     gate immediately before the PUT. This is what makes a dry-run summary
+	//     add up (wouldUnmonitor=N withheldWrites=N is the shape of a healthy
+	//     rehearsal) and what stops a gate-blocked pass from reporting N
+	//     promised writes against a line of zeroes. The same attr name and
+	//     meaning as the gate's own warning line, which quantifies just its
+	//     own half.
+	//
+	// Both are always present, including as 0, for the same reason
+	// writeEchoUnverified always is in write mode: an absent number must never
+	// be readable as "none happened".
+	attrs = append(attrs, "writesRefused", writesRefusedCount, "withheldWrites", withheldWriteCount)
 
 	attrs = append(attrs, "skipReasons", formatSkipCounts(skipCounts), "crossCheck", crossCheckSummary)
 	logger.Info("radarr decision summary", attrs...)
@@ -638,50 +679,55 @@ func libraryContainsID(movies []movieListElement, id int) bool {
 // Per §2.6 a failed write is logged, counted, and abandoned for the cycle —
 // the pass moves to the next item and never retries.
 //
-// Five outcomes are counted, not two, because a PUT has five meaningfully
-// different endings and only two of them are the ones people expect:
+// Five outcomes are counted, not two, because a would-unmonitor decision has
+// five meaningfully different endings and only two of them are the ones people
+// expect:
 //
 //   - confirmed (unmonitored): the server accepted the write AND its echo
 //     says the movie is now unmonitored. The only outcome that logs
 //     msg=unmonitor and the only one Phase 5's no-op contract counts.
-//   - failed (writeErrors): the server rejected the write, or its echo says
-//     the movie is still monitored. The change did not happen.
+//   - failed (writeErrors): the server rejected the write, its echo says the
+//     movie is still monitored, or the pre-write fetch itself failed. The
+//     change did not happen. In dry-run the same counter is reported under
+//     the name writeRehearsalErrors, since no write was attempted and only
+//     the rehearsal of one can have failed.
 //   - accepted but unconfirmed (echoUnverified): a 2xx whose body cannot
-//     settle the question — empty, not an object, no "monitored" key, or
-//     "monitored" as JSON null. The change probably DID happen and cannot be
-//     proven, which is neither of the above and must not be reported as
-//     either.
-//   - refused before any request was sent (writesRefused): unmonitorMovie's
-//     own pre-write exclusion-tag re-check refused to proceed — either
-//     because the fresh payload confirms the exclusion tag is now present
-//     (errExcludedAtWrite), or because its tags could not be trusted at all
-//     (errTagsUnverifiable). REVIEW FIX (Phase 5 round 2): these three
-//     refusal branches used to return (false, nil) and go completely
-//     uncounted, so an instance where the exclusion tag is active and every
-//     fresh fetch is refused could report wouldUnmonitor=N against
-//     unmonitored=0, writeErrors=0, writeEchoUnverified=0 — every counter on
-//     the summary line zero, with nothing explaining where N promised writes
-//     went. It is neither a failed write (no PUT was ever sent, so nothing
-//     Radarr did can have failed) nor a no-op (a no-op is "nothing needed
-//     doing"; this is "something needed doing and the safety check said no")
-//     and so gets its own name rather than being folded into either.
-//   - lost the scan-to-write race (alreadyUnmonitoredAtWrite): the fresh
-//     pre-write fetch shows the movie is already unmonitored — something
-//     else changed it between the scan and this pass reaching it.
-//     unmonitorMovie wraps errAlreadyUnmonitoredAtWrite for this (REVIEW FIX,
-//     Phase 5 round 4), for the identical reason the tag refusals above got
-//     their own sentinel one round earlier: it used to be (false, nil), the
-//     same shape as "dry-run withheld it", so it fell into the `if !written`
-//     no-op branch below and was never counted anywhere — an instance where
-//     every candidate lost this race reported wouldUnmonitor=N against every
-//     other counter, including alreadyUnmonitored (the DIFFERENT, scan-time
-//     counter for rule-1 exclusions), at zero. Not folded into
-//     alreadyUnmonitored: that counter is about movies rule 1 excluded from
-//     the report before the write pass ever saw them; this one is about a
-//     would-unmonitor decision that reached the write pass and lost a race
-//     there. Conflating the two would make wouldUnmonitor=N look
-//     inconsistent with a count that never promised anything about those N
-//     movies.
+//     settle the question — empty, not an object, about a different movie, no
+//     "monitored" key, or "monitored" as JSON null. The change probably DID
+//     happen and cannot be proven, which is neither of the above and must not
+//     be reported as either.
+//   - refused before any request was sent (writesRefused): unmonitorMovie
+//     declined to proceed. Four causes, each logging its own reason at the
+//     moment it refuses: the fresh payload confirms the exclusion tag is now
+//     present (errExcludedAtWrite), its tags could not be trusted at all
+//     (errTagsUnverifiable), its "monitored" could not be read at all
+//     (errMonitoredUnverifiable), or the movie is already unmonitored —
+//     something else changed it between the scan and this pass reaching it
+//     (errAlreadyUnmonitoredAtWrite). None is a failed write (no PUT was ever
+//     sent, so nothing Radarr did can have failed) and none is a no-op (a
+//     no-op is "nothing needed doing"; these are "something needed doing and
+//     the write path said no"), so they are neither of those counters.
+//   - withheld (withheld): no attempt was made at all — either the
+//     cross-check gate blocked the entire pass, or this is a dry-run and
+//     unmonitorMovie stopped at the gate immediately before the PUT (§2.1).
+//     The one outcome that is a genuine non-event.
+//
+// Those five are exhaustive by construction, and that is the point. Two review
+// rounds each found a different silent (false, nil) path that made promised
+// writes evaporate with every counter reading zero, and each was closed by
+// adding a counter — a pattern that only stops when the numbers are required
+// to add up:
+//
+//	wouldUnmonitor == unmonitored + echoUnverified + writeErrors
+//	                  + writesRefused + withheld
+//
+// (In the summary line, writeErrors is printed as writeRehearsalErrors during
+// a dry-run; the identity is over the same value either way.) The identity is
+// pinned by
+// TestRunRadarrDecisionEngine_EveryWouldUnmonitorDecisionIsAccountedForInTheSummary,
+// which walks every ending a decision can have and fails if one of them lands
+// nowhere. Any future outcome must increment one of these five terms, or that
+// test says so.
 //
 // exclusionTagID and tagActive are threaded straight through to
 // unmonitorMovie's own pre-write re-check (Phase 5, mandated write-path
@@ -689,7 +735,7 @@ func libraryContainsID(movies []movieListElement, id int) bool {
 // and §2.5 says the exclusion tag always wins, in every mode — including a
 // tag added to a movie after it was evaluated but before the write pass
 // reached it.
-func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, decisions []movieDecision, cc crossCheckResult, exclusionTagID int, tagActive bool, dryRun bool) (unmonitored, writeErrors, echoUnverified, writesRefused, alreadyUnmonitoredAtWrite int) {
+func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, decisions []movieDecision, cc crossCheckResult, exclusionTagID int, tagActive bool, dryRun bool) (unmonitored, writeErrors, echoUnverified, writesRefused, withheld int) {
 	// The count is what makes the warnings below actionable: "the gate
 	// blocked 12 writes" and "the gate blocked, but there was nothing to
 	// write anyway" are very different situations, and without a number they
@@ -718,7 +764,12 @@ func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, i
 		} else {
 			logger.Info(msg, attrs...)
 		}
-		return 0, 0, 0, 0, 0
+		// Every pending write is withheld, and says so on the summary line as
+		// well as here: the gate's own warning scrolls past in a daemon loop,
+		// while the summary is the line a human greps, and a blocked pass that
+		// left wouldUnmonitor=N against five zeroes was exactly the
+		// unexplained gap the reconciliation identity above exists to forbid.
+		return 0, 0, 0, 0, pending
 	}
 
 	// The gate opened, but "opened" is not the same as "the sample was
@@ -752,33 +803,18 @@ func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, i
 		}
 
 		written, err := unmonitorMovie(ctx, logger, client, inst, d.id, exclusionTagID, tagActive, dryRun)
-		if errors.Is(err, errExcludedAtWrite) || errors.Is(err, errTagsUnverifiable) {
-			// unmonitorMovie already logged the specific reason (the
-			// exclusion tag is now present, or its tags could not be
-			// trusted) at the point it refused; nothing more to log here.
-			// This is not a write failure (no PUT was ever sent — the
-			// re-check runs before that, in both modes) and not a no-op
-			// (unlike the already-unmonitored-at-write and dry-run-withheld
-			// cases, something DID need doing here), so it gets counted under
-			// its own name instead of falling into writeErrors or vanishing
-			// through the `!written` no-op branch below.
+		if isWriteRefusal(err) {
+			// unmonitorMovie already logged the specific reason — the
+			// exclusion tag is now present, its tags could not be trusted, its
+			// "monitored" could not be read, or something else unmonitored the
+			// movie first — at the point it refused, so nothing more is logged
+			// here and no cause is lost by sharing a counter. None of them is
+			// a write failure (no PUT was ever sent: every refusal happens
+			// before that point, in both modes) and none is a no-op (something
+			// DID need doing), so they are counted here rather than falling
+			// into writeErrors or vanishing through the `!written` branch
+			// below.
 			writesRefused++
-			continue
-		}
-		if errors.Is(err, errAlreadyUnmonitoredAtWrite) {
-			// unmonitorMovie already logged "already unmonitored, skipping
-			// write" at info; nothing more to log here. This is the
-			// scan-to-write race (something else unmonitored the movie
-			// between the scan and this pass reaching it) — a REAL race, not
-			// dry-run being withheld, and REVIEW FIX (Phase 5 round 4) gives
-			// it its own counter for the same reason writesRefused got one a
-			// round earlier: falling through to the `if !written` branch
-			// below would count nothing, and an instance where every
-			// candidate lost this race would report every counter on the
-			// summary line — including the DIFFERENT, scan-time
-			// alreadyUnmonitored counter — at zero, with nothing explaining
-			// where the promised writes went.
-			alreadyUnmonitoredAtWrite++
 			continue
 		}
 		if errors.Is(err, errWriteUnverified) {
@@ -817,12 +853,15 @@ func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, i
 		}
 		if !written {
 			// Dry-run: unmonitorMovie withheld the write immediately before
-			// the PUT (§2.1) and has already logged it at debug. This is now
-			// the ONLY remaining (false, nil) case — the already-unmonitored
-			// race above and the tag refusals above that both moved to their
-			// own sentinel-wrapped errors, counted separately, precisely so
-			// nothing real falls silently through this branch. Nothing was
-			// changed here, and nothing needed to be, so nothing is counted.
+			// the PUT (§2.1) and has already logged it at debug. This is the
+			// ONLY remaining (false, nil) case — the already-unmonitored race
+			// and the tag/monitored refusals all moved to sentinel-wrapped
+			// errors, counted above, precisely so nothing real falls silently
+			// through this branch. Nothing was written, so it is counted with
+			// the gate-blocked writes rather than left to vanish: "withheld"
+			// is what both mean, and the reconciliation identity needs every
+			// pending write to end in exactly one counter.
+			withheld++
 			continue
 		}
 
@@ -831,7 +870,7 @@ func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, i
 			"id", d.id, "title", d.title, "reason", d.reason, "profile", d.profileName, "instance", inst.Name)
 	}
 
-	return unmonitored, writeErrors, echoUnverified, writesRefused, alreadyUnmonitoredAtWrite
+	return unmonitored, writeErrors, echoUnverified, writesRefused, withheld
 }
 
 // writeGateBlockReason decides whether the cross-check authorizes this
