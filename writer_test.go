@@ -19,11 +19,18 @@ import (
 )
 
 // recordedRequest captures one request a write-path fake server received,
-// so tests can assert on method, path, and exact body bytes.
+// so tests can assert on method, path, exact body bytes, and Content-Type.
+//
+// contentType is not bookkeeping: DoJSON exists solely to set it, because
+// Radarr's ASP.NET Core stack answers a body it cannot type with 415, and
+// nothing else in the suite binds the write path to DoJSON. Without this
+// field, swapping client.DoJSON for client.Do in writer.go leaves every test
+// in this project green and fails on the first live write.
 type recordedRequest struct {
-	method string
-	path   string
-	body   []byte
+	method      string
+	path        string
+	body        []byte
+	contentType string
 }
 
 // writerTestServer serves movieJSON at GET /api/v3/movie/{id} and accepts a
@@ -37,7 +44,7 @@ func writerTestServer(t *testing.T, movieJSON string, putStatus int) (*httptest.
 	var got []recordedRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		got = append(got, recordedRequest{method: r.Method, path: r.URL.Path, body: body})
+		got = append(got, recordedRequest{method: r.Method, path: r.URL.Path, body: body, contentType: r.Header.Get("Content-Type")})
 
 		switch r.Method {
 		case http.MethodGet:
@@ -162,6 +169,14 @@ func TestUnmonitorMovie_WriteMode_PutsFullObjectWithOnlyMonitoredChanged(t *test
 	}
 	if puts[0].path != "/api/v3/movie/7" {
 		t.Errorf("PUT path = %q, want /api/v3/movie/7", puts[0].path)
+	}
+	// The header is the whole reason DoJSON exists: Radarr's ASP.NET Core
+	// stack answers a body it cannot type with 415, and Do/DoQuery set no
+	// Content-Type at all. Nothing else in this suite would notice
+	// client.DoJSON being swapped for client.Do — the fake would happily
+	// serve it — so the first live write would be the test.
+	if puts[0].contentType != "application/json" {
+		t.Errorf("PUT Content-Type = %q, want application/json (Radarr rejects an untyped body with 415)", puts[0].contentType)
 	}
 
 	var sent, fetched map[string]json.RawMessage
@@ -737,7 +752,7 @@ func (f *radarrFake) handle(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		f.mu.Lock()
-		f.requests = append(f.requests, recordedRequest{method: r.Method, path: r.URL.Path, body: body})
+		f.requests = append(f.requests, recordedRequest{method: r.Method, path: r.URL.Path, body: body, contentType: r.Header.Get("Content-Type")})
 		f.mu.Unlock()
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		next(w, r)
@@ -987,6 +1002,12 @@ func TestRun_WriteMode_OnlyID_MakesExactlyOnePutForTheNamedMovie(t *testing.T) {
 	}
 	if writes[0].method != http.MethodPut || writes[0].path != "/api/v3/movie/2" {
 		t.Fatalf("write was %s %s, want PUT /api/v3/movie/2", writes[0].method, writes[0].path)
+	}
+	// Asserted here too, not only at the unit: this is the exact request the
+	// live acceptance criterion will send, and an untyped body is a 415 from
+	// Radarr however correct its contents are.
+	if writes[0].contentType != "application/json" {
+		t.Errorf("PUT Content-Type = %q, want application/json (Radarr rejects an untyped body with 415)", writes[0].contentType)
 	}
 
 	var sent map[string]json.RawMessage
