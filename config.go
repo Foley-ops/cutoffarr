@@ -227,6 +227,22 @@ func validateConfig(cfg *Config) error {
 		return fmt.Errorf("config: webhook_port %d is out of range (must be between 1 and 65535)", cfg.WebhookPort)
 	}
 
+	// Phase 8 made webhook_debounce load-bearing: it is the only thing bounding
+	// how many full instance scans a burst of webhooks costs (a webhook cycle
+	// is a full-evidence evaluation, by binding ruling). A NEGATIVE value would
+	// put every key's deadline in the past on arrival, turning a 24-episode
+	// season-pack import into 24 full library evaluations — the precise
+	// behavior the debounce exists to prevent, and one that would also read the
+	// *arr mid-import, before it has finished its own database writes.
+	//
+	// Zero is allowed and means "evaluate as soon as the loop sees it", which
+	// is a legitimate choice for a small library; unlike poll_interval there is
+	// no floor, because the cost of a short debounce is bounded by how often an
+	// *arr actually imports something.
+	if cfg.WebhookDebounce < 0 {
+		return fmt.Errorf("config: webhook_debounce %s must not be negative (use 0 to evaluate without waiting)", cfg.WebhookDebounce)
+	}
+
 	// FIX 8 (controller-mandated correction after the initial Phase 3
 	// review): exclusion_tag is now load-bearing (the decision engine's
 	// rule 4 resolves it to a tag id), and an explicitly empty string

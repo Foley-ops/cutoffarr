@@ -558,22 +558,84 @@ func TestDaemon_SecondCycleWithNothingChanged_LogsSummariesOnlyAtInfo(t *testing
 	mark := h.mark()
 	h.clock.Advance(time.Hour)
 	h.awaitLogCount("reconciliation sweep complete", 1)
+	// The cycle's own output, captured BEFORE the shutdown: the shutdown lines
+	// are the daemon stopping, not the cycle running, and folding them in would
+	// make this test about the wrong thing.
+	cycle2 := h.since(mark)
 	h.stop()
 
-	cycle2 := h.since(mark)
 	if len(fake.writes()) != writesAfterStartup {
 		t.Errorf("the second cycle must be a no-op, it made %d more write(s)", len(fake.writes())-writesAfterStartup)
 	}
-	for _, forbidden := range []string{"msg=would-unmonitor", "msg=skip "} {
-		if strings.Contains(cycle2, forbidden) {
-			t.Errorf("an idle reconciliation cycle must not reprint per-item report lines at INFO (%q):\n%s", forbidden, cycle2)
-		}
-	}
-	if !strings.Contains(cycle2, "sonarr decision summary") {
-		t.Errorf("the summary is what an idle cycle DOES print — it is how a human sees the daemon is alive and idle:\n%s", cycle2)
-	}
 	if strings.Contains(cycle2, "level=WARN") || strings.Contains(cycle2, "level=ERROR") {
 		t.Errorf("a steady-state cycle must be free of warnings and errors:\n%s", cycle2)
+	}
+
+	// SUMMARIES ONLY, asserted as such rather than as a list of forbidden
+	// messages: an idle cycle's INFO output is the daemon's own two bookends
+	// (the sweep beginning and completing) plus one decision summary per
+	// instance, and NOTHING that scales with the size of the library. A
+	// forbidden-substring test would pass the day someone adds a thirteenth
+	// per-item INFO line nobody thought to list.
+	allowedInfo := []string{
+		"reconciliation sweep beginning",
+		"reconciliation sweep complete",
+		"sonarr decision summary",
+	}
+	sawSummary := false
+	for _, line := range strings.Split(cycle2, "\n") {
+		if !strings.Contains(line, "level=INFO") {
+			continue
+		}
+		matched := ""
+		for _, allowed := range allowedInfo {
+			if strings.Contains(line, allowed) {
+				matched = allowed
+			}
+		}
+		if matched == "" {
+			t.Errorf("an idle reconciliation cycle printed an INFO line that is not a summary:\n%s\n(whole cycle:\n%s)", line, cycle2)
+		}
+		if matched == "sonarr decision summary" {
+			sawSummary = true
+		}
+	}
+	if !sawSummary {
+		t.Errorf("the summary is what an idle cycle DOES print — it is how a human sees the daemon is alive and idle:\n%s", cycle2)
+	}
+
+	// And the demotion is a demotion, not a deletion: everything the cycle
+	// stopped saying at INFO is still there at DEBUG for anyone who turns it
+	// on. Proven by the startup scan, which said all of it at INFO.
+	if !strings.Contains(startup, "msg=would-unmonitor") || !strings.Contains(startup, "cross-check season") {
+		t.Errorf("the startup scan must still report in full at INFO:\n%s", startup)
+	}
+}
+
+// TestDaemon_ReconciliationCycleAtDebug_StillSaysEverything is the other half
+// of the noise budget, and the reason it is a DEMOTION rather than a deletion:
+// with log_level: debug, an idle sweep says exactly what the startup scan said.
+func TestDaemon_ReconciliationCycleAtDebug_StillSaysEverything(t *testing.T) {
+	fake := writableSonarrFake(t)
+	h := startDaemon(t, writeDaemonConfig(t, "sonarr", fake.srv.URL, true, "debug", "1h", "45s"))
+	h.waitReady()
+	eventually(t, "the reconciliation schedule to be announced", func() bool {
+		return strings.Contains(h.out.String(), "reconciliation sweep scheduled")
+	})
+	mark := h.mark()
+
+	h.clock.Advance(time.Hour)
+	h.awaitLogCount("reconciliation sweep complete", 1)
+	h.stop()
+
+	cycle2 := h.since(mark)
+	for _, want := range []string{"msg=would-unmonitor", "cross-check season", "system status", "series library"} {
+		if !strings.Contains(cycle2, want) {
+			t.Errorf("at log_level=debug an idle cycle must still say %q — the noise budget demotes, it never deletes:\n%s", want, cycle2)
+		}
+	}
+	if strings.Contains(cycle2, "level=INFO msg=would-unmonitor") {
+		t.Errorf("...and it must say it at DEBUG:\n%s", cycle2)
 	}
 }
 

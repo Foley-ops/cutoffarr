@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"sort"
 	"strconv"
@@ -146,4 +147,66 @@ func (s evalScope) summaryAttrs() []any {
 	default:
 		return []any{"scopeIds", s.String()}
 	}
+}
+
+// --- the idle-cycle noise budget -------------------------------------------
+
+// demoteInfoTo returns a logger that emits INFO records at level instead, and
+// leaves every other level exactly where it was. When level is LevelInfo — the
+// startup scan, a --once run — it returns logger untouched, so the common path
+// carries no wrapper at all.
+//
+// It exists because the daemon repeats the whole reporting pipeline forever
+// (binding controller note 6). Almost every INFO line the read path emits is
+// news exactly once: the *arr's version, its quality profiles, the library
+// totals, the exclusion tag resolution, each cross-check sample. Repeated every
+// reconciliation sweep and every webhook cycle, they bury the lines that are
+// genuinely news — a write, a warning, an error, the summary that says the
+// cycle happened at all.
+//
+// A LEVEL-REWRITING HANDLER rather than a level parameter threaded through
+// twelve read helpers is a deliberate choice, and the rule it encodes is narrow
+// enough to state in one sentence: on a repeating cycle, informational records
+// are debug; nothing else moves. Warnings and errors are untouched — a daemon
+// that quieted those would be hiding exactly what it exists to surface — and
+// the lines that must stay at INFO on every cycle (the per-instance summaries,
+// each confirmed write) are emitted through the UNWRAPPED logger by the engines
+// themselves, which is why they are unaffected by anything here.
+func demoteInfoTo(logger *slog.Logger, level slog.Level) *slog.Logger {
+	if level == slog.LevelInfo {
+		return logger
+	}
+	return slog.New(demotingHandler{inner: logger.Handler(), to: level})
+}
+
+// demotingHandler is demoteInfoTo's implementation.
+type demotingHandler struct {
+	inner slog.Handler
+	to    slog.Level
+}
+
+// Enabled maps the INFO question onto the level INFO records will actually be
+// emitted at. Without this, slog would build and hand over an INFO record that
+// Handle then rewrites to DEBUG — meaning a demoted line would print at
+// log_level=info, which is the one thing this whole mechanism exists to stop.
+func (h demotingHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	if level == slog.LevelInfo {
+		return h.inner.Enabled(ctx, h.to)
+	}
+	return h.inner.Enabled(ctx, level)
+}
+
+func (h demotingHandler) Handle(ctx context.Context, r slog.Record) error {
+	if r.Level == slog.LevelInfo {
+		r.Level = h.to
+	}
+	return h.inner.Handle(ctx, r)
+}
+
+func (h demotingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return demotingHandler{inner: h.inner.WithAttrs(attrs), to: h.to}
+}
+
+func (h demotingHandler) WithGroup(name string) slog.Handler {
+	return demotingHandler{inner: h.inner.WithGroup(name), to: h.to}
 }

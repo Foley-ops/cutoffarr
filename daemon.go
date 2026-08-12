@@ -81,15 +81,27 @@ func runScanCycle(ctx context.Context, logger *slog.Logger, cfg Config, cycle sc
 			return
 		}
 
-		ok := checkInstanceConnectivity(ctx, logger, inst)
+		// The READ path logs through a logger whose INFO records are demoted
+		// to the cycle's report level (see demoteInfoTo): the *arr's version,
+		// its quality profiles and the library totals are news exactly once,
+		// and a daemon reprinting them on every sweep buries the lines that
+		// are not. On the startup scan and on --once the level IS info, and
+		// demoteInfoTo hands the logger straight back untouched.
+		//
+		// The ENGINES get the undemoted logger: their summaries and their
+		// confirmed writes stay at INFO on every cycle forever, and they level
+		// their own per-item report lines from the same scope.
+		readLogger := demoteInfoTo(logger, cycle.scope.itemLevel)
+
+		ok := checkInstanceConnectivity(ctx, readLogger, inst)
 		if ok && inst.Type == "radarr" {
-			movies, wantedIDs, dataOK := inspectRadarrLibrary(ctx, logger, inst, cycle.samples)
+			movies, wantedIDs, dataOK := inspectRadarrLibrary(ctx, readLogger, inst, cycle.samples)
 			if dataOK {
 				runRadarrDecisionEngine(ctx, logger, inst, movies, wantedIDs, cfg.ExclusionTag, cycle.scope, cycle.dryRun)
 			}
 		}
 		if ok && inst.Type == "sonarr" {
-			series, wantedEpisodeIDs, wantedSeasons, dataOK := inspectSonarrLibrary(ctx, logger, inst)
+			series, wantedEpisodeIDs, wantedSeasons, dataOK := inspectSonarrLibrary(ctx, readLogger, inst)
 			if dataOK {
 				runSonarrDecisionEngine(ctx, logger, inst, series, wantedEpisodeIDs, wantedSeasons, cfg.ExclusionTag, cycle.scope, cycle.dryRun)
 			}
@@ -231,6 +243,16 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 	}
 
 	srv := &http.Server{
+		// Timeouts, because this listener is reachable by whatever can route to
+		// the container and net/http has none by default: without them a single
+		// connection that opens and then dribbles bytes holds a goroutine (and
+		// a file descriptor) open for as long as it likes. The values are
+		// generous for a request whose body is a few kilobytes of JSON and
+		// whose handler does no I/O.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 		Handler: newWebhookHandler(&webhookServer{
 			logger:    logger,
 			queue:     d.queue,

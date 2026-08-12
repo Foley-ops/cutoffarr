@@ -443,6 +443,13 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, movies []movieListElement, wantedIDs map[int]bool, exclusionTagLabel string, scope evalScope, dryRun bool) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
+	// The per-cycle-repetition logger (see demoteInfoTo): the profile fetch,
+	// the exclusion-tag resolution and the cross-check's per-sample lines are
+	// all news exactly once, and this engine runs forever in daemon mode. It is
+	// the same logger on a --once run or a startup scan, where the level is
+	// INFO and demoteInfoTo is a no-op.
+	cycleLogger := demoteInfoTo(logger, scope.itemLevel)
+
 	// An --only-id naming a movie this instance's library does not contain
 	// is checked before anything else is fetched: there is nothing to decide
 	// or write, so there is no reason to make further API calls. A mistyped
@@ -478,12 +485,12 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		}
 	}
 
-	profiles, ok := fetchQualityProfiles(ctx, logger, client, inst)
+	profiles, ok := fetchQualityProfiles(ctx, cycleLogger, client, inst)
 	if !ok {
 		return
 	}
 
-	exclusionTagID, tagActive, ok := resolveExclusionTagID(ctx, logger, client, inst, exclusionTagLabel)
+	exclusionTagID, tagActive, ok := resolveExclusionTagID(ctx, cycleLogger, client, inst, exclusionTagLabel)
 	if !ok {
 		return
 	}
@@ -624,7 +631,7 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 			append([]any{"instance", inst.Name, "type", inst.Type}, scope.summaryAttrs()...)...)
 	}
 
-	cc := runCrossCheck(logger, inst, decisions, wantedIDs)
+	cc := runCrossCheck(cycleLogger, inst, decisions, wantedIDs)
 	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
 
 	unmonitoredCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount := runWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun)
@@ -2003,6 +2010,10 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, series []seriesElement, wantedEpisodeIDs map[int]bool, wantedSeasons map[seasonKey]bool, exclusionTagLabel string, scope evalScope, dryRun bool) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
+	// See the Radarr twin: the once-per-cycle informational reads log through
+	// a logger that demotes INFO to this cycle's report level.
+	cycleLogger := demoteInfoTo(logger, scope.itemLevel)
+
 	// An --only-id naming a series this instance's library does not contain is
 	// checked before anything else is fetched: there is nothing to decide or
 	// write, so there is no reason to make further API calls. A mistyped id is
@@ -2030,12 +2041,12 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		}
 	}
 
-	profiles, ok := fetchQualityProfiles(ctx, logger, client, inst)
+	profiles, ok := fetchQualityProfiles(ctx, cycleLogger, client, inst)
 	if !ok {
 		return
 	}
 
-	exclusionTagID, tagActive, ok := resolveExclusionTagID(ctx, logger, client, inst, exclusionTagLabel)
+	exclusionTagID, tagActive, ok := resolveExclusionTagID(ctx, cycleLogger, client, inst, exclusionTagLabel)
 	if !ok {
 		return
 	}
@@ -2135,7 +2146,7 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 			append([]any{"instance", inst.Name, "type", inst.Type}, scope.summaryAttrs()...)...)
 	}
 
-	cc := runSonarrCrossCheck(ctx, logger, client, inst, allDecisions, wantedEpisodeIDs)
+	cc := runSonarrCrossCheck(ctx, cycleLogger, client, inst, allDecisions, wantedEpisodeIDs)
 	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
 
 	unmonitoredCount, recoveredWriteCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount := runSonarrWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"log/slog"
+	"strings"
 	"testing"
 )
 
@@ -82,5 +83,77 @@ func TestEvalScope_Missing_NamesOnlyWhatTheLibraryLacks(t *testing.T) {
 	}
 	if none := fullLibraryScope(slog.LevelInfo).missing(func(int) bool { return false }); none != nil {
 		t.Errorf("an inactive scope names no missing ids, got %v", none)
+	}
+}
+
+// --- the demoting handler ---------------------------------------------------
+
+func TestDemoteInfoTo_LevelInfo_ReturnsTheLoggerUntouched(t *testing.T) {
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	if got := demoteInfoTo(logger, slog.LevelInfo); got != logger {
+		t.Error("demoting INFO to INFO must hand the logger straight back: the common path carries no wrapper")
+	}
+}
+
+// TestDemoteInfoTo_InfoRecordsBecomeDebug_AndNothingElseMoves is the whole
+// contract. The demotion must be invisible to warnings and errors — a daemon
+// that quieted those would be hiding exactly what it exists to surface.
+func TestDemoteInfoTo_InfoRecordsBecomeDebug_AndNothingElseMoves(t *testing.T) {
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+	demoted := demoteInfoTo(logger, slog.LevelDebug)
+
+	demoted.Info("informational", "k", "v")
+	demoted.Warn("a warning")
+	demoted.Error("an error")
+	demoted.Debug("already debug")
+
+	out := buf.String()
+	if !strings.Contains(out, "level=DEBUG msg=informational") {
+		t.Errorf("an INFO record must be emitted at DEBUG:\n%s", out)
+	}
+	if !strings.Contains(out, "k=v") {
+		t.Errorf("the record's attributes must survive the rewrite:\n%s", out)
+	}
+	if !strings.Contains(out, `level=WARN msg="a warning"`) {
+		t.Errorf("a WARN must be untouched:\n%s", out)
+	}
+	if !strings.Contains(out, `level=ERROR msg="an error"`) {
+		t.Errorf("an ERROR must be untouched:\n%s", out)
+	}
+}
+
+// TestDemoteInfoTo_AtLogLevelInfo_TheDemotedRecordDisappears is the property
+// that makes this a noise budget rather than a relabelling. slog asks the
+// handler whether a level is enabled BEFORE building the record, so without the
+// Enabled override a demoted line would still print at log_level=info — with a
+// DEBUG label, which is worse than not demoting at all.
+func TestDemoteInfoTo_AtLogLevelInfo_TheDemotedRecordDisappears(t *testing.T) {
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	demoted := demoteInfoTo(logger, slog.LevelDebug)
+
+	demoted.Info("should not appear")
+	demoted.Warn("should appear")
+
+	out := buf.String()
+	if strings.Contains(out, "should not appear") {
+		t.Errorf("a demoted record must be filtered out entirely at log_level=info:\n%s", out)
+	}
+	if !strings.Contains(out, "should appear") {
+		t.Errorf("a WARN must still get through:\n%s", out)
+	}
+}
+
+// TestDemoteInfoTo_WithAttrs_KeepsDemoting: slog.Logger.With returns a new
+// logger from Handler.WithAttrs, and a handler that forgot to re-wrap there
+// would silently stop demoting for every caller that used With.
+func TestDemoteInfoTo_WithAttrs_KeepsDemoting(t *testing.T) {
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+	demoted := demoteInfoTo(logger, slog.LevelDebug).With("instance", "radarr-main")
+
+	demoted.Info("still demoted")
+
+	out := buf.String()
+	if !strings.Contains(out, "level=DEBUG msg=\"still demoted\"") || !strings.Contains(out, "instance=radarr-main") {
+		t.Errorf("With() must preserve the demotion and the attribute:\n%s", out)
 	}
 }
