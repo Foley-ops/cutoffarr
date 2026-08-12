@@ -175,6 +175,38 @@ func TestEvaluateFileReportRoot_GroupCountReflectsSiblingDuplicates(t *testing.T
 	}
 }
 
+func TestEvaluateFileReportRoot_MismatchedSeasonWalkedFileIsSkippedUntrusted(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureFiles(t, dir,
+		"Show/Show.S01E05.mkv",     // tracked
+		"Show/Show.S01E05 (2).mkv", // skipped-untrusted: season 1 is mismatched
+		"Show/Show.S02E01.mkv",     // duplicate: season 2 is not mismatched
+	)
+	root := mediaRoot{arrPath: "/tv_shows", diskPath: dir}
+	set := instanceTrackedSet{
+		files:             map[string]bool{filepath.Join(dir, "Show/Show.S01E05.mkv"): true},
+		folders:           map[string]string{filepath.Join(dir, "Show"): "Show"},
+		seriesFolder:      map[string]bool{filepath.Join(dir, "Show"): true},
+		mismatchedSeasons: map[string]map[int]bool{filepath.Join(dir, "Show"): {1: true}},
+	}
+	logger, _ := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "sonarr-main", Type: "sonarr"}, root, set)
+
+	if outcome.skipped {
+		t.Fatalf("outcome unexpectedly skipped: %+v", outcome)
+	}
+	if outcome.seenSkippedUntrusted != 1 {
+		t.Errorf("seenSkippedUntrusted = %d, want 1", outcome.seenSkippedUntrusted)
+	}
+	if got := outcome.skipReasons[FileSkipReasonMismatchedSeason]; got != 1 {
+		t.Errorf("skipReasons[mismatched season] = %d, want 1", got)
+	}
+	if len(outcome.findings) != 1 || outcome.findings[0].kind != fileKindDuplicate {
+		t.Errorf("findings = %+v, want exactly one duplicate (season 2, not excluded)", outcome.findings)
+	}
+	assertFileReportIdentity(t, 3, outcome)
+}
+
 // --- mount-problem heuristic (binding controller resolution 4) -------------
 
 func TestEvaluateFileReportRoot_MissingRootAborts(t *testing.T) {
