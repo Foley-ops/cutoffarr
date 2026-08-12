@@ -157,7 +157,7 @@ func inspectRadarrLibrary(ctx context.Context, logger *slog.Logger, inst Instanc
 
 	logSampleMovies(logger, inst, samples, matches)
 
-	wantedIDs, ok := fetchWantedCutoff(ctx, logger, client, inst)
+	wantedIDs, ok := fetchWantedCutoff(ctx, logger, client, inst, nil)
 	if !ok {
 		return nil, nil, false
 	}
@@ -388,7 +388,19 @@ func logSampleMovies(logger *slog.Logger, inst Instance, samples []string, match
 // partial result would silently manufacture false positives in that
 // dangerous direction, so it must never be handed off as if it were the
 // whole truth.
-func fetchWantedCutoffPages(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, handleRecord func(page int, raw json.RawMessage) bool) (fetched, totalRecords int, ok bool) {
+//
+// filter (Phase 10) narrows WHICH wanted set is paged, and is the only thing
+// the reverse scan changes about this fetch: nil is the forward set (the
+// endpoint's own default, which the live probe confirmed is identical to
+// monitored=true), and unmonitoredWantedFilter() is the reverse one. It is
+// merged into every page's query rather than sent only on the first, because a
+// filter that silently stopped applying at page 2 would return a set that is
+// neither the monitored nor the unmonitored one while still adding up to
+// totalRecords. Nothing else about the machinery — least of all the
+// completeness contract — is parameterized: the reverse direction's failure
+// mode (false findings, and wrong re-monitors once the flag is on) needs it
+// exactly as much as the forward direction does.
+func fetchWantedCutoffPages(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, filter url.Values, handleRecord func(page int, raw json.RawMessage) bool) (fetched, totalRecords int, ok bool) {
 	completed := false
 	// endedEarly distinguishes, for the post-loop incomplete-result warning,
 	// "stopped because a page returned 0 records before totalRecords was
@@ -402,6 +414,9 @@ func fetchWantedCutoffPages(ctx context.Context, logger *slog.Logger, client *AP
 		query := url.Values{
 			"page":     {strconv.Itoa(page)},
 			"pageSize": {strconv.Itoa(wantedCutoffPageSize)},
+		}
+		for k, vs := range filter {
+			query[k] = vs
 		}
 
 		body, err := fetchLargeBody(ctx, client, "/api/v3/wanted/cutoff", query)
@@ -481,16 +496,48 @@ func fetchWantedCutoffPages(ctx context.Context, logger *slog.Logger, client *AP
 	return fetched, totalRecords, true
 }
 
+// unmonitoredWantedFilter is the Phase 10 reverse scan's narrowing of
+// /wanted/cutoff to UNMONITORED records — the reverse quality-cutoff signal,
+// and the only query parameter this project ever adds to that endpoint.
+//
+// It is a function returning a fresh url.Values rather than a package-level
+// var because fetchWantedCutoffPages merges it into a per-page query: a shared
+// map would be one aliasing mistake away from a filter that a caller could
+// mutate for every other caller.
+//
+// Verified against both live instances before any code depended on it (the
+// plan's "dump and confirm" rule, done by the controller): Radarr returns 3
+// records with monitored=false against 131 for the default, Sonarr 1213
+// against 2405, and every returned record really does carry monitored=false.
+func unmonitoredWantedFilter() url.Values { return url.Values{"monitored": {"false"}} }
+
+// wantedFilterLabel renders a filter for the log line that reports what was
+// fetched. "none" rather than an empty string, because the forward fetch's
+// line has always existed and a reader must be able to tell "this is the
+// ordinary set" from "an attribute went missing".
+func wantedFilterLabel(filter url.Values) string {
+	if len(filter) == 0 {
+		return "none"
+	}
+	return filter.Encode()
+}
+
 // fetchWantedCutoff fully pages GET /api/v3/wanted/cutoff via
 // fetchWantedCutoffPages, returning the set of movie ids it contains. A
 // record missing its id can never be added to the set and can never be
 // reconstructed, so it makes the whole set non-authoritative (handleRecord
 // returns false, which fetchWantedCutoffPages treats as instance-fatal —
 // see its doc comment for the completeness contract this preserves).
-func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance) (map[int]bool, bool) {
+//
+// filter (Phase 10) selects which set: nil for the forward one, and
+// unmonitoredWantedFilter() for the reverse scan's. The two are reported under
+// the same message with a wantedFilter attr rather than under two messages,
+// because they are the same fetch of the same endpoint and a reader comparing
+// their totals wants them to line up.
+func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, filter url.Values) (map[int]bool, bool) {
 	ids := make(map[int]bool)
 
-	fetched, totalRecords, ok := fetchWantedCutoffPages(ctx, logger, client, inst, func(page int, raw json.RawMessage) bool {
+	fetched, totalRecords, ok := fetchWantedCutoffPages(ctx, logger, client, inst, filter, func(page int, raw json.RawMessage) bool {
 		var r wantedCutoffRecord
 		if err := json.Unmarshal(raw, &r); err != nil {
 			logger.Warn("skipping instance: wanted/cutoff record is not valid JSON",
@@ -521,7 +568,8 @@ func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClie
 	}
 
 	logger.Info("wanted/cutoff",
-		"instance", inst.Name, "type", inst.Type, "totalRecords", totalRecords, "fetched", fetched)
+		"instance", inst.Name, "type", inst.Type, "wantedFilter", wantedFilterLabel(filter),
+		"totalRecords", totalRecords, "fetched", fetched)
 
 	return ids, true
 }

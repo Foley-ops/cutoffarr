@@ -434,7 +434,7 @@ func TestFetchSonarrWantedCutoff_HappyPath_BuildsEpisodeIDsAndSeasonLookup(t *te
 	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	episodeIDs, seasons, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst)
+	episodeIDs, seasons, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst, nil)
 	if !ok {
 		t.Fatalf("fetchSonarrWantedCutoff returned ok=false, want true:\n%s", buf.String())
 	}
@@ -469,7 +469,7 @@ func TestFetchSonarrWantedCutoff_RecordMissingSeriesId_SkipsInstance(t *testing.
 	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	_, _, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst)
+	_, _, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst, nil)
 	if ok {
 		t.Fatal("fetchSonarrWantedCutoff returned ok=true, want false: a record missing seriesId makes the whole result untrustworthy")
 	}
@@ -489,7 +489,7 @@ func TestFetchSonarrWantedCutoff_RecordMissingSeasonNumber_SkipsInstance(t *test
 	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	_, _, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst)
+	_, _, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst, nil)
 	if ok {
 		t.Fatal("fetchSonarrWantedCutoff returned ok=true, want false: a record missing seasonNumber makes the whole result untrustworthy")
 	}
@@ -509,7 +509,7 @@ func TestFetchSonarrWantedCutoff_RecordMissingId_SkipsInstance(t *testing.T) {
 	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	_, _, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst)
+	_, _, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst, nil)
 	if ok {
 		t.Fatal("fetchSonarrWantedCutoff returned ok=true, want false: a record missing id makes the whole result untrustworthy")
 	}
@@ -548,7 +548,7 @@ func TestFetchSonarrWantedCutoff_PagingUsesSharedMachinery(t *testing.T) {
 	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	episodeIDs, seasons, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst)
+	episodeIDs, seasons, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst, nil)
 	if !ok {
 		t.Fatalf("fetchSonarrWantedCutoff returned ok=false, want true:\n%s", buf.String())
 	}
@@ -1778,5 +1778,43 @@ func TestFetchSeriesLibrary_TagsKeyPresentTwiceInDifferentCases_TreatedAsUnverif
 	}
 	if !strings.Contains(buf.String(), "level=WARN") {
 		t.Errorf("expected a warning:\n%s", buf.String())
+	}
+}
+
+// TestFetchSonarrWantedCutoff_UnmonitoredFilter_SendsMonitoredFalseAndBuildsBothLookups
+// is the Sonarr half of the reverse scan's quality-cutoff signal. The record
+// shape is unchanged — id, seriesId, seasonNumber, verified live against the
+// monitored=false set itself (1213 records, every one monitored=false) — so the
+// reverse scan reuses this fetch whole rather than growing a second decoder for
+// the same records.
+func TestFetchSonarrWantedCutoff_UnmonitoredFilter_SendsMonitoredFalseAndBuildsBothLookups(t *testing.T) {
+	var gotQueries []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/wanted/cutoff", func(w http.ResponseWriter, r *http.Request) {
+		gotQueries = append(gotQueries, r.URL.RawQuery)
+		w.Write([]byte(`{"page":1,"pageSize":100,"totalRecords":2,"records":[
+			{"id": 57093, "seriesId": 416, "seasonNumber": 2},
+			{"id": 17131, "seriesId": 226, "seasonNumber": 5}
+		]}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	episodeIDs, seasons, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst, unmonitoredWantedFilter())
+	if !ok {
+		t.Fatalf("fetchSonarrWantedCutoff returned ok=false, want true:\n%s", buf.String())
+	}
+	if !episodeIDs[57093] || !episodeIDs[17131] || len(episodeIDs) != 2 {
+		t.Errorf("episode id set = %v, want exactly the two records' ids", episodeIDs)
+	}
+	if !seasons[seasonKey{seriesID: 416, seasonNumber: 2}] || !seasons[seasonKey{seriesID: 226, seasonNumber: 5}] {
+		t.Errorf("season lookup = %v, want both (seriesId, seasonNumber) pairs", seasons)
+	}
+	if len(gotQueries) != 1 || !strings.Contains(gotQueries[0], "monitored=false") {
+		t.Errorf("query = %v, want the monitored=false filter", gotQueries)
 	}
 }
