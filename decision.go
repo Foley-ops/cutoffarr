@@ -249,15 +249,16 @@ const (
 // of wording where the brief left it unspecified, following the same
 // concise, lowercase, no-trailing-punctuation style as the Radarr reasons
 // above.
-// ReasonSeasonMonitorMismatch (Phase 10 round 3) is the seventh, and the only
-// one produced in the REVERSE direction alone: the season's own monitored flag
-// says false while episodes inside it say true. It is a season-only concept for
-// the same reason the others are — a movie's monitored flag has nothing below it
-// to disagree with — and it is a finding rather than a skip because nothing else
-// in this program can see that state: the forward pass excludes the season at
-// rule 1, so its monitored episodes are upgraded by Sonarr forever with no
-// cutoff enforcement of any kind. See evaluateSeries' rule 7 for why it is
-// decided there and nowhere else.
+//
+// ReasonSeasonMonitorMismatch (Phase 10 round 3) is the newest of them, and the
+// only one produced in the REVERSE direction alone: the season's own monitored
+// flag says false while episodes inside it say true. It is a season-only concept
+// for the same reason the others are — a movie's monitored flag has nothing
+// below it to disagree with — and it is reported rather than skipped over
+// because nothing else in this program can see that state: the forward pass
+// excludes the season at rule 1, so its monitored episodes are upgraded by
+// Sonarr forever with no cutoff enforcement of any kind. See evaluateSeries'
+// rule 7 for why it is decided there and nowhere else.
 const (
 	ReasonSeasonIncomplete              = "season incomplete on disk"
 	ReasonSeasonNotFullyAired           = "unaired or undated episodes"
