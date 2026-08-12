@@ -906,6 +906,12 @@ var idleCycleAllowedInfo = []string{
 	"radarr decision summary",
 	"exclusion tag not defined in this instance",
 	"writes withheld for this instance",
+	// Phase 11: msg="file report" is the same per-instance, always-INFO
+	// summary shape the decision-summary lines already are — see
+	// logFileReportSummary. Per-finding lines (msg="file-report finding")
+	// are demoted to debug on sweeps exactly like every other per-item line
+	// here, so they never reach this allowlist at all.
+	"file report",
 }
 
 // assertIdleCycleInfoIsWithinTheBudget fails the test for every INFO line of

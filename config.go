@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"strings"
 	"time"
@@ -62,6 +63,16 @@ type Instance struct {
 	Type   string
 	URL    string
 	APIKey string
+
+	// MediaRootMap is Phase 11's opt-in switch for the duplicate & orphan file
+	// report: arr-side root folder path -> the same root as cutoffarr's own
+	// filesystem sees it (identity mapping when the container mounts media at
+	// the same path as the *arr, per TRaSH convention). Nil (the key entirely
+	// absent from this instance's YAML) means the file report is OFF for this
+	// instance — binding controller resolution 1. An explicitly empty map is
+	// accepted and treated exactly the same as absent (see validateConfig):
+	// there is nothing wrong with the value, there is simply nothing to walk.
+	MediaRootMap map[string]string
 }
 
 // Redacted returns a copy of the config with every instance's APIKey replaced
@@ -100,10 +111,11 @@ type rawConfig struct {
 }
 
 type rawInstance struct {
-	Name   string `yaml:"name"`
-	Type   string `yaml:"type"`
-	URL    string `yaml:"url"`
-	APIKey string `yaml:"api_key"`
+	Name         string            `yaml:"name"`
+	Type         string            `yaml:"type"`
+	URL          string            `yaml:"url"`
+	APIKey       string            `yaml:"api_key"`
+	MediaRootMap map[string]string `yaml:"media_root_map"`
 }
 
 // envVarPattern matches only the ${VAR} form, per the plan's binding
@@ -225,10 +237,11 @@ func (r rawConfig) toConfig() (*Config, error) {
 	cfg.Instances = make([]Instance, len(r.Instances))
 	for i, ri := range r.Instances {
 		cfg.Instances[i] = Instance{
-			Name:   ri.Name,
-			Type:   ri.Type,
-			URL:    ri.URL,
-			APIKey: ri.APIKey,
+			Name:         ri.Name,
+			Type:         ri.Type,
+			URL:          ri.URL,
+			APIKey:       ri.APIKey,
+			MediaRootMap: ri.MediaRootMap,
 		}
 	}
 
@@ -324,6 +337,35 @@ func validateConfig(cfg *Config) error {
 		parsed, err := url.Parse(inst.URL)
 		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 			return fmt.Errorf("config: instance %q: invalid url %q (must be an absolute http or https URL)", inst.Name, inst.URL)
+		}
+
+		// media_root_map (Phase 11, binding controller resolution 1): the
+		// "non-map" half of present-but-invalid is already fatal for free —
+		// rawInstance.MediaRootMap is typed map[string]string, so yaml.v3's
+		// KnownFields decode above refuses a scalar value there exactly the
+		// way it refuses a non-boolean reverse_scan_remonitor. What is left to
+		// check here is the shape of a value that DID decode as a map: every
+		// key and value must be non-empty (after trimming whitespace-only
+		// values, the same reasoning applied to exclusion_tag above) and
+		// absolute (server filesystems are Linux, so "absolute" means
+		// starting with "/" — path.IsAbs, not filepath.IsAbs, since this
+		// project's *arr paths are never Windows paths regardless of what OS
+		// cutoffarr itself is built for). An empty map is valid and left
+		// alone: it is treated as identical to the key being entirely absent
+		// (filereport.go), not as a malformed value.
+		for arrPath, diskPath := range inst.MediaRootMap {
+			if strings.TrimSpace(arrPath) == "" {
+				return fmt.Errorf("config: instance %q: media_root_map has an empty key (arr-side root path)", inst.Name)
+			}
+			if strings.TrimSpace(diskPath) == "" {
+				return fmt.Errorf("config: instance %q: media_root_map[%q] is empty (cutoffarr-side path)", inst.Name, arrPath)
+			}
+			if !path.IsAbs(arrPath) {
+				return fmt.Errorf("config: instance %q: media_root_map key %q must be an absolute path", inst.Name, arrPath)
+			}
+			if !path.IsAbs(diskPath) {
+				return fmt.Errorf("config: instance %q: media_root_map[%q] value %q must be an absolute path", inst.Name, arrPath, diskPath)
+			}
 		}
 	}
 

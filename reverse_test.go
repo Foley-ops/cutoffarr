@@ -91,7 +91,7 @@ func TestRunRadarrDecisionEngine_ReverseScan_ReportsUnmonitoredBelowCutoff(t *te
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	movies := []movieListElement{unmonitoredBelowCutoffMovie(7, "Accidentally Unmonitored")}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn())
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn(), fileReportOptions{})
 
 	out := buf.String()
 	if !strings.Contains(out, `msg="reverse-scan finding"`) {
@@ -118,7 +118,7 @@ func TestRunRadarrDecisionEngine_ReverseScan_ReportsUnmonitoredBelowCFScore(t *t
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	movies := []movieListElement{unmonitoredMeetingCriteriaMovie(7, "Low Score")}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn())
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn(), fileReportOptions{})
 
 	out := buf.String()
 	if !strings.Contains(out, `msg="reverse-scan finding"`) || !strings.Contains(out, `reason="`+ReasonCFCutoffNotMet+`"`) {
@@ -137,7 +137,7 @@ func TestRunRadarrDecisionEngine_ReverseScan_ItemMeetingCriteriaIsNotReported(t 
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	movies := []movieListElement{unmonitoredMeetingCriteriaMovie(7, "Correctly Unmonitored")}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn())
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn(), fileReportOptions{})
 
 	out := buf.String()
 	if strings.Contains(out, "reverse-scan finding") {
@@ -161,7 +161,7 @@ func TestRunRadarrDecisionEngine_ReverseScan_NoFileMovieIsNotAFinding(t *testing
 		QualityProfileID: intPtr(1), Tags: &noTags,
 	}}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn())
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn(), fileReportOptions{})
 
 	out := buf.String()
 	if strings.Contains(out, "reverse-scan finding") {
@@ -193,7 +193,7 @@ func TestRunRadarrDecisionEngine_ReverseScan_ExcludedByTagIsNeverAFinding(t *tes
 		MovieFile: &movieFileElement{ID: intPtr(1), QualityCutoffNotMet: boolPtr(true)},
 	}}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn())
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn(), fileReportOptions{})
 
 	out := buf.String()
 	if strings.Contains(out, "reverse-scan finding") || strings.Contains(out, "Excluded") {
@@ -216,7 +216,7 @@ func TestRunRadarrDecisionEngine_ReverseScan_MonitoredMoviesAreNeverFindings(t *
 		MovieFile: &movieFileElement{ID: intPtr(1), QualityCutoffNotMet: boolPtr(true)},
 	}}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{7: true}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn())
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{7: true}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn(), fileReportOptions{})
 
 	out := buf.String()
 	if strings.Contains(out, "reverse-scan finding") {
@@ -241,7 +241,7 @@ func TestRunRadarrDecisionEngine_ReverseScan_IncompleteWantedSet_SkipsOnlyTheRev
 		unmonitoredBelowCutoffMovie(7, "Reverse Candidate"),
 	}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn())
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn(), fileReportOptions{})
 
 	out := buf.String()
 	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "skipping the reverse scan for this instance") {
@@ -278,7 +278,7 @@ func TestRunRadarrDecisionEngine_ReverseScanDisabled_MakesNoUnmonitoredWantedFet
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	movies := []movieListElement{unmonitoredBelowCutoffMovie(7, "Accidentally Unmonitored")}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseOptions{})
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseOptions{}, fileReportOptions{})
 
 	if n := fake.countRequests("/api/v3/wanted/cutoff"); n != 0 {
 		t.Errorf("the engine made %d wanted/cutoff request(s) with the reverse pass disabled, want 0", n)
@@ -302,7 +302,7 @@ func TestRunRadarrDecisionEngine_ReverseScan_FindingsFollowTheCycleReportLevel(t
 	logger, buf := newDecisionTestLogger(slog.LevelDebug)
 	movies := []movieListElement{unmonitoredBelowCutoffMovie(7, "Accidentally Unmonitored")}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelDebug), true, reverseScanOn())
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelDebug), true, reverseScanOn(), fileReportOptions{})
 
 	for _, line := range strings.Split(buf.String(), "\n") {
 		if strings.Contains(line, "reverse-scan finding") && !strings.Contains(line, "level=DEBUG") {
@@ -417,7 +417,7 @@ func TestRunSonarrDecisionEngine_ReverseScan_ReportsUnmonitoredSeasonBelowCutoff
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	series := []seriesElement{testSeries(1, "Accidentally Unmonitored Season", true, 1, []int{}, testSeason(2, false, 1, 1))}
 
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn())
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn(), fileReportOptions{})
 
 	out := buf.String()
 	line := reverseFindingLine(t, out)
@@ -449,7 +449,7 @@ func TestRunSonarrDecisionEngine_ReverseScan_UnmonitoredSeriesIsReportedWithTheA
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	series := []seriesElement{testSeries(1, "Retired Show", false, 1, []int{}, testSeason(2, false, 1, 1))}
 
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn())
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn(), fileReportOptions{})
 
 	out := buf.String()
 	line := reverseFindingLine(t, out)
@@ -487,7 +487,7 @@ func TestRunSonarrDecisionEngine_ReverseScan_MonitorMismatch_IsReported(t *testi
 		logger, buf := newDecisionTestLogger(slog.LevelInfo)
 		series := []seriesElement{testSeries(1, "Half Written Show", true, 1, []int{}, testSeason(2, false, 1, 1))}
 		runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{},
-			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn())
+			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn(), fileReportOptions{})
 
 		out := buf.String()
 		line := reverseFindingLine(t, out)
@@ -507,7 +507,7 @@ func TestRunSonarrDecisionEngine_ReverseScan_MonitorMismatch_IsReported(t *testi
 		logger, buf := newDecisionTestLogger(slog.LevelInfo)
 		series := []seriesElement{testSeries(1, "Correctly Unmonitored Show", true, 1, []int{}, testSeason(2, false, 1, 1))}
 		runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{},
-			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn())
+			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn(), fileReportOptions{})
 
 		out := buf.String()
 		if strings.Contains(out, "reverse-scan finding") {
@@ -532,7 +532,7 @@ func TestRunSonarrDecisionEngine_ReverseScan_MonitoredSeasonsAreNeverFindings(t 
 	series := []seriesElement{testSeries(1, "Ordinary Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
 	wanted := map[seasonKey]bool{{seriesID: 1, seasonNumber: 1}: true}
 
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{100: true}, wanted, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn())
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{100: true}, wanted, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn(), fileReportOptions{})
 
 	out := buf.String()
 	if strings.Contains(out, "reverse-scan finding") {
@@ -553,7 +553,7 @@ func TestRunSonarrDecisionEngine_ReverseScan_IncompleteWantedSet_SkipsOnlyTheRev
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	series := []seriesElement{testSeries(1, "Mixed Show", true, 1, []int{}, testSeason(1, true, 1, 1), testSeason(2, false, 1, 1))}
 
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn())
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn(), fileReportOptions{})
 
 	out := buf.String()
 	if !strings.Contains(out, "skipping the reverse scan for this instance") {
@@ -593,7 +593,7 @@ func TestRunSonarrDecisionEngine_ReverseScan_FindingsFollowTheCycleReportLevel(t
 
 	// A repeating cycle: everything that scales with the library is demoted.
 	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{},
-		"cutoffarr-exclude", fullLibraryScope(slog.LevelDebug), true, reverseScanOn())
+		"cutoffarr-exclude", fullLibraryScope(slog.LevelDebug), true, reverseScanOn(), fileReportOptions{})
 
 	out := buf.String()
 	found := false
@@ -624,7 +624,7 @@ func TestRunSonarrDecisionEngine_ReverseScanDisabled_MakesNoUnmonitoredWantedFet
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	series := []seriesElement{testSeries(1, "Some Show", true, 1, []int{}, testSeason(2, false, 1, 1))}
 
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseOptions{})
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseOptions{}, fileReportOptions{})
 
 	if n := fake.countRequests("/api/v3/wanted/cutoff"); n != 0 {
 		t.Errorf("the engine made %d wanted/cutoff request(s) with the reverse pass disabled, want 0", n)
@@ -906,7 +906,7 @@ func TestRunRadarrDecisionEngine_ReverseScan_CrossCheckNotPassed_WithholdsEveryW
 	}
 
 	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude",
-		fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+		fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true}, fileReportOptions{})
 
 	out := buf.String()
 	if !strings.Contains(out, "crossCheck=FAILED") {
@@ -1032,7 +1032,7 @@ func TestRunRadarrDecisionEngine_ReverseWriteGate_NeedsAVerifiedForwardSample(t 
 
 		logger, buf := newDecisionTestLogger(slog.LevelInfo)
 		runRadarrDecisionEngine(context.Background(), logger, fake.instance(), []movieListElement{finding}, map[int]bool{},
-			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true}, fileReportOptions{})
 
 		out := buf.String()
 		if !strings.Contains(out, `crossCheck="passed (nothing sampled`) {
@@ -1061,7 +1061,7 @@ func TestRunRadarrDecisionEngine_ReverseWriteGate_NeedsAVerifiedForwardSample(t 
 		logger, buf := newDecisionTestLogger(slog.LevelInfo)
 		movies := []movieListElement{crossCheckWitnessMovie(5, "Ordinary Monitored"), finding}
 		runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{5: true},
-			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true}, fileReportOptions{})
 
 		out := buf.String()
 		if !strings.Contains(out, `crossCheck="passed (1 verified`) {
@@ -1238,7 +1238,7 @@ func TestRunRadarrDecisionEngine_ReverseScan_SkippedWithTheFlagOn_StillCarriesTh
 		movies := []movieListElement{unmonitoredBelowCutoffMovie(7, "Never Evaluated")}
 		// Write mode, so nothing but the flag itself distinguishes the two runs.
 		runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude",
-			fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: remonitor})
+			fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: remonitor}, fileReportOptions{})
 		return buf.String()
 	}
 
@@ -1544,7 +1544,7 @@ func TestRunSonarrDecisionEngine_ReverseScan_CrossCheckFailed_WithholdsEverySeas
 		testSeason(1, true, 1, 1), testSeason(2, false, 1, 1))}
 
 	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{},
-		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true}, fileReportOptions{})
 
 	out := buf.String()
 	if !strings.Contains(out, "crossCheck=FAILED") {
@@ -1612,7 +1612,7 @@ func TestRunSonarrDecisionEngine_ReverseScan_SeriesRetiredBeforeTheWrite_IsRefus
 
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodes, wantedSeasons,
-		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true}, fileReportOptions{})
 
 	out := buf.String()
 	if !strings.Contains(out, `crossCheck="passed (1 verified`) {
@@ -1662,7 +1662,7 @@ func TestRunSonarrDecisionEngine_ReverseScan_SeasonThatNowMeetsCriteria_IsRefuse
 
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodes, wantedSeasons,
-		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true}, fileReportOptions{})
 
 	out := buf.String()
 	if !strings.Contains(out, `reason="`+ReasonCFCutoffNotMet+`"`) {
@@ -1718,7 +1718,7 @@ func TestRunSonarrDecisionEngine_ReverseScan_MismatchSeasonWithUnmonitoredEpisod
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series,
 		map[int]bool{900: true}, map[seasonKey]bool{{seriesID: 9, seasonNumber: 1}: true},
-		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true}, fileReportOptions{})
 
 	out := buf.String()
 	line := reverseFindingLine(t, out)
@@ -2325,7 +2325,7 @@ func TestRunRadarrDecisionEngine_EveryReverseFindingIsAccountedForInTheSummary(t
 			// nothing about the others.
 			movies := []movieListElement{crossCheckWitnessMovie(5, "Ordinary Monitored"), unmonitoredBelowCutoffMovie(findingID, "Accounted Movie")}
 			runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{5: true}, "cutoffarr-exclude",
-				fullLibraryScope(slog.LevelInfo), tc.dryRun, reverseOptions{enabled: true, remonitor: true})
+				fullLibraryScope(slog.LevelInfo), tc.dryRun, reverseOptions{enabled: true, remonitor: true}, fileReportOptions{})
 
 			out := buf.String()
 			c := summaryCounters(t, out)
@@ -2359,7 +2359,7 @@ func TestRunRadarrDecisionEngine_ReverseGateBlocked_WithheldAccountsForThePass(t
 	}
 
 	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude",
-		fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+		fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true}, fileReportOptions{})
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("a blocked pass must write nothing, got %+v", writes)
@@ -2403,7 +2403,7 @@ func TestRunRadarrDecisionEngine_ReverseScan_ShutdownMidEvaluation_ReportsNoFind
 	}
 
 	runRadarrDecisionEngine(ctx, logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude",
-		fullLibraryScope(slog.LevelInfo), true, reverseScanOn())
+		fullLibraryScope(slog.LevelInfo), true, reverseScanOn(), fileReportOptions{})
 
 	out := buf.String()
 	if !strings.Contains(out, "abandoning this instance's reverse scan mid-evaluation") {
@@ -2441,7 +2441,7 @@ func TestRunRadarrDecisionEngine_ReverseFindings_NeverEnterTheForwardCrossCheck(
 	movies := []movieListElement{unmonitoredBelowCutoffMovie(7, "A"), unmonitoredBelowCutoffMovie(8, "B")}
 
 	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude",
-		fullLibraryScope(slog.LevelInfo), true, reverseScanOn())
+		fullLibraryScope(slog.LevelInfo), true, reverseScanOn(), fileReportOptions{})
 
 	out := buf.String()
 	if !strings.Contains(out, "reverseFindings=2") {
@@ -2545,7 +2545,7 @@ func TestRunSonarrDecisionEngine_ReverseScan_BelowCutoffSeasonWithOneMonitoredEp
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series,
 		map[int]bool{900: true}, map[seasonKey]bool{{seriesID: 9, seasonNumber: 1}: true},
-		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true}, fileReportOptions{})
 
 	out := buf.String()
 	line := reverseFindingLine(t, out)
@@ -2624,7 +2624,7 @@ func TestSeasonEpisodeMonitorWrite_TransportFailure_NamesTheDirectionItAttempted
 		logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 		runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodes, wantedSeasons,
-			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true}, fileReportOptions{})
 
 		out := buf.String()
 		if !strings.Contains(out, `msg="remonitor write failed`) {
@@ -2680,7 +2680,7 @@ func TestRunSonarrDecisionEngine_ReverseScan_UnreadableEpisodeAtWrite_GivesTheRe
 			logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 			runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodes, wantedSeasons,
-				"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+				"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true}, fileReportOptions{})
 
 			out := buf.String()
 			if writes := fake.writes(); len(writes) != 0 {
@@ -2756,7 +2756,7 @@ func TestRunSonarrDecisionEngine_ReverseScan_ShutdownMidEvaluation_CountsWhatItE
 		testSeries(2, "Second Show", true, 1, []int{}, testSeason(2, false, 1, 1)),
 	}
 	runSonarrDecisionEngine(ctx, logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{},
-		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn())
+		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn(), fileReportOptions{})
 
 	out := buf.String()
 	if !strings.Contains(out, "abandoning this instance's reverse scan mid-evaluation") {
@@ -2789,7 +2789,7 @@ func TestReverseScan_UntrustedPreWriteData_IsNeverReportedAsNowMeetingTheCriteri
 		logger, buf := newDecisionTestLogger(slog.LevelInfo)
 		movies := []movieListElement{crossCheckWitnessMovie(5, "Ordinary Monitored"), unmonitoredBelowCutoffMovie(7, "Accidentally Unmonitored")}
 		runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{5: true},
-			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true}, fileReportOptions{})
 
 		out := buf.String()
 		if !strings.Contains(out, `crossCheck="passed (1 verified`) {
@@ -2813,7 +2813,7 @@ func TestReverseScan_UntrustedPreWriteData_IsNeverReportedAsNowMeetingTheCriteri
 
 		logger, buf := newDecisionTestLogger(slog.LevelInfo)
 		runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodes, wantedSeasons,
-			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true}, fileReportOptions{})
 
 		out := buf.String()
 		if !strings.Contains(out, `crossCheck="passed (1 verified`) {
@@ -2912,7 +2912,7 @@ func TestRunSonarrDecisionEngine_ReverseScan_SeasonMonitoredBeforeTheWrite_IsRef
 
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodes, wantedSeasons,
-		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true}, fileReportOptions{})
 
 	out := buf.String()
 	if !strings.Contains(out, `crossCheck="passed (1 verified`) {
@@ -2959,7 +2959,7 @@ func TestRunSonarrDecisionEngine_ReverseScan_SeasonNarrowedScope_ReportsOnlyThat
 		testSeries(1, "Two Unmonitored Seasons", true, 1, []int{}, testSeason(2, false, 1, 1), testSeason(3, false, 1, 1)),
 	}
 	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{},
-		"cutoffarr-exclude", webhookScope([]int{1}, map[int][]int{1: {2}}), true, reverseScanOn())
+		"cutoffarr-exclude", webhookScope([]int{1}, map[int][]int{1: {2}}), true, reverseScanOn(), fileReportOptions{})
 
 	out := buf.String()
 	line := reverseFindingLine(t, out)

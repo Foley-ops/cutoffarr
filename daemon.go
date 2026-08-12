@@ -70,6 +70,19 @@ type scanCycle struct {
 	// mode, where those flags are refused). The zero value is "no reverse pass",
 	// so a cycle has to ask.
 	reverse reverseOptions
+
+	// fileReport says whether this cycle runs the Phase 11 duplicate & orphan
+	// file report at all — SCHEDULING, exactly like reverse above and for
+	// the same reason: it belongs to full-library cycles only (the startup
+	// scan, the reconciliation sweep, a full --once run) and never to a
+	// webhook cycle or a --only-id scoped run (binding controller resolution
+	// 8) — the zero value is "no file report", so a cycle has to ask. Unlike
+	// reverse there is no scoped acceptance-instrument exception and no
+	// per-cycle write switch: this pass never writes anything, ever, so a
+	// scoped run has nothing to rehearse and the only question this field
+	// answers is "yes or no". Per-instance opt-in (media_root_map) is read
+	// fresh from cfg.Instances by the engines themselves, not carried here.
+	fileReport fileReportOptions
 }
 
 // runScanCycle performs one full pass: for every in-scope instance, the
@@ -114,13 +127,13 @@ func runScanCycle(ctx context.Context, logger *slog.Logger, cfg Config, cycle sc
 		if ok && inst.Type == "radarr" {
 			movies, wantedIDs, dataOK := inspectRadarrLibrary(ctx, readLogger, inst, cycle.samples)
 			if dataOK {
-				runRadarrDecisionEngine(ctx, logger, inst, movies, wantedIDs, cfg.ExclusionTag, cycle.scope, cycle.dryRun, cycle.reverse)
+				runRadarrDecisionEngine(ctx, logger, inst, movies, wantedIDs, cfg.ExclusionTag, cycle.scope, cycle.dryRun, cycle.reverse, cycle.fileReport)
 			}
 		}
 		if ok && inst.Type == "sonarr" {
 			series, wantedEpisodeIDs, wantedSeasons, dataOK := inspectSonarrLibrary(ctx, readLogger, inst)
 			if dataOK {
-				runSonarrDecisionEngine(ctx, logger, inst, series, wantedEpisodeIDs, wantedSeasons, cfg.ExclusionTag, cycle.scope, cycle.dryRun, cycle.reverse)
+				runSonarrDecisionEngine(ctx, logger, inst, series, wantedEpisodeIDs, wantedSeasons, cfg.ExclusionTag, cycle.scope, cycle.dryRun, cycle.reverse, cycle.fileReport)
 			}
 		}
 	}
@@ -311,7 +324,7 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 	// equivalent of a --once run, and the baseline every later cycle's silence
 	// is read against.
 	logger.Info("startup scan beginning", "instances", len(cfg.Instances), "dryRun", cfg.DryRun)
-	runScanCycle(ctx, logger, cfg, scanCycle{scope: fullLibraryScope(slog.LevelInfo), dryRun: cfg.DryRun, reverse: fullScanReverseOptions(cfg)})
+	runScanCycle(ctx, logger, cfg, scanCycle{scope: fullLibraryScope(slog.LevelInfo), dryRun: cfg.DryRun, reverse: fullScanReverseOptions(cfg), fileReport: fullScanFileReportOptions()})
 	// A pass that stopped early must never print the line a pass that finished
 	// prints. runScanCycle returns the same way whether it covered every
 	// instance or abandoned the cycle on shutdown (its own between-instances
@@ -418,7 +431,7 @@ func (d *daemon) loop(ctx context.Context) {
 			// same full-library scope — only the report level differs, because
 			// this cycle repeats forever and its per-item lines are repetition
 			// rather than news (binding controller note 6).
-			runScanCycle(ctx, d.logger, d.cfg, scanCycle{scope: fullLibraryScope(slog.LevelDebug), dryRun: d.cfg.DryRun, reverse: fullScanReverseOptions(d.cfg)})
+			runScanCycle(ctx, d.logger, d.cfg, scanCycle{scope: fullLibraryScope(slog.LevelDebug), dryRun: d.cfg.DryRun, reverse: fullScanReverseOptions(d.cfg), fileReport: fullScanFileReportOptions()})
 			if ctx.Err() != nil {
 				// The startup scan's rule (see runDaemon) plus the half only the
 				// sweep has: the completion line RE-ARMS the schedule and

@@ -55,6 +55,22 @@ services:
       # mounting it :ro removes a way for a bug to matter.
       - /mnt/user/appdata/cutoffarr:/config:ro
 
+      # The file report (Phase 11, opt-in per instance via media_root_map in
+      # config.yml) needs read access to your media to compare it against
+      # what each *arr actually tracks. ALWAYS mount media :ro here — this
+      # feature never writes, deletes, moves, or renames a file and never
+      # gains an option to (enforced by TestTree_BansFilesystemMutationAPIsEverywhere,
+      # not just documented), but :ro removes even the THEORETICAL blast
+      # radius of a bug, the same reasoning the :ro config mount above uses.
+      # Uncomment and edit the right-hand side to match your real media
+      # paths, and add a matching media_root_map entry in config.yml for
+      # each one you mount. Mounting media at the *same* path the *arr
+      # containers use (the TRaSH-guides convention) makes the map trivial
+      # but does not make it optional — an absent media_root_map is what
+      # keeps the file report off for an instance that hasn't opted in.
+      # - /mnt/user/data/media/Movies:/data/media/Movies:ro
+      # - /mnt/user/data/media/TV_Shows:/data/media/TV_Shows:ro
+
     ports:
       # The webhook endpoint: POST /webhook/{instance-name}. It must be
       # reachable from the *arrs — on the shared network below, they can reach

@@ -49,6 +49,12 @@ type seriesElement struct {
 	QualityProfileID *int                   `json:"qualityProfileId"`
 	Tags             *[]int                 `json:"tags"`
 	Seasons          *[]seriesSeasonElement `json:"seasons"`
+
+	// Path is the series' own root folder on the *arr's filesystem (e.g.
+	// "/tv_shows/Some Show"). Phase 11 only — see movieListElement.Path
+	// (radarr.go) for why nothing before this phase reads it and why its
+	// absence is never warned about outside filereport.go.
+	Path *string `json:"path"`
 }
 
 // seriesSeasonElement decodes one element of a series's "seasons" array —
@@ -262,6 +268,13 @@ type episodeFileElement struct {
 	SeasonNumber        *int  `json:"seasonNumber"`
 	CustomFormatScore   *int  `json:"customFormatScore"`
 	QualityCutoffNotMet *bool `json:"qualityCutoffNotMet"`
+
+	// Path is the absolute path of this episode file on the *arr's
+	// filesystem. Phase 11 only: the file report's Sonarr tracked-file set is
+	// built from exactly this field, mapped through media_root_map. See
+	// movieListElement.Path (radarr.go) for why absence is not warned about
+	// here.
+	Path *string `json:"path"`
 }
 
 // fetchEpisodeFiles fetches GET /api/v3/episodefile?seriesId=<seriesID> —

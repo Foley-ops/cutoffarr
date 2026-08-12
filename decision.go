@@ -470,7 +470,7 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 // — when its own write switch is on — the cross-check verdict it answers to is
 // the one this cycle already produced. It is silent and free on any cycle that
 // did not ask for it.
-func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, movies []movieListElement, wantedIDs map[int]bool, exclusionTagLabel string, scope evalScope, dryRun bool, reverse reverseOptions) {
+func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, movies []movieListElement, wantedIDs map[int]bool, exclusionTagLabel string, scope evalScope, dryRun bool, reverse reverseOptions, fileReport fileReportOptions) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	// The per-cycle-repetition logger (see demoteInfoTo): the profile fetch,
@@ -686,6 +686,21 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 			profiles: profiles, exclusionTagID: exclusionTagID, tagActive: tagActive,
 			cc: cc, scope: scope, itemLevel: scope.itemLevel, dryRun: dryRun, opts: reverse,
 		}.runRadarr(ctx, movies)
+	}
+
+	// Phase 11, the fifth and last pass: the duplicate & orphan file report.
+	// Runs after the forward AND reverse passes (binding controller
+	// resolution 8) and reuses the movies this cycle already fetched — see
+	// runRadarrFileReport's own doc comment for why Radarr needs no
+	// additional API calls at all. It is scheduling-gated exactly like the
+	// reverse pass (fileReport.enabled is the zero-value-off field a webhook
+	// or --only-id cycle never sets), and its own summary is a SEPARATE log
+	// line (msg="file report"), not folded into the attrs below: an instance
+	// that never configured media_root_map must log nothing whatsoever about
+	// this phase, and logFileReportSummary's off-state debug demotion can
+	// only do that from its own call, not as an attr on an always-INFO line.
+	if fileReport.enabled {
+		logFileReportSummary(logger, inst, runRadarrFileReport(ctx, logger, scope.itemLevel, inst, movies, exclusionTagID, tagActive))
 	}
 
 	attrs := []any{"instance", inst.Name, "type", inst.Type}
@@ -2223,7 +2238,7 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 // reasons the Radarr engine runs it there: it is a separate question about the
 // same library, its findings must never enter the forward cross-check's pools,
 // and its own write gate reads the verdict this cycle already produced.
-func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, series []seriesElement, wantedEpisodeIDs map[int]bool, wantedSeasons map[seasonKey]bool, exclusionTagLabel string, scope evalScope, dryRun bool, reverse reverseOptions) {
+func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, series []seriesElement, wantedEpisodeIDs map[int]bool, wantedSeasons map[seasonKey]bool, exclusionTagLabel string, scope evalScope, dryRun bool, reverse reverseOptions, fileReport fileReportOptions) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	// See the Radarr twin: the once-per-cycle informational reads log through
@@ -2431,6 +2446,18 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 			profiles: profiles, exclusionTagID: exclusionTagID, tagActive: tagActive,
 			cc: cc, scope: scope, itemLevel: scope.itemLevel, dryRun: dryRun, opts: reverse,
 		}.runSonarr(ctx, series)
+	}
+
+	// Phase 11, the fifth and last pass — see the Radarr twin for the shape
+	// and the reasoning. Unlike Radarr, Sonarr's tracked set costs its own
+	// /episodefile fetches (buildSonarrTrackedSet), which is why this needs
+	// the client already built above and allDecisions (the FORWARD, unscoped
+	// decisions this cycle already computed) to know which seasons the
+	// forward engine distrusted for an episode-file-count mismatch (binding
+	// controller resolution 5).
+	if fileReport.enabled {
+		mismatched := buildMismatchedSeasonsIndex(allDecisions)
+		logFileReportSummary(logger, inst, runSonarrFileReport(ctx, logger, scope.itemLevel, client, inst, series, mismatched, exclusionTagID, tagActive))
 	}
 
 	attrs := []any{"instance", inst.Name, "type", inst.Type}

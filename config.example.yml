@@ -57,7 +57,22 @@ instances:
     type: radarr         # radarr | sonarr
     url: http://radarr:7878
     api_key: ${RADARR_MAIN_API_KEY}
+    # media_root_map (Phase 11): opt-in, per instance, absent by default.
+    # Maps this *arr's own root folder path to the same path as cutoffarr's
+    # own filesystem sees it, so the read-only duplicate & orphan file report
+    # can walk your media and compare it against what Radarr actually
+    # tracks. Absent means the file report never runs for this instance —
+    # no disk access of any kind. Requires the matching :ro media volume in
+    # docker-compose.yml (see docker-compose.example.yml) and every key/
+    # value below must be a non-empty absolute path. See the README's "The
+    # file report" section — it never writes, deletes, moves, or renames
+    # anything, permanently, with no flag to change that.
+    # media_root_map:
+    #   /movies: /data/media/Movies
   - name: sonarr-main
     type: sonarr
     url: http://sonarr:8989
     api_key: ${SONARR_MAIN_API_KEY}
+    # media_root_map:
+    #   /tv_shows: /data/media/TV_Shows
+    #   /anime: /data/media/Anime
