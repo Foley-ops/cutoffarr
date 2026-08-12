@@ -2559,6 +2559,8 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		stats.reverseRan = true
 		stats.reverseFindings = sonarrReverseFindings(rev.seasonFindings)
 	}
+	// Combined here, once, regardless of which passes ran — see the Radarr
+	// twin's identical comment.
 	stats.actions = append(forwardActions, rev.actions...)
 
 	// Phase 11, the fifth and last pass — see the Radarr twin for the shape

@@ -688,10 +688,12 @@ script, a status-page widget, whatever) without ever loading the HTML:
   }
   ```
 
-  `lastCycleKind` is one of `startup`, `sweep`, `webhook`, `once`, or `null`
-  before that instance's first completed cycle — a manual scan (below)
-  reports itself as `sweep`, since it's mechanically the same full-library
-  pass, just run on demand instead of on the timer. `fileReport.status` is
+  `lastCycleKind` is `startup`, `sweep`, `webhook`, or `once` (the shape's
+  own `null` covers a case this response never actually shows: an instance
+  with no completed cycle yet is simply absent from `instances`, rather than
+  present with null fields). A manual scan (below) reports itself as
+  `sweep`, since it's mechanically the same full-library pass, just run on
+  demand instead of on the timer. `fileReport.status` is
   the same three-way `ran`/`skipped`/`off` the log's own `msg="file report"`
   line uses: `off` means that instance never set `media_root_map` at all, so
   `duplicates`/`orphans` being `0` there is "not configured", not "clean" —

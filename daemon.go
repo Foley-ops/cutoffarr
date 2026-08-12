@@ -463,6 +463,16 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 	loopDone := make(chan struct{})
 	installShutdownHandler(logger, opts.signals, cancel, forceExit, loopDone)
 
+	// Marked running BEFORE the server starts accepting, closing what would
+	// otherwise be a narrow race: a POST /api/scan handled between the
+	// listener accepting a connection and the startup scan's own begin()
+	// call (below) would see running=false and report "queued" instead of
+	// "already-pending", even though a full cycle is about to start
+	// regardless. No request can reach any handler until srv.Serve's own
+	// Accept loop is running, which happens strictly after this line, so
+	// setting it here closes the window completely rather than merely
+	// narrowing it.
+	d.scan.begin()
 	serveDone := make(chan struct{})
 	go func() {
 		defer close(serveDone)
@@ -480,7 +490,8 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 	// equivalent of a --once run, and the baseline every later cycle's silence
 	// is read against.
 	logger.Info("startup scan beginning", "instances", len(cfg.Instances), "dryRun", cfg.DryRun)
-	d.scan.begin()
+	// d.scan is already marked running (see its begin() call above, before
+	// the server started accepting) — not repeated here.
 	runScanCycle(ctx, logger, cfg, scanCycle{kind: cycleKindStartup, now: d.clock.Now, scope: fullLibraryScope(slog.LevelInfo), dryRun: cfg.DryRun, reverse: fullScanReverseOptions(cfg), fileReport: fullScanFileReportOptions()}, d.stats)
 	d.scan.end()
 	// A pass that stopped early must never print the line a pass that finished

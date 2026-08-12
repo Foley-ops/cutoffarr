@@ -194,11 +194,35 @@ func TestDaemon_ScanNow_NeverInterleavesWithAWebhookCycle(t *testing.T) {
 	h.clock.Advance(time.Second)
 	h.awaitLogCount("webhook debounce expired; evaluating", 1)
 
-	resp, err := http.Post(h.url+"/api/scan", "", nil)
-	if err != nil {
-		t.Fatalf("POST /api/scan: %v", err)
+	// The webhook cycle's own runScanCycle may still be in flight at this
+	// exact instant (the log line above is written before it starts, not
+	// after) — under -race in particular, real wall-clock time passes
+	// between that line and the cycle's completion. Retried rather than
+	// posted once: while the webhook cycle still holds scanCoordinator's
+	// running flag, this legitimately (and correctly) reports
+	// already-pending — which is not a nothing-happened outcome, it is the
+	// single-flight contract doing its job — and posting again a moment
+	// later is exactly what a human re-clicking the button would do.
+	queued := false
+	for i := 0; i < 200; i++ {
+		resp, err := http.Post(h.url+"/api/scan", "", nil)
+		if err != nil {
+			t.Fatalf("POST /api/scan: %v", err)
+		}
+		var body map[string]string
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatalf("POST /api/scan: response is not valid JSON: %v", err)
+		}
+		resp.Body.Close()
+		if body["status"] == "queued" {
+			queued = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	resp.Body.Close()
+	if !queued {
+		t.Fatalf("POST /api/scan never queued after retrying (the webhook cycle never released the running flag):\n%s", h.out.String())
+	}
 
 	h.awaitLogCount("manual scan complete", 1)
 
