@@ -65,7 +65,15 @@ USER nonroot:nonroot
 EXPOSE 9898
 
 # Default run mode is the daemon: startup scan, webhook listener, reconciliation
-# sweep. `docker run ... --once` appends to this and gets a single pass instead,
-# and `--dry-run` forces dry-run on regardless of the config.
+# sweep.
+#
+# `docker run <image> --once` REPLACES this CMD — Docker does not append to it —
+# so that container runs `/cutoffarr --once` with no --config at all. It still
+# reads the right file only because --config's flag default is this same path
+# (defaultConfigPath in main.go, pinned equal to the CMD below by
+# TestDockerfile_DefaultsMatchTheProgramsOwnDefaults). Change one without the
+# other and every `docker run ... --once` silently looks for its config
+# somewhere else. `--dry-run` is passed the same way, and forces dry-run on
+# regardless of the config.
 ENTRYPOINT ["/cutoffarr"]
 CMD ["--config", "/config/config.yml"]

@@ -74,6 +74,12 @@ func TestDockerfile_FinalStageIsDistrolessNonRootAndStaticallyLinked(t *testing.
 // TestDockerfile_DefaultsMatchTheProgramsOwnDefaults: the image's CMD and its
 // EXPOSE are claims about this program, and both have a single source of truth
 // in the Go code.
+//
+// The CMD equality is load-bearing beyond tidiness, because `docker run <image>
+// --once` REPLACES the CMD rather than appending to it: that container runs
+// `/cutoffarr --once` with no --config argument at all, and finds its config
+// only because the flag's own default is the same path. Let the two drift and
+// the documented one-shot invocation quietly reads a file that is not there.
 func TestDockerfile_DefaultsMatchTheProgramsOwnDefaults(t *testing.T) {
 	dockerfile := readRepoFile(t, "Dockerfile")
 

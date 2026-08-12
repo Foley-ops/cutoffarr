@@ -61,13 +61,15 @@ func run(args []string, stdout, stderr io.Writer, daemonOpts ...daemonOptions) i
 	// narrow. fs.Visit distinguishes "explicitly passed 0" from "not passed
 	// at all"; a non-integer value never reaches here, since fs.Parse
 	// rejects it above.
-	onlyIDSet, instanceSet := false, false
+	onlyIDSet, instanceSet, samplesSet := false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "only-id":
 			onlyIDSet = true
 		case "instance":
 			instanceSet = true
+		case "samples":
+			samplesSet = true
 		}
 	})
 	if onlyIDSet && *onlyID <= 0 {
@@ -201,6 +203,16 @@ func run(args []string, stdout, stderr io.Writer, daemonOpts ...daemonOptions) i
 		if instanceSet {
 			logger.Warn("--instance has no effect without --once: it scopes a single pass, while daemon mode reconciles every configured instance",
 				"instance", *instanceName)
+		}
+		// The third --once-only flag, and the one that was ignored in silence
+		// until now. It is not a scoping flag, but the rationale is the same and
+		// arguably stronger: --samples is a debugging aid whose entire output is
+		// log lines, so someone who passes it here is WATCHING for detail dumps
+		// that will never arrive, with no way to tell "the flag did nothing"
+		// from "none of those titles matched".
+		if samplesSet {
+			logger.Warn("--samples has no effect without --once: it dumps per-movie detail during a single watched pass, while daemon mode's repeating cycles demote their per-item report lines instead",
+				"samples", *samplesFlag)
 		}
 		return runDaemon(context.Background(), logger, *cfg, opts)
 	}

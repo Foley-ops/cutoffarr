@@ -419,6 +419,36 @@ instances:
 	}
 }
 
+// TestRun_SamplesWithoutOnce_WarnsThatItHasNoEffect is the third of the three
+// --once-only flags, and it had been the only one ignored in silence.
+//
+// The rationale its two siblings carry applies here verbatim: a flag that is
+// quietly ignored is worse than one that is rejected, because the human
+// believes the run was affected. --samples is a debugging aid — "dump full
+// detail for these titles" — so someone who passes it without --once is
+// actively watching the log for output that will never arrive, and has no way
+// to tell "the flag did nothing" from "the titles matched nothing".
+//
+// Same loopback-only URL as its siblings: this boots the real daemon, whose
+// startup scan contacts every configured instance.
+func TestRun_SamplesWithoutOnce_WarnsThatItHasNoEffect(t *testing.T) {
+	path := writeMainTestConfig(t, `
+instances:
+  - name: radarr-main
+    type: radarr
+    url: http://127.0.0.1:1
+    api_key: key1
+`)
+	h := startDaemonWithArgs(t, []string{"--config", path, "--samples", "Arrival,Dune"})
+	h.waitReady()
+	out := h.out.String()
+	h.stop()
+
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "samples") {
+		t.Errorf("expected a warning that --samples has no effect without --once:\n%s", out)
+	}
+}
+
 // TestRun_InstanceFlag_NamesASonarrInstance_ScopesToIt pins that --instance
 // is a general instance selector, not a radarr-only one: it names which
 // configured instance a pass runs against, whatever its type.
