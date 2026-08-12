@@ -1554,3 +1554,118 @@ instances:
 		t.Error("the sonarr's series-level monitored flag was changed")
 	}
 }
+
+// TestUnmonitorSeason_FreshStatisticsClaimNoEpisodes_Refuses closes the
+// vacuous-guard corner: a season whose fresh statistics claim zero episodes
+// makes the airing loop run over nothing and "pass" by having nothing to
+// check. Rule 2 requires totalEpisodeCount > 0 at decision time for exactly
+// that reason, and the fresh payload has to clear the same bar.
+func TestUnmonitorSeason_FreshStatisticsClaimNoEpisodes_Refuses(t *testing.T) {
+	seriesJSON := strings.Replace(sonarrWriterSeriesJSON,
+		`{"seasonNumber": 1, "monitored": true, "statistics": {"episodeFileCount": 2, "totalEpisodeCount": 2, "sizeOnDisk": 9876543210123}}`,
+		`{"seasonNumber": 1, "monitored": true, "statistics": {"episodeFileCount": 0, "totalEpisodeCount": 0}}`, 1)
+	fake := newSonarrWriterFake(t, seriesJSON, `[]`)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false)
+	if written {
+		t.Error("written = true, want false")
+	}
+	if !isWriteRefusal(err) {
+		t.Fatalf("err = %v, want a counted write refusal", err)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("nothing may be written: %+v", writes)
+	}
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("expected a warning:\n%s", buf.String())
+	}
+}
+
+// TestAssembleSeasonWrite_RefusesToEmitAChangedSeriesLevelMonitored is the
+// binding "a test must prove no sonarr write pass can emit a payload whose
+// series-level monitored differs from the fresh GET" mandate, aimed at the
+// guard rather than at one happy path.
+//
+// The scenario is the one that would actually cause it: the target season
+// object turning out to BE the series object (an aliasing or lookup bug), so
+// the single mutation lands on the series' own monitored flag and unmonitors
+// the entire show. The assembly must refuse to produce a payload at all, so
+// such a bug fails at the moment of assembly instead of at Sonarr.
+func TestAssembleSeasonWrite_RefusesToEmitAChangedSeriesLevelMonitored(t *testing.T) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(sonarrWriterSeriesJSON), &payload); err != nil {
+		t.Fatalf("fixture is not a JSON object: %v", err)
+	}
+	var seasons []json.RawMessage
+	if err := json.Unmarshal(payload["seasons"], &seasons); err != nil {
+		t.Fatalf("fixture seasons is not an array: %v", err)
+	}
+
+	// payload is handed in as its own "target season": the mutation therefore
+	// lands on the series-level monitored flag.
+	encoded, err := assembleSeasonWrite(payload, seasons, 0, payload, "series 3 season 1")
+	if err == nil {
+		t.Fatalf("assembleSeasonWrite produced a payload that changes the series-level monitored flag:\n%s", encoded)
+	}
+	if !strings.Contains(err.Error(), "monitored") || !strings.Contains(err.Error(), "season") {
+		t.Errorf("the refusal must say what it refused and why, got: %v", err)
+	}
+	if encoded != nil {
+		t.Errorf("no payload may be returned alongside the refusal: %s", encoded)
+	}
+}
+
+// TestUnmonitorSeason_AcrossPayloadShapes_SeriesLevelMonitoredIsAlwaysTheFetchedValue
+// is the same mandate stated as a property over the write pass itself: across
+// every payload shape and target season this suite can produce, EVERY series
+// PUT body carries exactly the series-level monitored value the fresh GET
+// returned. A single happy-path assertion proves one write; this proves the
+// invariant the phase actually promises.
+func TestUnmonitorSeason_AcrossPayloadShapes_SeriesLevelMonitoredIsAlwaysTheFetchedValue(t *testing.T) {
+	cases := []struct {
+		name       string
+		seriesJSON string
+		season     int
+		tagActive  bool
+	}{
+		{"target is the first season", sonarrWriterSeriesJSON, 1, false},
+		{"target is the last season", sonarrWriterSeriesJSON, 2, false},
+		{"exclusion tag active but absent from the series", sonarrWriterSeriesJSON, 1, true},
+		{"series carries no unknown fields at all", `{"id":3,"title":"Plain","monitored":true,"tags":[],"seasons":[{"seasonNumber":1,"monitored":true,"statistics":{"episodeFileCount":2,"totalEpisodeCount":2}}]}`, 1, false},
+		{"seasons in descending order", `{"id":3,"title":"Descending","monitored":true,"tags":[],"seasons":[{"seasonNumber":2,"monitored":true,"statistics":{"episodeFileCount":1,"totalEpisodeCount":1}},{"seasonNumber":1,"monitored":true,"statistics":{"episodeFileCount":2,"totalEpisodeCount":2}}]}`, 1, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newSonarrWriterFake(t, tc.seriesJSON, sonarrWriterEpisodesJSON)
+			logger, _ := newDecisionTestLogger(slog.LevelInfo)
+
+			if _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, tc.season, 42, tc.tagActive, false); err != nil {
+				t.Fatalf("unmonitorSeason returned error = %v", err)
+			}
+
+			var fetched map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(tc.seriesJSON), &fetched); err != nil {
+				t.Fatalf("fixture is not a JSON object: %v", err)
+			}
+			puts := 0
+			for _, w := range fake.writes() {
+				if w.path != "/api/v3/series/3" {
+					continue
+				}
+				puts++
+				var sent map[string]json.RawMessage
+				if err := json.Unmarshal(w.body, &sent); err != nil {
+					t.Fatalf("PUT body is not a JSON object: %v", err)
+				}
+				if !jsonBytesEqual(t, sent["monitored"], fetched["monitored"]) {
+					t.Errorf("series-level monitored = %s, want the fetched %s", sent["monitored"], fetched["monitored"])
+				}
+			}
+			if puts != 1 {
+				t.Fatalf("expected exactly 1 season PUT, got %d", puts)
+			}
+		})
+	}
+}

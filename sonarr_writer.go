@@ -270,6 +270,18 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 		episodeIDs = append(episodeIDs, *e.ID)
 	}
 
+	// The season payload is assembled BEFORE either write goes out, even
+	// though it is the second one that sends it. An assembly failure (or the
+	// series-level monitored guard inside it tripping) must not be discovered
+	// after the episode call has already landed: that would leave the season
+	// half-written for a reason that had nothing to do with the server. It
+	// also makes the dry-run rehearsal complete — the payload is really built,
+	// really checked, and only then withheld.
+	encoded, err := assembleSeasonWrite(payload, seasonElems, targetIdx, targetSeason, subject)
+	if err != nil {
+		return false, err
+	}
+
 	// FIRST write call (binding order). episodesConfirmed stays true when no
 	// call was needed at all: "nothing to do" is not "could not be verified".
 	episodesConfirmed := true
@@ -295,11 +307,6 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 					append(append([]any(nil), attrs...), "episodeIds", len(episodeIDs))...)
 			}
 		}
-	}
-
-	encoded, err := assembleSeasonWrite(payload, seasonElems, targetIdx, targetSeason, subject)
-	if err != nil {
-		return false, err
 	}
 
 	// §2.1 again: the SECOND dry-run gate, immediately before the second HTTP
@@ -453,6 +460,17 @@ func verifySeasonStillWritable(logger *slog.Logger, targetSeason map[string]json
 		logger.Warn("season statistics.totalEpisodeCount could not be read from the pre-write fetch; refusing to write",
 			append(append([]any(nil), attrs...), "error", err)...)
 		return fmt.Errorf("%s: %w: %q.totalEpisodeCount could not be read from the pre-write fetch", subject, errSeasonUnverifiableAtWrite, statisticsKey)
+	}
+	// A season claiming zero episodes would make the airing loop below run
+	// over nothing and "pass" vacuously — the guard satisfied by the absence
+	// of anything to check. Rule 2 requires totalEpisodeCount > 0 for exactly
+	// that reason at decision time; the fresh payload has to clear the same
+	// bar, or this write rests on a season that no longer resembles the one
+	// the decision was about.
+	if *stats.TotalEpisodeCount <= 0 {
+		logger.Warn("the season's own statistics now claim it has no episodes; the airing guard would have nothing to check, refusing to write",
+			append(append([]any(nil), attrs...), "totalEpisodeCount", *stats.TotalEpisodeCount)...)
+		return fmt.Errorf("%s: %w: %q.totalEpisodeCount is %d in the pre-write fetch", subject, errSeasonUnverifiableAtWrite, statisticsKey, *stats.TotalEpisodeCount)
 	}
 	if len(seasonEpisodes) != *stats.TotalEpisodeCount {
 		logger.Warn("the fresh episode list does not match the season's own statistics.totalEpisodeCount; the airing guard cannot be trusted over an incomplete set, refusing to write",
