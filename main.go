@@ -25,7 +25,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	once := fs.Bool("once", false, "run a single pass and exit (daemon mode arrives in a later phase)")
 	forceDryRun := fs.Bool("dry-run", false, "force dry-run mode on; cannot be used to disable dry-run set by config")
 	samplesFlag := fs.String("samples", "", "comma-separated movie titles to dump full detail for during Radarr library inspection (--once only)")
-	onlyID := fs.Int("only-id", 0, "process only the item with this id in the single in-scope instance's library — a radarr movie, or a sonarr series and its eligible seasons: evaluate, report, and (outside dry-run) write just that one (--once only)")
+	onlyID := fs.Int("only-id", 0, "report and (outside dry-run) write only the item with this id — a radarr movie, or a sonarr series and its eligible seasons — in the single in-scope instance's library; the rest of that library is still READ, so the cross-check can still validate the data behind the decision (--once only)")
 	instanceName := fs.String("instance", "", "process only the configured instance with this name; required alongside --only-id when more than one instance is in scope (--once only)")
 
 	if err := fs.Parse(args); err != nil {

@@ -1669,3 +1669,83 @@ func TestUnmonitorSeason_AcrossPayloadShapes_SeriesLevelMonitoredIsAlwaysTheFetc
 		})
 	}
 }
+
+// TestUnmonitorSeason_EpisodeWithUnreadableStateAtWriteTime_Refuses closes the
+// stranding hole the write ORDER exists to prevent, on the one path that
+// could still reach it: an episode of the target season whose own id or
+// monitored value cannot be read is excluded from the episode-monitor call by
+// construction (it cannot be named, or its state is unknown) — and if the
+// season PUT then went out anyway, that episode would be left monitored inside
+// a season rule 1 excludes from every future cycle. Nothing would ever revisit
+// it, which is exactly the stranded state the binding episodes-first order was
+// chosen to avoid. Untrusted input on a load-bearing field is a refusal here,
+// as it is everywhere else in this write path.
+func TestUnmonitorSeason_EpisodeWithUnreadableStateAtWriteTime_Refuses(t *testing.T) {
+	cases := []struct {
+		name     string
+		episodes string
+	}{
+		{"episode has no id", `[
+			{"id": 100, "seriesId": 3, "seasonNumber": 1, "episodeNumber": 1, "monitored": true, "hasFile": true, "airDateUtc": "2015-01-01T00:00:00Z", "episodeFileId": 500},
+			{"seriesId": 3, "seasonNumber": 1, "episodeNumber": 2, "monitored": true, "hasFile": true, "airDateUtc": "2015-01-02T00:00:00Z", "episodeFileId": 501}
+		]`},
+		{"episode monitored is JSON null", `[
+			{"id": 100, "seriesId": 3, "seasonNumber": 1, "episodeNumber": 1, "monitored": true, "hasFile": true, "airDateUtc": "2015-01-01T00:00:00Z", "episodeFileId": 500},
+			{"id": 101, "seriesId": 3, "seasonNumber": 1, "episodeNumber": 2, "monitored": null, "hasFile": true, "airDateUtc": "2015-01-02T00:00:00Z", "episodeFileId": 501}
+		]`},
+		{"episode monitored is absent", `[
+			{"id": 100, "seriesId": 3, "seasonNumber": 1, "episodeNumber": 1, "monitored": true, "hasFile": true, "airDateUtc": "2015-01-01T00:00:00Z", "episodeFileId": 500},
+			{"id": 101, "seriesId": 3, "seasonNumber": 1, "episodeNumber": 2, "hasFile": true, "airDateUtc": "2015-01-02T00:00:00Z", "episodeFileId": 501}
+		]`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newSonarrWriterFake(t, sonarrWriterSeriesJSON, tc.episodes)
+			logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+			written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false)
+			if written {
+				t.Error("written = true, want false")
+			}
+			if !isWriteRefusal(err) {
+				t.Fatalf("err = %v, want a counted write refusal", err)
+			}
+			if writes := fake.writes(); len(writes) != 0 {
+				t.Errorf("neither half may be written when an episode's state is unreadable: %+v", writes)
+			}
+			if !strings.Contains(buf.String(), "level=WARN") {
+				t.Errorf("expected a warning:\n%s", buf.String())
+			}
+		})
+	}
+}
+
+// TestUnmonitorSeason_SeasonNoLongerCompleteOnDisk_Refuses re-runs rule 2's
+// own condition against the fresh payload. "This season is finished, stop
+// monitoring it" rests on the season being complete on disk; if a file was
+// removed between the scan and the write, that premise is gone, and
+// unmonitoring the season would strand the missing episode forever — rule 1
+// excludes an unmonitored season from every future cycle, so nothing would
+// ever notice the gap. The value is already decoded from the same statistics
+// object the completeness check reads.
+func TestUnmonitorSeason_SeasonNoLongerCompleteOnDisk_Refuses(t *testing.T) {
+	seriesJSON := strings.Replace(sonarrWriterSeriesJSON,
+		`"statistics": {"episodeFileCount": 2, "totalEpisodeCount": 2, "sizeOnDisk": 9876543210123}`,
+		`"statistics": {"episodeFileCount": 1, "totalEpisodeCount": 2}`, 1)
+	fake := newSonarrWriterFake(t, seriesJSON, sonarrWriterEpisodesJSON)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false)
+	if written {
+		t.Error("written = true, want false")
+	}
+	if !isWriteRefusal(err) {
+		t.Fatalf("err = %v, want a counted write refusal", err)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("a season that is no longer complete on disk must not be written: %+v", writes)
+	}
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("expected a warning:\n%s", buf.String())
+	}
+}

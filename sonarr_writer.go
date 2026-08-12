@@ -248,21 +248,27 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 	// The episode ids to unmonitor: ONLY episodes this fresh read says are
 	// still monitored (binding). An episode already false needs no write, and
 	// leaving it out is what makes a retry after a partial failure smaller
-	// rather than a duplicate. An episode whose own monitored could not be
-	// read is excluded too — but warned about, because excluding it means it
-	// keeps whatever state it has inside a season that is about to stop being
-	// evaluated at all.
+	// rather than a duplicate.
+	//
+	// An episode that cannot be named (no id) or whose own monitored value
+	// cannot be read is a REFUSAL, not an exclusion — REVIEW FIX. Excluding it
+	// and writing the season anyway would leave a possibly-monitored episode
+	// inside a season rule 1 removes from every future cycle: nothing would
+	// ever revisit it, which is precisely the stranded state the binding
+	// episodes-first order was chosen to prevent, arrived at by a different
+	// road. Every other unreadable load-bearing field in this write path
+	// refuses; so does this one.
 	var episodeIDs []int
 	for _, e := range seasonEpisodes {
 		if e.ID == nil {
-			logger.Warn("episode has no id in the pre-write fetch; it cannot be named in the episode monitor write",
+			logger.Warn("an episode of this season has no id in the pre-write fetch; it could not be named in the episode monitor write, so unmonitoring the season would strand it, refusing to write",
 				append(append([]any(nil), attrs...), "episodeNumber", derefOrAbsent(e.EpisodeNumber))...)
-			continue
+			return false, fmt.Errorf("%s: %w: an episode of this season has no id in the pre-write fetch", subject, errSeasonUnverifiableAtWrite)
 		}
 		if e.Monitored == nil {
-			logger.Warn("episode monitored is absent or JSON null in the pre-write fetch; excluded from the episode monitor write",
+			logger.Warn("an episode of this season has an absent or JSON-null monitored field in the pre-write fetch; unmonitoring the season would strand it in an unknown state, refusing to write",
 				append(append([]any(nil), attrs...), "episodeId", *e.ID)...)
-			continue
+			return false, fmt.Errorf("%s: %w: episode %d has no readable monitored field in the pre-write fetch", subject, errSeasonUnverifiableAtWrite, *e.ID)
 		}
 		if !*e.Monitored {
 			continue
@@ -456,10 +462,24 @@ func verifySeasonStillWritable(logger *slog.Logger, targetSeason map[string]json
 		return fmt.Errorf("%s: %w: %q absent from the pre-write fetch", subject, errSeasonUnverifiableAtWrite, statisticsKey)
 	}
 	var stats seasonStatisticsElement
-	if err := json.Unmarshal(rawStats, &stats); err != nil || stats.TotalEpisodeCount == nil {
-		logger.Warn("season statistics.totalEpisodeCount could not be read from the pre-write fetch; refusing to write",
+	if err := json.Unmarshal(rawStats, &stats); err != nil || stats.TotalEpisodeCount == nil || stats.EpisodeFileCount == nil {
+		logger.Warn("season statistics could not be read from the pre-write fetch; refusing to write",
 			append(append([]any(nil), attrs...), "error", err)...)
-		return fmt.Errorf("%s: %w: %q.totalEpisodeCount could not be read from the pre-write fetch", subject, errSeasonUnverifiableAtWrite, statisticsKey)
+		return fmt.Errorf("%s: %w: %q could not be read from the pre-write fetch", subject, errSeasonUnverifiableAtWrite, statisticsKey)
+	}
+
+	// Rule 2's own condition, re-run against the fresh payload (REVIEW FIX).
+	// "This season is finished, stop monitoring it" rests entirely on the
+	// season being complete on disk; if a file was removed between the scan
+	// and the write, that premise is gone and unmonitoring the season would
+	// strand the missing episode forever — rule 1 excludes an unmonitored
+	// season from every future cycle, so nothing would ever notice the gap.
+	// The value is already in hand from the same statistics object the
+	// completeness check below reads.
+	if *stats.EpisodeFileCount != *stats.TotalEpisodeCount {
+		logger.Warn("the season is no longer complete on disk as of the pre-write fetch; refusing to write",
+			append(append([]any(nil), attrs...), "episodeFileCount", *stats.EpisodeFileCount, "totalEpisodeCount", *stats.TotalEpisodeCount)...)
+		return fmt.Errorf("%s: %w: statistics now report %d files for %d episodes", subject, errSeasonUnverifiableAtWrite, *stats.EpisodeFileCount, *stats.TotalEpisodeCount)
 	}
 	// A season claiming zero episodes would make the airing loop below run
 	// over nothing and "pass" vacuously — the guard satisfied by the absence
@@ -544,12 +564,19 @@ func assembleSeasonWrite(payload map[string]json.RawMessage, seasonElems []json.
 }
 
 // putEpisodeMonitor issues the episode half of the write and reports whether
-// the server's response confirms it. A non-2xx (or an unreadable body) is an
-// error — nothing was written and the caller must not proceed to the season
-// write, or it would leave monitored episodes inside a season nothing will
-// ever evaluate again. A 2xx whose body cannot settle the question returns
-// (false, nil): the write probably landed, so aborting would be worse than
-// proceeding, but it cannot be counted as confirmed.
+// the server's response confirms it.
+//
+// A non-2xx is an error: nothing was written, and the caller must not proceed
+// to the season write, or it would leave monitored episodes inside a season
+// nothing will ever evaluate again.
+//
+// Every 2xx returns a nil error, confirmed=false when the body cannot settle
+// the question — including a body that could not be READ at all, which lands
+// here rather than with the rejections on purpose: the server took the write,
+// so the episodes have most likely already changed, and refusing to continue
+// would strand them for the sake of a reading failure on our own side. The
+// caller proceeds to the season write and reports the whole season as
+// accepted-but-unconfirmed, which the next cycle reconciles.
 func putEpisodeMonitor(ctx context.Context, client *APIClient, episodeIDs []int, subject string) (confirmed bool, err error) {
 	body, err := json.Marshal(episodeMonitorRequest{EpisodeIDs: episodeIDs, Monitored: false})
 	if err != nil {

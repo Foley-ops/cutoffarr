@@ -110,28 +110,39 @@ func decodeTagIDs(raw []byte) ([]int, error) {
 // to check here" rather than as a new error, since the earlier typed decode
 // is what is authoritative for "is this a well-formed object".
 //
-// The lookup deliberately mirrors encoding/json's own key matching — exact
-// match first, then a case-insensitive scan (REVIEW FIX, Phase 6 branch
-// review, carried into Phase 7). This function's whole job is to re-inspect
-// the SAME bytes a struct decode already consumed, and encoding/json matches
-// field names case-insensitively when no exact match exists: a payload
-// spelling the key "Tags" populated movieListElement.Tags (turning
-// [3, null, 9] into [3, 0, 9] with no error) while an exact-only lookup here
-// reported found=false, skipped the null-element re-check entirely, and left
-// the corrupted array trusted — the one hole the re-check exists to close,
-// open for any differently-cased key.
+// The lookup is case-INsensitive, because encoding/json's own field matching
+// is (REVIEW FIX, Phase 6 branch review, carried into Phase 7). This
+// function's whole job is to re-inspect the SAME bytes a struct decode already
+// consumed: a payload spelling the key "Tags" populated movieListElement.Tags
+// (turning [3, null, 9] into [3, 0, 9] with no error) while an exact,
+// case-sensitive lookup here reported found=false, skipped the null-element
+// re-check entirely, and left the corrupted array trusted — the one hole the
+// re-check exists to close, open for any differently-cased key.
+//
+// When MORE THAN ONE key matches case-insensitively, this reports found=false
+// rather than picking one (REVIEW FIX, Phase 7). encoding/json decodes an
+// object key by key, so with both "tags" and "Tags" present the LAST one wins
+// for the struct field — an exact-match-first rule here would validate the
+// clean array while the corrupted one is what actually populated the field,
+// which is precisely the outcome this re-check exists to prevent, and a bare
+// map scan would pick between them nondeterministically. Two keys that could
+// each have populated the field means the field's provenance is ambiguous, and
+// the callers treat found=false with a populated field as untrusted input.
 func rawObjectField(raw json.RawMessage, key string) (json.RawMessage, bool) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return nil, false
 	}
-	if v, found := obj[key]; found {
-		return v, true
-	}
+	var found json.RawMessage
+	matches := 0
 	for k, v := range obj {
 		if strings.EqualFold(k, key) {
-			return v, true
+			found = v
+			matches++
 		}
 	}
-	return nil, false
+	if matches != 1 {
+		return nil, false
+	}
+	return found, true
 }

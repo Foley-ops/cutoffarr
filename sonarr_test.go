@@ -1689,3 +1689,39 @@ func TestFetchEpisodeFiles_ForeignSeriesIdRecord_WarnedAndExcluded(t *testing.T)
 		t.Errorf("expected a WARN naming the foreign episode file record:\n%s", out)
 	}
 }
+
+// TestFetchSeriesLibrary_TagsKeyPresentTwiceInDifferentCases_TreatedAsUnverifiable
+// closes the last hole in the tags re-check. encoding/json decodes an object
+// key by key, so when BOTH "tags" and "Tags" are present the LAST one wins for
+// the struct field — while a re-check that stopped at the first match would
+// validate the clean array and pass the corrupted one straight through, which
+// is the very outcome the re-check exists to prevent. Two keys that could each
+// have populated the field means the field's provenance is ambiguous, and
+// ambiguous provenance on the exclusion tag's own input is untrusted input.
+func TestFetchSeriesLibrary_TagsKeyPresentTwiceInDifferentCases_TreatedAsUnverifiable(t *testing.T) {
+	seriesJSON := `[{"id": 1, "title": "Two Tags Keys Show", "monitored": true, "qualityProfileId": 1, "tags": [1, 2], "Tags": [3, null], "seasons": []}]`
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/series", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(seriesJSON))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	series, ok := fetchSeriesLibrary(context.Background(), logger, client, inst)
+	if !ok {
+		t.Fatalf("fetchSeriesLibrary returned ok=false, want true:\n%s", buf.String())
+	}
+	if len(series) != 1 {
+		t.Fatalf("expected 1 series, got %d", len(series))
+	}
+	if series[0].Tags != nil {
+		t.Errorf("two keys could each have populated tags; the field's provenance is ambiguous and must be treated as unverifiable, got %v", *series[0].Tags)
+	}
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("expected a warning:\n%s", buf.String())
+	}
+}
