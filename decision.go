@@ -1984,7 +1984,25 @@ func runSonarrCrossCheck(ctx context.Context, logger *slog.Logger, client *APICl
 			continue
 		}
 
+		// REVIEW FIX (Phase 6 final round, F3): seasonVerified (renamed
+		// nowhere — still the exact test runSonarrCrossCheck's own
+		// verified/unverifiable split below reads) counts episodes that
+		// reached the final agreement/disagreement comparison;
+		// seasonFinalDisagreed counts how many of THOSE disagreed, so
+		// seasonVerified-seasonFinalDisagreed is always >= 0 (it can never
+		// undercount, unlike a counter that also folded in the structural
+		// would-unmonitor/wanted-set contradiction below, which fires on
+		// episodes this final comparison may exclude entirely).
+		// seasonUnverifiableEpisodes counts episodes excluded from
+		// comparison for a DATA reason — a missing qualityCutoffNotMet, or
+		// the CF-only ambiguous shape (b) the binding live-probe ruling
+		// says to "classify as unverifiable, never a disagreement" — as
+		// opposed to shape (a)'s unmonitored-episode exclusion, which is
+		// simply out of the comparable population and contributes to
+		// neither count.
 		seasonVerified := 0
+		seasonFinalDisagreed := 0
+		seasonUnverifiableEpisodes := 0
 		for _, ep := range crossCheckEpisodes {
 			if ep.monitored == nil || !*ep.monitored {
 				// IMPORTANT REVIEW FIX: excluded from the comparison
@@ -2015,6 +2033,15 @@ func runSonarrCrossCheck(ctx context.Context, logger *slog.Logger, client *APICl
 					"episodeId", ep.episodeID, "inWantedSet", inWantedSet, "qualityCutoffNotMet", derefOrAbsent(ep.qualityCutoffNotMet))
 			}
 
+			// REVIEW FIX (Phase 6 final round, F3): demoted from Info to
+			// Debug. Up to 20 sampled seasons of ordinary 12-24-episode
+			// seasons produced 200-500 INFO lines per instance per cycle —
+			// burying the ERROR disagreement and WARN unverifiable lines
+			// this cross-check exists to surface, the same noise-budget
+			// hazard this project has already fixed twice by mandate
+			// elsewhere. The one-line-per-sampled-season INFO aggregate
+			// below replaces it at INFO; this per-episode detail is still
+			// available, just gated behind Debug.
 			attrs := []any{
 				"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season,
 				"episodeId", ep.episodeID, "inWantedSet", inWantedSet, "qualityCutoffNotMet", derefOrAbsent(ep.qualityCutoffNotMet),
@@ -2022,27 +2049,49 @@ func runSonarrCrossCheck(ctx context.Context, logger *slog.Logger, client *APICl
 			if d.wouldUnmonitor {
 				attrs = append(attrs, "cfThreshold", d.cfThreshold)
 			}
-			logger.Info("cross-check", attrs...)
+			logger.Debug("cross-check", attrs...)
 
 			if ep.qualityCutoffNotMet == nil {
 				// Data-quality issue distinct from an actual disagreement,
 				// same as Radarr's cross-check: silently treating "absent"
 				// as "false" here could mask a real disagreement.
+				seasonUnverifiableEpisodes++
 				continue
 			}
 			if inWantedSet && !*ep.qualityCutoffNotMet {
 				// IMPORTANT REVIEW FIX: the CF-only ambiguous shape — see
-				// the function doc comment, shape (b). Not a disagreement.
+				// the function doc comment, shape (b), and the binding
+				// live-probe ruling ("classify as unverifiable, never a
+				// disagreement"). Not a disagreement.
+				seasonUnverifiableEpisodes++
 				continue
 			}
 			seasonVerified++
 			if inWantedSet != *ep.qualityCutoffNotMet {
 				disagreementFound = true
+				seasonFinalDisagreed++
 				logger.Error("cross-check disagreement: wanted-set membership does not match episodeFile.qualityCutoffNotMet",
 					"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season,
 					"episodeId", ep.episodeID, "inWantedSet", inWantedSet, "qualityCutoffNotMet", *ep.qualityCutoffNotMet)
 			}
 		}
+
+		// REVIEW FIX (Phase 6 final round, F3): the season-level INFO
+		// aggregate replacing the per-episode INFO lines above — one line
+		// per sampled season, stating the verdict this season landed in
+		// plus the three counts a human needs to judge it without reading
+		// every per-episode Debug line: how many episodes were actually
+		// comparable (compared), how many of those agreed (agreed), and how
+		// many could not be compared at all (unverifiable). Any
+		// disagreement is still separately visible via its own ERROR line
+		// above; this line is a summary, not a replacement for it.
+		verdict := "unverifiable"
+		if seasonVerified > 0 {
+			verdict = "verified"
+		}
+		logger.Info("cross-check season",
+			"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season, "wouldUnmonitor", d.wouldUnmonitor,
+			"verdict", verdict, "compared", seasonVerified, "agreed", seasonVerified-seasonFinalDisagreed, "unverifiable", seasonUnverifiableEpisodes)
 
 		if seasonVerified > 0 {
 			result.verified++

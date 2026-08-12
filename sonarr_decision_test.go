@@ -1421,6 +1421,84 @@ func TestRunSonarrCrossCheck_SkipPoolExcludesIncompleteSeasons(t *testing.T) {
 	}
 }
 
+// TestRunSonarrCrossCheck_PerEpisodeLineDemotedToDebug_SeasonAggregateAtInfo
+// pins F3 (Phase 6 final review round): the cross-check used to log one INFO
+// "cross-check" line per COMPARED EPISODE — for up to 20 sampled seasons of
+// ordinary 12-24-episode seasons, that is 200-500 INFO lines per instance
+// per cycle, burying the ERROR disagreement and WARN unverifiable lines the
+// cross-check exists to surface (the same noise-budget hazard this project
+// has already fixed twice by mandate elsewhere). The per-episode line must
+// drop to DEBUG, and a single INFO aggregate ("cross-check season": verdict
+// + compared/agreed/unverifiable counts) must appear once per sampled
+// season instead. This season has 3 compared episodes (one disagreeing) and
+// 1 unverifiable (nil qualityCutoffNotMet) to prove the aggregate counts
+// are real, not placeholders.
+func TestRunSonarrCrossCheck_PerEpisodeLineDemotedToDebug_SeasonAggregateAtInfo(t *testing.T) {
+	wanted := map[int]bool{} // none of these episodes are in the wanted set
+	episodes := []seasonCrossCheckEpisode{
+		{episodeID: 100, monitored: boolPtr(true), qualityCutoffNotMet: boolPtr(false)}, // agrees: inWantedSet=false == qualityCutoffNotMet=false
+		{episodeID: 101, monitored: boolPtr(true), qualityCutoffNotMet: boolPtr(false)}, // agrees
+		{episodeID: 102, monitored: boolPtr(true), qualityCutoffNotMet: boolPtr(true)},  // disagrees: inWantedSet=false != qualityCutoffNotMet=true
+		{episodeID: 103, monitored: boolPtr(true), qualityCutoffNotMet: nil},            // unverifiable
+	}
+	decisions := []seasonDecision{sonarrCandidateDecision(1, 1, false, episodes)}
+
+	infoLogger, infoBuf := newDecisionTestLogger(slog.LevelInfo)
+	runSonarrCrossCheck(context.Background(), infoLogger, nil, Instance{Name: "sonarr-main", Type: "sonarr"}, decisions, wanted)
+	infoOut := infoBuf.String()
+
+	if strings.Contains(infoOut, "msg=cross-check ") || strings.HasSuffix(strings.TrimRight(infoOut, "\n"), "msg=cross-check") {
+		t.Errorf("the per-episode msg=cross-check line must no longer appear at INFO level:\n%s", infoOut)
+	}
+	for _, line := range strings.Split(infoOut, "\n") {
+		if strings.Contains(line, "level=INFO") && strings.Contains(line, "msg=cross-check") && !strings.Contains(line, `msg="cross-check season"`) {
+			t.Errorf("found a per-episode cross-check line at INFO level, want it demoted to DEBUG: %q", line)
+		}
+	}
+
+	aggregateLine := ""
+	aggregateCount := 0
+	for _, line := range strings.Split(infoOut, "\n") {
+		if strings.Contains(line, `msg="cross-check season"`) {
+			aggregateCount++
+			aggregateLine = line
+		}
+	}
+	if aggregateCount != 1 {
+		t.Fatalf(`expected exactly 1 msg="cross-check season" aggregate line for this one sampled season, got %d:%s`, aggregateCount, infoOut)
+	}
+	if !strings.Contains(aggregateLine, "seriesId=1") || !strings.Contains(aggregateLine, "season=1") {
+		t.Errorf("aggregate line missing seriesId/season identifying attrs: %q", aggregateLine)
+	}
+	if !strings.Contains(aggregateLine, "compared=3") {
+		t.Errorf("aggregate line = %q, want compared=3 (3 episodes had a comparable qualityCutoffNotMet value)", aggregateLine)
+	}
+	if !strings.Contains(aggregateLine, "agreed=2") {
+		t.Errorf("aggregate line = %q, want agreed=2 (2 of the 3 compared episodes agreed)", aggregateLine)
+	}
+	if !strings.Contains(aggregateLine, "unverifiable=1") {
+		t.Errorf("aggregate line = %q, want unverifiable=1 (episode 103's nil qualityCutoffNotMet)", aggregateLine)
+	}
+
+	// The per-episode detail must still exist, just gated behind DEBUG — a
+	// human who actually needs to see every episode can still get it.
+	debugLogger, debugBuf := newDecisionTestLogger(slog.LevelDebug)
+	runSonarrCrossCheck(context.Background(), debugLogger, nil, Instance{Name: "sonarr-main", Type: "sonarr"}, decisions, wanted)
+	debugOut := debugBuf.String()
+	perEpisodeDebugCount := 0
+	for _, line := range strings.Split(debugOut, "\n") {
+		if strings.Contains(line, "level=DEBUG") && strings.Contains(line, "msg=cross-check") && !strings.Contains(line, `msg="cross-check season"`) {
+			perEpisodeDebugCount++
+		}
+	}
+	if perEpisodeDebugCount != 4 {
+		t.Errorf("expected 4 per-episode msg=cross-check lines at DEBUG (one per sampled episode), got %d:\n%s", perEpisodeDebugCount, debugOut)
+	}
+	if !strings.Contains(debugOut, `msg="cross-check season"`) {
+		t.Errorf("the season aggregate line must still appear at DEBUG level too (INFO is a floor, not a ceiling):\n%s", debugOut)
+	}
+}
+
 func TestRunSonarrDecisionEngine_CrossCheckDisagreement_SummaryStatesFailed(t *testing.T) {
 	// Series 1 has an episode in the wanted set (rule 4 fails, skip
 	// reason=quality cutoff not met) whose file claims qualityCutoffNotMet
