@@ -53,8 +53,17 @@ const (
 func (d scanDirection) wantsMonitored() bool { return d == directionForward }
 
 // isReverseFinding reports whether a decision reason means "this item is
-// unmonitored AND still fails the criteria" — the one thing the reverse scan
-// reports.
+// unmonitored AND something about that is wrong" — the one thing the reverse
+// scan reports.
+//
+// Two of the three are the plan's own "still fails the criteria". The third,
+// ReasonSeasonMonitorMismatch, is a Sonarr-only state added in the round-3
+// review: a season whose flag says unmonitored while episodes inside it say
+// monitored. It belongs here for the same reason the other two do — nothing else
+// in this program will ever look at that season again (rule 1 excludes it from
+// every forward cycle) while Sonarr goes on upgrading its episodes — and it is
+// what makes the half-done reverse write converge, since the season is retried
+// as an ordinary finding on the next cycle.
 //
 // It is deliberately a small, explicit allowlist of EXISTING reason constants
 // rather than "anything that is not wouldUnmonitor", because most of the ways
@@ -81,10 +90,11 @@ func (d scanDirection) wantsMonitored() bool { return d == directionForward }
 //   - ReasonSeasonIncomplete, ReasonSeasonNotFullyAired: the plan's reverse
 //     pool is complete, fully-aired seasons only.
 //
-// What is left is exactly the plan's "still below cutoff / below CF score".
+// What is left is exactly the plan's "still below cutoff / below CF score",
+// plus the one state that is invisible to every other pass.
 func isReverseFinding(reason string) bool {
 	switch reason {
-	case ReasonQualityCutoffNotMet, ReasonCFCutoffNotMet:
+	case ReasonQualityCutoffNotMet, ReasonCFCutoffNotMet, ReasonSeasonMonitorMismatch:
 		return true
 	default:
 		return false
@@ -540,11 +550,22 @@ func verifyMovieStillAReverseFinding(ctx context.Context, logger *slog.Logger, c
 //     with itself. The forward gate blocks this shape; so does this one, on the
 //     aggregate counts that match its own question.
 //
-// There is no recovery-equivalent here, and none is needed: a half-done
-// re-monitor converges by itself, because a season or movie that is still
-// unmonitored is still a finding next cycle. That is also why blocking costs so
-// little: a withheld reverse write is retried, in full, by the next cycle whose
-// data does check out.
+// There is no recovery-equivalent here, and blocking therefore costs little: a
+// withheld reverse write is retried, in full, by the next cycle whose data does
+// check out, because the item is still unmonitored and still a finding.
+//
+// REVIEW FIX (Phase 10 round 3): that used to be stated as an unqualified "a
+// half-done re-monitor converges by itself", which was true of a movie (one
+// flag, one write) and FALSE of a Sonarr season until this round. A season is
+// two writes — the episodes, then the flag — so a failure between them leaves
+// the season unmonitored with MONITORED episodes inside it, a state whose
+// episodes have left the monitored=false wanted set (rule 4 stops firing) and
+// whose season the forward pass excludes at rule 1. It evaluated as "cutoff
+// met", which is not a finding, so nothing revisited it, ever. What makes the
+// sentence true now is ReasonSeasonMonitorMismatch (evaluateSeries rule 7): the
+// half-done state is itself a finding, so the retry is the ordinary finding
+// path, and the failure that creates it says so at WARN
+// (writeSeasonMonitored).
 func reverseWriteGateBlockReason(cc crossCheckResult) string {
 	switch cc.status {
 	case crossCheckStatusPassed:
@@ -586,6 +607,13 @@ func (c *reverseCounts) record(logger *slog.Logger, attrs []any, written bool, e
 		// counter. No HTTP write was sent, so none of them is a failed write.
 		c.refused++
 	case errors.Is(err, errWriteUnverified):
+		// "Let the next cycle reconcile it" is a promise, and it is kept in both
+		// directions: if the write did not land, the movie is still unmonitored
+		// (a finding again) and the season is either still unmonitored or
+		// unmonitored with monitored episodes inside it — which is also a finding
+		// now (ReasonSeasonMonitorMismatch). Before Phase 10 round 3 the second
+		// shape was invisible and this line misdirected a human toward a cycle
+		// that would never revisit it.
 		c.echoUnverified++
 		logger.Warn("remonitor write accepted but the response was unverifiable; treat it as applied and let the next cycle reconcile it",
 			withAttrs("error", err)...)

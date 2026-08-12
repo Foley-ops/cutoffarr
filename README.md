@@ -219,6 +219,20 @@ In practice a finding is almost always an accidental unmonitor — a stray
 click in the UI, an import that flipped something, a list sync — and nothing
 else in the stack would ever tell you about it.
 
+Sonarr has one extra finding with no Radarr equivalent, because a season has
+episodes underneath its own flag:
+
+```
+level=INFO msg="reverse-scan finding" seriesId=42 series="Some Show" season=2 reason="unmonitored season with monitored episodes" ...
+```
+
+The season says unmonitored while episodes inside it say monitored. Sonarr
+goes on searching and upgrading those episodes, and *nothing else in
+cutoffarr can see them* — the forward scan skips the whole season on its
+flag. It is the state a season write interrupted halfway leaves behind, and
+it is also what you get by monitoring one episode of an unmonitored season by
+hand; either way the season is reported until the two agree again.
+
 What is **not** a finding, deliberately:
 
 - An unmonitored item that *meets* the criteria. That is cutoffarr's own
@@ -251,6 +265,13 @@ direction needs: the decision is **re-run against fresh data**, and the write
 is refused if the item no longer fails the criteria. (Without that, an item
 upgraded since the scan would be re-monitored, unmonitored again by the next
 forward pass, and found again by the next reverse one.)
+
+Re-monitoring a Sonarr season is two writes as well (the episodes, then the
+flag). If the second one fails, the season is left unmonitored with monitored
+episodes inside it — and that is neither silent nor permanent: the failure is
+logged as a warning naming exactly that state, and the next full cycle
+reports the season as `unmonitored season with monitored episodes` and
+finishes the flag on its own.
 
 Two things it will never do:
 

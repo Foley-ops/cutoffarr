@@ -74,14 +74,27 @@ func sonarrEpisodeFileServer(t *testing.T, episodeJSON, episodefileJSON string, 
 	return httptest.NewServer(mux)
 }
 
-// episodeJSON renders one /api/v3/episode array element.
+// episodeJSON renders one /api/v3/episode array element, monitored.
 func episodeJSON(id, season, episodeNum int, airDate string, episodeFileID int) string {
+	return episodeJSONWithMonitored(id, season, episodeNum, airDate, episodeFileID, true)
+}
+
+// episodeJSONWithMonitored spells the episode's own monitored flag out.
+//
+// It exists because the flag stopped being incidental in Phase 10 round 3: an
+// UNMONITORED season whose episodes are still monitored is the state a half-done
+// reverse write leaves behind, and evaluateSeries now reports it
+// (ReasonSeasonMonitorMismatch) instead of calling such a season "cutoff met".
+// A fixture that could only say monitored:true could not express the healthy
+// side of that distinction — a season this project itself unmonitored, episodes
+// and all — which is the case that must NOT be reported.
+func episodeJSONWithMonitored(id, season, episodeNum int, airDate string, episodeFileID int, monitored bool) string {
 	airDateJSON := "null"
 	if airDate != "" {
 		airDateJSON = strconv.Quote(airDate)
 	}
-	return fmt.Sprintf(`{"id": %d, "seasonNumber": %d, "episodeNumber": %d, "monitored": true, "hasFile": true, "airDateUtc": %s, "episodeFileId": %d}`,
-		id, season, episodeNum, airDateJSON, episodeFileID)
+	return fmt.Sprintf(`{"id": %d, "seasonNumber": %d, "episodeNumber": %d, "monitored": %t, "hasFile": true, "airDateUtc": %s, "episodeFileId": %d}`,
+		id, season, episodeNum, monitored, airDateJSON, episodeFileID)
 }
 
 // stampSeriesID adds "seriesId": seriesID to every element of an /api/v3/episode
@@ -2674,6 +2687,87 @@ func TestEvaluateSeries_ReverseDirection_ExclusionTagStillWins(t *testing.T) {
 	}
 	if len(gotEp) != 0 {
 		t.Errorf("an excluded series must cost zero fetches in the reverse direction too, got %v", gotEp)
+	}
+}
+
+// --- the monitor mismatch (Phase 10 round 3) --------------------------------
+//
+// A season is unmonitored while its own episodes are monitored. On Sonarr that
+// is not a state anything else in this program can see: the forward pass
+// excludes the season at rule 1 (its flag is false) and, before this fix, the
+// reverse pass called it "cutoff met" and said nothing — so Sonarr went on
+// upgrading its monitored episodes forever and cutoffarr could never unmonitor
+// them again. It is also exactly what a half-done reverse write leaves behind,
+// since the episode call lands before the season PUT.
+
+// TestEvaluateSeries_ReverseDirection_UnmonitoredSeasonWithMonitoredEpisodes_IsAMismatch
+// is the detection itself, at the level that decides it.
+func TestEvaluateSeries_ReverseDirection_UnmonitoredSeasonWithMonitoredEpisodes_IsAMismatch(t *testing.T) {
+	// Meets every criterion — complete, aired, absent from the unmonitored
+	// wanted set, scoring 200 against the profile's 100 — so without the
+	// mismatch this season is a plain "cutoff met" and nothing is reported.
+	episodes := "[" + episodeJSON(200, 2, 1, pastAirDate, 600) + "]"
+	files := "[" + episodeFileJSON(600, 2, 200, false) + "]"
+	srv := sonarrEpisodeFileServer(t, stampSeriesID(t, episodes, 1), files, nil, nil)
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	s := testSeries(1, "Half Written Show", true, 1, []int{}, testSeason(2, false, 1, 1))
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionReverse)
+
+	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonSeasonMonitorMismatch {
+		t.Fatalf("decisions = %+v, want one with reason %q", eval.decisions, ReasonSeasonMonitorMismatch)
+	}
+	if eval.decisions[0].wouldUnmonitor {
+		t.Errorf("a mismatch is not a would-unmonitor decision: %+v", eval.decisions[0])
+	}
+}
+
+// TestEvaluateSeries_ReverseDirection_UnmonitoredSeasonWithUnmonitoredEpisodes_MeetsCriteria
+// is the other side of that branch, and the more important one: a season this
+// project itself unmonitored — flag and episodes together — is the healthy,
+// expected state of a large part of a library. Reporting it would turn the whole
+// history of cutoffarr's own work into findings, every cycle.
+func TestEvaluateSeries_ReverseDirection_UnmonitoredSeasonWithUnmonitoredEpisodes_MeetsCriteria(t *testing.T) {
+	episodes := "[" + episodeJSONWithMonitored(200, 2, 1, pastAirDate, 600, false) + "]"
+	files := "[" + episodeFileJSON(600, 2, 200, false) + "]"
+	srv := sonarrEpisodeFileServer(t, stampSeriesID(t, episodes, 1), files, nil, nil)
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	s := testSeries(1, "Correctly Unmonitored Show", true, 1, []int{}, testSeason(2, false, 1, 1))
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionReverse)
+
+	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonCutoffMet {
+		t.Fatalf("decisions = %+v, want one with reason %q", eval.decisions, ReasonCutoffMet)
+	}
+}
+
+// TestEvaluateSeries_ForwardDirection_MonitoredSeasonWithUnmonitoredEpisodes_IsUnaffected
+// pins the direction guard. The MIRROR state — a monitored season whose episodes
+// are all unmonitored — is the forward path's recovery shape, which already has
+// its own machinery (recoveryCandidate, the recovery pass, unmonitorSeason's
+// fresh verdict). If the mismatch check ran in both directions it would relabel
+// every recovery-shaped season as a mismatch and take it out of the would-
+// unmonitor pool the recovery pass draws from.
+func TestEvaluateSeries_ForwardDirection_MonitoredSeasonWithUnmonitoredEpisodes_IsUnaffected(t *testing.T) {
+	episodes := "[" + episodeJSONWithMonitored(100, 1, 1, pastAirDate, 500, false) + "]"
+	files := "[" + episodeFileJSON(500, 1, 200, false) + "]"
+	srv := sonarrEpisodeFileServer(t, stampSeriesID(t, episodes, 1), files, nil, nil)
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	s := testSeries(1, "Recovery Shaped Show", true, 1, []int{}, testSeason(1, true, 1, 1))
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
+
+	if len(eval.decisions) != 1 || !eval.decisions[0].wouldUnmonitor || eval.decisions[0].reason != ReasonCutoffMet {
+		t.Fatalf("decisions = %+v, want one would-unmonitor with reason %q", eval.decisions, ReasonCutoffMet)
 	}
 }
 

@@ -249,12 +249,22 @@ const (
 // of wording where the brief left it unspecified, following the same
 // concise, lowercase, no-trailing-punctuation style as the Radarr reasons
 // above.
+// ReasonSeasonMonitorMismatch (Phase 10 round 3) is the seventh, and the only
+// one produced in the REVERSE direction alone: the season's own monitored flag
+// says false while episodes inside it say true. It is a season-only concept for
+// the same reason the others are — a movie's monitored flag has nothing below it
+// to disagree with — and it is a finding rather than a skip because nothing else
+// in this program can see that state: the forward pass excludes the season at
+// rule 1, so its monitored episodes are upgraded by Sonarr forever with no
+// cutoff enforcement of any kind. See evaluateSeries' rule 7 for why it is
+// decided there and nowhere else.
 const (
 	ReasonSeasonIncomplete              = "season incomplete on disk"
 	ReasonSeasonNotFullyAired           = "unaired or undated episodes"
 	ReasonSeasonEpisodeDataInconsistent = "episode data inconsistent with statistics"
 	ReasonSeasonFileCountMismatch       = "episode file count mismatch"
 	ReasonSeasonEpisodesUnavailable     = "could not fetch episode data"
+	ReasonSeasonMonitorMismatch         = "unmonitored season with monitored episodes"
 )
 
 // movieDecision is the outcome of evaluating one monitored movie against
@@ -1559,6 +1569,33 @@ func buildSeasonCrossCheckEpisodes(logger *slog.Logger, inst Instance, seriesID,
 	return out, complete
 }
 
+// seasonHasMonitoredEpisode reports whether any episode of this season's
+// evidence set explicitly says it is monitored. It is the reverse direction's
+// mirror of recoveryCandidate (sonarr_writer.go), asking the same question from
+// the other side, and it reads the same already-built set — no extra fetch, no
+// second join, no second copy of the episode/file matching rules.
+//
+// The asymmetry with recoveryCandidate is deliberate and is the safe direction
+// in each case. Recovery asks "is EVERY episode already unmonitored?", which an
+// incomplete set can never answer positively, so it demands
+// crossCheckEpisodesComplete. This asks "is ANY episode monitored?", which one
+// positive observation settles regardless of what else was dropped; and when
+// nothing observed says true, an incomplete set simply produces no mismatch,
+// which is the conservative answer (no finding invented from data that was never
+// read). An episode lost on the way in has already been warned about where it
+// was dropped (buildSeasonCrossCheckEpisodes).
+//
+// A nil monitored is untrusted input, not a state, and is never evidence of
+// anything — the same rule every other pointer decode in this engine follows.
+func seasonHasMonitoredEpisode(d seasonDecision) bool {
+	for _, ep := range d.crossCheckEpisodes {
+		if ep.monitored != nil && *ep.monitored {
+			return true
+		}
+	}
+	return false
+}
+
 // seriesEvaluation is evaluateSeries's full result for one series: the
 // season decisions to report (would-unmonitor/skip lines), plus the
 // season-level accounting runSonarrDecisionEngine's summary line needs.
@@ -2100,6 +2137,33 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 			decisions[idx].reason = ReasonCouldNotFetchCFScore
 		case belowThreshold:
 			decisions[idx].reason = ReasonCFCutoffNotMet
+		case dir == directionReverse && seasonHasMonitoredEpisode(decisions[idx]):
+			// REVIEW FIX (Phase 10 round 3), and the one place the reverse
+			// direction reaches a verdict the forward one cannot. This season is
+			// UNMONITORED and meets every criterion, which normally means
+			// cutoffarr's own work is done and there is nothing to say — but an
+			// episode inside it is still monitored, and that combination is a
+			// state nothing in this program can otherwise see or act on: the
+			// forward pass excludes the whole season at rule 1 (its flag is
+			// false), so Sonarr goes on searching and upgrading those episodes
+			// with no cutoff enforcement, forever, and the previous code reported
+			// ReasonCutoffMet — a silent all-clear.
+			//
+			// It is also precisely what a half-done reverse write leaves behind:
+			// writeSeasonMonitored sends PUT /episode/monitor first and the season
+			// PUT second, so a failure between them lands the episodes and not the
+			// flag. Binding controller resolution 6's premise ("a half-done
+			// re-monitor converges naturally next cycle: still-unmonitored items
+			// re-qualify") is only true because of this branch: the episodes that
+			// landed have LEFT the monitored=false wanted set, so rule 4 no longer
+			// fires for that season and nothing else would ever look at it again.
+			//
+			// Decided here rather than earlier because everything above it is a
+			// better answer: a season that is incomplete, still airing, in the
+			// wanted set, below its CF threshold or untrusted already has a reason
+			// that is either reported (and therefore retried) or warned about, and
+			// re-labelling those would lose the reason a human needs.
+			decisions[idx].reason = ReasonSeasonMonitorMismatch
 		default:
 			decisions[idx].wouldUnmonitor = true
 			decisions[idx].reason = ReasonCutoffMet

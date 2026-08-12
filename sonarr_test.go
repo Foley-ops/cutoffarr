@@ -1026,7 +1026,14 @@ func (f *statefulSonarrFake) serveSeriesDetail(w http.ResponseWriter, r *http.Re
 		}
 		w.Write([]byte(body))
 	case http.MethodPut:
-		if status, overridden := f.seriesPutStatus[id]; overridden && status >= 400 {
+		// Read under the fake's own lock (REVIEW FIX, Phase 10 round 3): a test
+		// that changes this override BETWEEN two runs against the same fake — the
+		// half-done-write convergence test does exactly that — would otherwise
+		// race the serving goroutines that read it.
+		f.mu.Lock()
+		status, overridden := f.seriesPutStatus[id]
+		f.mu.Unlock()
+		if overridden && status >= 400 {
 			w.WriteHeader(status)
 			w.Write([]byte(`{"message":"write rejected by fake"}`))
 			return
@@ -1213,6 +1220,21 @@ func (f *statefulSonarrFake) wantedCutoffJSON(monitored string) string {
 		}
 	}
 	return fmt.Sprintf(`{"page":1,"pageSize":100,"totalRecords":%d,"records":[%s]}`, len(recs), strings.Join(recs, ","))
+}
+
+// setSeriesPutStatus overrides (status >= 400) or clears (status 0) what
+// PUT /api/v3/series/{id} answers with, while the fake is serving. It models a
+// server that rejects one cycle's write and accepts the next one's, which is how
+// a half-completed season write — episodes landed, season flag not — is staged
+// without any hand-built state.
+func (f *statefulSonarrFake) setSeriesPutStatus(id, status int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if status == 0 {
+		delete(f.seriesPutStatus, id)
+		return
+	}
+	f.seriesPutStatus[id] = status
 }
 
 // countRequests reports how many requests this fake received for a path,
