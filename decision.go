@@ -1843,20 +1843,43 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 // runSonarrDecisionEngine is the entry point for a single sonarr instance.
 // It fetches quality profiles and resolves the exclusion tag once (the same
 // instance-generic helpers the Radarr engine uses — fetchQualityProfiles,
-// resolveExclusionTagID), then evaluates every monitored series against
-// evaluateSeries, reporting a would-unmonitor or skip line per season, then
-// runs the cross-check (runSonarrCrossCheck).
+// resolveExclusionTagID), then runs the same three passes
+// runRadarrDecisionEngine does, in the same order and for the same reasons:
 //
-// There is no write pass in this phase (Phase 7 territory): --only-id and
-// dry_run play no role here at all, per the binding scope guard that Sonarr
-// writes arrive later and that no code path in this engine may ever compose
-// a write, series-level or otherwise. Like checkInstanceConnectivity,
-// inspectRadarrLibrary, and runRadarrDecisionEngine, it never returns
-// anything: the binding error-handling rule (§2.6) is "skip that instance
-// for the cycle and log a warning", with no further work for a caller to
-// gate on.
-func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, series []seriesElement, wantedEpisodeIDs map[int]bool, wantedSeasons map[seasonKey]bool, exclusionTagLabel string) {
+//  1. EVALUATE every monitored season of every monitored series, logging a
+//     would-unmonitor or skip line for each.
+//  2. CROSS-CHECK the resulting decisions against Sonarr's own
+//     episodeFile.qualityCutoffNotMet data (runSonarrCrossCheck).
+//  3. WRITE (Phase 7) — but only if the cross-check's evidence authorizes it
+//     (runSonarrWritePass, gated by the shared writeGateBlockReason).
+//
+// onlyID (the --only-id flag, 0 when absent) is a SERIES id here, and narrows
+// what is REPORTED and WRITTEN to that one series' seasons. It deliberately
+// does not narrow what is EVALUATED: the cross-check validates the data the
+// decisions rest on, not the target, so it still samples the whole library —
+// the same split the Radarr engine makes, for the same reason.
+//
+// Like checkInstanceConnectivity, inspectSonarrLibrary, and
+// runRadarrDecisionEngine, it never returns anything: the binding
+// error-handling rule (§2.6) is "skip that instance for the cycle and log a
+// warning", with no further work for a caller to gate on.
+func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, series []seriesElement, wantedEpisodeIDs map[int]bool, wantedSeasons map[seasonKey]bool, exclusionTagLabel string, onlyID int, dryRun bool) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	// An --only-id naming a series this instance's library does not contain is
+	// checked before anything else is fetched: there is nothing to decide or
+	// write, so there is no reason to make further API calls. A mistyped id is
+	// the ordinary cause, and it is a warning rather than an error because
+	// §2.6's house rule for an instance that cannot be processed is "warn and
+	// skip the instance for the cycle". Mirrors the Radarr engine exactly,
+	// including what it does NOT guard: series ids are per-instance, so an id
+	// aimed at the wrong sonarr is a MATCH here, not a miss — run() refuses
+	// ambiguous --only-id runs up front instead.
+	if onlyID != 0 && !seriesLibraryContainsID(series, onlyID) {
+		logger.Warn("--only-id series not found in this instance's library; no decisions for this instance",
+			"instance", inst.Name, "type", inst.Type, "onlyId", onlyID)
+		return
+	}
 
 	profiles, ok := fetchQualityProfiles(ctx, logger, client, inst)
 	if !ok {
@@ -1868,7 +1891,12 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		return
 	}
 
+	// allDecisions holds every evaluated season and feeds the cross-check;
+	// reported holds the subset in scope for the report, the summary counts,
+	// and the write pass. The two are the same slice unless --only-id narrowed
+	// the scope.
 	var allDecisions []seasonDecision
+	var reported []seasonDecision
 	totalSeriesMonitored := 0
 	seasonsEvaluated := 0
 	wouldUnmonitorCount := 0
@@ -1900,11 +1928,18 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 				"instance", inst.Name, "type", inst.Type, "title", titleOrAbsent(s.Title))
 			continue
 		}
-		totalSeriesMonitored++
-
 		eval := evaluateSeries(ctx, logger, client, inst, s, profiles, exclusionTagID, tagActive, wantedSeasons)
-		alreadyUnmonitoredCount += eval.alreadyUnmonitored
 		allDecisions = append(allDecisions, eval.decisions...)
+
+		// --only-id scoping happens here and nowhere else: every series is
+		// still evaluated above (the cross-check needs the full candidate
+		// pools), but only the named series is reported, counted, or written.
+		if onlyID != 0 && *s.ID != onlyID {
+			continue
+		}
+		totalSeriesMonitored++
+		alreadyUnmonitoredCount += eval.alreadyUnmonitored
+		reported = append(reported, eval.decisions...)
 
 		for _, d := range eval.decisions {
 			seasonsEvaluated++
@@ -1920,14 +1955,58 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		}
 	}
 
+	// The series is in the library — established before any of this ran, and
+	// matching it there required a non-nil id — so the only thing that can
+	// have kept it out of the report is rule 1's series half: the series is
+	// not monitored, or its monitored key was absent entirely (warned about
+	// separately above). Without this line, --only-id on such a series would
+	// say nothing whatsoever about the one series the human explicitly named.
+	if onlyID != 0 && totalSeriesMonitored == 0 {
+		logger.Info("--only-id series produced no decision: it is not monitored, so rule 1 excludes it from the report",
+			"instance", inst.Name, "type", inst.Type, "onlyId", onlyID)
+	}
+
 	cc := runSonarrCrossCheck(ctx, logger, client, inst, allDecisions, wantedEpisodeIDs)
 	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
 
-	logger.Info("sonarr decision summary",
-		"instance", inst.Name, "type", inst.Type,
+	unmonitoredCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount := runSonarrWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun)
+
+	attrs := []any{"instance", inst.Name, "type", inst.Type}
+	if onlyID != 0 {
+		attrs = append(attrs, "onlyId", onlyID)
+	}
+	attrs = append(attrs,
 		"totalSeriesMonitored", totalSeriesMonitored, "seasonsEvaluated", seasonsEvaluated,
-		"wouldUnmonitor", wouldUnmonitorCount, "alreadyUnmonitored", alreadyUnmonitoredCount,
-		"skipReasons", formatSkipCounts(skipCounts), "crossCheck", crossCheckSummary)
+		"wouldUnmonitor", wouldUnmonitorCount, "unmonitored", unmonitoredCount, "alreadyUnmonitored", alreadyUnmonitoredCount)
+
+	// The same mode-dependent split the Radarr summary makes, for the same
+	// reasons (see runRadarrDecisionEngine): writeErrors counts failed WRITES,
+	// so in dry-run it is unconditionally 0 and the rehearsal's own failures
+	// are reported under a name that cannot be misread as "N writes failed";
+	// writeEchoUnverified cannot occur in dry-run, where no PUT is ever sent,
+	// so printing it there would only invite the question of what it means.
+	//
+	// unmonitored counts SEASONS — the decision unit — never episodes: a
+	// season write happens to involve two HTTP calls and any number of
+	// episodes, but the thing decided, reported, and counted is one season.
+	if dryRun {
+		attrs = append(attrs, "writeErrors", 0, "writeRehearsalErrors", writeErrorCount)
+	} else {
+		attrs = append(attrs, "writeErrors", writeErrorCount, "writeEchoUnverified", echoUnverifiedCount)
+	}
+	// Both mode-independent counters, always present including as 0: an absent
+	// number must never be readable as "none happened". Together with the
+	// above they satisfy the binding accounting identity
+	//
+	//	wouldUnmonitor == unmonitored + writeEchoUnverified + writeErrors
+	//	                  + writeRehearsalErrors + writesRefused + withheldWrites
+	//
+	// pinned by
+	// TestRunSonarrDecisionEngine_EveryWouldUnmonitorSeasonIsAccountedForInTheSummary.
+	attrs = append(attrs, "writesRefused", writesRefusedCount, "withheldWrites", withheldWriteCount)
+
+	attrs = append(attrs, "skipReasons", formatSkipCounts(skipCounts), "crossCheck", crossCheckSummary)
+	logger.Info("sonarr decision summary", attrs...)
 }
 
 // seasonKeySpread encodes a season decision's (seriesId, season) pair into

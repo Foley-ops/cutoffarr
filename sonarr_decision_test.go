@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -877,16 +880,17 @@ func TestEvaluateSeries_SeasonZeroSpecials_NoSpecialCasing(t *testing.T) {
 
 // --- runSonarrDecisionEngine: instance-level orchestration ------------------
 
-// sonarrDecisionEngineTestServer wires a read-only fake serving
-// /api/v3/qualityprofile, /api/v3/tag, /api/v3/episode, and
-// /api/v3/episodefile, recording every /episode and /episodefile request's
-// raw query into the two pointer slices. Mirrors decisionEngineTestServer's
-// (Radarr) write-refusal guarantee: any non-GET method to any registered
-// path is answered 405, and a catch-all records every request to any OTHER
-// path too — the structural half of the zero-write-verb pin (item 1 of the
-// controller's carried-forward notes): Sonarr's decision engine has no
-// write path at all in this phase, and this fake makes "it never even
-// tried" a checkable fact rather than an assumption.
+// sonarrEngineFake wires a fake serving every endpoint a full
+// runSonarrDecisionEngine pass touches: /api/v3/qualityprofile, /api/v3/tag,
+// /api/v3/episode, /api/v3/episodefile, and (Phase 7) the write path's own
+// GET/PUT /api/v3/series/{id} plus PUT /api/v3/episode/monitor. Every request
+// to every path is recorded, stubbed or not, so a "zero writes" claim is
+// about requests nobody thought to make rather than only the ones this fake
+// happens to answer.
+//
+// A read endpoint answers 405 to any non-GET method, which is what made the
+// Phase 6 zero-write-verb pin structural; the two write endpoints are the
+// exact, and only, additions Phase 7 makes to that surface.
 type sonarrEngineFake struct {
 	srv *httptest.Server
 
@@ -897,15 +901,41 @@ type sonarrEngineFake struct {
 	tagsJSON     string
 	episodeJSON  string
 	fileJSON     string
+
+	// Phase 7 write-path fixtures. seriesDetail holds the GET
+	// /api/v3/series/{id} body the write path re-fetches, by id — an id with
+	// no entry answers 404, modeling a series that vanished between the scan
+	// and the write. seriesPutStatus/seriesPutEcho override what a PUT
+	// answers with (an unset echo means "behave like Sonarr": echo the object
+	// that was sent); episodeMonitorStatus does the same for the episode
+	// half.
+	seriesDetail         map[int]string
+	seriesPutStatus      map[int]int
+	seriesPutEcho        map[int]string
+	episodeMonitorStatus int
+
+	// writeTimeEpisodeJSON, when set, is what /api/v3/episode answers with
+	// once the write pass has begun (detected by its own fresh GET of
+	// /api/v3/series/{id}, which always precedes its episode re-read). It is
+	// how a test models the world changing between the decision and the
+	// write — a season that started airing, an episode that was unmonitored
+	// by something else — which is the entire subject of the pre-write
+	// re-verification.
+	writeTimeEpisodeJSON string
+	writePassStarted     bool
 }
 
 func newSonarrEngineFake(t *testing.T, episodeJSON, fileJSON string) *sonarrEngineFake {
 	t.Helper()
 	f := &sonarrEngineFake{
-		profilesJSON: sonarrDecisionProfilesJSON,
-		tagsJSON:     sonarrDecisionNoTagsJSON,
-		episodeJSON:  episodeJSON,
-		fileJSON:     fileJSON,
+		profilesJSON:         sonarrDecisionProfilesJSON,
+		tagsJSON:             sonarrDecisionNoTagsJSON,
+		episodeJSON:          episodeJSON,
+		fileJSON:             fileJSON,
+		seriesDetail:         map[int]string{},
+		seriesPutStatus:      map[int]int{},
+		seriesPutEcho:        map[int]string{},
+		episodeMonitorStatus: http.StatusOK,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v3/qualityprofile", f.handle(func(w http.ResponseWriter, r *http.Request) {
@@ -927,8 +957,10 @@ func newSonarrEngineFake(t *testing.T, episodeJSON, fileJSON string) *sonarrEngi
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		w.Write([]byte(f.episodeJSON))
+		w.Write([]byte(f.episodesFor()))
 	}))
+	mux.HandleFunc("/api/v3/episode/monitor", f.handle(f.serveEpisodeMonitor))
+	mux.HandleFunc("/api/v3/series/", f.handle(f.serveSeriesDetail))
 	mux.HandleFunc("/api/v3/episodefile", f.handle(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -952,11 +984,98 @@ func newSonarrEngineFake(t *testing.T, episodeJSON, fileJSON string) *sonarrEngi
 
 func (f *sonarrEngineFake) handle(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
 		f.mu.Lock()
-		f.requests = append(f.requests, recordedRequest{method: r.Method, path: r.URL.Path})
+		f.requests = append(f.requests, recordedRequest{method: r.Method, path: r.URL.Path, body: body, contentType: r.Header.Get("Content-Type")})
 		f.mu.Unlock()
+		r.Body = io.NopCloser(bytes.NewReader(body))
 		next(w, r)
 	}
+}
+
+// episodesFor answers /api/v3/episode with the decision-time fixture until
+// the write pass starts, then with writeTimeEpisodeJSON if a test set one.
+// See the field's doc comment for why.
+func (f *sonarrEngineFake) episodesFor() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.writePassStarted && f.writeTimeEpisodeJSON != "" {
+		return f.writeTimeEpisodeJSON
+	}
+	return f.episodeJSON
+}
+
+// serveSeriesDetail is GET/PUT /api/v3/series/{id}: the write path's fresh
+// pre-write read and the season write itself.
+func (f *sonarrEngineFake) serveSeriesDetail(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/api/v3/series/"))
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		f.mu.Lock()
+		f.writePassStarted = true
+		body, found := f.seriesDetail[id]
+		f.mu.Unlock()
+		if !found {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Write([]byte(body))
+	case http.MethodPut:
+		status := http.StatusOK
+		if s, found := f.seriesPutStatus[id]; found {
+			status = s
+		}
+		w.WriteHeader(status)
+		if status >= 400 {
+			w.Write([]byte(`{"message":"write rejected by fake"}`))
+			return
+		}
+		if echo, overridden := f.seriesPutEcho[id]; overridden {
+			w.Write([]byte(echo))
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		w.Write(body)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// serveEpisodeMonitor answers PUT /api/v3/episode/monitor with the updated
+// episode resources, as Sonarr does.
+func (f *sonarrEngineFake) serveEpisodeMonitor(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if f.episodeMonitorStatus >= 400 {
+		w.WriteHeader(f.episodeMonitorStatus)
+		w.Write([]byte(`{"message":"episode monitor write rejected by fake"}`))
+		return
+	}
+	body, _ := io.ReadAll(r.Body)
+	var req struct {
+		EpisodeIDs []int `json:"episodeIds"`
+		Monitored  bool  `json:"monitored"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		// Never silently discard a decode failure the way an earlier fake
+		// did: a malformed write body is a defect in the code under test, and
+		// a fake that shrugs at it hides exactly the bug it exists to catch.
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"message":"episode monitor body is not valid JSON"}`))
+		return
+	}
+	var elems []string
+	for _, id := range req.EpisodeIDs {
+		elems = append(elems, fmt.Sprintf(`{"id":%d,"monitored":%t}`, id, req.Monitored))
+	}
+	w.WriteHeader(f.episodeMonitorStatus)
+	w.Write([]byte("[" + strings.Join(elems, ",") + "]"))
 }
 
 // writes returns every non-GET request the fake received — the "zero write
@@ -1021,7 +1140,7 @@ func TestRunSonarrDecisionEngine_LogsWouldUnmonitorAndSkipLinesWithMandatedAttrs
 		testSeries(1, "Would Unmonitor Show", true, 1, []int{}, testSeason(1, true, 1, 1)),
 		testSeries(2, "No File Show", true, 1, []int{}, testSeason(1, true, 0, 5)),
 	}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude")
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
 
 	out := buf.String()
 
@@ -1051,7 +1170,7 @@ func TestRunSonarrDecisionEngine_SeasonLinesNeverCarryMovieStyleAttrs(t *testing
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	series := []seriesElement{testSeries(1, "Some Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude")
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
 
 	out := buf.String()
 	for _, line := range strings.Split(out, "\n") {
@@ -1076,7 +1195,7 @@ func TestRunSonarrDecisionEngine_SummaryCountsCorrect(t *testing.T) {
 		testSeries(3, "Incomplete B", true, 1, []int{}, testSeason(1, true, 0, 5)),
 		testSeries(4, "Not Monitored Show", false, 1, []int{}, testSeason(1, true, 1, 1)),
 	}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude")
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
 
 	out := buf.String()
 	if !strings.Contains(out, "totalSeriesMonitored=3") {
@@ -1103,7 +1222,7 @@ func TestRunSonarrDecisionEngine_AlreadyUnmonitoredSeasonsCounted(t *testing.T) 
 	series := []seriesElement{
 		testSeries(1, "Mixed Show", true, 1, []int{}, testSeason(1, true, 0, 1), testSeason(2, false, 5, 5)),
 	}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude")
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
 
 	out := buf.String()
 	if !strings.Contains(out, "alreadyUnmonitored=1") {
@@ -1123,7 +1242,7 @@ func TestRunSonarrDecisionEngine_ProfileFetchFailure_NoReportLinesAtAll(t *testi
 	inst := Instance{Name: "sonarr-broken", Type: "sonarr", URL: srv.URL, APIKey: "key"}
 
 	series := []seriesElement{testSeries(1, "Some Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, inst, series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude")
+	runSonarrDecisionEngine(context.Background(), logger, inst, series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
 
 	out := buf.String()
 	if strings.Contains(out, "msg=would-unmonitor") || strings.Contains(out, "msg=skip") {
@@ -1149,7 +1268,7 @@ func TestRunSonarrDecisionEngine_TagFetchFailure_NoReportLinesAtAll(t *testing.T
 	inst := Instance{Name: "sonarr-broken", Type: "sonarr", URL: srv.URL, APIKey: "key"}
 
 	series := []seriesElement{testSeries(1, "Some Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, inst, series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude")
+	runSonarrDecisionEngine(context.Background(), logger, inst, series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
 
 	out := buf.String()
 	if strings.Contains(out, "msg=would-unmonitor") || strings.Contains(out, "msg=skip") {
@@ -1162,7 +1281,7 @@ func TestRunSonarrDecisionEngine_SeriesNotMonitored_ExcludedEntirelyFromReport(t
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	series := []seriesElement{testSeries(1, "Unmonitored Show", false, 1, []int{}, testSeason(1, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude")
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
 
 	out := buf.String()
 	if strings.Contains(out, "Unmonitored Show") {
@@ -1184,7 +1303,7 @@ func TestRunSonarrDecisionEngine_NeverMakesAWriteRequest(t *testing.T) {
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	series := []seriesElement{testSeries(1, "Would Unmonitor Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude")
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
 
 	if !strings.Contains(buf.String(), "would-unmonitor") {
 		t.Fatalf("test setup did not actually produce a would-unmonitor decision:\n%s", buf.String())
@@ -1517,7 +1636,7 @@ func TestRunSonarrDecisionEngine_CrossCheckDisagreement_SummaryStatesFailed(t *t
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	series := []seriesElement{testSeries(1, "Disagreeing Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude")
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
 
 	out := buf.String()
 	if !strings.Contains(out, "crossCheck=FAILED") {
@@ -1543,7 +1662,7 @@ func TestRunSonarrDecisionEngine_WouldUnmonitorSeasonHasWantedEpisode_CrossCheck
 	series := []seriesElement{testSeries(1, "Contradiction Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
 	wantedEpisodeIDs := map[int]bool{100: true} // episode 100 IS in the wanted set...
 	wantedSeasons := map[seasonKey]bool{}       // ...but its season key is absent, so rule 4 lets the season through
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodeIDs, wantedSeasons, "cutoffarr-exclude")
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodeIDs, wantedSeasons, "cutoffarr-exclude", 0, true)
 
 	out := buf.String()
 	if !strings.Contains(out, "msg=would-unmonitor") {
@@ -1573,7 +1692,7 @@ func TestRunSonarrDecisionEngine_SkipSideCrossCheck_RuleFourSkip_BecomesVerifiab
 	series := []seriesElement{testSeries(1, "Skip Side Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
 	wantedEpisodeIDs := map[int]bool{100: true}
 	wantedSeasons := map[seasonKey]bool{{seriesID: 1, seasonNumber: 1}: true} // rule 4 fails: never reaches rule 7
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodeIDs, wantedSeasons, "cutoffarr-exclude")
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodeIDs, wantedSeasons, "cutoffarr-exclude", 0, true)
 
 	out := buf.String()
 	if !strings.Contains(out, `reason="quality cutoff not met"`) {

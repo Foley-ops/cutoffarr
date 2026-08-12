@@ -208,7 +208,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			if ok && inst.Type == "sonarr" {
 				series, wantedEpisodeIDs, wantedSeasons, dataOK := inspectSonarrLibrary(context.Background(), logger, inst)
 				if dataOK {
-					runSonarrDecisionEngine(context.Background(), logger, inst, series, wantedEpisodeIDs, wantedSeasons, cfg.ExclusionTag)
+					runSonarrDecisionEngine(context.Background(), logger, inst, series, wantedEpisodeIDs, wantedSeasons, cfg.ExclusionTag, *onlyID, cfg.DryRun)
 				}
 			}
 		}

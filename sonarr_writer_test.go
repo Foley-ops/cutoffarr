@@ -926,3 +926,349 @@ func TestUnmonitorSeason_TwoSeasonsOfOneSeries_EachWriteChangesOnlyItsOwn(t *tes
 		}
 	}
 }
+
+// ============================================================================
+// The Sonarr write pass, driven through runSonarrDecisionEngine
+// ============================================================================
+
+// sonarrWriteEngineSeriesDetail renders the GET /api/v3/series/{id} body the
+// write path re-fetches: one series, one monitored season whose statistics
+// match the engine fake's episode fixture.
+func sonarrWriteEngineSeriesDetail(id int, title string, seasonNumber, episodes int, monitored bool) string {
+	return fmt.Sprintf(`{"id":%d,"title":%q,"monitored":true,"qualityProfileId":1,"tags":[],"seasons":[{"seasonNumber":%d,"monitored":%t,"statistics":{"episodeFileCount":%d,"totalEpisodeCount":%d}}]}`,
+		id, title, seasonNumber, monitored, episodes, episodes)
+}
+
+// sonarrSummaryCounters parses every integer attr off the run's single
+// "sonarr decision summary" line, mirroring summaryCounters (decision_test.go)
+// for the Radarr summary.
+func sonarrSummaryCounters(t *testing.T, output string) map[string]int {
+	t.Helper()
+	return summaryCountersFor(t, output, "sonarr decision summary")
+}
+
+// TestRunSonarrDecisionEngine_WriteMode_ConfirmedWriteCountsAsUnmonitored is
+// the Sonarr write pass end to end through the engine: a season that passes
+// every rule, a cross-check that verifies it, and a write both of whose
+// halves the server confirms.
+func TestRunSonarrDecisionEngine_WriteMode_ConfirmedWriteCountsAsUnmonitored(t *testing.T) {
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "]"
+	filesJSON := "[" + episodeFileJSON(500, 1, 200, false) + "]"
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	fake.seriesDetail[1] = sonarrWriteEngineSeriesDetail(1, "Writable Show", 1, 1, true)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	series := []seriesElement{testSeries(1, "Writable Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, false)
+
+	out := buf.String()
+	c := sonarrSummaryCounters(t, out)
+	if c["wouldUnmonitor"] != 1 {
+		t.Fatalf("wouldUnmonitor = %d, want 1; this test proves nothing otherwise:\n%s", c["wouldUnmonitor"], out)
+	}
+	if c["unmonitored"] != 1 {
+		t.Errorf("unmonitored = %d, want 1 (seasons, the decision unit — not episodes):\n%s", c["unmonitored"], out)
+	}
+	if !strings.Contains(out, "msg=unmonitor ") {
+		t.Errorf("expected a msg=unmonitor report line for the written season:\n%s", out)
+	}
+
+	writes := fake.writes()
+	if len(writes) != 2 {
+		t.Fatalf("expected exactly 2 write requests for one season (episode monitor, then series), got %d: %+v", len(writes), writes)
+	}
+	if writes[0].path != "/api/v3/episode/monitor" || writes[1].path != "/api/v3/series/1" {
+		t.Errorf("write order = %s then %s, want /api/v3/episode/monitor then /api/v3/series/1", writes[0].path, writes[1].path)
+	}
+}
+
+// TestRunSonarrDecisionEngine_DryRun_RehearsesAndWithholds is §2.1 at the
+// engine level: the decisions are made, the write pass runs as a full
+// rehearsal (the fresh reads happen), and not one write request is sent.
+func TestRunSonarrDecisionEngine_DryRun_RehearsesAndWithholds(t *testing.T) {
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "]"
+	filesJSON := "[" + episodeFileJSON(500, 1, 200, false) + "]"
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	fake.seriesDetail[1] = sonarrWriteEngineSeriesDetail(1, "Rehearsed Show", 1, 1, true)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	series := []seriesElement{testSeries(1, "Rehearsed Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
+
+	out := buf.String()
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("dry-run made %d write request(s), want ZERO: %+v", len(writes), writes)
+	}
+	// The rehearsal really ran: the write path's own fresh GET happened.
+	sawFreshGet := false
+	for _, r := range fake.all() {
+		if r.method == http.MethodGet && r.path == "/api/v3/series/1" {
+			sawFreshGet = true
+		}
+	}
+	if !sawFreshGet {
+		t.Errorf("dry-run must rehearse the write path, including its fresh GET:\n%+v", fake.all())
+	}
+
+	c := sonarrSummaryCounters(t, out)
+	if c["withheldWrites"] != 1 || c["unmonitored"] != 0 {
+		t.Errorf("withheldWrites/unmonitored = %d/%d, want 1/0:\n%s", c["withheldWrites"], c["unmonitored"], out)
+	}
+	// writeErrors is unconditionally 0 in dry-run — no write was attempted,
+	// so none can have failed — and the rehearsal's own failures are reported
+	// under their own name so a report a human reads as "nothing was
+	// attempted" never carries a number that reads as "N writes failed".
+	if !strings.Contains(out, "writeRehearsalErrors=0") {
+		t.Errorf("a dry-run summary must carry writeRehearsalErrors, not writeEchoUnverified:\n%s", out)
+	}
+	if strings.Contains(out, "writeEchoUnverified") {
+		t.Errorf("writeEchoUnverified cannot occur in dry-run and must not be printed there:\n%s", out)
+	}
+}
+
+// TestRunSonarrDecisionEngine_EveryWouldUnmonitorSeasonIsAccountedForInTheSummary
+// is the Sonarr half of the Phase 5 accounting identity (binding controller
+// resolution 5):
+//
+//	wouldUnmonitor == unmonitored + writeEchoUnverified + writeErrors
+//	                  + writeRehearsalErrors + writesRefused + withheldWrites
+//
+// Each case makes the single would-unmonitor season end a different way; the
+// named counter must absorb it, and the identity is what proves nothing fell
+// between the counters.
+func TestRunSonarrDecisionEngine_EveryWouldUnmonitorSeasonIsAccountedForInTheSummary(t *testing.T) {
+	const okEpisodes = `[{"id": 100, "seriesId": 1, "seasonNumber": 1, "episodeNumber": 1, "monitored": true, "hasFile": true, "airDateUtc": "2015-01-01T00:00:00Z", "episodeFileId": 500}]`
+	cases := []struct {
+		name         string
+		detail       map[int]string
+		tagsJSON     string
+		seriesPut    map[int]int
+		seriesEcho   map[int]string
+		episodeMonPU int
+		episodesJSON string
+		dryRun       bool
+		wantCounter  string
+	}{
+		{
+			name:        "confirmed write",
+			detail:      map[int]string{1: sonarrWriteEngineSeriesDetail(1, "Accounted Show", 1, 1, true)},
+			wantCounter: "unmonitored",
+		},
+		{
+			name:        "the server rejected the season PUT",
+			detail:      map[int]string{1: sonarrWriteEngineSeriesDetail(1, "Accounted Show", 1, 1, true)},
+			seriesPut:   map[int]int{1: http.StatusInternalServerError},
+			wantCounter: "writeErrors",
+		},
+		{
+			name:        "the season PUT was accepted but the echo confirms nothing",
+			detail:      map[int]string{1: sonarrWriteEngineSeriesDetail(1, "Accounted Show", 1, 1, true)},
+			seriesEcho:  map[int]string{1: ""},
+			wantCounter: "writeEchoUnverified",
+		},
+		{
+			name:        "the series vanished before the pre-write fetch",
+			detail:      map[int]string{},
+			wantCounter: "writeErrors",
+		},
+		{
+			name:        "the exclusion tag was added between scan and write",
+			detail:      map[int]string{1: `{"id":1,"title":"Accounted Show","monitored":true,"tags":[42],"seasons":[{"seasonNumber":1,"monitored":true,"statistics":{"episodeFileCount":1,"totalEpisodeCount":1}}]}`},
+			tagsJSON:    `[{"id": 42, "label": "cutoffarr-exclude"}]`,
+			wantCounter: "writesRefused",
+		},
+		{
+			name:        "the fresh payload's tags cannot be verified",
+			detail:      map[int]string{1: `{"id":1,"title":"Accounted Show","monitored":true,"seasons":[{"seasonNumber":1,"monitored":true,"statistics":{"episodeFileCount":1,"totalEpisodeCount":1}}]}`},
+			tagsJSON:    `[{"id": 42, "label": "cutoffarr-exclude"}]`,
+			wantCounter: "writesRefused",
+		},
+		{
+			name:        "something else unmonitored the season first",
+			detail:      map[int]string{1: sonarrWriteEngineSeriesDetail(1, "Accounted Show", 1, 1, false)},
+			wantCounter: "writesRefused",
+		},
+		{
+			name:        "the season's monitored is JSON null",
+			detail:      map[int]string{1: `{"id":1,"title":"Accounted Show","monitored":true,"tags":[],"seasons":[{"seasonNumber":1,"monitored":null,"statistics":{"episodeFileCount":1,"totalEpisodeCount":1}}]}`},
+			wantCounter: "writesRefused",
+		},
+		{
+			name:   "the season started airing between scan and write",
+			detail: map[int]string{1: sonarrWriteEngineSeriesDetail(1, "Accounted Show", 1, 1, true)},
+			// The decision-time fixture is aired; the write-time re-read is not.
+			episodesJSON: `[{"id": 100, "seriesId": 1, "seasonNumber": 1, "episodeNumber": 1, "monitored": true, "hasFile": true, "airDateUtc": "2099-01-01T00:00:00Z", "episodeFileId": 500}]`,
+			wantCounter:  "writesRefused",
+		},
+		{
+			name:        "dry-run withheld the write at the gate",
+			detail:      map[int]string{1: sonarrWriteEngineSeriesDetail(1, "Accounted Show", 1, 1, true)},
+			dryRun:      true,
+			wantCounter: "withheldWrites",
+		},
+		{
+			name:        "dry-run rehearsal failed before the gate",
+			detail:      map[int]string{},
+			dryRun:      true,
+			wantCounter: "writeRehearsalErrors",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			filesJSON := "[" + episodeFileJSON(500, 1, 200, false) + "]"
+			fake := newSonarrEngineFake(t, okEpisodes, filesJSON)
+			if tc.tagsJSON != "" {
+				fake.tagsJSON = tc.tagsJSON
+			}
+			for id, body := range tc.detail {
+				fake.seriesDetail[id] = body
+			}
+			for id, status := range tc.seriesPut {
+				fake.seriesPutStatus[id] = status
+			}
+			for id, echo := range tc.seriesEcho {
+				fake.seriesPutEcho[id] = echo
+			}
+			if tc.episodesJSON != "" {
+				// The decision engine reads the healthy fixture; only the
+				// write path's own fresh re-read sees the changed world.
+				fake.writeTimeEpisodeJSON = tc.episodesJSON
+			}
+
+			logger, buf := newDecisionTestLogger(slog.LevelInfo)
+			series := []seriesElement{testSeries(1, "Accounted Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
+			runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, tc.dryRun)
+
+			out := buf.String()
+			c := sonarrSummaryCounters(t, out)
+			if c["wouldUnmonitor"] != 1 {
+				t.Fatalf("wouldUnmonitor = %d, want 1: this case must actually reach the write pass or it proves nothing:\n%s", c["wouldUnmonitor"], out)
+			}
+			if c[tc.wantCounter] != 1 {
+				t.Errorf("%s = %d, want 1: this outcome must be counted under that name:\n%s", tc.wantCounter, c[tc.wantCounter], out)
+			}
+			accounted := c["unmonitored"] + c["writeEchoUnverified"] + c["writeErrors"] + c["writeRehearsalErrors"] + c["writesRefused"] + c["withheldWrites"]
+			if accounted != c["wouldUnmonitor"] {
+				t.Errorf("the summary accounts for %d of %d promised writes; every would-unmonitor season must end in exactly one counted outcome:\n%s", accounted, c["wouldUnmonitor"], out)
+			}
+			for _, always := range []string{"unmonitored=", "writesRefused=", "withheldWrites=", "writeErrors="} {
+				if !strings.Contains(out, always) {
+					t.Errorf("the summary must always carry %s, including as 0:\n%s", always, out)
+				}
+			}
+		})
+	}
+}
+
+// TestRunSonarrDecisionEngine_GateBlocked_WithheldWritesAccountsForThePass is
+// the identity's remaining term, which no case above can reach: when the
+// cross-check refuses to authorize the pass, every pending write is withheld
+// before unmonitorSeason is called even once.
+func TestRunSonarrDecisionEngine_GateBlocked_WithheldWritesAccountsForThePass(t *testing.T) {
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "]"
+	// qualityCutoffNotMet=true while the (empty) wanted set says the episode
+	// is not below cutoff: two Sonarr code paths disagreeing, so the
+	// cross-check FAILS and the gate blocks the whole pass.
+	filesJSON := "[" + episodeFileJSON(500, 1, 200, true) + "]"
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	fake.seriesDetail[1] = sonarrWriteEngineSeriesDetail(1, "Blocked Show", 1, 1, true)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	series := []seriesElement{testSeries(1, "Blocked Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, false)
+
+	out := buf.String()
+	if !strings.Contains(out, "crossCheck=FAILED") {
+		t.Fatalf("expected the cross-check to fail in this fixture:\n%s", out)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("a blocked gate must write nothing at all, got %+v", writes)
+	}
+	c := sonarrSummaryCounters(t, out)
+	if c["withheldWrites"] != c["wouldUnmonitor"] || c["wouldUnmonitor"] == 0 {
+		t.Errorf("withheldWrites = %d, want it to account for all %d pending writes:\n%s", c["withheldWrites"], c["wouldUnmonitor"], out)
+	}
+	if !strings.Contains(out, "writes withheld for this instance") {
+		t.Errorf("a blocked pass must say so out loud — \"nothing was written\" and \"nothing needed writing\" must never look the same:\n%s", out)
+	}
+}
+
+// TestRunSonarrDecisionEngine_OnlyID_ScopesReportAndWritesToOneSeries is
+// controller resolution 4: --only-id <seriesId> names a series, and both the
+// report and the write pass are scoped to it. Every series is still
+// EVALUATED, because the cross-check validates the data the decision rests on
+// rather than the target — the same split runRadarrDecisionEngine makes.
+func TestRunSonarrDecisionEngine_OnlyID_ScopesReportAndWritesToOneSeries(t *testing.T) {
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "]"
+	filesJSON := "[" + episodeFileJSON(500, 1, 200, false) + "]"
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	fake.seriesDetail[1] = sonarrWriteEngineSeriesDetail(1, "Named Show", 1, 1, true)
+	fake.seriesDetail[2] = sonarrWriteEngineSeriesDetail(2, "Other Show", 1, 1, true)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	series := []seriesElement{
+		testSeries(1, "Named Show", true, 1, []int{}, testSeason(1, true, 1, 1)),
+		testSeries(2, "Other Show", true, 1, []int{}, testSeason(1, true, 1, 1)),
+	}
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 2, false)
+
+	out := buf.String()
+	for _, w := range fake.writes() {
+		if w.path == "/api/v3/series/1" {
+			t.Errorf("a --only-id run must never write a series it does not name: %+v", w)
+		}
+	}
+	sawNamed := false
+	for _, w := range fake.writes() {
+		if w.path == "/api/v3/series/2" {
+			sawNamed = true
+		}
+	}
+	if !sawNamed {
+		t.Errorf("expected the named series to be written, got %+v", fake.writes())
+	}
+	c := sonarrSummaryCounters(t, out)
+	if c["wouldUnmonitor"] != 1 || c["unmonitored"] != 1 {
+		t.Errorf("wouldUnmonitor/unmonitored = %d/%d, want 1/1 (the named series only):\n%s", c["wouldUnmonitor"], c["unmonitored"], out)
+	}
+	if !strings.Contains(out, "onlyId=2") {
+		t.Errorf("the summary must say the run was scoped:\n%s", out)
+	}
+	// Report lines only. The cross-check's own lines DO name the unnamed
+	// series, and correctly so: it samples the whole library because it
+	// validates the data the decision rests on, not the target.
+	for _, line := range strings.Split(out, "\n") {
+		isReport := strings.Contains(line, "msg=would-unmonitor") || strings.Contains(line, "msg=skip") || strings.Contains(line, "msg=unmonitor ")
+		if isReport && strings.Contains(line, `series="Named Show"`) {
+			t.Errorf("a --only-id run must not REPORT a series it does not name: %q", line)
+		}
+	}
+	if !strings.Contains(out, `msg="cross-check season" instance=sonarr-main seriesId=1`) {
+		t.Errorf("the cross-check must still sample the whole library — it validates the data, not the target:\n%s", out)
+	}
+}
+
+// TestRunSonarrDecisionEngine_OnlyID_UnknownSeries_WarnsAndWritesNothing
+// mirrors the Radarr precedent: a mistyped id is a warning, not a silent
+// no-op, and nothing further is fetched or written for the instance.
+func TestRunSonarrDecisionEngine_OnlyID_UnknownSeries_WarnsAndWritesNothing(t *testing.T) {
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "]"
+	filesJSON := "[" + episodeFileJSON(500, 1, 200, false) + "]"
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	series := []seriesElement{testSeries(1, "Only Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 99, false)
+
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "onlyId=99") {
+		t.Errorf("expected a warning naming the id that matched nothing:\n%s", out)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("nothing may be written, got %+v", writes)
+	}
+	if strings.Contains(out, "msg=would-unmonitor") {
+		t.Errorf("no decisions may be reported for an id this library does not contain:\n%s", out)
+	}
+}

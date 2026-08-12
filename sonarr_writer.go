@@ -682,3 +682,146 @@ func encodeRawArray(elems []json.RawMessage) ([]byte, error) {
 	}
 	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
+
+// runSonarrWritePass is the Sonarr engine's third pass, and the exact
+// counterpart of runWritePass (decision.go) — same two gates, same five
+// outcomes, same reconciliation identity, same §2.6 "log it, count it, move
+// on" posture. Only the unit differs: a SEASON, not a movie.
+//
+// The two gates in front of every write:
+//
+//   - The cross-check must have authorized writes, judged by the same
+//     evidence-based rule the Radarr pass uses (writeGateBlockReason, shared
+//     rather than reimplemented): an explicit PASS, plus evidence that the
+//     pass says something about the would-unmonitor decisions this pass is
+//     about to act on. FAILED and inconclusive — and any status a future
+//     change might add — block the entire pass, loudly.
+//   - The decision's wouldUnmonitor bool. Never its reason text.
+//
+// The five outcomes, and why five (see runWritePass's own doc comment for the
+// two review rounds that produced them):
+//
+//   - unmonitored: BOTH write calls were made and BOTH were confirmed by the
+//     server's own response. The only outcome that logs msg=unmonitor.
+//     Counted in SEASONS, the decision unit — never episodes, whose count is
+//     an implementation detail of how a season is unmonitored.
+//
+//   - writeErrors: something was rejected or could not be read. Includes the
+//     partial completion controller resolution 1 defines — episode call done,
+//     season PUT refused by the server — whose error names the completed half
+//     because the season is left monitored and the next cycle must be
+//     expected to revisit it. Reported as writeRehearsalErrors in dry-run,
+//     where no write was attempted and only a rehearsal can have failed.
+//
+//   - writeEchoUnverified: a 2xx whose body cannot settle whether the change
+//     landed, on either call. Probably applied, cannot be proven, and must not
+//     be reported as either success or failure.
+//
+//   - writesRefused: unmonitorSeason declined before any HTTP write was sent —
+//     the exclusion tag reappeared, tags or monitored could not be read, the
+//     series or season was already unmonitored (a race), the season's own
+//     state could not be verified, or the season started airing since the
+//     decision. Each logs its specific reason at the moment it refuses.
+//
+//   - withheld: no attempt was made at all — the gate blocked the pass, or a
+//     dry-run stopped at the gate immediately before the PUT.
+//
+//     wouldUnmonitor == unmonitored + echoUnverified + writeErrors
+//
+//   - writesRefused + withheld
+func runSonarrWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, decisions []seasonDecision, cc crossCheckResult, exclusionTagID int, tagActive bool, dryRun bool) (unmonitored, writeErrors, echoUnverified, writesRefused, withheld int) {
+	pending := 0
+	for _, d := range decisions {
+		if d.wouldUnmonitor {
+			pending++
+		}
+	}
+
+	if reason := writeGateBlockReason(cc, pending); reason != "" {
+		attrs := []any{"instance", inst.Name, "type", inst.Type, "crossCheck", cc.status}
+		attrs = append(attrs, cc.logAttrs()...)
+		attrs = append(attrs, "withheldWrites", pending, "dryRun", dryRun)
+		msg := "writes withheld for this instance: " + reason
+		// Same noise-budget rule the Radarr pass applies: blocking a pass that
+		// had nothing to write anyway is a health signal, not an alarm — but
+		// an UNRECOGNIZED status is itself a bug signal and stays WARN however
+		// little was pending.
+		if pending > 0 || !isKnownCrossCheckStatus(cc.status) {
+			logger.Warn(msg, attrs...)
+		} else {
+			logger.Info(msg, attrs...)
+		}
+		return 0, 0, 0, 0, pending
+	}
+
+	if pending > 0 && cc.unverifiable > 0 {
+		attrs := []any{"instance", inst.Name, "type", inst.Type}
+		attrs = append(attrs, cc.logAttrs()...)
+		attrs = append(attrs, "pendingWrites", pending, "dryRun", dryRun)
+		msg := "writes proceeding on a partially verified cross-check: some sampled seasons could not be verified"
+		if dryRun {
+			msg = "dry-run: write rehearsal proceeding on a partially verified cross-check: some sampled seasons could not be verified (no write is sent; this is a rehearsal)"
+		}
+		logger.Warn(msg, attrs...)
+	}
+
+	for _, d := range decisions {
+		if !d.wouldUnmonitor {
+			continue
+		}
+
+		written, err := unmonitorSeason(ctx, logger, client, inst, d.seriesID, d.season, exclusionTagID, tagActive, dryRun)
+		if isWriteRefusal(err) {
+			// unmonitorSeason already logged the specific reason at the point
+			// it refused, so nothing more is logged here and no cause is lost
+			// by sharing a counter. None is a write failure (no HTTP write was
+			// sent) and none is a no-op (something DID need doing).
+			writesRefused++
+			continue
+		}
+		if errors.Is(err, errWriteUnverified) {
+			echoUnverified++
+			logger.Warn("unmonitor write accepted but the response was unverifiable; treat it as applied and let the next cycle reconcile it",
+				"instance", inst.Name, "type", inst.Type, "seriesId", d.seriesID, "series", d.series, "season", d.season, "error", err)
+			continue
+		}
+		if err != nil {
+			writeErrors++
+			msg := "unmonitor write failed; skipping this season for the cycle"
+			if dryRun {
+				msg = "unmonitor write rehearsal failed; no write was attempted (dry-run), and this season is skipped for the cycle"
+			}
+			logger.Error(msg,
+				"instance", inst.Name, "type", inst.Type, "seriesId", d.seriesID, "series", d.series, "season", d.season, "error", err)
+			continue
+		}
+		if !written {
+			// Dry-run: unmonitorSeason withheld both writes at their own gates
+			// (§2.1) and has already logged it at debug. The ONLY remaining
+			// (false, nil) case — every refusal and every race is a
+			// sentinel-wrapped error, precisely so nothing real falls silently
+			// through here.
+			withheld++
+			continue
+		}
+
+		unmonitored++
+		logger.Info("unmonitor",
+			"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season, "reason", d.reason, "profile", d.profileName)
+	}
+
+	return unmonitored, writeErrors, echoUnverified, writesRefused, withheld
+}
+
+// seriesLibraryContainsID reports whether any series in the library carries
+// id. Used only to tell "--only-id names a series this instance does not
+// have" (a warning, not an error) apart from a target that exists but is
+// filtered out by the decision rules. Mirrors libraryContainsID (decision.go).
+func seriesLibraryContainsID(series []seriesElement, id int) bool {
+	for _, s := range series {
+		if s.ID != nil && *s.ID == id {
+			return true
+		}
+	}
+	return false
+}
