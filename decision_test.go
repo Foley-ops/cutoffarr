@@ -1682,6 +1682,45 @@ func TestRenderCrossCheckSummary_Inconclusive(t *testing.T) {
 	}
 }
 
+// TestRenderCrossCheckSummary_PassedWithNothingSampled_RendersDistinctly is
+// Phase 9's one allowed code ride-along (binding controller resolution 7),
+// mirroring FIX 2's honesty rule for a second edge case in the same
+// function. crossCheckStatusPassed with verified==0 and unverifiable==0 is
+// reached only one way: nothing was even sampled, because this cycle had no
+// would-unmonitor decisions and no monitored+hasFile skip decisions to draw
+// from (an empty library, or a library where every eligible item was already
+// handled). That is a genuinely benign outcome, but left to the general
+// `passed (%d verified, %d unverifiable)` case it renders the exact string
+// "passed (0 verified, 0 unverifiable)" — a string a REAL sample can never
+// produce, since a sample that ran always has verified+unverifiable > 0 —
+// making "nothing was checked" visually indistinguishable from "a sample was
+// taken and it checked out". The zero-sample case must render as its own
+// explicit branch, not the general formatter's coincidental output.
+func TestRenderCrossCheckSummary_PassedWithNothingSampled_RendersDistinctly(t *testing.T) {
+	got := renderCrossCheckSummary(crossCheckStatusPassed, 0, 0)
+	if got == "passed (0 verified, 0 unverifiable)" {
+		t.Errorf("renderCrossCheckSummary(passed, 0, 0) = %q, must not read the same as a sample that ran and found nothing wrong", got)
+	}
+	if !strings.Contains(got, "passed") {
+		t.Errorf("renderCrossCheckSummary(passed, 0, 0) = %q, must still read as passed (it is not a failure)", got)
+	}
+	if !strings.Contains(got, "nothing") && !strings.Contains(got, "sampled") {
+		t.Errorf("renderCrossCheckSummary(passed, 0, 0) = %q, expected wording naming that nothing was sampled", got)
+	}
+}
+
+// TestRenderCrossCheckSummary_PassedWithRealZeroUnverifiable_StillUsesGeneralForm
+// pins the boundary the fix above must not blur: verified>0, unverifiable==0
+// is a REAL sample (something was actually checked and everything agreed),
+// so it must keep using the general counted form, not the nothing-sampled
+// wording.
+func TestRenderCrossCheckSummary_PassedWithRealZeroUnverifiable_StillUsesGeneralForm(t *testing.T) {
+	got := renderCrossCheckSummary(crossCheckStatusPassed, 4, 0)
+	if got != "passed (4 verified, 0 unverifiable)" {
+		t.Errorf("renderCrossCheckSummary(passed, 4, 0) = %q, want %q", got, "passed (4 verified, 0 unverifiable)")
+	}
+}
+
 // TestRenderCrossCheckSummary_UnrecognizedStatus_NeverReadsAsPassed is
 // FIX 2's core pin: feed an unrecognized status through the renderer and
 // assert the output does not contain "passed" — the exact hazard the old

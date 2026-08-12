@@ -1043,7 +1043,26 @@ func writeGateBlockReason(cc crossCheckResult, pendingWrites int) string {
 // counts instead: something that can never be mistaken for "passed (...)",
 // so an unrecognized status is loud and debuggable rather than falsely
 // reassuring.
+//
+// Phase 9 ride-along (binding controller resolution 7), same honesty rule
+// applied to a second edge case this function can reach: crossCheckStatusPassed
+// with verified==0 and unverifiable==0 happens only when nothing was even
+// sampled (runCrossCheck / runSonarrCrossCheck fall through to their own
+// `default: … Passed` when the sampled slice is empty — no would-unmonitor
+// decisions and no monitored+hasFile skip decisions existed this cycle to draw
+// from). That is a benign outcome, but the general counted form below would
+// render it as "passed (0 verified, 0 unverifiable)" — a string a REAL sample
+// can never produce (a sample that actually ran always has
+// verified+unverifiable > 0) — making "nothing was checked this cycle"
+// indistinguishable from "a sample was taken and it checked out clean". Since
+// crossCheckStatusInconclusive already claims every other verified==0 case
+// (len(sampled) > 0 && verified == 0), verified==0 && unverifiable==0 under
+// Passed uniquely identifies "nothing sampled" with no risk of shadowing a
+// real result.
 func renderCrossCheckSummary(status string, verified, unverifiable int) string {
+	if status == crossCheckStatusPassed && verified == 0 && unverifiable == 0 {
+		return "passed (nothing sampled: no would-unmonitor or skip candidates existed this cycle)"
+	}
 	switch status {
 	case crossCheckStatusPassed:
 		return fmt.Sprintf("passed (%d verified, %d unverifiable)", verified, unverifiable)
