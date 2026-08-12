@@ -843,20 +843,29 @@ type statefulSonarrSeries struct {
 type statefulSonarrFake struct {
 	srv *httptest.Server
 
-	mu          sync.Mutex
-	series      map[int]*statefulSonarrSeries
-	seriesOrder []int
-	episodes    map[int]*statefulSonarrEpisode     // keyed by episode id
-	files       map[int]*statefulSonarrEpisodeFile // keyed by file id
-	requests    []recordedRequest
+	mu           sync.Mutex
+	series       map[int]*statefulSonarrSeries
+	seriesOrder  []int
+	episodes     map[int]*statefulSonarrEpisode     // keyed by episode id
+	episodeOrder []int                              // REVIEW FIX (F6): construction order, see episodesJSON
+	files        map[int]*statefulSonarrEpisodeFile // keyed by file id
+	fileOrder    []int                              // REVIEW FIX (F6): construction order, see episodeFilesJSON
+	requests     []recordedRequest
 
 	profilesJSON string
 	tagsJSON     string
 }
 
 // newStatefulSonarrFake starts a fake Sonarr backed by series/episodes/
-// files. Order is preserved for /series (iterating seriesOrder), matching
-// statefulRadarrFake's determinism rationale for report-line assertions.
+// files. Order is preserved for /series, /episode, and /episodefile alike
+// (iterating seriesOrder/episodeOrder/fileOrder, REVIEW FIX F6), matching
+// statefulRadarrFake's determinism rationale for report-line assertions:
+// production code is itself order-sensitive (rule 7 stops at the first
+// disqualifying episode file it sees; the rule-3 airing loop stops at the
+// first not-yet-aired episode), so a fake that answered /episode or
+// /episodefile in random per-call order (a bare `range` over the backing
+// map) would make any future multi-item-per-season test flake
+// intermittently.
 func newStatefulSonarrFake(t *testing.T, series []*statefulSonarrSeries, episodes []*statefulSonarrEpisode, files []*statefulSonarrEpisodeFile) *statefulSonarrFake {
 	t.Helper()
 	f := &statefulSonarrFake{
@@ -872,9 +881,11 @@ func newStatefulSonarrFake(t *testing.T, series []*statefulSonarrSeries, episode
 	}
 	for _, e := range episodes {
 		f.episodes[e.id] = e
+		f.episodeOrder = append(f.episodeOrder, e.id)
 	}
 	for _, ef := range files {
 		f.files[ef.id] = ef
+		f.fileOrder = append(f.fileOrder, ef.id)
 	}
 
 	mux := http.NewServeMux()
@@ -945,7 +956,8 @@ func (f *statefulSonarrFake) episodesJSON(seriesID int) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var elems []string
-	for _, e := range f.episodes {
+	for _, id := range f.episodeOrder {
+		e := f.episodes[id]
 		if e.seriesID != seriesID {
 			continue
 		}
@@ -963,7 +975,8 @@ func (f *statefulSonarrFake) episodeFilesJSON(seriesID int) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var elems []string
-	for _, ef := range f.files {
+	for _, id := range f.fileOrder {
+		ef := f.files[id]
 		// Only include files belonging to episodes of this series — the
 		// fake models the join the same way real Sonarr's /episodefile
 		// endpoint does (scoped by seriesId), via each episode's own
@@ -1014,6 +1027,86 @@ func (f *statefulSonarrFake) writes() []recordedRequest {
 
 func (f *statefulSonarrFake) instance() Instance {
 	return Instance{Name: "sonarr-main", Type: "sonarr", URL: f.srv.URL, APIKey: "key"}
+}
+
+// TestStatefulSonarrFake_EpisodesAndEpisodeFilesJSON_OrderIsInsertionStable
+// pins F6 (Phase 6 final review round): episodesJSON and episodeFilesJSON
+// both used to iterate a Go map directly, so their element order was random
+// per call — unlike seriesJSON, which deliberately iterates seriesOrder for
+// exactly this determinism reason (see its own doc comment). Production
+// code IS order-sensitive (rule 7 stops at the first episode file that is
+// missing its score or below threshold, so which reason a season gets can
+// depend on which file is examined first; the rule-3 airing loop similarly
+// stops at the first not-yet-aired episode it finds), so the first future
+// test with two files or two problem episodes in one season would flake
+// intermittently against the unfixed fake. Calling each JSON builder many
+// times and requiring byte-identical output is what actually catches a
+// regression back to ranging the map: Go's map iteration order is
+// randomized per range statement, not merely per process, so a large enough
+// repeat count reliably disagrees with itself once the fix regresses.
+func TestStatefulSonarrFake_EpisodesAndEpisodeFilesJSON_OrderIsInsertionStable(t *testing.T) {
+	fake := newStatefulSonarrFake(t,
+		[]*statefulSonarrSeries{
+			{id: 1, title: "Order Show", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 1, monitored: true, episodeFileCount: 5, totalEpisodeCount: 5}}},
+		},
+		[]*statefulSonarrEpisode{
+			// Deliberately not id-ascending, so "stable" cannot be confused
+			// with "coincidentally sorted".
+			{id: 105, seriesID: 1, seasonNumber: 1, episodeNumber: 5, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 605},
+			{id: 101, seriesID: 1, seasonNumber: 1, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 601},
+			{id: 104, seriesID: 1, seasonNumber: 1, episodeNumber: 4, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 604},
+			{id: 102, seriesID: 1, seasonNumber: 1, episodeNumber: 2, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 602},
+			{id: 103, seriesID: 1, seasonNumber: 1, episodeNumber: 3, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 603},
+		},
+		[]*statefulSonarrEpisodeFile{
+			{id: 605, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
+			{id: 601, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
+			{id: 604, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
+			{id: 602, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
+			{id: 603, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
+		},
+	)
+
+	wantEpisodes := fake.episodesJSON(1)
+	wantFiles := fake.episodeFilesJSON(1)
+	for i := 0; i < 50; i++ {
+		if got := fake.episodesJSON(1); got != wantEpisodes {
+			t.Fatalf("episodesJSON order is not stable across calls (iteration %d):\nfirst: %s\ngot:   %s", i, wantEpisodes, got)
+		}
+		if got := fake.episodeFilesJSON(1); got != wantFiles {
+			t.Fatalf("episodeFilesJSON order is not stable across calls (iteration %d):\nfirst: %s\ngot:   %s", i, wantFiles, got)
+		}
+	}
+
+	// Order must also match construction order, not merely be self-
+	// consistent — otherwise a fix that stabilized on some other, equally
+	// arbitrary order (e.g. always sorted by id) would pass the loop above
+	// without actually matching seriesOrder's own "preserve insertion
+	// order" contract.
+	var gotEpisodes []episodeElement
+	if err := json.Unmarshal([]byte(wantEpisodes), &gotEpisodes); err != nil {
+		t.Fatalf("episodesJSON did not produce valid JSON: %v\n%s", err, wantEpisodes)
+	}
+	var gotEpisodeIDs []int
+	for _, e := range gotEpisodes {
+		gotEpisodeIDs = append(gotEpisodeIDs, *e.ID)
+	}
+	if want := fmt.Sprint([]int{105, 101, 104, 102, 103}); fmt.Sprint(gotEpisodeIDs) != want {
+		t.Errorf("episodesJSON element order = %v, want construction order %s", gotEpisodeIDs, want)
+	}
+
+	var gotFiles []episodeFileElement
+	if err := json.Unmarshal([]byte(wantFiles), &gotFiles); err != nil {
+		t.Fatalf("episodeFilesJSON did not produce valid JSON: %v\n%s", err, wantFiles)
+	}
+	var gotFileIDs []int
+	for _, ef := range gotFiles {
+		gotFileIDs = append(gotFileIDs, *ef.ID)
+	}
+	if want := fmt.Sprint([]int{605, 601, 604, 602, 603}); fmt.Sprint(gotFileIDs) != want {
+		t.Errorf("episodeFilesJSON element order = %v, want construction order %s", gotFileIDs, want)
+	}
 }
 
 // TestRun_SonarrInstance_FullPipelineNeverMakesAWriteRequest is the run()-
