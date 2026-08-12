@@ -337,6 +337,65 @@ func TestEvaluateFileReportRoot_MismatchedSeasonExclusionIsByFolderNotFilename(t
 	assertFileReportIdentity(t, 4, outcome)
 }
 
+// --- sampleFileReportPaths: deterministic stride sampling -------------------
+
+// TestSampleFileReportPaths_StridesAcrossTheSortedSliceNotJustTheHead is the
+// [FIX] pin: sampleFileReportPaths used to head-slice the sorted tracked-path
+// list, so heuristic (b)'s up-to-100-file sample was always the
+// alphabetically-first cluster. A partially-mounted share does not fail
+// randomly — a mergerfs branch going down, or a per-letter split mount,
+// drops a contiguous ALPHABETICAL subtree — so a head-slice sample could
+// pass heuristic (b) cleanly (every one of the first 100 alphabetically
+// sorted paths present) while the rest of the library, past the sample
+// window, is entirely missing. Stride sampling (the string twin of
+// sampleEveryKth, decision.go) draws evenly from across the WHOLE sorted
+// slice, so a share missing everything past some alphabetical point is
+// caught instead of silently passing.
+func TestSampleFileReportPaths_StridesAcrossTheSortedSliceNotJustTheHead(t *testing.T) {
+	var sorted []string
+	for i := 0; i < 500; i++ {
+		sorted = append(sorted, fmt.Sprintf("/data/Movies/a%04d/movie.mkv", i))
+	}
+	for i := 0; i < 500; i++ {
+		sorted = append(sorted, fmt.Sprintf("/data/Movies/z%04d/movie.mkv", i))
+	}
+
+	sample := sampleFileReportPaths(sorted, 100)
+	if len(sample) != 100 {
+		t.Fatalf("len(sample) = %d, want 100", len(sample))
+	}
+	sawA, sawZ := false, false
+	for _, p := range sample {
+		if strings.HasPrefix(p, "/data/Movies/a") {
+			sawA = true
+		}
+		if strings.HasPrefix(p, "/data/Movies/z") {
+			sawZ = true
+		}
+	}
+	if !sawA || !sawZ {
+		t.Errorf("sample drawn from a%%/z%% split = %v, want paths from BOTH halves of the sorted slice, not just the alphabetically-first cluster", sample)
+	}
+}
+
+// TestSampleFileReportPaths_SliceAtOrBelowCapReturnedUnchanged pins the
+// cap branch (fileReportMountSampleSize's "nothing to sample down" case) that
+// was previously exercised only indirectly, by every evaluateFileReportRoot
+// test's small fixture counts, never as a direct assertion on the function
+// itself.
+func TestSampleFileReportPaths_SliceAtOrBelowCapReturnedUnchanged(t *testing.T) {
+	sorted := []string{"/a", "/b", "/c"}
+	sample := sampleFileReportPaths(sorted, 100)
+	if len(sample) != len(sorted) {
+		t.Fatalf("len(sample) = %d, want %d: a slice at or below the cap must be returned unchanged", len(sample), len(sorted))
+	}
+	for i := range sorted {
+		if sample[i] != sorted[i] {
+			t.Errorf("sample[%d] = %q, want %q", i, sample[i], sorted[i])
+		}
+	}
+}
+
 // --- mount-problem heuristic (binding controller resolution 4) -------------
 
 func TestEvaluateFileReportRoot_MissingRootAborts(t *testing.T) {
@@ -946,6 +1005,34 @@ func TestClassifyFileReportPath_ExtrasSubfolderSkipped(t *testing.T) {
 	}
 }
 
+// TestClassifyFileReportPath_RootNamedLikeAnExtrasDirIsNotSelfExcluded is the
+// [FIX] pin: underExtrasDir tested the climbed-to directory's own basename
+// against extrasDirNames BEFORE checking whether that directory was the root
+// itself, so a media root whose own basename happens to be one of the eleven
+// Plex-convention extras names (e.g. /data/media/Shorts — a perfectly
+// plausible real library name) matched extrasDirNames the moment the climb
+// reached the root, for every file anywhere under it, no matter how deep.
+// The whole root then silently reported skipped-by-rule/extras for
+// everything: duplicates=0 orphans=0, indistinguishable from a clean pass.
+func TestClassifyFileReportPath_RootNamedLikeAnExtrasDirIsNotSelfExcluded(t *testing.T) {
+	root := mediaRoot{arrPath: "/anime", diskPath: "/data/media/Shorts"}
+	set := instanceTrackedSet{
+		files:   map[string]bool{"/data/media/Shorts/Title/movie.mkv": true},
+		folders: map[string]string{"/data/media/Shorts/Title": "Title"},
+	}
+	c := classifyFileReportPath("/data/media/Shorts/Title/movie.mkv", root, set)
+	if c.kind != fileKindTracked {
+		t.Errorf("classify(tracked file under a root named like an extras dir) = %+v, want tracked: the root's own basename must never self-exclude everything beneath it", c)
+	}
+
+	// A stray file directly under such a root (outside every tracked folder)
+	// must surface as a real orphan too, not skipped-by-rule/extras.
+	c2 := classifyFileReportPath("/data/media/Shorts/stray.mkv", root, set)
+	if c2.kind != fileKindOrphan {
+		t.Errorf("classify(orphan directly under a root named like an extras dir) = %+v, want orphan", c2)
+	}
+}
+
 func TestClassifyFileReportPath_TrackedFileIsTracked(t *testing.T) {
 	root := mediaRoot{arrPath: "/movies", diskPath: "/data/Movies"}
 	set := instanceTrackedSet{
@@ -1377,6 +1464,58 @@ func TestRunRadarrFileReport_CleanLibraryRansWithZeroFindings(t *testing.T) {
 	}
 	if c.duplicates != 0 || c.orphans != 0 {
 		t.Errorf("duplicates=%d orphans=%d, want 0/0 for a clean library", c.duplicates, c.orphans)
+	}
+}
+
+// TestRunRadarrFileReport_ManyUntrackedPathsWarnOnceNotOncePerItem is the
+// [FIX] pin for the per-item WARN flood: buildRadarrTrackedSet used to log
+// its own logger.Warn call for EVERY FileSkipReasonUntrackedPath occurrence,
+// during tracked-set build — which runs BEFORE
+// warnIfInstanceTrackedSetEntirelyUnmapped ever gets a chance to abort. If a
+// speculatively-added *arr field name turns out wrong at the live gate (the
+// implementer's own stated risk), every movie in the library would warn,
+// potentially thousands of lines per sweep, drowning the one abort WARN that
+// actually matters. This pins that a whole instance's worth of
+// untracked-path items produces exactly ONE aggregated WARN carrying the
+// count — mirroring warnIfAnyTrackedPathUnmapped's existing aggregation for
+// the sibling FileSkipReasonOutsideConfiguredRoots reason — while the
+// per-reason count on the always-INFO summary stays exact.
+func TestRunRadarrFileReport_ManyUntrackedPathsWarnOnceNotOncePerItem(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureFiles(t, dir, "Healthy/Healthy.mkv")
+	inst := Instance{Name: "radarr-main", Type: "radarr", MediaRootMap: map[string]string{"/movies": dir}}
+
+	var movies []movieListElement
+	for i := 0; i < 25; i++ {
+		// Path maps fine (folder tracked, no warn from that half) but
+		// MovieFile is nil and HasFile is nil: the untrustworthy-file half
+		// fires exactly once per movie.
+		movies = append(movies, movieListElement{
+			ID: intPtr(100 + i), Title: strPtr(fmt.Sprintf("Broken %d", i)), HasFile: nil,
+			Path: strPtr(fmt.Sprintf("/movies/Broken %d", i)), MovieFile: nil,
+		})
+	}
+	// A healthy movie with a real tracked file so neither the instance-wide
+	// guard nor the per-root mount heuristics fire — this test is about the
+	// per-item flood, a separate guard from either.
+	movies = append(movies, movieListElement{
+		ID: intPtr(1), Title: strPtr("Healthy"), HasFile: boolPtr(true),
+		Path: strPtr("/movies/Healthy"), MovieFile: &movieFileElement{Path: strPtr("/movies/Healthy/Healthy.mkv")},
+	})
+
+	logger, buf := newFileReportTestLogger(slog.LevelInfo)
+	c := runRadarrFileReport(context.Background(), logger, slog.LevelInfo, inst, movies, 0, false)
+	if c.state() != "ran" {
+		t.Fatalf("state() = %q, want ran:\n%s", c.state(), buf.String())
+	}
+	if got := c.skipReasons[FileSkipReasonUntrackedPath]; got != 25 {
+		t.Fatalf("skipReasons[untracked path] = %d, want 25: the count must stay exact even when the WARN is aggregated", got)
+	}
+	if got := strings.Count(buf.String(), "level=WARN"); got != 1 {
+		t.Errorf("WARN lines = %d, want exactly 1: 25 untracked-path movies must aggregate into ONE WARN, not flood the log one per item:\n%s", got, buf.String())
+	}
+	if !strings.Contains(buf.String(), "count=25") {
+		t.Errorf("expected the aggregated WARN to carry count=25:\n%s", buf.String())
 	}
 }
 
@@ -1896,6 +2035,51 @@ func TestBuildSonarrTrackedSet_HappyPath_TracksFolderAndFiles(t *testing.T) {
 	}
 	if !set.files["/data/TV/Show/Show.S01E01.mkv"] || !set.files["/data/TV/Show/Show.S01E02.mkv"] {
 		t.Errorf("files = %v, want both episode files tracked", set.files)
+	}
+}
+
+// TestBuildSonarrTrackedSet_ManyIdAbsentSeriesWarnOnceNotOncePerItem is the
+// [FIX] pin for the per-item WARN flood, Sonarr's side: buildSonarrTrackedSet
+// used to log its own logger.Warn call for EVERY series/episode-file that hit
+// a FileSkipReasonUntrackedPath condition (id absent, path absent, or an
+// episode file with an absent path) — a systemic field-name break at the
+// live gate (series.path/episodeFile.path both being untrusted input this
+// project only ever speculatively named) would flood the log one line per
+// series, drowning the one abort WARN that actually matters. This pins that
+// many id-absent series aggregate into exactly ONE WARN carrying the count.
+func TestBuildSonarrTrackedSet_ManyIdAbsentSeriesWarnOnceNotOncePerItem(t *testing.T) {
+	fake := newEpisodeFileFakeServer(t, map[string]string{
+		"1": `[{"id":100,"seriesId":1,"seasonNumber":1,"path":"/tv_shows/Healthy/Healthy.S01E01.mkv"}]`,
+	})
+	client := NewAPIClient(fake.srv.URL, "key")
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: fake.srv.URL, APIKey: "key"}
+	roots := []mediaRoot{{arrPath: "/tv_shows", diskPath: "/data/TV"}}
+
+	var series []seriesElement
+	for i := 0; i < 25; i++ {
+		// Path maps fine (folder tracked, no warn from that half) but ID is
+		// nil: the id-absent half fires exactly once per series.
+		series = append(series, seriesElement{
+			ID: nil, Title: strPtr(fmt.Sprintf("Broken %d", i)), Path: strPtr(fmt.Sprintf("/tv_shows/Broken %d", i)),
+		})
+	}
+	// A healthy series with a real tracked file so the instance-wide guard
+	// never fires — this test is about the per-item flood, a separate guard.
+	series = append(series, seriesElement{ID: intPtr(1), Title: strPtr("Healthy"), Path: strPtr("/tv_shows/Healthy")})
+
+	logger, buf := newFileReportTestLogger(slog.LevelInfo)
+	_, skipCounts, ok := buildSonarrTrackedSet(context.Background(), logger, client, inst, roots, series, nil, 0, false)
+	if !ok {
+		t.Fatal("buildSonarrTrackedSet returned ok=false")
+	}
+	if got := skipCounts[FileSkipReasonUntrackedPath]; got != 25 {
+		t.Fatalf("skipCounts[untracked path] = %d, want 25: the count must stay exact even when the WARN is aggregated", got)
+	}
+	if got := strings.Count(buf.String(), "level=WARN"); got != 1 {
+		t.Errorf("WARN lines = %d, want exactly 1: 25 id-absent series must aggregate into ONE WARN, not flood the log one per item:\n%s", got, buf.String())
+	}
+	if !strings.Contains(buf.String(), "count=25") {
+		t.Errorf("expected the aggregated WARN to carry count=25:\n%s", buf.String())
 	}
 }
 
@@ -2521,6 +2705,40 @@ instances:
 	return path
 }
 
+// advanceClockUntilReconciliationSweepFires is the [FIX] shared helper this
+// project's own root-cause analysis (originally documented inline here)
+// already called for: waitReady()/awaitLogCount("reconciliation sweep
+// scheduled") close most, but not all, of the race window between the
+// startup scan finishing and d.loop()'s first iteration actually reaching
+// its own clock.NewTimer(wait) call (daemon.go). A single unretried
+// h.clock.Advance can land in that last sliver — before the timer is
+// armed — and the sweep it was meant to trigger then silently never fires,
+// because nextReconcile ends up computed from the ALREADY-advanced clock
+// value, unreachable by that one Advance call.
+//
+// Retrying Advance is safe: it is idempotent (it only ever moves the fake
+// clock further forward and fires whatever is already due), so whichever
+// attempt lands after loop() has actually armed its timer wins. This was
+// previously written out only in
+// TestDaemon_StartupScanAndReconciliationSweep_BothRunTheFileReport, while
+// its sibling TestDaemon_IdleCycleWithFileReportFindings_StaysWithinTheNoiseBudget
+// used a single, unretried Advance for both of its sweeps — the exact gap
+// this helper closes by giving every reconciliation-sweep test the same
+// hardening.
+func advanceClockUntilReconciliationSweepFires(t *testing.T, h *daemonHarness, mark int, step time.Duration) {
+	t.Helper()
+	for attempt := 0; attempt < 5; attempt++ {
+		h.clock.Advance(step)
+		deadline := time.Now().Add(200 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if strings.Contains(h.since(mark), "reconciliation sweep complete") {
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+}
+
 func TestDaemon_StartupScanAndReconciliationSweep_BothRunTheFileReport(t *testing.T) {
 	// The movie's own path/movieFile.path are set (and mapped, with a real
 	// fixture file on disk) so every cycle's file report is a genuinely
@@ -2540,40 +2758,12 @@ func TestDaemon_StartupScanAndReconciliationSweep_BothRunTheFileReport(t *testin
 		t.Fatalf("the startup scan must run the file report for a configured instance:\n%s", h.out.String())
 	}
 
-	// waitReady() unblocks the instant the startup SCAN finishes (onStartupScanDone,
-	// daemon.go) — strictly BEFORE d.loop() computes nextReconcile from the
-	// CURRENT clock value. Advancing the clock before that computation has
-	// happened races: if Advance(time.Hour) lands first, nextReconcile is
-	// computed from the ALREADY-advanced time (now+1h+1h), which this test's
-	// one Advance call can never reach, and the sweep silently never fires.
-	// Waiting for the daemon's own "reconciliation sweep scheduled" line
-	// (logged at the top of loop(), before nextReconcile is used for
-	// anything) closes most of that window, but not the very last sliver of
-	// it: loop()'s first iteration still has to reach its own
-	// clock.NewTimer(wait) call (daemon.go) before an Advance is guaranteed
-	// to be seen by it, and that gap has no log line to synchronize on.
-	// Retrying Advance is safe (idempotent — it only ever moves the fake
-	// clock further forward and fires whatever is due) and closes it
-	// completely: whichever attempt lands after loop() has actually armed
-	// its timer wins.
+	// See advanceClockUntilReconciliationSweepFires's doc comment for why a
+	// single Advance would race.
 	h.awaitLogCount("reconciliation sweep scheduled", 1)
 
 	mark := h.mark()
-	for attempt := 0; attempt < 5; attempt++ {
-		h.clock.Advance(time.Hour)
-		deadline := time.Now().Add(200 * time.Millisecond)
-		fired := false
-		for time.Now().Before(deadline) {
-			if strings.Contains(h.since(mark), "reconciliation sweep complete") {
-				fired = true
-				break
-			}
-			time.Sleep(2 * time.Millisecond)
-		}
-		if fired {
-			break
-		}
-	}
+	advanceClockUntilReconciliationSweepFires(t, h, mark, time.Hour)
 	h.awaitLogCount("reconciliation sweep complete", 1)
 	h.stop()
 
@@ -2815,13 +3005,15 @@ func TestDaemon_IdleCycleWithFileReportFindings_StaysWithinTheNoiseBudget(t *tes
 		return strings.Contains(h.out.String(), "reconciliation sweep scheduled")
 	})
 
+	// See advanceClockUntilReconciliationSweepFires's doc comment for why a
+	// single, unretried Advance races the daemon's own timer arming.
 	mark := h.mark()
-	h.clock.Advance(time.Hour)
+	advanceClockUntilReconciliationSweepFires(t, h, mark, time.Hour)
 	h.awaitLogCount("reconciliation sweep complete", 1)
 	cycle2 := h.since(mark)
 
 	mark3 := h.mark()
-	h.clock.Advance(time.Hour)
+	advanceClockUntilReconciliationSweepFires(t, h, mark3, time.Hour)
 	h.awaitLogCount("reconciliation sweep complete", 2)
 	cycle3 := h.since(mark3)
 	h.stop()
@@ -2872,10 +3064,24 @@ func TestDaemon_IdleCycleWithFileReportFindings_StaysWithinTheNoiseBudget(t *tes
 // the drift the binding Phase 10 branch review ordered this test to prevent.
 var fsMutationAllowlist = map[string]bool{}
 
-// fsMutationAPIs are the os-package calls that mutate the filesystem: create,
-// delete, rename, truncate, or open for writing. Named individually (not a
-// single "Remove|Rename|..." substring) so the failure message for each is
+// fsMutationAPIs are the calls that mutate the filesystem: create, delete,
+// rename, truncate, or open for writing. Named individually (not a single
+// "Remove|Rename|..." substring) so the failure message for each is
 // unambiguous about which one fired.
+//
+// [FIX] Originally os-package-only, extended to close the two likeliest
+// drift routes around it: shelling out (os/exec — a subprocess can mutate
+// the filesystem in ways no static scan of THIS tree could ever catch, so
+// the import itself is banned, not just one constructor call on it) and the
+// raw syscall package, which every os-package mutator above is a thin
+// wrapper over and could be called directly to bypass this exact list.
+// syscall.* is intentionally NOT banned as a bare prefix: daemon.go
+// legitimately calls signal.Notify(..., syscall.SIGTERM, syscall.SIGINT)
+// for graceful-shutdown signal handling, which has nothing to do with the
+// filesystem — a bare "syscall." ban would false-positive on that
+// pre-existing, correct code. Only the specific raw mutation calls (the
+// syscall-level twins of the os-package functions already listed) are
+// named.
 var fsMutationAPIs = []string{
 	"os.Remove(",
 	"os.RemoveAll(",
@@ -2886,14 +3092,38 @@ var fsMutationAPIs = []string{
 	"os.OpenFile(",
 	"os.Mkdir(",
 	"os.MkdirAll(",
+	"os.MkdirTemp(",
 	"os.Truncate(",
 	"os.Symlink(",
 	"os.Link(",
 	"os.Chmod(",
 	"os.Chown(",
+	"os.Chtimes(",
+	"os.Lchown(",
+	`"os/exec"`,
+	"exec.Command(",
+	"syscall.Unlink(",
+	"syscall.Rmdir(",
+	"syscall.Rename(",
+	"syscall.Mkdir(",
+	"syscall.Truncate(",
+	"syscall.Chmod(",
+	"syscall.Chown(",
+	"syscall.Symlink(",
+	"syscall.Link(",
 }
 
+// minScannedNonTestGoFiles is [FIX] the vacuity-guard floor for
+// TestTree_BansFilesystemMutationAPIsEverywhere: comfortably below this
+// project's actual non-test .go file count (15 as of this writing) so
+// ordinary file churn never trips it, but high enough that a walk finding
+// close to nothing — the working directory changing out from under the
+// test, a filter bug excluding everything real, WalkDir silently erroring
+// out on the first entry — cannot pass silently.
+const minScannedNonTestGoFiles = 10
+
 func TestTree_BansFilesystemMutationAPIsEverywhere(t *testing.T) {
+	scanned := 0
 	err := filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -2908,6 +3138,7 @@ func TestTree_BansFilesystemMutationAPIsEverywhere(t *testing.T) {
 		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
 			return nil
 		}
+		scanned++
 		src, err := os.ReadFile(path)
 		if err != nil {
 			return err
@@ -2923,6 +3154,18 @@ func TestTree_BansFilesystemMutationAPIsEverywhere(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("walking the tree: %v", err)
+	}
+
+	// [FIX] vacuity guard: without this, a walk that (for whatever reason)
+	// finds none of the project's real source files passes this audit
+	// forever, having verified nothing — an audit that can never see a
+	// real violation is worse than no audit at all, because it still looks
+	// green. TestTree_HasExactlyThreeWriteVerbCallSites (writer_test.go)
+	// gets this for free from its exact-count ("!= 3") assertion; this
+	// test's assertions are all per-file t.Errorf calls with no equivalent
+	// built-in floor, so the floor is made explicit here instead.
+	if scanned < minScannedNonTestGoFiles {
+		t.Fatalf("scanned only %d non-test .go file(s), want at least %d: this audit is vacuous unless the walk is actually finding the project's source", scanned, minScannedNonTestGoFiles)
 	}
 }
 

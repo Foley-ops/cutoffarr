@@ -412,11 +412,21 @@ func containingTrackedFolder(filePath string, folders map[string]string) (string
 func underExtrasDir(filePath, root string) bool {
 	dir := path.Dir(filePath)
 	for hasPathPrefix(dir, root) {
-		if extrasDirNames[strings.ToLower(path.Base(dir))] {
-			return true
-		}
+		// [FIX] dir==root must be checked BEFORE testing dir's own basename
+		// against extrasDirNames: a mapped root's basename is not a
+		// sub-folder name a file sits inside, it is the boundary of the
+		// walk itself. Testing the name first meant a root whose own
+		// basename happens to match one of the eleven Plex-convention
+		// extras names (e.g. /data/media/Shorts, /data/media/Other — all
+		// plausible real library names) matched the moment the climb
+		// reached the root, self-excluding every file under it, at any
+		// depth, as skipped-by-rule/extras — a whole root silently
+		// reporting duplicates=0 orphans=0, indistinguishable from clean.
 		if dir == root {
 			return false
+		}
+		if extrasDirNames[strings.ToLower(path.Base(dir))] {
+			return true
 		}
 		dir = path.Dir(dir)
 	}
@@ -598,16 +608,35 @@ func foldersUnderRoot(folders map[string]string, root string) []string {
 	return out
 }
 
-// sampleFileReportPaths deterministically samples up to n paths: the first n
-// of a slice the caller has already sorted. Simpler than
-// crossCheckSampleSize's stride sampling (decision.go) because heuristic (b)
-// only needs SOME evidence the root is healthy, not a representative spread —
-// any 100 tracked files existing (or not) answers the same question.
+// sampleFileReportPaths deterministically samples up to n paths, evenly
+// spread across the whole ALREADY-SORTED slice the caller passes in — the
+// string twin of sampleEveryKth (decision.go).
+//
+// [FIX] This used to head-slice (return sorted[:n]), on the reasoning that
+// heuristic (b) only needs SOME evidence the root is healthy, not a
+// representative spread. That reasoning missed how a real partial mount
+// fails: a mergerfs branch going down, or a per-letter split mount, drops a
+// contiguous ALPHABETICAL subtree of the library, not a random scatter of
+// files. A head-slice sample of the sorted tracked-path list is always the
+// alphabetically-first cluster, so such a share could pass heuristic (b)
+// cleanly — every one of the first n sorted paths present — while
+// everything past the sample window is entirely missing, and heuristic (c)
+// only catches TOTAL absence, not a partial one. Striding across the whole
+// slice means a subtree dropped anywhere in the alphabet shows up in the
+// sample.
 func sampleFileReportPaths(sorted []string, n int) []string {
 	if len(sorted) <= n {
 		return sorted
 	}
-	return sorted[:n]
+	step := len(sorted) / n
+	if step < 1 {
+		step = 1
+	}
+	sampled := make([]string, 0, n)
+	for i := 0; i < len(sorted) && len(sampled) < n; i += step {
+		sampled = append(sampled, sorted[i])
+	}
+	return sampled
 }
 
 // evaluateFileReportRoot applies the mount-problem heuristic to root and,
@@ -884,6 +913,16 @@ func buildRadarrTrackedSet(logger *slog.Logger, inst Instance, roots []mediaRoot
 	}
 	skipCounts := map[string]int{}
 
+	// [FIX] untrackedPathExample remembers only the FIRST item that ever
+	// triggers a FileSkipReasonUntrackedPath skip below (either half: an
+	// absent movie.path, or hasFile true/unknown with an unreadable
+	// movieFile.path) — see the deferred aggregate WARN at the bottom of
+	// this function for why. This is a build-time count/example only; the
+	// per-item detail is never lost, since skipCounts (and the
+	// always-INFO fileSkipReasons summary it feeds) still tallies every
+	// occurrence exactly.
+	untrackedPathExample := ""
+
 	for _, m := range movies {
 		title := titleOrAbsent(m.Title)
 		excluded := tagActive && (m.Tags == nil || containsTag(m.Tags, exclusionTagID))
@@ -902,8 +941,9 @@ func buildRadarrTrackedSet(logger *slog.Logger, inst Instance, roots []mediaRoot
 				skipCounts[FileSkipReasonOutsideConfiguredRoots]++
 			}
 		} else {
-			logger.Warn("file report: movie path absent; its folder cannot be protected from false-orphan classification for any extra files sitting in it",
-				"instance", inst.Name, "type", inst.Type, "title", title, "id", derefOrAbsent(m.ID), "reason", FileSkipReasonUntrackedPath)
+			if untrackedPathExample == "" {
+				untrackedPathExample = fmt.Sprintf("title=%q id=%v", title, derefOrAbsent(m.ID))
+			}
 			skipCounts[FileSkipReasonUntrackedPath]++
 		}
 
@@ -948,8 +988,9 @@ func buildRadarrTrackedSet(logger *slog.Logger, inst Instance, roots []mediaRoot
 			// so this never becomes a false ORPHAN either) but is now marked
 			// distrusted so extras — including the movie's own
 			// misclassified file — resolve to skipped-untrusted instead.
-			logger.Warn("file report: movie may have a file (hasFile is true or unknown) but its path is unreadable; its folder is withheld from duplicate candidacy so a real file is never misreported as a duplicate of itself",
-				"instance", inst.Name, "type", inst.Type, "title", title, "id", derefOrAbsent(m.ID), "reason", FileSkipReasonUntrackedPath)
+			if untrackedPathExample == "" {
+				untrackedPathExample = fmt.Sprintf("title=%q id=%v", title, derefOrAbsent(m.ID))
+			}
 			skipCounts[FileSkipReasonUntrackedPath]++
 			if folderKnown {
 				set.distrustedFolders[diskFolder] = true
@@ -957,7 +998,30 @@ func buildRadarrTrackedSet(logger *slog.Logger, inst Instance, roots []mediaRoot
 		}
 	}
 
+	warnAggregatedUntrackedPaths(logger, inst, skipCounts[FileSkipReasonUntrackedPath], untrackedPathExample)
 	return set, skipCounts
+}
+
+// warnAggregatedUntrackedPaths is the [FIX] per-item-WARN-flood fix: every
+// FileSkipReasonUntrackedPath occurrence used to log its own logger.Warn
+// call DURING tracked-set build — before either
+// warnIfInstanceTrackedSetEntirelyUnmapped or the per-root mount heuristics
+// ever get a chance to abort. If a speculatively-added *arr field name
+// (movie.path/movieFile.path/series.path/episodeFile.path) turns out wrong
+// at the live gate — the risk this whole untrusted-input posture exists
+// for — every item in the library would warn, potentially thousands of
+// lines per sweep, drowning the one abort WARN that actually matters. This
+// is ONE aggregated WARN per instance per build call, mirroring
+// warnIfAnyTrackedPathUnmapped's existing aggregation for the sibling
+// FileSkipReasonOutsideConfiguredRoots reason: the exact count is never
+// lost (skipCounts, and the always-INFO fileSkipReasons summary it feeds,
+// still tally every occurrence), only the WARN volume is bounded.
+func warnAggregatedUntrackedPaths(logger *slog.Logger, inst Instance, count int, example string) {
+	if count == 0 {
+		return
+	}
+	logger.Warn("file report: some tracked paths were unreadable and could not be fully protected from misclassification — see the per-instance summary's fileSkipReasons count for the exact total",
+		"instance", inst.Name, "type", inst.Type, "count", count, "example", example)
 }
 
 // --- scheduling + the off/skipped/ran summary vocabulary --------------------
@@ -1210,6 +1274,19 @@ func buildSonarrTrackedSet(ctx context.Context, logger *slog.Logger, client *API
 	}
 	skipCounts := map[string]int{}
 
+	// [FIX] untrackedPathExample, and the deferred warnAggregatedUntrackedPaths
+	// call below, are buildRadarrTrackedSet's per-item-WARN-flood fix
+	// (see its doc comment) applied here: series id absent, series path
+	// absent, and an episode file with an absent path all used to log
+	// their own logger.Warn call, per occurrence. Deferred so it still
+	// fires — with whatever count/example was accumulated so far — on
+	// every return path (shutdown, an episodefile fetch failure, or a
+	// normal completion), not just the happy one.
+	untrackedPathExample := ""
+	defer func() {
+		warnAggregatedUntrackedPaths(logger, inst, skipCounts[FileSkipReasonUntrackedPath], untrackedPathExample)
+	}()
+
 	for _, s := range series {
 		if ctx.Err() != nil {
 			logger.Info("shutdown requested: abandoning this instance's file-report tracked-set build",
@@ -1250,8 +1327,9 @@ func buildSonarrTrackedSet(ctx context.Context, logger *slog.Logger, client *API
 					// The folder now stays registered (so containment finds
 					// it) AND is marked distrusted, routing its files to
 					// skipped-untrusted — neither duplicate nor orphan.
-					logger.Warn("file report: series id absent; its episode files can never be fetched, so its folder is withheld from duplicate candidacy rather than becoming a false-duplicate (or, if left unregistered, a false-orphan) generator for every real episode it contains",
-						"instance", inst.Name, "type", inst.Type, "title", title, "reason", FileSkipReasonUntrackedPath)
+					if untrackedPathExample == "" {
+						untrackedPathExample = fmt.Sprintf("title=%q seriesId=absent", title)
+					}
 					skipCounts[FileSkipReasonUntrackedPath]++
 					set.distrustedFolders[diskFolder] = true
 				}
@@ -1259,8 +1337,9 @@ func buildSonarrTrackedSet(ctx context.Context, logger *slog.Logger, client *API
 				skipCounts[FileSkipReasonOutsideConfiguredRoots]++
 			}
 		} else {
-			logger.Warn("file report: series path absent; its folder cannot be protected from false-orphan classification for any extra files sitting in it",
-				"instance", inst.Name, "type", inst.Type, "title", title, "seriesId", derefOrAbsent(s.ID), "reason", FileSkipReasonUntrackedPath)
+			if untrackedPathExample == "" {
+				untrackedPathExample = fmt.Sprintf("title=%q seriesId=%v", title, derefOrAbsent(s.ID))
+			}
 			skipCounts[FileSkipReasonUntrackedPath]++
 		}
 
@@ -1289,8 +1368,9 @@ func buildSonarrTrackedSet(ctx context.Context, logger *slog.Logger, client *API
 				// location, so the whole series folder is marked
 				// distrusted rather than guessing that only this one
 				// record is affected.
-				logger.Warn("file report: episode file path absent; its series folder is withheld from duplicate candidacy so this file is not misreported as a duplicate",
-					"instance", inst.Name, "type", inst.Type, "series", title, "seriesId", *s.ID, "fileId", derefOrAbsent(f.ID), "reason", FileSkipReasonUntrackedPath)
+				if untrackedPathExample == "" {
+					untrackedPathExample = fmt.Sprintf("series=%q seriesId=%v fileId=%v", title, *s.ID, derefOrAbsent(f.ID))
+				}
 				skipCounts[FileSkipReasonUntrackedPath]++
 				if folderKnown {
 					set.distrustedFolders[diskFolder] = true
