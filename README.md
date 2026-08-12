@@ -52,6 +52,10 @@ that setup — copy them, don't retype them:
    missing host directory produces an empty, unwritable `/config` and the
    container exits at startup rather than silently running with no config.
 
+   `docker-compose.example.yml`'s `image:` already names cutoffarr's
+   published GHCR image, so no build step is required; uncomment its
+   `build: .` line instead if you'd rather build from source.
+
 2. Edit `config.yml`: list each Radarr/Sonarr instance under `instances:`
    with its real `url`, and reference its API key as `${SOME_ENV_VAR}` —
    never write a real key into this file. See
@@ -95,9 +99,10 @@ that setup — copy them, don't retype them:
 Prefer a single one-off pass over a long-running daemon (e.g. to sanity-check
 a config before committing to it)? The binary also supports `--once`, which
 runs one full scan and exits — this is how every phase of this project was
-tested. `docker run <image> --once` replaces the image's default `CMD`
-entirely, so it runs `/cutoffarr --once` against the same config path the
-image always defaults to.
+tested. `docker run ghcr.io/foley-ops/cutoffarr:latest --once` replaces the
+image's default `CMD` entirely, so it runs `/cutoffarr --once` against the
+same config path the image always defaults to (mount the same `/config`
+volume `docker-compose.yml` does, or it has nothing to read).
 
 ## Configuration reference
 

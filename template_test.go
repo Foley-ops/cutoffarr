@@ -74,14 +74,42 @@ func TestTemplate_IsWellFormedXML(t *testing.T) {
 }
 
 // TestTemplate_RepositoryPointsAtTheGHCRImage pins the one field the binding
-// resolution names outright, independent of anything docker-compose.example.yml
-// says (compose's own `image:` line is a local build tag, not this project's
-// published image).
+// resolution names outright: the published GHCR image release.yml pushes on
+// a tag push.
 func TestTemplate_RepositoryPointsAtTheGHCRImage(t *testing.T) {
 	tmpl := parseUnraidTemplate(t)
 	const want = "ghcr.io/foley-ops/cutoffarr"
 	if tmpl.Repository != want {
 		t.Errorf("Repository = %q, want %q", tmpl.Repository, want)
+	}
+}
+
+// TestTemplate_AgreesWithComposeExample_Image closes the gap the Phase 9
+// branch review found: docker-compose.example.yml's own `image:` line used
+// to be the bare local tag `cutoffarr:latest`, which Docker resolves to
+// docker.io/library/cutoffarr — nowhere — and fails "pull access denied /
+// repository does not exist" for anyone who follows the README's compose
+// quick start verbatim, even though this file's Repository already named
+// the real published image. Now that docker-compose.example.yml points at
+// the same GHCR image, this pins the two from drifting apart again: the
+// compose repository (everything before the `:tag`) must equal the
+// template's Repository. Each file is still free to pin its own tag
+// independently (`latest` vs. a specific `vX.Y.Z`).
+func TestTemplate_AgreesWithComposeExample_Image(t *testing.T) {
+	tmpl := parseUnraidTemplate(t)
+
+	compose := readRepoFile(t, "docker-compose.example.yml")
+	m := regexp.MustCompile(`(?m)^\s*image:\s*(\S+)\s*$`).FindStringSubmatch(uncommented(compose))
+	if m == nil {
+		t.Fatalf("docker-compose.example.yml must set an image: line:\n%s", compose)
+	}
+	composeImage := m[1]
+	composeRepo, _, ok := strings.Cut(composeImage, ":")
+	if !ok {
+		t.Fatalf("docker-compose.example.yml's image %q has no :tag", composeImage)
+	}
+	if composeRepo != tmpl.Repository {
+		t.Errorf("docker-compose.example.yml's image repository is %q but the template's Repository is %q; they must name the same published image (a bare local tag like cutoffarr:latest resolves to docker.io/library/cutoffarr and does not exist)", composeRepo, tmpl.Repository)
 	}
 }
 
