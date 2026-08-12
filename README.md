@@ -178,6 +178,22 @@ deliberately small and independently checked, not just documented:
   no write anywhere calls anything that deletes, imports, renames, or
   triggers a search — `deleteFiles` and `/api/v3/command` are never
   touched.
+- **`monitored: true` is written by one pass only, and only if you switch it
+  on.** Everything above describes both directions, because both go through
+  the same three sites; this is what is additionally true of the reverse one.
+  Re-monitoring exists solely behind `reverse_scan_remonitor` (default
+  `false`), and with that switch off the reverse pass composes no write at all
+  — not a gated one, not a rehearsed one. With it on, three further conditions
+  hold, each of them a refusal that is logged and counted rather than a silent
+  skip: the cycle's cross-check must have **passed and actually verified
+  something**; the decision is **re-run against a fresh fetch** and the write
+  refused unless the item still fails its own profile's criteria; and a Sonarr
+  season is re-monitored only when its **series is monitored** and **every
+  episode under it is unmonitored** — the clean shape an accidental unmonitor
+  leaves. A series-level `monitored` flag is never written in either
+  direction, ever. See [The reverse scan](#the-reverse-scan) for what it finds
+  and [Trying it on one item first](#trying-it-on-one-item-first) for how to
+  test it against a single item before trusting it with a library.
 - **A Sonarr season write is atomic with respect to shutdown.** Unmonitoring
   a season is two sequential API calls (the episodes, then the season flag),
   and the state in between — episodes unmonitored, season still monitored —
@@ -185,7 +201,11 @@ deliberately small and independently checked, not just documented:
   leave behind. That pair is deliberately detached from Go's own
   cancellation (`context.WithoutCancel`) so it always completes or never
   starts, and a dedicated recovery pass on the next cycle finishes any pair
-  a hard kill did interrupt.
+  a hard kill did interrupt. Re-monitoring a season is the same two calls and
+  the same detachment, but there is no recovery pass in that direction: an
+  interrupted re-monitor is *reported* every cycle from then on and never
+  finished automatically, because the state it leaves is indistinguishable
+  from one you made by hand ([The reverse scan](#the-reverse-scan)).
   <br><br>
   That guarantee only holds if the *process* is given time to finish the
   item it's mid-way through before it's killed, which is why
