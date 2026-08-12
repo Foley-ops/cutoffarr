@@ -803,6 +803,27 @@ func TestRunRadarrFileReport_FindingsAreCountedAndAbortedRootIsSkipped(t *testin
 	}
 }
 
+// TestRunRadarrFileReport_ShutdownBetweenRootsAbandonsRemainingRoots pins the
+// same shutdown boundary daemon.go's runScanCycle draws BETWEEN instances,
+// applied here between a multi-root instance's own roots: a cancelled
+// context stops the loop before touching a root it had not yet reached,
+// rather than reporting a partial picture as though it were complete.
+func TestRunRadarrFileReport_ShutdownBetweenRootsAbandonsRemainingRoots(t *testing.T) {
+	dir := t.TempDir()
+	inst := Instance{Name: "radarr-main", Type: "radarr", MediaRootMap: map[string]string{"/movies": dir}}
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("Movie A"), HasFile: boolPtr(false), Path: strPtr("/movies/Movie A")},
+	}
+	logger, _ := newFileReportTestLogger(slog.LevelDebug)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c := runRadarrFileReport(ctx, logger, slog.LevelInfo, inst, movies)
+	if c.state() != "skipped" {
+		t.Errorf("state() = %q, want skipped: a cancelled context must abandon the remaining roots rather than report a partial picture", c.state())
+	}
+}
+
 func TestFileReportCounts_State(t *testing.T) {
 	cases := []struct {
 		name string

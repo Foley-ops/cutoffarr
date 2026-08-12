@@ -668,7 +668,7 @@ func buildRadarrTrackedSet(logger *slog.Logger, inst Instance, roots []mediaRoot
 			}
 		} else {
 			logger.Warn("file report: movie path absent; its folder cannot be protected from false-orphan classification for any extra files sitting in it",
-				"instance", inst.Name, "type", inst.Type, "title", title, "id", derefOrAbsent(m.ID))
+				"instance", inst.Name, "type", inst.Type, "title", title, "id", derefOrAbsent(m.ID), "reason", FileSkipReasonUntrackedPath)
 		}
 
 		if m.HasFile != nil && *m.HasFile {
@@ -678,7 +678,7 @@ func buildRadarrTrackedSet(logger *slog.Logger, inst Instance, roots []mediaRoot
 				}
 			} else {
 				logger.Warn("file report: movie has a file but its path is unreadable; it cannot be added to the tracked set, and the file itself risks being reported as an orphan",
-					"instance", inst.Name, "type", inst.Type, "title", title, "id", derefOrAbsent(m.ID))
+					"instance", inst.Name, "type", inst.Type, "title", title, "id", derefOrAbsent(m.ID), "reason", FileSkipReasonUntrackedPath)
 			}
 		}
 	}
@@ -889,7 +889,7 @@ func buildSonarrTrackedSet(ctx context.Context, logger *slog.Logger, client *API
 			}
 		} else {
 			logger.Warn("file report: series path absent; its folder cannot be protected from false-orphan classification for any extra files sitting in it",
-				"instance", inst.Name, "type", inst.Type, "title", title, "seriesId", derefOrAbsent(s.ID))
+				"instance", inst.Name, "type", inst.Type, "title", title, "seriesId", derefOrAbsent(s.ID), "reason", FileSkipReasonUntrackedPath)
 		}
 
 		if s.ID == nil || !relevant {
@@ -905,7 +905,7 @@ func buildSonarrTrackedSet(ctx context.Context, logger *slog.Logger, client *API
 		for _, f := range files {
 			if f.Path == nil || strings.TrimSpace(*f.Path) == "" {
 				logger.Warn("file report: episode file path absent; it cannot be added to the tracked set, and the file itself risks being reported as an orphan",
-					"instance", inst.Name, "type", inst.Type, "series", title, "seriesId", *s.ID, "fileId", derefOrAbsent(f.ID))
+					"instance", inst.Name, "type", inst.Type, "series", title, "seriesId", *s.ID, "fileId", derefOrAbsent(f.ID), "reason", FileSkipReasonUntrackedPath)
 				continue
 			}
 			if diskFile, ok := mapArrPathToAnyRoot(*f.Path, roots); ok {
