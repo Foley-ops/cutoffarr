@@ -907,7 +907,11 @@ func recoveryAllowed(cc crossCheckResult, d seasonDecision) bool {
 //     completed write leaves behind and is unverifiable by construction, so
 //     the gate would otherwise block its own retry forever; it is safe
 //     because unmonitoring such a season cannot strand anything. Every other
-//     pending season of the instance is still withheld.
+//     pending season of the instance is still withheld, and every write the
+//     allowance admits names itself on its own msg=unmonitor line
+//     (recovery=true, the gate reason it bypassed, and why) — a write made
+//     without cross-check authorization must be identifiable per season, not
+//     only counted per instance.
 //
 //   - The decision's wouldUnmonitor bool. Never its reason text.
 //
@@ -1054,8 +1058,27 @@ func runSonarrWritePass(ctx context.Context, logger *slog.Logger, client *APICli
 		}
 
 		unmonitored++
-		logger.Info("unmonitor",
-			"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season, "reason", d.reason, "profile", d.profileName)
+		writeAttrs := []any{"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season, "reason", d.reason, "profile", d.profileName}
+		if recoveryOnly {
+			// REVIEW FIX (round 3): the allowance is the ONE path in this
+			// project that writes without cross-check authorization, so it
+			// must be the best-attributed, not the worst. The blocked-gate
+			// WARN above carries recoveryWrites=N — a count, which on a run
+			// with three allowance writes among eight pending seasons proves
+			// that three happened and never which three. The marker goes on
+			// the write's own line, together with the gate reason it bypassed
+			// and why bypassing it was permitted, so one grep separates every
+			// unauthorized write from every authorized one.
+			//
+			// It marks the BYPASS, not the signature: a season matching
+			// seasonWriteRecoverySignature written through an OPEN gate is an
+			// ordinary write and its line stays identical to the Radarr twin's.
+			writeAttrs = append(writeAttrs,
+				"recovery", true,
+				"gateBlocked", gateBlocked,
+				"recoveryReason", "the cross-check gate was shut; this season was admitted by the recovery allowance because every one of its episodes was already unmonitored, so unmonitoring it cannot strand anything")
+		}
+		logger.Info("unmonitor", writeAttrs...)
 	}
 
 	return unmonitored, writeErrors, echoUnverified, writesRefused, withheld

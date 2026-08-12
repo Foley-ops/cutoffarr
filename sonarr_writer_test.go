@@ -574,6 +574,92 @@ func TestUnmonitorSeason_SeriesEchoSaysStillMonitored_IsAWriteError(t *testing.T
 	}
 }
 
+// TestUnmonitorSeason_SeriesEchoShapesThatCannotConfirm covers the season
+// echo's "cannot tell" shapes one at a time, and exists because they were only
+// ever covered transitively by the empty-body case above.
+//
+// The first case is the load-bearing one (REVIEW FIX, round 3): the echo's
+// IDENTITY check had NO test at all — every echo fixture in this suite returned
+// the right id, so deleting verifySeriesIdentity from verifySeasonWriteEcho left
+// the whole suite green. That check is binding (controller resolution 2:
+// "identity-check the echo (series id)") precisely because this echo is the ONLY
+// evidence the project accepts that a write landed: a proxy, redirect, or cache
+// answering the PUT with a DIFFERENT series' object that happens to carry this
+// season number as monitored:false would otherwise be logged msg=unmonitor and
+// counted unmonitored=1 for a write that never happened. The next cycle would
+// self-heal, but the report the live acceptance is read from would already be
+// false.
+//
+// Every case here must be errWriteUnverified — "cannot confirm", never "confirmed
+// failure" — because none of them is the server saying the season is still
+// monitored.
+func TestUnmonitorSeason_SeriesEchoShapesThatCannotConfirm(t *testing.T) {
+	cases := []struct {
+		name        string
+		echo        string
+		wantInError string
+	}{{
+		name:        "another series' object",
+		echo:        `{"id":4,"monitored":true,"seasons":[{"seasonNumber":1,"monitored":false}]}`,
+		wantInError: "series 4",
+	}, {
+		name:        "no id at all",
+		echo:        `{"monitored":true,"seasons":[{"seasonNumber":1,"monitored":false}]}`,
+		wantInError: "unidentifiable",
+	}, {
+		name:        "no seasons key",
+		echo:        `{"id":3,"monitored":true}`,
+		wantInError: `"seasons"`,
+	}, {
+		name:        "seasons is not an array",
+		echo:        `{"id":3,"monitored":true,"seasons":{"seasonNumber":1}}`,
+		wantInError: `"seasons"`,
+	}, {
+		name:        "the target season is not mentioned",
+		echo:        `{"id":3,"monitored":true,"seasons":[{"seasonNumber":2,"monitored":false}]}`,
+		wantInError: "does not mention this season",
+	}, {
+		name:        "the target season's monitored is JSON null",
+		echo:        `{"id":3,"monitored":true,"seasons":[{"seasonNumber":1,"monitored":null}]}`,
+		wantInError: "does not confirm",
+	}, {
+		name:        "not a JSON object",
+		echo:        `[{"id":3}]`,
+		wantInError: "not a JSON object",
+	}}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newSonarrWriterFake(t, sonarrWriterSeriesJSON, sonarrWriterEpisodesJSON)
+			echo := tc.echo
+			fake.seriesPutEcho = &echo
+			logger, _ := newDecisionTestLogger(slog.LevelInfo)
+
+			written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+			if written {
+				t.Error("written = true, want false: only an echo this series confirmed may be counted as a write")
+			}
+			if !errors.Is(err, errWriteUnverified) {
+				t.Fatalf("err = %v, want an errWriteUnverified-wrapped error", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantInError) {
+				t.Errorf("error must say what could not be confirmed (want %q):\n%v", tc.wantInError, err)
+			}
+			// The unconfirmable echo arrives AFTER both writes went out, so the
+			// episode call is expected; what must not happen is a retry.
+			seriesPuts := 0
+			for _, w := range fake.writes() {
+				if w.path == "/api/v3/series/3" {
+					seriesPuts++
+				}
+			}
+			if seriesPuts != 1 {
+				t.Errorf("series PUT attempts = %d, want exactly 1 (never retried within a cycle)", seriesPuts)
+			}
+		})
+	}
+}
+
 // TestUnmonitorSeason_EpisodeEchoDoesNotConfirm_WithholdsTheSeasonWrite is the
 // other half of the same rule, on the other call — and the CRITICAL review-round
 // correction to it.
@@ -1173,6 +1259,63 @@ func TestRunSonarrWritePass_GateBlocked_RecoverySeasonIsStillWritten(t *testing.
 	}
 	if !strings.Contains(buf.String(), "recoveryWrites=1") {
 		t.Errorf("the blocked-gate line must say how many seasons the allowance admitted:\n%s", buf.String())
+	}
+	// REVIEW FIX (round 3): the instance-level count says how many, never
+	// which. The one write in this project that happens without cross-check
+	// authorization must be identifiable from its OWN line, or a run with
+	// three allowance writes among eight pending seasons proves that three
+	// happened and nothing more.
+	unmonitorLine := ""
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if strings.Contains(line, "msg=unmonitor ") {
+			unmonitorLine = line
+		}
+	}
+	if unmonitorLine == "" {
+		t.Fatalf("expected an msg=unmonitor line for the recovery season:\n%s", buf.String())
+	}
+	if !strings.Contains(unmonitorLine, "recovery=true") {
+		t.Errorf("the unmonitor line for an allowance write must mark itself recovery=true:\n%s", unmonitorLine)
+	}
+	if !strings.Contains(unmonitorLine, "gateBlocked=") {
+		t.Errorf("the unmonitor line for an allowance write must name the gate reason it bypassed:\n%s", unmonitorLine)
+	}
+	if !strings.Contains(unmonitorLine, "recoveryReason=") {
+		t.Errorf("the unmonitor line for an allowance write must carry the allowance's justification:\n%s", unmonitorLine)
+	}
+	if !strings.Contains(unmonitorLine, "season=1") {
+		t.Errorf("the allowance write's line must name WHICH season it wrote:\n%s", unmonitorLine)
+	}
+}
+
+// TestRunSonarrWritePass_GateOpen_OrdinaryWriteIsNeverMarkedRecovery is the
+// other half of the marker's meaning. recovery=true says "this write bypassed
+// the cross-check gate" — NOT "this season matched the allowance's signature".
+// With the gate open, the same season 1 whose episodes are all unmonitored is
+// an ordinary, fully authorized write, and its line must be
+// indistinguishable from any other Sonarr write (and from the Radarr twin's).
+// Without this, a reader who greps recovery=true still could not tell an
+// unauthorized write from an authorized one.
+func TestRunSonarrWritePass_GateOpen_OrdinaryWriteIsNeverMarkedRecovery(t *testing.T) {
+	fake := sonarrRecoveryFixture(t)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	// An explicit pass with would-unmonitor evidence: the gate is OPEN.
+	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 2, writeVerified: 2}
+	unmonitored, writeErrors, echoUnverified, refused, withheld := runSonarrWritePass(
+		context.Background(), logger, fake.client(), fake.instance(), sonarrRecoveryDecisions(), cc, 0, false, false)
+
+	if unmonitored != 2 {
+		t.Fatalf("unmonitored = %d, want 2 (an open gate writes both pending seasons):\n%s", unmonitored, buf.String())
+	}
+	if writeErrors+echoUnverified+refused+withheld != 0 {
+		t.Errorf("writeErrors/echoUnverified/refused/withheld = %d/%d/%d/%d, want all 0", writeErrors, echoUnverified, refused, withheld)
+	}
+	if strings.Contains(buf.String(), "recovery=true") {
+		t.Errorf("a gate-authorized write must never carry the allowance marker:\n%s", buf.String())
+	}
+	if strings.Contains(buf.String(), "recoveryWrites=") {
+		t.Errorf("an open gate logs no blocked-gate line at all:\n%s", buf.String())
 	}
 }
 
