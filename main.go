@@ -169,11 +169,46 @@ func run(args []string, stdout, stderr io.Writer) int {
 			if instanceSet && inst.Name != *instanceName {
 				continue
 			}
+			// REVIEW FIX (Phase 6 final round, F4, controller ruling):
+			// --only-id is a radarr movie id in this phase (Sonarr gets its
+			// own meaning in Phase 7). Without this guard, a mixed
+			// radarr+sonarr config's --once --only-id run would still run a
+			// FULL unscoped sonarr library report for every sonarr
+			// instance — the flag silently failing to scope half the run,
+			// in a phase whose --instance/--only-id checks above go out of
+			// their way to refuse exactly that kind of silent evaporation
+			// elsewhere. Least-surprise: a targeted run must never fan out
+			// into a full unscoped Sonarr report, so the instance is
+			// skipped entirely — not contacted at all, not even for
+			// connectivity — with one INFO line saying so per sonarr
+			// instance.
+			if onlyIDSet && inst.Type == "sonarr" {
+				logger.Info("--only-id is a radarr-scoped flag; skipping this sonarr instance for the cycle",
+					"instance", inst.Name, "type", inst.Type, "onlyId", *onlyID)
+				continue
+			}
 			ok := checkInstanceConnectivity(context.Background(), logger, inst)
 			if ok && inst.Type == "radarr" {
 				movies, wantedIDs, dataOK := inspectRadarrLibrary(context.Background(), logger, inst, samples)
 				if dataOK {
 					runRadarrDecisionEngine(context.Background(), logger, inst, movies, wantedIDs, cfg.ExclusionTag, *onlyID, cfg.DryRun)
+				}
+			}
+			// Phase 6: the Sonarr equivalent of the two Radarr steps above —
+			// read the library (series + paged wanted/cutoff), then evaluate
+			// every monitored series' monitored seasons against the season
+			// decision rule and report. Unlike Radarr, there is no write
+			// pass and no --only-id/dry-run threading here at all: Sonarr
+			// writes arrive in Phase 7, and this phase's binding scope guard
+			// is that no code path may compose a write, series-level or
+			// otherwise. cfg.DryRun and *onlyID are therefore never passed
+			// to runSonarrDecisionEngine's signature — a bug that made this
+			// phase write anything would have to fight the type system to
+			// do it, not merely forget a check.
+			if ok && inst.Type == "sonarr" {
+				series, wantedEpisodeIDs, wantedSeasons, dataOK := inspectSonarrLibrary(context.Background(), logger, inst)
+				if dataOK {
+					runSonarrDecisionEngine(context.Background(), logger, inst, series, wantedEpisodeIDs, wantedSeasons, cfg.ExclusionTag)
 				}
 			}
 		}

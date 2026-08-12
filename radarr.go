@@ -96,15 +96,22 @@ func movieFileQualityName(mf *movieFileElement) *string {
 	return mf.Quality.Quality.Name
 }
 
-// wantedCutoffPage decodes the /api/v3/wanted/cutoff envelope. Per plan §5,
-// an entirely absent totalRecords means paging cannot be done safely (we
-// cannot tell when to stop) and is treated as malformed per §2.6: warn and
-// skip the instance for the cycle.
-type wantedCutoffPage struct {
-	TotalRecords *int                  `json:"totalRecords"`
-	Records      *[]wantedCutoffRecord `json:"records"`
+// wantedCutoffEnvelope decodes the /api/v3/wanted/cutoff paging envelope
+// shared by Radarr (movies) and Sonarr (episodes, Phase 6): only the paging
+// shape (page/totalRecords/records) is common between them, so Records is
+// left as raw JSON here and decoded into the endpoint-specific record shape
+// by each caller's own handleRecord callback (see fetchWantedCutoffPages).
+// Per plan §5, an entirely absent totalRecords means paging cannot be done
+// safely (we cannot tell when to stop) and is treated as malformed per
+// §2.6: warn and skip the instance for the cycle.
+type wantedCutoffEnvelope struct {
+	TotalRecords *int               `json:"totalRecords"`
+	Records      *[]json.RawMessage `json:"records"`
 }
 
+// wantedCutoffRecord decodes one Radarr /api/v3/wanted/cutoff record: a
+// movie, identified minimally by id (title is kept only for the
+// missing-id warning's context).
 type wantedCutoffRecord struct {
 	ID    *int    `json:"id"`
 	Title *string `json:"title"`
@@ -224,6 +231,31 @@ func fetchMovies(ctx context.Context, logger *slog.Logger, client *APIClient, in
 			return counts, nil, nil, false
 		}
 
+		// REVIEW FIX (Phase 6, carried forward from the phase-5 branch
+		// review): movieListElement.Tags is *[]int, so the struct decode
+		// above already tells "tags absent" apart from "tags present" — but
+		// a *[]int destination still silently turns a null ARRAY ELEMENT
+		// ("tags": [3, null, 9]) into tag id 0 with no decode error at all,
+		// since encoding/json leaves a non-pointer destination at its zero
+		// value when it meets JSON null. Re-inspecting the raw "tags" bytes
+		// through decodeTagIDs (shared.go), which decodes through []*int
+		// first specifically to make a null element visible, catches what
+		// the struct decode cannot. This is per-movie, not instance-fatal
+		// (unlike the decode failure above): the movie's Tags is normalized
+		// back to nil, exactly what "tags": null already produces, so it
+		// flows into decision.go rule 4's already-correct, already-tested
+		// untrusted-tags handling instead of silently trusting a corrupted
+		// array.
+		if m.Tags != nil {
+			if rawTags, found := rawObjectField(raw, "tags"); found {
+				if _, err := decodeTagIDs(rawTags); err != nil {
+					logger.Warn("movie tags array contains an unusable element (e.g. JSON null); treating tags as unverifiable",
+						"instance", inst.Name, "type", inst.Type, "title", titleOrAbsent(m.Title), "error", err)
+					m.Tags = nil
+				}
+			}
+		}
+
 		counts.total++
 		if m.Monitored != nil && *m.Monitored {
 			counts.monitored++
@@ -312,35 +344,40 @@ func logSampleMovies(logger *slog.Logger, inst Instance, samples []string, match
 	}
 }
 
-// fetchWantedCutoff fully pages GET /api/v3/wanted/cutoff (pageSize=100),
-// returning the set of movie ids it contains. Defensive paging, per this
-// phase's binding requirements:
+// fetchWantedCutoffPages fully pages GET /api/v3/wanted/cutoff
+// (pageSize=100), invoking handleRecord once per raw record element in page
+// order, and owns nothing about what a record MEANS — that is entirely up
+// to the caller's handleRecord (a movie for Radarr, an episode for Sonarr;
+// see fetchWantedCutoff below and fetchSonarrWantedCutoff in sonarr.go).
+// What this function owns is the paging machinery both endpoints share
+// (mandated refactor, generalized further in Phase 6 rather than forking a
+// second copy for Sonarr): the defensive completeness contract —
+//
 //   - totalRecords absent from the first page's envelope means paging
 //     cannot be done safely; warn and skip the instance for the cycle
 //     (ok=false), same as any other malformed response.
 //   - a page returning 0 records ends paging; if fewer records were fetched
-//     than totalRecords claimed, the resulting id set is only partial.
+//     than totalRecords claimed, the result is only partial.
 //   - a hard cap of maxWantedCutoffPages bounds the loop; hitting it without
-//     reaching totalRecords also leaves the id set partial.
-//   - any record missing its id can never be added to the set and can never
-//     be reconstructed, so the set is not authoritative from that point on.
+//     reaching totalRecords also leaves the result partial.
+//   - handleRecord returning false makes the WHOLE result untrustworthy from
+//     that point on (mirrors a Radarr record missing its id, or a Sonarr
+//     record missing seriesId/seasonNumber: without the field the record can
+//     never be reconstructed, so nothing built from it can be authoritative)
+//     — handleRecord is responsible for logging its own specific reason
+//     before returning false, since only it knows what shape it expected.
 //
 // completeness contract (mandated refactor, extended by a controller-
-// mandated fix to also cover the third case above): an incomplete or
-// untrustworthy id set — any of the three cases above — must return
-// ok=false (warn + instance skipped), never a partial map with ok=true.
-// The decision engine (Phase 3)
-// treats absence from this set as "would-unmonitor"; a partial set would
-// silently manufacture false positives in that dangerous direction (a
-// movie merely missing from an incomplete fetch would look exactly like
-// one whose quality cutoff is genuinely met), so it must never be handed
-// off as if it were the whole truth.
-func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance) (map[int]bool, bool) {
-	ids := make(map[int]bool)
-	var totalRecords int
-	fetched := 0
+// mandated fix to also cover the handleRecord-false case): an incomplete or
+// untrustworthy result — any of the above — returns ok=false (warn +
+// instance skipped), never a partial success. Both callers' decision
+// engines treat absence from their derived set as "would-unmonitor"; a
+// partial result would silently manufacture false positives in that
+// dangerous direction, so it must never be handed off as if it were the
+// whole truth.
+func fetchWantedCutoffPages(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, handleRecord func(page int, raw json.RawMessage) bool) (fetched, totalRecords int, ok bool) {
 	completed := false
-	// endedEarly distinguishes, for the post-loop incomplete-set warning,
+	// endedEarly distinguishes, for the post-loop incomplete-result warning,
 	// "stopped because a page returned 0 records before totalRecords was
 	// reached" (already warned about specifically inside the loop above)
 	// from "ran out of the maxWantedCutoffPages budget" (warned about
@@ -358,14 +395,14 @@ func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClie
 		if err != nil {
 			logger.Warn("skipping instance: wanted/cutoff request failed",
 				"instance", inst.Name, "type", inst.Type, "page", page, "error", err)
-			return nil, false
+			return 0, 0, false
 		}
 
-		var envelope wantedCutoffPage
+		var envelope wantedCutoffEnvelope
 		if err := json.Unmarshal(body, &envelope); err != nil {
 			logger.Warn("skipping instance: wanted/cutoff response is not valid JSON",
 				"instance", inst.Name, "type", inst.Type, "page", page, "error", err)
-			return nil, false
+			return 0, 0, false
 		}
 
 		// An entirely absent "records" key is malformed per §2.6: there is
@@ -377,7 +414,7 @@ func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClie
 		if envelope.Records == nil {
 			logger.Warn("skipping instance: wanted/cutoff response missing records",
 				"instance", inst.Name, "type", inst.Type, "page", page)
-			return nil, false
+			return 0, 0, false
 		}
 		records := *envelope.Records
 
@@ -385,7 +422,7 @@ func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClie
 			if envelope.TotalRecords == nil {
 				logger.Warn("skipping instance: wanted/cutoff response missing totalRecords",
 					"instance", inst.Name, "type", inst.Type)
-				return nil, false
+				return 0, 0, false
 			}
 			totalRecords = *envelope.TotalRecords
 		}
@@ -393,7 +430,7 @@ func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClie
 		if len(records) == 0 {
 			if fetched != totalRecords {
 				// Leave completed=false: fewer records were fetched than
-				// totalRecords claimed, so the id set below is only
+				// totalRecords claimed, so the result below is only
 				// partial. Per the completeness contract this must not be
 				// returned as ok=true; the check after the loop handles it.
 				logger.Warn("wanted/cutoff paging stopped: page returned 0 records before totalRecords was reached",
@@ -405,25 +442,10 @@ func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClie
 			break
 		}
 
-		for _, r := range records {
-			if r.ID == nil {
-				// Without an id this record can't be cross-referenced
-				// against the /movie library at all; title is the only
-				// other identifying information the envelope carries, so
-				// it is the natural context to report here. This makes the
-				// whole id set non-authoritative — there is no way to
-				// recover which movie this record meant, so its true
-				// cutoff-not-met membership can never be reconstructed —
-				// which is the same "partial set masquerading as complete"
-				// hazard refactor (a) guards against for the
-				// empty-page-early and page-cap cases: warn and skip the
-				// instance for the cycle instead of silently returning an
-				// incomplete set as if it were the whole truth.
-				logger.Warn("skipping instance: wanted/cutoff record missing id field; id set cannot be trusted",
-					"instance", inst.Name, "type", inst.Type, "page", page, "title", derefOrAbsent(r.Title))
-				return nil, false
+		for _, raw := range records {
+			if !handleRecord(page, raw) {
+				return 0, 0, false
 			}
-			ids[*r.ID] = true
 		}
 		fetched += len(records)
 
@@ -440,6 +462,48 @@ func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClie
 		}
 		logger.Warn("skipping instance: wanted/cutoff id set is incomplete",
 			"instance", inst.Name, "type", inst.Type, "fetched", fetched, "totalRecords", totalRecords)
+		return 0, 0, false
+	}
+
+	return fetched, totalRecords, true
+}
+
+// fetchWantedCutoff fully pages GET /api/v3/wanted/cutoff via
+// fetchWantedCutoffPages, returning the set of movie ids it contains. A
+// record missing its id can never be added to the set and can never be
+// reconstructed, so it makes the whole set non-authoritative (handleRecord
+// returns false, which fetchWantedCutoffPages treats as instance-fatal —
+// see its doc comment for the completeness contract this preserves).
+func fetchWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance) (map[int]bool, bool) {
+	ids := make(map[int]bool)
+
+	fetched, totalRecords, ok := fetchWantedCutoffPages(ctx, logger, client, inst, func(page int, raw json.RawMessage) bool {
+		var r wantedCutoffRecord
+		if err := json.Unmarshal(raw, &r); err != nil {
+			logger.Warn("skipping instance: wanted/cutoff record is not valid JSON",
+				"instance", inst.Name, "type", inst.Type, "page", page, "error", err)
+			return false
+		}
+		if r.ID == nil {
+			// Without an id this record can't be cross-referenced against
+			// the /movie library at all; title is the only other
+			// identifying information the envelope carries, so it is the
+			// natural context to report here. This makes the whole id set
+			// non-authoritative — there is no way to recover which movie
+			// this record meant, so its true cutoff-not-met membership can
+			// never be reconstructed — which is the same "partial set
+			// masquerading as complete" hazard refactor (a) guards against
+			// for the empty-page-early and page-cap cases: warn and skip
+			// the instance for the cycle instead of silently returning an
+			// incomplete set as if it were the whole truth.
+			logger.Warn("skipping instance: wanted/cutoff record missing id field; id set cannot be trusted",
+				"instance", inst.Name, "type", inst.Type, "page", page, "title", derefOrAbsent(r.Title))
+			return false
+		}
+		ids[*r.ID] = true
+		return true
+	})
+	if !ok {
 		return nil, false
 	}
 

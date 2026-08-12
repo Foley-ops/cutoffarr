@@ -385,6 +385,43 @@ func TestInspectRadarrLibrary_PresentEmptyTagsField_NoWarn(t *testing.T) {
 	}
 }
 
+// TestInspectRadarrLibrary_TagsArrayContainsNullElement_NormalizedToAbsent
+// pins the null-ARRAY-ELEMENT corner (REVIEW FIX, Phase 6, carried forward
+// from the phase-5 branch review): "tags": [3, null, 9] decodes cleanly
+// through movieListElement's *[]int field with NO error at all — a plain
+// []int destination silently turns a null element into tag id 0 — so
+// without an explicit check, a movie whose tags array is corrupted this way
+// would look exactly like a real "tags": [3, 0, 9]. Rather than aborting the
+// whole /movie fetch (the existing behavior for a movie element that fails
+// to decode at all), a detected null element normalizes THIS movie's Tags
+// back to nil so it flows into the already-correct, already-tested "tags
+// absent" untrusted-input handling (decision.go rule 4) instead of silently
+// treating the corrupted array as trustworthy.
+func TestInspectRadarrLibrary_TagsArrayContainsNullElement_NormalizedToAbsent(t *testing.T) {
+	moviesJSON := `[{"id": 1, "title": "Corrupted Tags Movie", "monitored": true, "hasFile": true, "qualityProfileId": 1, "tags": [3, null, 9]}]`
+	var gotRequests []string
+	srv := radarrTestServer(t, http.StatusOK, moviesJSON, staticWantedCutoffHandler(http.StatusOK, emptyWantedCutoffJSON), &gotRequests)
+	defer srv.Close()
+
+	logger, buf := newRadarrTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	movies, _, ok := inspectRadarrLibrary(context.Background(), logger, inst, nil)
+	if !ok {
+		t.Fatalf("inspectRadarrLibrary returned ok=false, want true (a corrupted tags array is per-movie, not instance-fatal):\n%s", buf.String())
+	}
+	if len(movies) != 1 {
+		t.Fatalf("expected 1 movie, got %d", len(movies))
+	}
+	if movies[0].Tags != nil {
+		t.Errorf("expected Tags to be normalized to nil after a null array element was detected, got %v", *movies[0].Tags)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "Corrupted Tags Movie") {
+		t.Errorf("expected a warning naming the movie whose tags array contained a null element:\n%s", out)
+	}
+}
+
 func TestInspectRadarrLibrary_MovieRequestNonTwoxx_SkipsInstanceWithWarning(t *testing.T) {
 	var gotRequests []string
 	srv := radarrTestServer(t, http.StatusInternalServerError, radarrMovieJSON, staticWantedCutoffHandler(http.StatusOK, emptyWantedCutoffJSON), &gotRequests)
