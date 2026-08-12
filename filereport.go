@@ -749,6 +749,32 @@ func evaluateFileReportRoot(ctx context.Context, logger *slog.Logger, itemLevel 
 			"trackedUnderRoot", len(tracked))
 	}
 
+	// Heuristic (d), the per-ROOT twin of
+	// warnIfInstanceTrackedSetEntirelyUnmapped: a root under which THIS
+	// instance tracks NOTHING AT ALL — zero tracked files (tracked, above)
+	// AND zero tracked folders (trackedFolders, above) — but the walk found
+	// real video files anyway is not evidence of a legitimate empty or
+	// unmanaged root (a genuinely empty/unmanaged root has nothing to walk
+	// in the first place, which is exactly why this is gated on
+	// videoFilesSeen > 0). It is evidence THIS SPECIFIC root has a
+	// media_root_map problem the instance-wide guard cannot see, because
+	// every one of the instance's OTHER tracked paths mapped fine: a key
+	// typo/case-mismatch on just this one root, or the same per-instance
+	// media_root_map block copy-pasted into two instances that each
+	// actually manage a different root (README/compose examples show one
+	// map per instance and multiple roots like /tv_shows + /anime as
+	// normal). Without this guard every real file here falls through
+	// classifyFileReportPath's containment check to fileKindOrphan and
+	// prints as a confident kind=orphan — a healthy library (this
+	// instance's or another instance's) reported as a flood of false
+	// orphans, at INFO, with no WARN anywhere: the same failure
+	// warnIfInstanceTrackedSetEntirelyUnmapped exists to prevent, one root
+	// down from where that guard can see.
+	if len(tracked) == 0 && len(trackedFolders) == 0 && videoFilesSeen > 0 {
+		return warnAbort("file report: mount-problem heuristic aborted this root: this instance tracks nothing at all under it (zero tracked files, zero tracked folders) but the walk found real video files here — check media_root_map for a key typo/case-mismatch on this root, or the same map copy-pasted into another instance that actually manages it",
+			"videoFilesSeen", videoFilesSeen)
+	}
+
 	// Group counts, computed now that every file under the root has been
 	// seen: a duplicate finding's "N extra files for <group>" number is a
 	// fact about the WHOLE root, not about any one file in isolation.
@@ -888,28 +914,41 @@ func buildRadarrTrackedSet(logger *slog.Logger, inst Instance, roots []mediaRoot
 		// (hasFile absent -> treated as false -> "do not unmonitor") inverts
 		// to UNSAFE here: "do not protect a file I can see" is the exact
 		// false-orphan-of-your-own-file mistake this file's own doc comment
-		// exists to prevent. hasFile is consulted ONLY to decide whether an
-		// unreadable movieFile.path is itself worth a warning (hasFile=true
-		// with no readable path is a genuine contradiction worth flagging;
-		// hasFile absent or false with no path is not).
+		// exists to prevent.
+		//
+		// [IMPORTANT/plan-mandated FIX, round 3] The distrust branch below
+		// draws the SYMMETRIC conclusion: only an EXPLICIT hasFile=false is
+		// trustworthy evidence that "no readable movieFile.path" means the
+		// movie genuinely has no file. hasFile ABSENT (nil) is exactly as
+		// untrustworthy here as it is above — it must never be read as "no
+		// file exists" any more than it may be read as "a file exists".
+		// Gating the distrust branch on hasFile==true alone (as it used to)
+		// let the nil case fall all the way through with the folder
+		// registered and set.files untouched and NOT distrusted: a real file
+		// on disk under that folder then matched the containment branch and
+		// printed as a confident kind=duplicate naming itself — the
+		// identical mistake fixed below for hasFile=true, just reached
+		// through the nil door instead. Against a real Radarr (which always
+		// emits hasFile) this changes nothing; it only matters against the
+		// untrusted-input case this whole file exists to defend against.
 		if m.MovieFile != nil && m.MovieFile.Path != nil && strings.TrimSpace(*m.MovieFile.Path) != "" {
 			if diskFile, ok := mapArrPathToAnyRoot(*m.MovieFile.Path, roots); ok {
 				set.files[diskFile] = true
 			} else {
 				skipCounts[FileSkipReasonOutsideConfiguredRoots]++
 			}
-		} else if m.HasFile != nil && *m.HasFile {
-			// [IMPORTANT/plan-mandated FIX] hasFile=true with an unreadable
-			// path means set.files was never told about this movie's own
-			// file — so, without distrustedFolders, the movie's own real
-			// file on disk falls through classifyFileReportPath's folder-
-			// containment branch and prints as a confident kind=duplicate
-			// (its groupCount=1 "sibling" is itself). The folder stays
-			// registered above (containment must still find it, so this
-			// never becomes a false ORPHAN either) but is now marked
+		} else if m.HasFile == nil || *m.HasFile {
+			// [IMPORTANT/plan-mandated FIX] hasFile=true (or unknown) with an
+			// unreadable path means set.files was never told about this
+			// movie's own file — so, without distrustedFolders, the movie's
+			// own real file on disk falls through classifyFileReportPath's
+			// folder-containment branch and prints as a confident
+			// kind=duplicate (its groupCount=1 "sibling" is itself). The
+			// folder stays registered above (containment must still find it,
+			// so this never becomes a false ORPHAN either) but is now marked
 			// distrusted so extras — including the movie's own
 			// misclassified file — resolve to skipped-untrusted instead.
-			logger.Warn("file report: movie has a file but its path is unreadable; its folder is withheld from duplicate candidacy so the file is not misreported as a duplicate of itself",
+			logger.Warn("file report: movie may have a file (hasFile is true or unknown) but its path is unreadable; its folder is withheld from duplicate candidacy so a real file is never misreported as a duplicate of itself",
 				"instance", inst.Name, "type", inst.Type, "title", title, "id", derefOrAbsent(m.ID), "reason", FileSkipReasonUntrackedPath)
 			skipCounts[FileSkipReasonUntrackedPath]++
 			if folderKnown {
