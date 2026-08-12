@@ -192,12 +192,24 @@ func run(args []string, stdout, stderr io.Writer, daemonOpts ...daemonOptions) i
 		if onlyIDSet {
 			reverse = scopedReverseOptions(*cfg)
 		}
+		// The file report has no scoped acceptance-instrument exception (see
+		// fileReportOptions' own doc comment): it never writes anything, so
+		// there is nothing for a --only-id run to rehearse, and binding
+		// controller resolution 8 says "never --only-id" without
+		// qualification. A full --once run gets it; a scoped one gets the
+		// zero value, exactly like --only-id already refuses --samples and
+		// gets no reverse pass without the remonitor flag.
+		fileReport := fullScanFileReportOptions()
+		if onlyIDSet {
+			fileReport = fileReportOptions{}
+		}
 		runScanCycle(context.Background(), logger, *cfg, scanCycle{
 			instanceName: *instanceName,
 			samples:      parseSamples(*samplesFlag),
 			scope:        scope,
 			dryRun:       cfg.DryRun,
 			reverse:      reverse,
+			fileReport:   fileReport,
 		})
 	} else {
 		// --only-id and --instance stay --once-only. Daemon mode DOES run
