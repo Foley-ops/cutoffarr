@@ -20,10 +20,11 @@ import (
 // rather than forking a second copy of any of it — binding controller
 // resolution.
 //
-// Season decision logic (evaluateSeries/evaluateSeason,
-// runSonarrDecisionEngine) lives in decision.go alongside Radarr's, so the
-// two engines' shared vocabulary (reason consts, cross-check shape, summary
-// conventions) stays visibly in one place.
+// Season decision logic (evaluateSeries, runSonarrDecisionEngine,
+// runSonarrCrossCheck) lives in decision.go alongside Radarr's, so the two
+// engines' shared vocabulary (reason consts, cross-check shape, summary
+// conventions) stays visibly in one place; the Sonarr write path lives in
+// sonarr_writer.go, mirroring writer.go's split from decision.go.
 
 // seriesElement decodes the subset of one /api/v3/series array element the
 // season decision engine needs. Fields are pointers (Tags is *[]int, same
@@ -123,13 +124,19 @@ func fetchSeriesLibrary(ctx context.Context, logger *slog.Logger, client *APICli
 			return nil, false
 		}
 
+		// See fetchMovies (radarr.go) for why found==false with a non-nil
+		// Tags pointer normalizes rather than trusting: a re-check that
+		// cannot see the key it is re-checking has verified nothing.
 		if s.Tags != nil {
-			if rawTags, found := rawObjectField(raw, "tags"); found {
-				if _, err := decodeTagIDs(rawTags); err != nil {
-					logger.Warn("series tags array contains an unusable element (e.g. JSON null); treating tags as unverifiable",
-						"instance", inst.Name, "type", inst.Type, "title", titleOrAbsent(s.Title), "error", err)
-					s.Tags = nil
-				}
+			rawTags, found := rawObjectField(raw, "tags")
+			if !found {
+				logger.Warn("series tags decoded but could not be located in the raw payload for re-checking; treating tags as unverifiable",
+					"instance", inst.Name, "type", inst.Type, "title", titleOrAbsent(s.Title))
+				s.Tags = nil
+			} else if _, err := decodeTagIDs(rawTags); err != nil {
+				logger.Warn("series tags array contains an unusable element (e.g. JSON null); treating tags as unverifiable",
+					"instance", inst.Name, "type", inst.Type, "title", titleOrAbsent(s.Title), "error", err)
+				s.Tags = nil
 			}
 		}
 
@@ -165,14 +172,32 @@ func fetchSeriesLibrary(ctx context.Context, logger *slog.Logger, client *APICli
 // airing-guard rule), rather than an invalid date anywhere in a large
 // episode list aborting the entire decode the way a *time.Time field's
 // UnmarshalJSON error would.
+//
+// SeriesID exists purely as an echo-check on the ?seriesId=X query (REVIEW
+// FIX, Phase 6 branch review): without it the code simply trusted the server
+// to have honoured the filter, and a proxy or routing mistake would have fed
+// rules 3 and 7 another series' episodes with nothing but the incidental
+// count comparisons as backstop.
 type episodeElement struct {
 	ID            *int    `json:"id"`
+	SeriesID      *int    `json:"seriesId"`
 	SeasonNumber  *int    `json:"seasonNumber"`
 	EpisodeNumber *int    `json:"episodeNumber"`
 	Monitored     *bool   `json:"monitored"`
 	HasFile       *bool   `json:"hasFile"`
 	AirDateUtc    *string `json:"airDateUtc"`
 	EpisodeFileID *int    `json:"episodeFileId"`
+}
+
+// belongsToSeries reports whether a record decoded from a ?seriesId=want
+// response actually claims to belong to that series. A record whose seriesId
+// is present and DIFFERENT is foreign data and is dropped by the callers
+// below; an absent seriesId is left alone, since "the key is missing" is not
+// evidence of a routing mistake and the existing count guards
+// (evaluateSeries' episode-count and file-count checks) remain the backstop
+// for a wholesale wrong-series response.
+func belongsToSeries(got *int, want int) bool {
+	return got == nil || *got == want
 }
 
 // fetchEpisodes fetches GET /api/v3/episode?seriesId=<seriesID> for a single
@@ -203,11 +228,22 @@ func fetchEpisodes(ctx context.Context, logger *slog.Logger, client *APIClient, 
 		return nil, false
 	}
 
-	var episodes []episodeElement
-	if err := json.Unmarshal(body, &episodes); err != nil {
+	var decoded []episodeElement
+	if err := json.Unmarshal(body, &decoded); err != nil {
 		logger.Warn("episode response is not valid JSON",
 			"instance", inst.Name, "type", inst.Type, "seriesId", seriesID, "error", err)
 		return nil, false
+	}
+
+	episodes := make([]episodeElement, 0, len(decoded))
+	for _, e := range decoded {
+		if !belongsToSeries(e.SeriesID, seriesID) {
+			logger.Warn("episode record belongs to a different series than the one requested; excluded",
+				"instance", inst.Name, "type", inst.Type, "seriesId", seriesID,
+				"episodeId", derefOrAbsent(e.ID), "recordSeriesId", derefOrAbsent(e.SeriesID))
+			continue
+		}
+		episodes = append(episodes, e)
 	}
 
 	return episodes, true
@@ -218,8 +254,11 @@ func fetchEpisodes(ctx context.Context, logger *slog.Logger, client *APIClient, 
 // customFormatScore actually exists for a Sonarr episode file (mirrors
 // Radarr's /moviefile discovery from Phase 2: the score lives on the file
 // endpoint only, confirmed on live Sonarr 4.0.19.2979).
+// SeriesID is the same ?seriesId=X echo-check episodeElement carries, for
+// the same reason.
 type episodeFileElement struct {
 	ID                  *int  `json:"id"`
+	SeriesID            *int  `json:"seriesId"`
 	SeasonNumber        *int  `json:"seasonNumber"`
 	CustomFormatScore   *int  `json:"customFormatScore"`
 	QualityCutoffNotMet *bool `json:"qualityCutoffNotMet"`
@@ -249,11 +288,22 @@ func fetchEpisodeFiles(ctx context.Context, logger *slog.Logger, client *APIClie
 		return nil, false
 	}
 
-	var files []episodeFileElement
-	if err := json.Unmarshal(body, &files); err != nil {
+	var decoded []episodeFileElement
+	if err := json.Unmarshal(body, &decoded); err != nil {
 		logger.Warn("episodefile response is not valid JSON",
 			"instance", inst.Name, "type", inst.Type, "seriesId", seriesID, "error", err)
 		return nil, false
+	}
+
+	files := make([]episodeFileElement, 0, len(decoded))
+	for _, f := range decoded {
+		if !belongsToSeries(f.SeriesID, seriesID) {
+			logger.Warn("episode file record belongs to a different series than the one requested; excluded",
+				"instance", inst.Name, "type", inst.Type, "seriesId", seriesID,
+				"fileId", derefOrAbsent(f.ID), "recordSeriesId", derefOrAbsent(f.SeriesID))
+			continue
+		}
+		files = append(files, f)
 	}
 
 	return files, true

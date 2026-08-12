@@ -2445,9 +2445,18 @@ func TestRunRadarrDecisionEngine_AllPreWriteTagChecksRefused_SummaryAccountsForE
 // that contain spaces are the ones this never looks up.
 func summaryCounters(t *testing.T, output string) map[string]int {
 	t.Helper()
+	return summaryCountersFor(t, output, "radarr decision summary")
+}
+
+// summaryCountersFor is summaryCounters generalized over which engine's
+// summary line to parse, so the Sonarr write pass's own accounting-identity
+// test (sonarr_writer_test.go) reads its counters through exactly the same
+// parser rather than a second copy that could drift from it.
+func summaryCountersFor(t *testing.T, output, msg string) map[string]int {
+	t.Helper()
 	var line string
 	for _, l := range strings.Split(output, "\n") {
-		if !strings.Contains(l, "radarr decision summary") {
+		if !strings.Contains(l, msg) {
 			continue
 		}
 		if line != "" {
@@ -2456,7 +2465,7 @@ func summaryCounters(t *testing.T, output string) map[string]int {
 		line = l
 	}
 	if line == "" {
-		t.Fatalf("no %q line in the output:\n%s", "radarr decision summary", output)
+		t.Fatalf("no %q line in the output:\n%s", msg, output)
 	}
 	counters := make(map[string]int)
 	for _, field := range strings.Fields(line) {

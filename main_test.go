@@ -420,46 +420,31 @@ instances:
 	}
 }
 
-// TestRun_OnlyIDSet_MixedConfig_SkipsSonarrInstancesEntirely pins F4 (Phase
-// 6 final review round, controller ruling): --only-id is a radarr movie id
-// in this phase (Sonarr gets its own meaning in Phase 7), and with a mixed
-// radarr+sonarr config a --once --only-id run used to still run a FULL
-// unscoped sonarr library report for every sonarr instance — no
-// acknowledgment anywhere that the flag left that half of the pass
-// untouched, inverting this project's own precedent of refusing silent flag
-// evaporation (the --instance/--only-id checks in run() itself). Per the
-// controller's least-surprise ruling, a targeted run must never fan out
-// into a full unscoped Sonarr report: every sonarr instance is skipped
-// ENTIRELY — not contacted at all, not even for connectivity — each with
-// one INFO line stating --only-id is radarr-scoped. Radarr behavior must be
-// completely unaffected.
-func TestRun_OnlyIDSet_MixedConfig_SkipsSonarrInstancesEntirely(t *testing.T) {
-	var sonarrHits int
+// TestRun_OnlyIDSet_MixedConfig_IsAmbiguousAndRefusesBeforeContact replaces
+// the Phase 6 F4 pin, which held only while --only-id had no Sonarr meaning:
+// then, a mixed-config --only-id run skipped every sonarr entirely (with an
+// INFO line) so a targeted run could not fan out into a full unscoped Sonarr
+// report.
+//
+// Phase 7 gives --only-id a Sonarr meaning — a SERIES id — and that turns the
+// same invocation into a genuine ambiguity rather than a scoping question:
+// "--only-id 42" names movie 42 in the radarr AND series 42 in the sonarr,
+// which are two unrelated things. Ids are per-instance, there is no safe way
+// to guess which the human meant, and acting on both is the precise opposite
+// of "a single item, explicitly named" — so the run refuses before contacting
+// anything and says how to say it (binding controller resolution 4: when more
+// than one instance of ANY type is in scope, --instance is required).
+func TestRun_OnlyIDSet_MixedConfig_IsAmbiguousAndRefusesBeforeContact(t *testing.T) {
+	var sonarrHits, radarrHits int
 	sonarrSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sonarrHits++
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer sonarrSrv.Close()
-
-	var radarrHits int
-	radarrMux := http.NewServeMux()
-	radarrMux.HandleFunc("/api/v3/system/status", func(w http.ResponseWriter, r *http.Request) {
+	radarrSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		radarrHits++
-		w.Write([]byte(`{"appName": "Radarr", "version": "5.14.0.9383"}`))
-	})
-	radarrMux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
-		radarrHits++
-		w.Write([]byte(`[]`))
-	})
-	radarrMux.HandleFunc("/api/v3/movie", func(w http.ResponseWriter, r *http.Request) {
-		radarrHits++
-		w.Write([]byte(`[]`))
-	})
-	radarrMux.HandleFunc("/api/v3/wanted/cutoff", func(w http.ResponseWriter, r *http.Request) {
-		radarrHits++
-		w.Write([]byte(`{"page":1,"pageSize":100,"totalRecords":0,"records":[]}`))
-	})
-	radarrSrv := httptest.NewServer(radarrMux)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
 	defer radarrSrv.Close()
 
 	path := writeMainTestConfig(t, `
@@ -475,17 +460,16 @@ instances:
 `)
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"--config", path, "--once", "--only-id", "42"}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2: --only-id across two instances is ambiguous\nstdout=%s\nstderr=%s", code, stdout.String(), stderr.String())
 	}
-	if sonarrHits != 0 {
-		t.Errorf("the sonarr instance received %d request(s); --only-id must skip sonarr instances entirely, before any connectivity check ever runs", sonarrHits)
+	if sonarrHits != 0 || radarrHits != 0 {
+		t.Errorf("the run contacted an instance before refusing: radarr=%d sonarr=%d", radarrHits, sonarrHits)
 	}
-	if radarrHits == 0 {
-		t.Error("the radarr instance was never contacted; --only-id must not change radarr behavior")
-	}
-	out := stdout.String()
-	if !strings.Contains(out, "level=INFO") || !strings.Contains(out, "instance=sonarr-main") || !strings.Contains(out, "only-id") {
-		t.Errorf("expected an INFO line naming sonarr-main and stating --only-id is radarr-scoped:\n%s", out)
+	msg := stderr.String()
+	for _, want := range []string{"--only-id", "42", "--instance", "radarr-main", "sonarr-main"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the refusal must name %q so the human can act on it:\n%s", want, msg)
+		}
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -610,7 +611,9 @@ func TestInspectSonarrLibrary_SeriesFetchFailure_ReturnsNotOK(t *testing.T) {
 	if wantedHit {
 		t.Error("wanted/cutoff must not be fetched when /series already failed")
 	}
-	_ = buf
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("a skipped instance must say so (§2.6: warn and skip):\n%s", buf.String())
+	}
 }
 
 func TestInspectSonarrLibrary_WantedCutoffFailure_ReturnsNotOK(t *testing.T) {
@@ -634,7 +637,9 @@ func TestInspectSonarrLibrary_WantedCutoffFailure_ReturnsNotOK(t *testing.T) {
 	if series != nil || episodeIDs != nil || seasons != nil {
 		t.Error("expected all return values nil on failure")
 	}
-	_ = buf
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("a skipped instance must say so (§2.6: warn and skip):\n%s", buf.String())
+	}
 }
 
 // --- Phase 6: decision engine wiring into main.go's run() -------------------
@@ -842,6 +847,7 @@ type statefulSonarrSeries struct {
 
 type statefulSonarrFake struct {
 	srv *httptest.Server
+	t   *testing.T
 
 	mu           sync.Mutex
 	series       map[int]*statefulSonarrSeries
@@ -854,6 +860,12 @@ type statefulSonarrFake struct {
 
 	profilesJSON string
 	tagsJSON     string
+
+	// Phase 7 write-path response overrides, by series id (seriesPutStatus)
+	// and globally (episodeMonitorStatus). Unset means "behave like Sonarr":
+	// apply the write and echo the updated resource.
+	seriesPutStatus      map[int]int
+	episodeMonitorStatus int
 }
 
 // newStatefulSonarrFake starts a fake Sonarr backed by series/episodes/
@@ -869,11 +881,14 @@ type statefulSonarrFake struct {
 func newStatefulSonarrFake(t *testing.T, series []*statefulSonarrSeries, episodes []*statefulSonarrEpisode, files []*statefulSonarrEpisodeFile) *statefulSonarrFake {
 	t.Helper()
 	f := &statefulSonarrFake{
-		series:       make(map[int]*statefulSonarrSeries, len(series)),
-		episodes:     make(map[int]*statefulSonarrEpisode, len(episodes)),
-		files:        make(map[int]*statefulSonarrEpisodeFile, len(files)),
-		profilesJSON: `[{"id": 1, "name": "HD-1080p", "upgradeAllowed": true, "cutoff": 7, "cutoffFormatScore": 100}]`,
-		tagsJSON:     `[]`,
+		t:                    t,
+		series:               make(map[int]*statefulSonarrSeries, len(series)),
+		episodes:             make(map[int]*statefulSonarrEpisode, len(episodes)),
+		files:                make(map[int]*statefulSonarrEpisodeFile, len(files)),
+		profilesJSON:         `[{"id": 1, "name": "HD-1080p", "upgradeAllowed": true, "cutoff": 7, "cutoffFormatScore": 100}]`,
+		tagsJSON:             `[]`,
+		seriesPutStatus:      map[int]int{},
+		episodeMonitorStatus: http.StatusOK,
 	}
 	for _, s := range series {
 		f.series[s.id] = s
@@ -905,6 +920,13 @@ func newStatefulSonarrFake(t *testing.T, series []*statefulSonarrSeries, episode
 		seriesID, _ := strconv.Atoi(r.URL.Query().Get("seriesId"))
 		w.Write([]byte(f.episodesJSON(seriesID)))
 	}))
+	// Phase 7: the two write endpoints, and the per-series GET the write path
+	// re-reads before either of them. Both PUTs MUTATE this fake's state, so a
+	// later GET (library, detail, episode, or wanted/cutoff) really does
+	// reflect what was written — which is what makes a second-run no-op test
+	// a proof rather than a hope.
+	mux.HandleFunc("/api/v3/episode/monitor", f.handle(f.serveEpisodeMonitor))
+	mux.HandleFunc("/api/v3/series/", f.handle(f.serveSeriesDetail))
 	mux.HandleFunc("/api/v3/episodefile", f.handle(func(w http.ResponseWriter, r *http.Request) {
 		seriesID, _ := strconv.Atoi(r.URL.Query().Get("seriesId"))
 		w.Write([]byte(f.episodeFilesJSON(seriesID)))
@@ -927,11 +949,160 @@ func newStatefulSonarrFake(t *testing.T, series []*statefulSonarrSeries, episode
 
 func (f *statefulSonarrFake) handle(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
 		f.mu.Lock()
-		f.requests = append(f.requests, recordedRequest{method: r.Method, path: r.URL.Path})
+		f.requests = append(f.requests, recordedRequest{method: r.Method, path: r.URL.Path, body: body, contentType: r.Header.Get("Content-Type")})
 		f.mu.Unlock()
+		r.Body = io.NopCloser(bytes.NewReader(body))
 		next(w, r)
 	}
+}
+
+// statefulSonarrExtraField is a key this codebase has no knowledge of at all,
+// carried by the per-series detail body so §2.4's "send the object back
+// otherwise unmodified" is testable against something the write path could
+// not possibly know to preserve deliberately.
+const statefulSonarrExtraField = `"someFutureField":{"nested":["a","b"],"flag":true}`
+
+// seriesDetailJSON renders GET /api/v3/series/{id} — the object the write
+// path re-fetches, mutates one value inside, and hands straight back. It
+// carries more than the library element does (a path, a large sizeOnDisk, and
+// an unknown nested object) precisely so the byte-preservation mandate has
+// something to preserve.
+//
+// Every SEASON object carries an images[].remoteUrl holding "&" and "<", the
+// characters encoding/json escapes by default. §2.4's surgery re-encodes the
+// seasons array through its own encoder (encodeRawArray), so escapable bytes
+// at the top level of this body prove nothing about that second encoder; a
+// season without them lets an escaping regression one level down pass every
+// byte-preservation assertion in the suite. Real seasons carry exactly this
+// (poster URLs with query strings, statistics.releaseGroups).
+func (f *statefulSonarrFake) seriesDetailJSON(id int) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, found := f.series[id]
+	if !found {
+		return "", false
+	}
+	var seasons []string
+	for _, season := range s.seasons {
+		seasons = append(seasons, fmt.Sprintf(`{"seasonNumber":%d,"monitored":%t,"images":[{"coverType":"poster","remoteUrl":"https://img/s%d?a=1&b=2&c=<d>"}],"statistics":{"episodeFileCount":%d,"totalEpisodeCount":%d}}`,
+			season.number, season.monitored, season.number, season.episodeFileCount, season.totalEpisodeCount))
+	}
+	tagsJSON, _ := json.Marshal(s.tags)
+	return fmt.Sprintf(`{"id":%d,"title":%q,"monitored":%t,"qualityProfileId":%d,"tags":%s,"path":"/tv/%s","sizeOnDisk":9876543210123,"seasons":[%s],%s}`,
+		s.id, s.title, s.monitored, s.profileID, tagsJSON, s.title, strings.Join(seasons, ","), statefulSonarrExtraField), true
+}
+
+// serveSeriesDetail is GET/PUT /api/v3/series/{id}. The PUT handler applies
+// what it was SENT — including the series-level monitored flag — rather than
+// only the fields this project is supposed to change: a fake that ignored the
+// series-level flag would make "the write never touches series monitoring" a
+// property of the fake instead of a property of the code under test.
+func (f *statefulSonarrFake) serveSeriesDetail(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/api/v3/series/"))
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		body, found := f.seriesDetailJSON(id)
+		if !found {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Write([]byte(body))
+	case http.MethodPut:
+		if status, overridden := f.seriesPutStatus[id]; overridden && status >= 400 {
+			w.WriteHeader(status)
+			w.Write([]byte(`{"message":"write rejected by fake"}`))
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var payload struct {
+			Monitored *bool `json:"monitored"`
+			Seasons   []struct {
+				SeasonNumber *int  `json:"seasonNumber"`
+				Monitored    *bool `json:"monitored"`
+			} `json:"seasons"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			// Never silently discard a malformed write body (the flaw
+			// statefulRadarrFake's PUT handler carried): a body the server
+			// cannot read is a defect in the code under test, and a fake that
+			// shrugs at it hides the very bug it exists to catch.
+			f.t.Errorf("statefulSonarrFake: PUT /api/v3/series/%d body is not valid JSON: %v\n%s", id, err, body)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		f.mu.Lock()
+		if s, found := f.series[id]; found {
+			if payload.Monitored != nil {
+				s.monitored = *payload.Monitored
+			}
+			for _, sent := range payload.Seasons {
+				if sent.SeasonNumber == nil || sent.Monitored == nil {
+					continue
+				}
+				for i := range s.seasons {
+					if s.seasons[i].number == *sent.SeasonNumber {
+						s.seasons[i].monitored = *sent.Monitored
+					}
+				}
+			}
+		}
+		f.mu.Unlock()
+		echo, found := f.seriesDetailJSON(id)
+		if !found {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Write([]byte(echo))
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// serveEpisodeMonitor is PUT /api/v3/episode/monitor: it applies the sent
+// monitored value to every named episode and echoes those episodes back, as
+// Sonarr does. Because wantedCutoffJSON is DERIVED from per-episode monitored
+// state, a write here visibly shrinks the wanted set on the next read.
+func (f *statefulSonarrFake) serveEpisodeMonitor(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if f.episodeMonitorStatus >= 400 {
+		w.WriteHeader(f.episodeMonitorStatus)
+		w.Write([]byte(`{"message":"episode monitor write rejected by fake"}`))
+		return
+	}
+	body, _ := io.ReadAll(r.Body)
+	var req struct {
+		EpisodeIDs []int `json:"episodeIds"`
+		Monitored  *bool `json:"monitored"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		f.t.Errorf("statefulSonarrFake: PUT /api/v3/episode/monitor body is not valid JSON: %v\n%s", err, body)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if req.Monitored == nil {
+		f.t.Errorf("statefulSonarrFake: PUT /api/v3/episode/monitor body has no monitored field: %s", body)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	f.mu.Lock()
+	var elems []string
+	for _, id := range req.EpisodeIDs {
+		if e, found := f.episodes[id]; found {
+			e.monitored = *req.Monitored
+		}
+		elems = append(elems, fmt.Sprintf(`{"id":%d,"monitored":%t}`, id, *req.Monitored))
+	}
+	f.mu.Unlock()
+	w.Write([]byte("[" + strings.Join(elems, ",") + "]"))
 }
 
 func (f *statefulSonarrFake) seriesJSON() string {
@@ -997,17 +1168,36 @@ func (f *statefulSonarrFake) episodeFilesJSON(seriesID int) string {
 	return "[" + strings.Join(elems, ",") + "]"
 }
 
+// wantedCutoffJSON is DERIVED from live per-episode state (binding controller
+// note): an episode appears in the wanted/cutoff set only while it is still
+// MONITORED, because Sonarr's own /wanted/cutoff is filtered to monitored
+// episodes of monitored series. That is what makes a write visible on the
+// next read — unmonitoring a season's episodes really does shrink the wanted
+// set — instead of the set being a hand-set constant that no write can ever
+// affect. Iteration follows episodeOrder for the same determinism reason
+// episodesJSON does.
 func (f *statefulSonarrFake) wantedCutoffJSON() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var recs []string
-	for _, e := range f.episodes {
-		if e.inWantedSet {
+	for _, id := range f.episodeOrder {
+		e := f.episodes[id]
+		if e.inWantedSet && e.monitored {
 			recs = append(recs, fmt.Sprintf(`{"id":%d,"seriesId":%d,"seasonNumber":%d,"episodeNumber":%d,"title":"Ep","airDateUtc":"2015-01-01T00:00:00Z","monitored":true,"hasFile":%t}`,
 				e.id, e.seriesID, e.seasonNumber, e.episodeNumber, e.hasFile))
 		}
 	}
 	return fmt.Sprintf(`{"page":1,"pageSize":100,"totalRecords":%d,"records":[%s]}`, len(recs), strings.Join(recs, ","))
+}
+
+// all returns a copy of every request the fake received, under the mutex the
+// handler goroutines append with. Reading f.requests directly from a test is a
+// data race — one the suite really carried, in the allowlist test that bounds
+// this project's entire Sonarr API surface.
+func (f *statefulSonarrFake) all() []recordedRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]recordedRequest(nil), f.requests...)
 }
 
 // writes returns every non-GET request the fake received. Anything that is
@@ -1027,6 +1217,39 @@ func (f *statefulSonarrFake) writes() []recordedRequest {
 
 func (f *statefulSonarrFake) instance() Instance {
 	return Instance{Name: "sonarr-main", Type: "sonarr", URL: f.srv.URL, APIKey: "key"}
+}
+
+// seriesMonitored, seasonMonitored and episodeMonitored read the fake's LIVE
+// state, so a write test asserts on what the fake actually holds rather than
+// on what the log claims. seriesMonitored is the one this phase cares most
+// about: it must never change, in any run, ever.
+func (f *statefulSonarrFake) seriesMonitored(id int) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, found := f.series[id]
+	return found && s.monitored
+}
+
+func (f *statefulSonarrFake) seasonMonitored(seriesID, seasonNumber int) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, found := f.series[seriesID]
+	if !found {
+		return false
+	}
+	for _, season := range s.seasons {
+		if season.number == seasonNumber {
+			return season.monitored
+		}
+	}
+	return false
+}
+
+func (f *statefulSonarrFake) episodeMonitored(id int) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	e, found := f.episodes[id]
+	return found && e.monitored
 }
 
 // TestStatefulSonarrFake_EpisodesAndEpisodeFilesJSON_OrderIsInsertionStable
@@ -1109,24 +1332,39 @@ func TestStatefulSonarrFake_EpisodesAndEpisodeFilesJSON_OrderIsInsertionStable(t
 	}
 }
 
-// TestRun_SonarrInstance_FullPipelineNeverMakesAWriteRequest is the run()-
-// level zero-write-verb pin (item 1 of the carried-forward controller
-// notes, "pin it the way Phases 4-5 pinned 'exactly one'" — here, zero):
-// across a complete run that really does produce would-unmonitor decisions
-// through the full connectivity + library inspection + season decision
-// engine pipeline, not one non-GET request of any kind reaches the fake, to
-// any path, stubbed or not.
+// TestRun_SonarrInstance_FullPipelineNeverMakesAWriteRequest is §2.1's
+// guarantee for Sonarr at run() level: across a complete DRY-RUN pass that
+// really does produce a would-unmonitor decision — through connectivity,
+// library inspection, the season decision engine, the cross-check, and the
+// write pass's own rehearsal — not one non-GET request of any kind reaches the
+// fake, to any path, stubbed or not.
+//
+// It was the zero-write-verb pin for Phase 6, when Sonarr had no write path at
+// all. Phase 7 gives it one, and the fixture now also carries a
+// currently-airing season, so the same run proves the phase's other accept
+// criterion in the mode a human will actually check it in first.
 func TestRun_SonarrInstance_FullPipelineNeverMakesAWriteRequest(t *testing.T) {
 	fake := newStatefulSonarrFake(t,
 		[]*statefulSonarrSeries{
 			{id: 1, title: "Would Unmonitor Show", monitored: true, profileID: 1, tags: []int{},
 				seasons: []statefulSonarrSeason{{number: 1, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1}}},
+			// A currently-airing series alongside it (carried-forward test
+			// debt): the phase's own accept criterion is that no airing season
+			// is ever written, and until this fixture existed that criterion
+			// had no run()-level test at all — every airing test stopped at
+			// evaluateSeries' return value.
+			{id: 2, title: "Airing Show", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 1, monitored: true, episodeFileCount: 2, totalEpisodeCount: 2}}},
 		},
 		[]*statefulSonarrEpisode{
 			{id: 100, seriesID: 1, seasonNumber: 1, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: "2015-01-01T00:00:00Z", episodeFileID: 500, inWantedSet: false},
+			{id: 200, seriesID: 2, seasonNumber: 1, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 600, inWantedSet: false},
+			{id: 201, seriesID: 2, seasonNumber: 1, episodeNumber: 2, monitored: true, hasFile: true, airDateUtc: futureAirDate, episodeFileID: 601, inWantedSet: false},
 		},
 		[]*statefulSonarrEpisodeFile{
 			{id: 500, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
+			{id: 600, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
+			{id: 601, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
 		},
 	)
 
@@ -1148,11 +1386,21 @@ instances:
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "msg=would-unmonitor") {
-		t.Fatalf("test setup did not actually produce a would-unmonitor decision:\n%s", stdout.String())
+	out := stdout.String()
+	if !strings.Contains(out, "msg=would-unmonitor") {
+		t.Fatalf("test setup did not actually produce a would-unmonitor decision:\n%s", out)
+	}
+	if !strings.Contains(out, `reason="unaired or undated episodes"`) {
+		t.Fatalf("test setup did not actually produce an airing skip:\n%s", out)
 	}
 	if writes := fake.writes(); len(writes) != 0 {
-		t.Errorf("a sonarr run must make ZERO write requests in this phase, got %+v", writes)
+		t.Errorf("a dry-run sonarr run must make ZERO write requests, got %+v", writes)
+	}
+	// The rehearsal is real: dry-run runs the write pass all the way to each
+	// gate, so the write path's own fresh read happens and its withholding is
+	// what the summary counts.
+	if !strings.Contains(out, "withheldWrites=1") {
+		t.Errorf("expected the withheld write to be counted:\n%s", out)
 	}
 }
 
@@ -1355,5 +1603,143 @@ instances:
 	}
 	if strings.Contains(out, "msg=would-unmonitor") {
 		t.Errorf("a currently-airing season must NEVER appear as would-unmonitor, per the phase's accept criterion:\n%s", out)
+	}
+}
+
+// ============================================================================
+// Phase 7: Phase 6 branch-review carry-over minors (binding)
+// ============================================================================
+
+// TestFetchSeriesLibrary_TagsKeyDifferentlyCased_NullElementStillCaught pins
+// the case-sensitivity hole the null-tag-element fix left open: the struct
+// decode that populates Tags matches JSON keys case-INsensitively (that is
+// encoding/json's documented behavior), while rawObjectField's re-check did
+// an exact, case-sensitive map lookup. A payload spelling the key "Tags"
+// therefore decoded [3, null, 9] into [3, 0, 9], rawObjectField reported
+// found=false, the re-check was skipped entirely, and the corrupted array —
+// the one shape this whole fix exists to catch — was trusted.
+func TestFetchSeriesLibrary_TagsKeyDifferentlyCased_NullElementStillCaught(t *testing.T) {
+	seriesJSON := `[{"id": 1, "title": "Oddly Cased Tags Show", "monitored": true, "qualityProfileId": 1, "Tags": [3, null, 9], "seasons": []}]`
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/series", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(seriesJSON))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	series, ok := fetchSeriesLibrary(context.Background(), logger, client, inst)
+	if !ok {
+		t.Fatalf("fetchSeriesLibrary returned ok=false, want true:\n%s", buf.String())
+	}
+	if len(series) != 1 {
+		t.Fatalf("expected 1 series, got %d", len(series))
+	}
+	if series[0].Tags != nil {
+		t.Errorf("a corrupted tags array must be normalized to nil regardless of how the JSON key is cased, got %v", *series[0].Tags)
+	}
+}
+
+// TestFetchEpisodes_ForeignSeriesIdRecord_WarnedAndExcluded pins the
+// seriesId echo-check: episodeElement did not decode seriesId at all, so the
+// code trusted the server to have honoured ?seriesId=X. A proxy or routing
+// mistake would feed rules 3 and 7 another series' episodes with only the
+// incidental count comparisons as backstop.
+func TestFetchEpisodes_ForeignSeriesIdRecord_WarnedAndExcluded(t *testing.T) {
+	episodesJSON := `[
+		{"id": 100, "seriesId": 1, "seasonNumber": 1, "episodeNumber": 1, "monitored": true, "hasFile": true, "airDateUtc": "2015-01-01T00:00:00Z", "episodeFileId": 500},
+		{"id": 999, "seriesId": 2, "seasonNumber": 1, "episodeNumber": 2, "monitored": true, "hasFile": true, "airDateUtc": "2015-01-01T00:00:00Z", "episodeFileId": 999}
+	]`
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/episode", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(episodesJSON))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	episodes, ok := fetchEpisodes(context.Background(), logger, client, inst, 1)
+	if !ok {
+		t.Fatalf("fetchEpisodes returned ok=false, want true:\n%s", buf.String())
+	}
+	if len(episodes) != 1 || episodes[0].ID == nil || *episodes[0].ID != 100 {
+		t.Fatalf("expected only the requested series' episode to survive, got %d: %+v", len(episodes), episodes)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "episodeId=999") {
+		t.Errorf("expected a WARN naming the foreign episode record:\n%s", out)
+	}
+}
+
+// TestFetchEpisodeFiles_ForeignSeriesIdRecord_WarnedAndExcluded is the same
+// guard on the endpoint that feeds rule 7's custom-format comparison.
+func TestFetchEpisodeFiles_ForeignSeriesIdRecord_WarnedAndExcluded(t *testing.T) {
+	filesJSON := `[
+		{"id": 500, "seriesId": 1, "seasonNumber": 1, "customFormatScore": 200, "qualityCutoffNotMet": false},
+		{"id": 999, "seriesId": 2, "seasonNumber": 1, "customFormatScore": 0, "qualityCutoffNotMet": true}
+	]`
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/episodefile", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(filesJSON))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	files, ok := fetchEpisodeFiles(context.Background(), logger, client, inst, 1)
+	if !ok {
+		t.Fatalf("fetchEpisodeFiles returned ok=false, want true:\n%s", buf.String())
+	}
+	if len(files) != 1 || files[0].ID == nil || *files[0].ID != 500 {
+		t.Fatalf("expected only the requested series' file to survive, got %d: %+v", len(files), files)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "fileId=999") {
+		t.Errorf("expected a WARN naming the foreign episode file record:\n%s", out)
+	}
+}
+
+// TestFetchSeriesLibrary_TagsKeyPresentTwiceInDifferentCases_TreatedAsUnverifiable
+// closes the last hole in the tags re-check. encoding/json decodes an object
+// key by key, so when BOTH "tags" and "Tags" are present the LAST one wins for
+// the struct field — while a re-check that stopped at the first match would
+// validate the clean array and pass the corrupted one straight through, which
+// is the very outcome the re-check exists to prevent. Two keys that could each
+// have populated the field means the field's provenance is ambiguous, and
+// ambiguous provenance on the exclusion tag's own input is untrusted input.
+func TestFetchSeriesLibrary_TagsKeyPresentTwiceInDifferentCases_TreatedAsUnverifiable(t *testing.T) {
+	seriesJSON := `[{"id": 1, "title": "Two Tags Keys Show", "monitored": true, "qualityProfileId": 1, "tags": [1, 2], "Tags": [3, null], "seasons": []}]`
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/series", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(seriesJSON))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	series, ok := fetchSeriesLibrary(context.Background(), logger, client, inst)
+	if !ok {
+		t.Fatalf("fetchSeriesLibrary returned ok=false, want true:\n%s", buf.String())
+	}
+	if len(series) != 1 {
+		t.Fatalf("expected 1 series, got %d", len(series))
+	}
+	if series[0].Tags != nil {
+		t.Errorf("two keys could each have populated tags; the field's provenance is ambiguous and must be treated as unverifiable, got %v", *series[0].Tags)
+	}
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("expected a warning:\n%s", buf.String())
 	}
 }
