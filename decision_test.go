@@ -1832,6 +1832,47 @@ func TestRunRadarrDecisionEngine_CrossCheckDisagreement_SummaryStatesFailed(t *t
 	}
 }
 
+// TestRunRadarrDecisionEngine_AllSkipsFileless_CrossCheckWordingDoesNotDenySkipsExisted
+// is the fix-round pin for the branch review's finding on renderCrossCheckSummary's
+// zero-sample wording: the cross-check sample pool is narrower than "skip
+// candidates" — runCrossCheck only draws its skip half from decisions that are
+// BOTH a skip AND hasFile==true (decision.go's `else if d.hasFile`). A cycle
+// where every monitored movie fails rule 2 (no file) populates skipCounts
+// under "no file" while leaving the cross-check pool empty, so wording that
+// says "no ... skip candidates existed this cycle" is false on exactly that
+// cycle — self-contradictory on the very same summary line as
+// skipReasons="no file=1". This test pins that the corrected wording never
+// makes that claim while skipReasons simultaneously reports a nonzero skip.
+func TestRunRadarrDecisionEngine_AllSkipsFileless_CrossCheckWordingDoesNotDenySkipsExisted(t *testing.T) {
+	var gotMoviefileRequests []string
+	moviefileHandler := func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[]`))
+	}
+	srv := decisionEngineTestServer(t, decisionEngineProfilesJSON, decisionEngineNoTagsJSON, moviefileHandler, &gotMoviefileRequests)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	// Monitored, but no file: rule 2 skips it before it can ever reach the
+	// cross-check's hasFile-gated skip pool.
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("No File Movie"), Monitored: boolPtr(true), HasFile: boolPtr(false)},
+	}
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
+
+	out := buf.String()
+	if !strings.Contains(out, `skipReasons="no file=1"`) {
+		t.Errorf("expected the summary to report the no-file skip:\n%s", out)
+	}
+	if strings.Contains(out, "no would-unmonitor or skip candidates existed") {
+		t.Errorf("crossCheck wording must not deny that skip candidates existed on a line where skipReasons reports one:\n%s", out)
+	}
+	if !strings.Contains(out, `crossCheck="passed (nothing sampled:`) {
+		t.Errorf("expected the crossCheck summary to still render the nothing-sampled form:\n%s", out)
+	}
+}
+
 func TestFetchQualityProfiles_MalformedJSON_SkipsInstance(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {

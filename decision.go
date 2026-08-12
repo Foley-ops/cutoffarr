@@ -1049,19 +1049,30 @@ func writeGateBlockReason(cc crossCheckResult, pendingWrites int) string {
 // with verified==0 and unverifiable==0 happens only when nothing was even
 // sampled (runCrossCheck / runSonarrCrossCheck fall through to their own
 // `default: … Passed` when the sampled slice is empty — no would-unmonitor
-// decisions and no monitored+hasFile skip decisions existed this cycle to draw
-// from). That is a benign outcome, but the general counted form below would
-// render it as "passed (0 verified, 0 unverifiable)" — a string a REAL sample
-// can never produce (a sample that actually ran always has
-// verified+unverifiable > 0) — making "nothing was checked this cycle"
-// indistinguishable from "a sample was taken and it checked out clean". Since
-// crossCheckStatusInconclusive already claims every other verified==0 case
-// (len(sampled) > 0 && verified == 0), verified==0 && unverifiable==0 under
-// Passed uniquely identifies "nothing sampled" with no risk of shadowing a
-// real result.
+// decisions and no monitored+hasFile (Radarr) / monitored+completeOnDisk
+// (Sonarr) skip decisions existed this cycle to draw from). That is a benign
+// outcome, but the general counted form below would render it as "passed (0
+// verified, 0 unverifiable)" — a string a REAL sample can never produce (a
+// sample that actually ran always has verified+unverifiable > 0) — making
+// "nothing was checked this cycle" indistinguishable from "a sample was taken
+// and it checked out clean". Since crossCheckStatusInconclusive already
+// claims every other verified==0 case (len(sampled) > 0 && verified == 0),
+// verified==0 && unverifiable==0 under Passed uniquely identifies "nothing
+// sampled" with no risk of shadowing a real result.
+//
+// FIX (branch review, round 2): the wording used to say "no would-unmonitor
+// or skip candidates existed this cycle" — false whenever every monitored
+// item skipped for a reason OTHER than missing a file (e.g. every movie
+// fails rule 2), because the sample pool's skip half is gated on hasFile /
+// completeOnDisk, not on "was a skip". Such a cycle populates skipCounts
+// (formatSkipCounts on the same summary line, e.g. skipReasons="no
+// file=300") while the pool stays empty, so the old wording denied on one
+// line what the line's own skipReasons attr asserted on the other side of
+// it. The wording below names the pool's actual membership — "skips with a
+// file on disk" — so it can never contradict a nonzero skipReasons count.
 func renderCrossCheckSummary(status string, verified, unverifiable int) string {
 	if status == crossCheckStatusPassed && verified == 0 && unverifiable == 0 {
-		return "passed (nothing sampled: no would-unmonitor or skip candidates existed this cycle)"
+		return "passed (nothing sampled: no would-unmonitor decisions and no skips with a file on disk this cycle)"
 	}
 	switch status {
 	case crossCheckStatusPassed:
