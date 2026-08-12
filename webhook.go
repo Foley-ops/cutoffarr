@@ -100,30 +100,80 @@ type webhookEpisodeRef struct {
 	SeasonNumber *int `json:"seasonNumber"`
 }
 
-// affectedSeasons returns the deduplicated, sorted season numbers a Sonarr
-// payload's episodes name. An absent or empty episodes array yields none.
+// scopeClaim is what ONE accepted event says about how much of its item must
+// be evaluated — which, since FIX 3, is also how much of it may be WRITTEN.
 //
-// These are the WRITE SCOPE, which is the plan's own granularity: "a webhook
-// event evaluates only that movie (Radarr) or that series' affected season
-// (Sonarr)". The EVIDENCE the evaluation rests on is unchanged and still
+// It exists because "the payload named no seasons" is not one situation but
+// two, and they are opposites. Collapsing them (which is what returning a bare
+// nil slice did) meant a single unreadable episode record anywhere in a
+// 24-event season-pack burst escalated the write scope for the whole burst from
+// the affected season to every eligible season of the series — sticky, so no
+// later well-formed event could narrow it back — and did so silently, one
+// debounce later, in a cycle whose per-item report lines are demoted to DEBUG.
+type scopeClaim int
+
+const (
+	// claimWholeItem: the event named no seasons because there were none to
+	// name. Every Radarr payload (a movie has no seasons), and the Sonarr
+	// payload whose episodes array is absent or empty, which binding controller
+	// resolution 2 defines as "evaluate all seasons of the series". This is a
+	// real, mandated claim on the whole item.
+	claimWholeItem scopeClaim = iota
+
+	// claimSeasons: the event named at least one readable season number. Those
+	// seasons, and no others.
+	claimSeasons
+
+	// claimNothing: the episodes array was present and non-empty and not one
+	// element of it yielded a season number. That is not a statement about the
+	// series; it is a payload this program could not read, and §2.6's rule for
+	// untrusted input is to refuse it loudly rather than guess. Guessing "the
+	// whole series" here is the widest possible guess about an unmonitor.
+	claimNothing
+)
+
+func (c scopeClaim) String() string {
+	switch c {
+	case claimWholeItem:
+		return "whole-item"
+	case claimSeasons:
+		return "named-seasons"
+	default:
+		return "none-unreadable"
+	}
+}
+
+// affectedSeasons returns the deduplicated, sorted season numbers a Sonarr
+// payload's episodes name, how many episode records carried NO readable
+// seasonNumber, and what the payload therefore claims.
+//
+// The seasons are the WRITE SCOPE, which is the plan's own granularity: "a
+// webhook event evaluates only that movie (Radarr) or that series' affected
+// season (Sonarr)". The EVIDENCE the evaluation rests on is unchanged and still
 // whole-library — the full-evidence ruling (controller resolution 4) is about
 // what is read and cross-checked, not about how much may be written — so a
 // webhook cycle still costs a full instance scan, bounded by the debounce.
 //
-// Yielding NONE is meaningful and widening: an event that named no season
-// claims the whole series, and is evaluated across every eligible season of it
-// exactly as --only-id is (controller resolution 2).
-func (p webhookPayload) affectedSeasons() []int {
-	if p.Episodes == nil {
-		return nil
+// The unreadable count is returned rather than swallowed because the caller has
+// to WARN about it: it is untrusted input in the position that decides how much
+// this program may unmonitor, and the one thing §2.6 never permits there is
+// silence. A partially unreadable payload still yields its readable seasons —
+// those are a real claim — and the records that named nothing widen nothing.
+func (p webhookPayload) affectedSeasons() (seasons []int, unreadable int, claim scopeClaim) {
+	if p.Episodes == nil || len(*p.Episodes) == 0 {
+		return nil, 0, claimWholeItem
 	}
-	var seasons []int
 	for _, e := range *p.Episodes {
 		if e.SeasonNumber != nil {
 			seasons = append(seasons, *e.SeasonNumber)
+			continue
 		}
+		unreadable++
 	}
-	return dedupeSortedIDs(seasons)
+	if len(seasons) == 0 {
+		return nil, unreadable, claimNothing
+	}
+	return dedupeSortedIDs(seasons), unreadable, claimSeasons
 }
 
 // debounceQueue is the in-memory, per-item debounce the plan calls for: each
@@ -173,8 +223,22 @@ func newDebounceQueue(limit int) *debounceQueue {
 }
 
 // add records an event for key, (re)setting its timer to fire debounce from
-// now. It returns the deadline it set and, when the queue was full and
-// something had to go, the key it dropped.
+// now. It returns the deadline it set, whether anything is now queued for the
+// key, and — when the queue was full and something had to go — the key it
+// dropped.
+//
+// THE CLAIM IS PASSED IN, not inferred from len(seasons), and that is the whole
+// of FIX 3's follow-up. "No seasons" used to mean one thing here (claim the
+// whole item) and reach this function from two places that meant opposite
+// things by it. A claimNothing event — episodes present, none readable — makes
+// NO claim: it does not widen the key to the whole item, it does not narrow or
+// discard whatever an earlier well-formed event accumulated, and it does not
+// create a key that did not already exist. All it can do is reset the timer of
+// an item something is already known to have happened to, which is exactly the
+// amount of trust an unreadable payload has earned.
+//
+// queued is false only for a claimNothing event naming an item with nothing
+// pending: nothing was recorded, and the caller says so.
 //
 // The bound exists because the queue is fed by an outside system: a runaway
 // *arr, a mass import, or a misconfigured hook could otherwise grow it without
@@ -189,11 +253,19 @@ func newDebounceQueue(limit int) *debounceQueue {
 // scheduled that would revisit it, and the key is gone until the process
 // restarts and its startup scan reads the whole library again. That is a real
 // difference in consequence, so it is never papered over with one message.
-func (q *debounceQueue) add(key queueKey, seasons []int, now time.Time, debounce time.Duration) (deadline time.Time, dropped *queueKey) {
+func (q *debounceQueue) add(key queueKey, seasons []int, claim scopeClaim, now time.Time, debounce time.Duration) (deadline time.Time, dropped *queueKey, queued bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	if _, existing := q.deadline[key]; !existing && len(q.deadline) >= q.limit {
+	_, existing := q.deadline[key]
+	if claim == claimNothing && !existing {
+		// Nothing readable arrived and nothing is pending for this item, so
+		// there is nothing to reset and no claim to record. Creating the key
+		// here would be creating it with an empty scope, which downstream reads
+		// as EVERY season — the widening this claim exists to refuse.
+		return time.Time{}, nil, false
+	}
+	if !existing && len(q.deadline) >= q.limit {
 		var oldest queueKey
 		var oldestAt time.Time
 		for k, at := range q.deadline {
@@ -209,23 +281,27 @@ func (q *debounceQueue) add(key queueKey, seasons []int, now time.Time, debounce
 
 	deadline = now.Add(debounce)
 	q.deadline[key] = deadline
-	switch {
-	case len(seasons) == 0:
-		// This event named no seasons, so it claims the whole item. See
-		// wholeItem: the claim is sticky and anything already accumulated is
-		// discarded, because a set of season numbers can only ever be narrower
-		// than "all of it".
+	switch claim {
+	case claimWholeItem:
+		// See wholeItem: the claim is sticky and anything already accumulated
+		// is discarded, because a set of season numbers can only ever be
+		// narrower than "all of it".
 		q.wholeItem[key] = true
 		delete(q.seasons, key)
-	case !q.wholeItem[key]:
-		q.seasons[key] = dedupeSortedIDs(append(q.seasons[key], seasons...))
+	case claimSeasons:
+		if !q.wholeItem[key] {
+			q.seasons[key] = dedupeSortedIDs(append(q.seasons[key], seasons...))
+		}
+	case claimNothing:
+		// The timer reset above is the ONLY effect. The accumulated scope is
+		// left exactly as the readable events left it.
 	}
 
 	select {
 	case q.notify <- struct{}{}:
 	default:
 	}
-	return deadline, dropped
+	return deadline, dropped, true
 }
 
 // expired removes and returns every key whose timer has come due as of now,
@@ -411,11 +487,34 @@ func (s *webhookServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	key := queueKey{instance: name, kind: kind, id: *ref.ID}
-	seasons := payload.affectedSeasons()
-	deadline, dropped := s.queue.add(key, seasons, s.now(), s.debounce)
+
+	// The seasons are consulted ONLY for a sonarr, because kind comes from the
+	// configured instance type and a movie has no seasons to name: an episodes
+	// array arriving on a radarr's endpoint is part of the same misconfiguration
+	// the ref check above surfaces, and must not be allowed to make a claim.
+	seasons, unreadable, claim := []int(nil), 0, claimWholeItem
+	if kind == webhookKindSeries {
+		seasons, unreadable, claim = payload.affectedSeasons()
+	}
+	deadline, dropped, queued := s.queue.add(key, seasons, claim, s.now(), s.debounce)
+	if unreadable > 0 {
+		s.warnUnreadableEpisodes(name, instType, key, unreadable, seasons, claim, queued)
+	}
+	if !queued {
+		// claimNothing for an item with nothing pending: the warning above has
+		// already said what happened and what covers it. Nothing was queued, so
+		// there is no deadline to report.
+		writeWebhookAccepted(w)
+		return
+	}
 
 	attrs := []any{"instance", name, "type", instType, "key", key.String(),
-		"eventType", *payload.EventType, "debounce", s.debounce, "evaluateAfter", deadline}
+		"eventType", *payload.EventType, "debounce", s.debounce, "evaluateAfter", deadline,
+		// scopeClaim is what this event said about the write scope, and it is
+		// logged unconditionally because its most important values are the ones
+		// that name no seasons: without it, a whole-series claim and a payload
+		// whose seasons could not be read produced byte-identical lines.
+		"scopeClaim", claim.String()}
 	if ref.Title != nil {
 		attrs = append(attrs, "title", *ref.Title)
 	}
@@ -444,6 +543,52 @@ func (s *webhookServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeWebhookAccepted(w)
+}
+
+// warnUnreadableEpisodes is the noise an episode record with no readable
+// seasonNumber is required to make.
+//
+// It is a WARN and not a debug line for the same reason the skip lines in §2.6
+// are: this is untrusted input in the position that decides how much of a
+// series this program may unmonitor, and the failure mode it replaces was
+// invisible — an unreadable record silently widened the write scope for the
+// whole burst and the log said nothing that a well-formed no-episodes event
+// would not also have said.
+//
+// The message states the CONSEQUENCE rather than the fact, because the fact is
+// not actionable on its own, and the consequence differs by case: a partially
+// readable payload still has a scope, an entirely unreadable one has none and
+// may not have queued anything at all.
+func (s *webhookServer) warnUnreadableEpisodes(name, instType string, key queueKey, unreadable int, seasons []int, claim scopeClaim, queued bool) {
+	attrs := []any{"instance", name, "type", instType, "key", key.String(),
+		"episodeRecordsWithNoSeasonNumber", unreadable}
+
+	if claim == claimSeasons {
+		s.logger.Warn("webhook payload contains episode records with no seasonNumber; those records name no season, so they are ignored and this event's write scope is only the seasons that WERE readable (they do not widen it to the whole series)",
+			append(attrs, "writeScopeSeasons", joinInts(seasons))...)
+		return
+	}
+
+	// claimNothing: not one record in a non-empty episodes array yielded a
+	// season. Saying WHY this is not treated as a whole-series claim matters,
+	// because the neighbouring, legitimate case (no episodes array at all) IS
+	// one, and an operator reading this line needs to know the difference is
+	// deliberate.
+	if queued {
+		s.logger.Warn("webhook payload's episodes array names no readable seasonNumber at all; this is NOT read as a claim on the whole series (that would widen an unmonitor from the affected season to every season of it on the strength of input that could not be read), so only this item's debounce timer was reset and the season scope its earlier, readable events established is unchanged",
+			attrs...)
+		return
+	}
+	// Nothing was pending for the item, so nothing was queued. What covers it
+	// instead depends on the configuration, exactly as the queue-overflow WARN
+	// does, and for the same reason: telling an operator a sweep will pick it up
+	// when no sweep exists would make them stop looking.
+	coveredBy := "the next reconciliation sweep, which reads this instance's whole library"
+	if s.pollInterval <= 0 {
+		coveredBy = "nothing until this daemon is restarted: poll_interval is 0, so it has no reconciliation sweep, and only a startup scan reads the whole library"
+	}
+	s.logger.Warn("webhook payload's episodes array names no readable seasonNumber at all; this is NOT read as a claim on the whole series (that would widen an unmonitor from the affected season to every season of it on the strength of input that could not be read), and nothing was pending for this item, so nothing was queued for it",
+		append(attrs, "coveredBy", coveredBy, "pollInterval", s.pollInterval)...)
 }
 
 // writeWebhookAccepted sends the only response this endpoint ever sends.

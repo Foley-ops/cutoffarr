@@ -237,6 +237,119 @@ func TestWebhookHandler_SonarrPayload_NoEpisodes_StillQueuesTheSeries(t *testing
 	}
 }
 
+// --- episodes present but unreadable ----------------------------------------
+//
+// These four pin the gap between the two things a Sonarr payload can mean when
+// no season number comes out of it, which the code used to collapse into one.
+//
+//	episodes ABSENT or EMPTY      -> "something in this series changed", the
+//	                                 mandated whole-series claim (binding
+//	                                 controller resolution 2).
+//	episodes PRESENT but with no
+//	readable seasonNumber          -> untrusted input. It is NOT a claim about
+//	                                 the whole series; it is a payload we could
+//	                                 not read.
+//
+// Treating the second as the first is how ONE unreadable episode record in a
+// 24-event burst escalated the write scope from "the affected season" to
+// "every eligible season of the series" — unattended, one debounce later, with
+// the per-item report lines demoted to DEBUG, and nothing at any level saying
+// it had happened. That is the §2.6 never-guess rule applied to the input that
+// decides how much this program may unmonitor.
+
+// TestWebhookHandler_SonarrEpisodesPresentButUnreadable_IsNotAWholeSeriesClaim
+// is the dangerous case: every element of a non-empty episodes array is
+// unreadable.
+func TestWebhookHandler_SonarrEpisodesPresentButUnreadable_IsNotAWholeSeriesClaim(t *testing.T) {
+	handler, queue, buf, _ := newWebhookTestServer(t, map[string]string{"sonarr-main": "sonarr"}, 45*time.Second, slog.LevelDebug)
+
+	rec := postWebhook(t, handler, "sonarr-main",
+		`{"eventType":"Download","series":{"id":7},"episodes":[{},{"seasonNumber":null},{"episodeNumber":3}]}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: an unreadable payload never makes an *arr's webhook look broken", rec.Code)
+	}
+	if queue.size() != 0 {
+		t.Errorf("queue size = %d, want 0: an event that names no readable season is not a claim on the whole series, and queueing it as one would widen the write scope to every season of it", queue.size())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") {
+		t.Errorf("input this program could not read, deciding how much it may unmonitor, must warn:\n%s", out)
+	}
+	for _, want := range []string{"sonarr-main", "sonarr-main/series/7", "3"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the warning must name the instance, the item, and how many episode records had no seasonNumber; %q is missing:\n%s", want, out)
+		}
+	}
+}
+
+// TestWebhookHandler_SonarrEpisodesPartiallyUnreadable_ScopeIsWhatWasReadable:
+// some records readable, some not. The readable ones are a real claim and are
+// kept; the unreadable ones widen nothing and are warned about, because "we
+// evaluated season 2 and there were three records we could not read" is a
+// materially different statement from "we evaluated season 2".
+func TestWebhookHandler_SonarrEpisodesPartiallyUnreadable_ScopeIsWhatWasReadable(t *testing.T) {
+	handler, queue, buf, clock := newWebhookTestServer(t, map[string]string{"sonarr-main": "sonarr"}, 45*time.Second, slog.LevelDebug)
+
+	rec := postWebhook(t, handler, "sonarr-main",
+		`{"eventType":"Download","series":{"id":7},"episodes":[{"seasonNumber":2},{},{"seasonNumber":2}]}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	due, seasons := queue.expired(clock.Now().Add(time.Hour))
+	if len(due) != 1 {
+		t.Fatalf("queued keys = %v, want the one series", due)
+	}
+	if got := joinInts(seasons[due[0]]); got != "2" {
+		t.Errorf("write scope = %q, want %q: the unreadable record names no season and must neither add one nor widen to all of them", got, "2")
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") {
+		t.Errorf("a dropped episode record must be warned about even when other records were readable:\n%s", out)
+	}
+}
+
+// TestWebhookHandler_UnreadableEpisodes_DoNotDiscardSeasonsAlreadyAccumulated:
+// a burst for one series mixes events. An unreadable one arriving after a
+// readable one must not throw away the scope the readable one established —
+// which is what a whole-series claim would do (add() deletes the accumulated
+// seasons when a key is claimed whole).
+func TestWebhookHandler_UnreadableEpisodes_DoNotDiscardSeasonsAlreadyAccumulated(t *testing.T) {
+	handler, queue, _, clock := newWebhookTestServer(t, map[string]string{"sonarr-main": "sonarr"}, 45*time.Second, slog.LevelDebug)
+
+	postWebhook(t, handler, "sonarr-main", `{"eventType":"Download","series":{"id":7},"episodes":[{"seasonNumber":2}]}`)
+	postWebhook(t, handler, "sonarr-main", `{"eventType":"Download","series":{"id":7},"episodes":[{"episodeNumber":9}]}`)
+
+	if queue.size() != 1 {
+		t.Fatalf("queue size = %d, want 1: both events name the same series", queue.size())
+	}
+	due, seasons := queue.expired(clock.Now().Add(time.Hour))
+	if got := joinInts(seasons[due[0]]); got != "2" {
+		t.Errorf("write scope = %q, want %q: an unreadable event must not discard a scope an earlier readable event established", got, "2")
+	}
+}
+
+// TestWebhookHandler_UnreadableEpisodes_AreDistinguishableFromNoEpisodesInTheLog
+// is the observability half, and it is the reason this went unnoticed. The
+// queued-event debug line only appends affectedSeasons when there ARE seasons,
+// so an unreadable-episodes event and a legitimate no-episodes event produced
+// byte-identical output while meaning opposite things about the write scope.
+func TestWebhookHandler_UnreadableEpisodes_AreDistinguishableFromNoEpisodesInTheLog(t *testing.T) {
+	mandated, _, mandatedLog, _ := newWebhookTestServer(t, map[string]string{"sonarr-main": "sonarr"}, 45*time.Second, slog.LevelDebug)
+	postWebhook(t, mandated, "sonarr-main", `{"eventType":"Download","series":{"id":7}}`)
+
+	unreadable, _, unreadableLog, _ := newWebhookTestServer(t, map[string]string{"sonarr-main": "sonarr"}, 45*time.Second, slog.LevelDebug)
+	postWebhook(t, unreadable, "sonarr-main", `{"eventType":"Download","series":{"id":7},"episodes":[{}]}`)
+
+	if strings.Contains(mandatedLog.String(), "level=WARN") {
+		t.Errorf("an absent episodes array is the MANDATED whole-series claim, not a problem:\n%s", mandatedLog.String())
+	}
+	if mandatedLog.String() == unreadableLog.String() {
+		t.Errorf("these two events make opposite claims about the write scope and produced identical output:\n%s", mandatedLog.String())
+	}
+}
+
 // TestWebhookHandler_RadarrPayloadToASonarrEndpoint_IsIgnoredWithAWarning:
 // the item kind comes from the CONFIGURED instance type, never from sniffing
 // the payload. The endpoint an event arrived on is what says which library it
@@ -301,9 +414,9 @@ func TestDebounceQueue_RepeatedEventsForOneKey_ResetTheTimerRatherThanStacking(t
 	clock := newFakeClock()
 	key := queueKey{instance: "sonarr-main", kind: webhookKindSeries, id: 7}
 
-	q.add(key, nil, clock.Now(), 45*time.Second)
+	q.add(key, nil, claimWholeItem, clock.Now(), 45*time.Second)
 	clock.Advance(30 * time.Second)
-	q.add(key, nil, clock.Now(), 45*time.Second) // 15s before the first would fire
+	q.add(key, nil, claimWholeItem, clock.Now(), 45*time.Second) // 15s before the first would fire
 
 	if q.size() != 1 {
 		t.Fatalf("size = %d, want 1: the same item is one key, however many events name it", q.size())
@@ -325,9 +438,9 @@ func TestDebounceQueue_RepeatedEventsForOneKey_ResetTheTimerRatherThanStacking(t
 func TestDebounceQueue_DistinctKeysDoNotCollapse(t *testing.T) {
 	q := newDebounceQueue(webhookQueueLimit)
 	clock := newFakeClock()
-	q.add(queueKey{instance: "radarr-main", kind: webhookKindMovie, id: 1}, nil, clock.Now(), time.Minute)
-	q.add(queueKey{instance: "radarr-main", kind: webhookKindMovie, id: 2}, nil, clock.Now(), time.Minute)
-	q.add(queueKey{instance: "radarr-4k", kind: webhookKindMovie, id: 1}, nil, clock.Now(), time.Minute)
+	q.add(queueKey{instance: "radarr-main", kind: webhookKindMovie, id: 1}, nil, claimWholeItem, clock.Now(), time.Minute)
+	q.add(queueKey{instance: "radarr-main", kind: webhookKindMovie, id: 2}, nil, claimWholeItem, clock.Now(), time.Minute)
+	q.add(queueKey{instance: "radarr-4k", kind: webhookKindMovie, id: 1}, nil, claimWholeItem, clock.Now(), time.Minute)
 
 	if q.size() != 3 {
 		t.Fatalf("size = %d, want 3: two movies of one instance and the same id in another are three different things", q.size())
@@ -357,11 +470,11 @@ func TestDebounceQueue_Overflow_DropsTheLongestSettlingItemAndReportsIt(t *testi
 	q := newDebounceQueue(3)
 	clock := newFakeClock()
 	for i := 1; i <= 3; i++ {
-		q.add(queueKey{instance: "radarr-main", kind: webhookKindMovie, id: i}, nil, clock.Now(), time.Minute)
+		q.add(queueKey{instance: "radarr-main", kind: webhookKindMovie, id: i}, nil, claimWholeItem, clock.Now(), time.Minute)
 		clock.Advance(time.Second)
 	}
 
-	_, dropped := q.add(queueKey{instance: "radarr-main", kind: webhookKindMovie, id: 4}, nil, clock.Now(), time.Minute)
+	_, dropped, _ := q.add(queueKey{instance: "radarr-main", kind: webhookKindMovie, id: 4}, nil, claimWholeItem, clock.Now(), time.Minute)
 
 	if q.size() != 3 {
 		t.Errorf("size = %d, want the limit of 3", q.size())
@@ -371,7 +484,7 @@ func TestDebounceQueue_Overflow_DropsTheLongestSettlingItemAndReportsIt(t *testi
 	}
 	// A repeat of an ALREADY-QUEUED key must not evict anything: it is a reset,
 	// not a new entry.
-	if _, d := q.add(queueKey{instance: "radarr-main", kind: webhookKindMovie, id: 2}, nil, clock.Now(), time.Minute); d != nil {
+	if _, d, _ := q.add(queueKey{instance: "radarr-main", kind: webhookKindMovie, id: 2}, nil, claimWholeItem, clock.Now(), time.Minute); d != nil {
 		t.Errorf("resetting an existing key evicted %v; only a NEW key can overflow the queue", d)
 	}
 }
@@ -385,8 +498,8 @@ func TestDebounceQueue_SeasonNumbersAccumulateAcrossEventsForOneKey(t *testing.T
 	clock := newFakeClock()
 	key := queueKey{instance: "sonarr-main", kind: webhookKindSeries, id: 7}
 
-	q.add(key, []int{2}, clock.Now(), time.Minute)
-	q.add(key, []int{3, 2}, clock.Now(), time.Minute)
+	q.add(key, []int{2}, claimSeasons, clock.Now(), time.Minute)
+	q.add(key, []int{3, 2}, claimSeasons, clock.Now(), time.Minute)
 
 	clock.Advance(2 * time.Minute)
 	due, seasons := q.expired(clock.Now())
@@ -413,8 +526,8 @@ func TestDebounceQueue_AnEventNamingNoSeasons_WidensTheKeyToTheWholeItem(t *test
 	t.Run("seasons then none", func(t *testing.T) {
 		q := newDebounceQueue(webhookQueueLimit)
 		clock := newFakeClock()
-		q.add(key, []int{2}, clock.Now(), time.Minute)
-		q.add(key, nil, clock.Now(), time.Minute)
+		q.add(key, []int{2}, claimSeasons, clock.Now(), time.Minute)
+		q.add(key, nil, claimWholeItem, clock.Now(), time.Minute)
 
 		clock.Advance(2 * time.Minute)
 		due, seasons := q.expired(clock.Now())
@@ -429,8 +542,8 @@ func TestDebounceQueue_AnEventNamingNoSeasons_WidensTheKeyToTheWholeItem(t *test
 	t.Run("none then seasons: the whole-item claim is sticky", func(t *testing.T) {
 		q := newDebounceQueue(webhookQueueLimit)
 		clock := newFakeClock()
-		q.add(key, nil, clock.Now(), time.Minute)
-		q.add(key, []int{2}, clock.Now(), time.Minute)
+		q.add(key, nil, claimWholeItem, clock.Now(), time.Minute)
+		q.add(key, []int{2}, claimSeasons, clock.Now(), time.Minute)
 
 		clock.Advance(2 * time.Minute)
 		due, seasons := q.expired(clock.Now())
@@ -442,17 +555,85 @@ func TestDebounceQueue_AnEventNamingNoSeasons_WidensTheKeyToTheWholeItem(t *test
 	t.Run("a fresh key after expiry starts over", func(t *testing.T) {
 		q := newDebounceQueue(webhookQueueLimit)
 		clock := newFakeClock()
-		q.add(key, nil, clock.Now(), time.Minute)
+		q.add(key, nil, claimWholeItem, clock.Now(), time.Minute)
 		clock.Advance(2 * time.Minute)
 		q.expired(clock.Now())
 
 		// A new import, later, that DOES name its season: the previous cycle's
 		// whole-series claim was consumed with it and must not linger.
-		q.add(key, []int{4}, clock.Now(), time.Minute)
+		q.add(key, []int{4}, claimSeasons, clock.Now(), time.Minute)
 		clock.Advance(2 * time.Minute)
 		due, seasons := q.expired(clock.Now())
 		if got := joinInts(seasons[due[0]]); got != "4" {
 			t.Errorf("seasons = %q, want %q: an expired key's accumulated claims are consumed with it", got, "4")
+		}
+	})
+}
+
+// TestDebounceQueue_AnUnreadableEventMakesNoClaim is the queue's half of the
+// three-way distinction, stated where the write scope actually lives.
+//
+// claimWholeItem and claimNothing both arrive here carrying no seasons, and
+// before they were told apart the queue could only see the empty slice — so it
+// applied the sticky whole-item widening to both. The three properties below
+// are what "makes no claim" has to mean for a value that decides how much may
+// be unmonitored: it cannot widen, it cannot narrow, and it cannot invent an
+// item to evaluate.
+func TestDebounceQueue_AnUnreadableEventMakesNoClaim(t *testing.T) {
+	key := queueKey{instance: "sonarr-main", kind: webhookKindSeries, id: 7}
+
+	t.Run("it cannot create a key, because an empty scope reads as EVERY season", func(t *testing.T) {
+		q := newDebounceQueue(webhookQueueLimit)
+		clock := newFakeClock()
+
+		deadline, dropped, queued := q.add(key, nil, claimNothing, clock.Now(), time.Minute)
+
+		if queued || !deadline.IsZero() || dropped != nil {
+			t.Errorf("add = (%v, %v, %v), want (zero, nil, false)", deadline, dropped, queued)
+		}
+		if q.size() != 0 {
+			t.Errorf("size = %d, want 0: a payload whose seasons could not be read must not enqueue a whole-series evaluation", q.size())
+		}
+	})
+
+	t.Run("it cannot evict anything either", func(t *testing.T) {
+		// The bound's eviction is reached only by a NEW key, and an unreadable
+		// event never becomes one — so a burst of unreadable payloads for
+		// unknown items cannot flush a full queue of real work.
+		q := newDebounceQueue(2)
+		clock := newFakeClock()
+		q.add(queueKey{instance: "sonarr-main", kind: webhookKindSeries, id: 1}, []int{1}, claimSeasons, clock.Now(), time.Minute)
+		q.add(queueKey{instance: "sonarr-main", kind: webhookKindSeries, id: 2}, []int{1}, claimSeasons, clock.Now(), time.Minute)
+
+		if _, dropped, _ := q.add(key, nil, claimNothing, clock.Now(), time.Minute); dropped != nil {
+			t.Errorf("an unreadable event evicted %v from a full queue; it may not displace real work", dropped)
+		}
+		if q.size() != 2 {
+			t.Errorf("size = %d, want 2", q.size())
+		}
+	})
+
+	t.Run("for a pending key it resets the timer and nothing else", func(t *testing.T) {
+		q := newDebounceQueue(webhookQueueLimit)
+		clock := newFakeClock()
+		q.add(key, []int{2}, claimSeasons, clock.Now(), time.Minute)
+
+		clock.Advance(45 * time.Second)
+		if _, _, queued := q.add(key, nil, claimNothing, clock.Now(), time.Minute); !queued {
+			t.Fatal("an unreadable event for an item already pending must still reset its timer: something did happen to that item")
+		}
+
+		clock.Advance(30 * time.Second) // t=75s: past the original deadline, before the reset one
+		if due, _ := q.expired(clock.Now()); len(due) != 0 {
+			t.Fatalf("the timer must have been reset, got %v due", due)
+		}
+		clock.Advance(45 * time.Second) // t=120s: past the reset deadline (105s)
+		due, seasons := q.expired(clock.Now())
+		if len(due) != 1 {
+			t.Fatalf("expected the key to fire, got %v", due)
+		}
+		if got := joinInts(seasons[due[0]]); got != "2" {
+			t.Errorf("seasons = %q, want %q: an unreadable event neither widens the scope to every season nor discards the one an earlier readable event established", got, "2")
 		}
 	})
 }
