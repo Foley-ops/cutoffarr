@@ -108,6 +108,53 @@ func TestComposeExample_MatchesThePlansDeploymentShape(t *testing.T) {
 		}
 	}
 
+	// And the one key the plan's list does not name but this program's own
+	// shutdown design requires. See the dedicated test below.
+	if !strings.Contains(uncommented(compose), "stop_grace_period:") {
+		t.Errorf("the compose example must set stop_grace_period; Docker's 10s default SIGKILLs mid-season-write:\n%s", compose)
+	}
+}
+
+// TestComposeExample_StopGracePeriodOutlastsASeasonWrite is the deployment
+// artifact's half of binding controller note 4.
+//
+// The invariant that note protects is that a season write is ATOMIC with
+// respect to shutdown: unmonitorSeason detaches its calls from cancellation
+// (context.WithoutCancel) so the episode PUT and the series PUT either both
+// happen or neither starts, because the state in between — episodes
+// unmonitored, season still monitored — is the one the recovery path exists to
+// mop up. The Go code cannot enforce that alone: if the supervisor SIGKILLs the
+// process mid-pair, the invariant is broken from outside, and Docker's default
+// stop timeout is 10 SECONDS.
+//
+// A season write is up to five sequential calls (GET /series, GET /episode,
+// PUT /episode/monitor, the confirming re-GET, PUT /series), each bounded by
+// apiClientTimeout — so against an *arr that is slow rather than dead, the
+// worst case is five times that, plus the server's own drain. The grace period
+// is asserted against the CODE's constant rather than a literal, so shortening
+// one without the other fails here instead of on deploy day.
+func TestComposeExample_StopGracePeriodOutlastsASeasonWrite(t *testing.T) {
+	compose := readRepoFile(t, "docker-compose.example.yml")
+
+	m := regexp.MustCompile(`(?m)^\s*stop_grace_period:\s*(\d+)s`).FindStringSubmatch(uncommented(compose))
+	if m == nil {
+		t.Fatalf("the compose example must set stop_grace_period as a plain number of seconds:\n%s", compose)
+	}
+	grace, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("parsing stop_grace_period %q: %v", m[1], err)
+	}
+
+	// The five calls of the worst-case season write, plus the webhook server's
+	// own drain: anything less and SIGKILL can land between the episode PUT and
+	// the series PUT.
+	const seasonWriteCalls = 5
+	want := seasonWriteCalls*int(apiClientTimeout.Seconds()) + int(webhookShutdownGrace.Seconds())
+	if grace < want {
+		t.Errorf("stop_grace_period is %ds; a season write can take %d x %s plus a %s drain, so anything under %ds lets SIGKILL land between the episode PUT and the series PUT",
+			grace, seasonWriteCalls, apiClientTimeout, webhookShutdownGrace, want)
+	}
+
 	// webui is deliberately omitted (plan: "webui omitted for now") — cutoffarr
 	// has no web UI, and the label would point Unraid's button at a 405. The
 	// check is against the UNCOMMENTED file, because saying so in a comment is

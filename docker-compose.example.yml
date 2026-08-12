@@ -13,6 +13,24 @@ services:
     container_name: cutoffarr
     restart: unless-stopped
 
+    # DO NOT LOWER THIS, and understand it before you raise the *arrs' timeouts.
+    #
+    # cutoffarr stops between ITEMS, never inside one. A Sonarr season is
+    # written as a pair of calls — the episodes first, then the season flag —
+    # and the pair is deliberately detached from shutdown so it completes or
+    # never starts: the state in between (episodes unmonitored, season still
+    # monitored) is the one thing this program goes out of its way never to
+    # leave behind. On SIGTERM it finishes the item in flight and exits.
+    #
+    # Docker's DEFAULT stop timeout is 10 seconds, after which it SIGKILLs —
+    # which would break that guarantee from the outside, in exactly the slow-*arr
+    # case the guarantee exists for. One season write is at most five sequential
+    # API calls, each bounded by cutoffarr's own 15s per-call timeout, plus a 5s
+    # drain of the webhook listener: 80s worst case, 90 for headroom. In the
+    # ordinary case the process is gone in well under a second — this is a
+    # ceiling, not a delay.
+    stop_grace_period: 90s
+
     # Unraid's usual nobody:users. The container's own default is distroless's
     # nonroot (65532:65532); this override exists so the mounted /config is
     # readable with the permissions Unraid shares elsewhere in the stack.
