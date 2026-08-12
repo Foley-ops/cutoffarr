@@ -3,13 +3,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -717,5 +720,324 @@ instances:
 	}
 	if len(gotEpisodeRequests) != 0 {
 		t.Errorf("expected zero /episode requests, got %d", len(gotEpisodeRequests))
+	}
+}
+
+// --- statefulSonarrFake: a whole-pipeline recording, mutable-state fake ----
+//
+// Built stateful from day one (binding controller notes item 6), the same
+// way statefulRadarrFake (writer_test.go) was for Radarr's write pass: even
+// though Phase 6 has no Sonarr write path at all, the per-episode monitored
+// state modeled here — reflected consistently across /series, /episode,
+// /episodefile, and /wanted/cutoff — is what Phase 7's write pass will need
+// to prove a PUT actually changed something. Building that model now, and
+// exercising it read-only in this phase, means Phase 7 extends this fake
+// with a PUT handler rather than retrofitting the whole thing (the
+// retrofit item 4's notes call out as Phase 4's hardest cycle).
+//
+// The catch-all handler and the writes() accessor (every non-GET request,
+// never a PUT-only filter) are what make "this phase never writes anything"
+// a checkable fact about requests nobody thought to make, not merely about
+// the ones this fake happens to answer.
+
+type statefulSonarrEpisode struct {
+	id            int
+	seriesID      int
+	seasonNumber  int
+	episodeNumber int
+	monitored     bool
+	hasFile       bool
+	airDateUtc    string // RFC3339, or "" for JSON null (unaired/undated)
+	episodeFileID int
+	inWantedSet   bool
+}
+
+type statefulSonarrEpisodeFile struct {
+	id                  int
+	seasonNumber        int
+	customFormatScore   int
+	qualityCutoffNotMet bool
+}
+
+type statefulSonarrSeason struct {
+	number            int
+	monitored         bool
+	episodeFileCount  int
+	totalEpisodeCount int
+}
+
+type statefulSonarrSeries struct {
+	id        int
+	title     string
+	monitored bool
+	profileID int
+	tags      []int
+	seasons   []statefulSonarrSeason
+}
+
+type statefulSonarrFake struct {
+	srv *httptest.Server
+
+	mu          sync.Mutex
+	series      map[int]*statefulSonarrSeries
+	seriesOrder []int
+	episodes    map[int]*statefulSonarrEpisode     // keyed by episode id
+	files       map[int]*statefulSonarrEpisodeFile // keyed by file id
+	requests    []recordedRequest
+
+	profilesJSON string
+	tagsJSON     string
+}
+
+// newStatefulSonarrFake starts a fake Sonarr backed by series/episodes/
+// files. Order is preserved for /series (iterating seriesOrder), matching
+// statefulRadarrFake's determinism rationale for report-line assertions.
+func newStatefulSonarrFake(t *testing.T, series []*statefulSonarrSeries, episodes []*statefulSonarrEpisode, files []*statefulSonarrEpisodeFile) *statefulSonarrFake {
+	t.Helper()
+	f := &statefulSonarrFake{
+		series:       make(map[int]*statefulSonarrSeries, len(series)),
+		episodes:     make(map[int]*statefulSonarrEpisode, len(episodes)),
+		files:        make(map[int]*statefulSonarrEpisodeFile, len(files)),
+		profilesJSON: `[{"id": 1, "name": "HD-1080p", "upgradeAllowed": true, "cutoff": 7, "cutoffFormatScore": 100}]`,
+		tagsJSON:     `[]`,
+	}
+	for _, s := range series {
+		f.series[s.id] = s
+		f.seriesOrder = append(f.seriesOrder, s.id)
+	}
+	for _, e := range episodes {
+		f.episodes[e.id] = e
+	}
+	for _, ef := range files {
+		f.files[ef.id] = ef
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/system/status", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"appName": "Sonarr", "version": "4.0.19.2979"}`))
+	}))
+	mux.HandleFunc("/api/v3/qualityprofile", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(f.profilesJSON))
+	}))
+	mux.HandleFunc("/api/v3/tag", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(f.tagsJSON))
+	}))
+	mux.HandleFunc("/api/v3/series", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(f.seriesJSON()))
+	}))
+	mux.HandleFunc("/api/v3/episode", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		seriesID, _ := strconv.Atoi(r.URL.Query().Get("seriesId"))
+		w.Write([]byte(f.episodesJSON(seriesID)))
+	}))
+	mux.HandleFunc("/api/v3/episodefile", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		seriesID, _ := strconv.Atoi(r.URL.Query().Get("seriesId"))
+		w.Write([]byte(f.episodeFilesJSON(seriesID)))
+	}))
+	mux.HandleFunc("/api/v3/wanted/cutoff", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(f.wantedCutoffJSON()))
+	}))
+	// Catch-all: same rationale as radarrFake's (writer_test.go) — a request
+	// to any path this fake does not stub (a future Sonarr write verb, an
+	// unexpected endpoint) is recorded before the 404 a real Sonarr would
+	// answer with, so "zero write requests" is a claim about requests
+	// nobody thought to make, not just the ones this fake happens to serve.
+	mux.HandleFunc("/", f.handle(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	f.srv = httptest.NewServer(mux)
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+func (f *statefulSonarrFake) handle(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.requests = append(f.requests, recordedRequest{method: r.Method, path: r.URL.Path})
+		f.mu.Unlock()
+		next(w, r)
+	}
+}
+
+func (f *statefulSonarrFake) seriesJSON() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var elems []string
+	for _, id := range f.seriesOrder {
+		s := f.series[id]
+		var seasons []string
+		for _, season := range s.seasons {
+			seasons = append(seasons, fmt.Sprintf(`{"seasonNumber":%d,"monitored":%t,"statistics":{"episodeFileCount":%d,"totalEpisodeCount":%d}}`,
+				season.number, season.monitored, season.episodeFileCount, season.totalEpisodeCount))
+		}
+		tagsJSON, _ := json.Marshal(s.tags)
+		elems = append(elems, fmt.Sprintf(`{"id":%d,"title":%q,"monitored":%t,"qualityProfileId":%d,"tags":%s,"seasons":[%s]}`,
+			s.id, s.title, s.monitored, s.profileID, tagsJSON, strings.Join(seasons, ",")))
+	}
+	return "[" + strings.Join(elems, ",") + "]"
+}
+
+func (f *statefulSonarrFake) episodesJSON(seriesID int) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var elems []string
+	for _, e := range f.episodes {
+		if e.seriesID != seriesID {
+			continue
+		}
+		airDateJSON := "null"
+		if e.airDateUtc != "" {
+			airDateJSON = strconv.Quote(e.airDateUtc)
+		}
+		elems = append(elems, fmt.Sprintf(`{"id":%d,"seasonNumber":%d,"episodeNumber":%d,"monitored":%t,"hasFile":%t,"airDateUtc":%s,"episodeFileId":%d}`,
+			e.id, e.seasonNumber, e.episodeNumber, e.monitored, e.hasFile, airDateJSON, e.episodeFileID))
+	}
+	return "[" + strings.Join(elems, ",") + "]"
+}
+
+func (f *statefulSonarrFake) episodeFilesJSON(seriesID int) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var elems []string
+	for _, ef := range f.files {
+		// Only include files belonging to episodes of this series — the
+		// fake models the join the same way real Sonarr's /episodefile
+		// endpoint does (scoped by seriesId), via each episode's own
+		// episodeFileId pointing at one of these files.
+		belongs := false
+		for _, e := range f.episodes {
+			if e.seriesID == seriesID && e.episodeFileID == ef.id {
+				belongs = true
+				break
+			}
+		}
+		if !belongs {
+			continue
+		}
+		elems = append(elems, fmt.Sprintf(`{"id":%d,"seasonNumber":%d,"customFormatScore":%d,"qualityCutoffNotMet":%t}`,
+			ef.id, ef.seasonNumber, ef.customFormatScore, ef.qualityCutoffNotMet))
+	}
+	return "[" + strings.Join(elems, ",") + "]"
+}
+
+func (f *statefulSonarrFake) wantedCutoffJSON() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var recs []string
+	for _, e := range f.episodes {
+		if e.inWantedSet {
+			recs = append(recs, fmt.Sprintf(`{"id":%d,"seriesId":%d,"seasonNumber":%d,"episodeNumber":%d,"title":"Ep","airDateUtc":"2015-01-01T00:00:00Z","monitored":true,"hasFile":%t}`,
+				e.id, e.seriesID, e.seasonNumber, e.episodeNumber, e.hasFile))
+		}
+	}
+	return fmt.Sprintf(`{"page":1,"pageSize":100,"totalRecords":%d,"records":[%s]}`, len(recs), strings.Join(recs, ","))
+}
+
+// writes returns every non-GET request the fake received. Anything that is
+// not a GET counts — the same "all non-GET, never a PUT-only filter" rule
+// statefulRadarrFake's writes() applies.
+func (f *statefulSonarrFake) writes() []recordedRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []recordedRequest
+	for _, r := range f.requests {
+		if r.method != http.MethodGet {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func (f *statefulSonarrFake) instance() Instance {
+	return Instance{Name: "sonarr-main", Type: "sonarr", URL: f.srv.URL, APIKey: "key"}
+}
+
+// TestRun_SonarrInstance_FullPipelineNeverMakesAWriteRequest is the run()-
+// level zero-write-verb pin (item 1 of the carried-forward controller
+// notes, "pin it the way Phases 4-5 pinned 'exactly one'" — here, zero):
+// across a complete run that really does produce would-unmonitor decisions
+// through the full connectivity + library inspection + season decision
+// engine pipeline, not one non-GET request of any kind reaches the fake, to
+// any path, stubbed or not.
+func TestRun_SonarrInstance_FullPipelineNeverMakesAWriteRequest(t *testing.T) {
+	fake := newStatefulSonarrFake(t,
+		[]*statefulSonarrSeries{
+			{id: 1, title: "Would Unmonitor Show", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 1, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1}}},
+		},
+		[]*statefulSonarrEpisode{
+			{id: 100, seriesID: 1, seasonNumber: 1, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: "2015-01-01T00:00:00Z", episodeFileID: 500, inWantedSet: false},
+		},
+		[]*statefulSonarrEpisodeFile{
+			{id: 500, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
+		},
+	)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := `
+instances:
+  - name: sonarr-main
+    type: sonarr
+    url: ` + fake.srv.URL + `
+    api_key: key1
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "msg=would-unmonitor") {
+		t.Fatalf("test setup did not actually produce a would-unmonitor decision:\n%s", stdout.String())
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("a sonarr run must make ZERO write requests in this phase, got %+v", writes)
+	}
+}
+
+// TestRun_SonarrInstance_CrossCheckAgreement_SummaryStatesPassed exercises
+// the cross-check's honest-agreement path through the full run() pipeline
+// against the stateful fake, proving wanted-set membership and
+// episodeFile.qualityCutoffNotMet genuinely agreeing (both false, for a
+// season that becomes a would-unmonitor candidate) renders "passed" with a
+// nonzero verified count — not a default or a guess.
+func TestRun_SonarrInstance_CrossCheckAgreement_SummaryStatesPassed(t *testing.T) {
+	fake := newStatefulSonarrFake(t,
+		[]*statefulSonarrSeries{
+			{id: 1, title: "Agreeing Show", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 1, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1}}},
+		},
+		[]*statefulSonarrEpisode{
+			{id: 100, seriesID: 1, seasonNumber: 1, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: "2015-01-01T00:00:00Z", episodeFileID: 500, inWantedSet: false},
+		},
+		[]*statefulSonarrEpisodeFile{
+			{id: 500, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
+		},
+	)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := `
+instances:
+  - name: sonarr-main
+    type: sonarr
+    url: ` + fake.srv.URL + `
+    api_key: key1
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "crossCheck=\"passed (1 verified, 0 unverifiable)\"") {
+		t.Errorf("expected crossCheck=\"passed (1 verified, 0 unverifiable)\" in the summary:\n%s", out)
 	}
 }
