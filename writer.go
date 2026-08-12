@@ -271,7 +271,13 @@ var errWriteUnverified = errors.New("the server accepted the write but did not c
 // would-unmonitor decision produced no write, so runWritePass can count it
 // (writesRefused) rather than let it vanish into an unexplained gap between
 // wouldUnmonitor and unmonitored+writeErrors+writeEchoUnverified.
-var errExcludedAtWrite = errors.New("movie carries the exclusion tag as of the pre-write fetch")
+//
+// Its text names no item type, and neither does any other sentinel in this
+// group: both write paths share them, so a wording like "movie carries the
+// exclusion tag" produced Sonarr refusals reading "series 3 season 1: movie
+// carries the exclusion tag". The caller's subject prefix ("movie 7", "series
+// 3 season 1") is what names the thing.
+var errExcludedAtWrite = errors.New("the exclusion tag is present as of the pre-write fetch")
 
 // errTagsUnverifiable marks the pre-write exclusion-tag re-check refusing to
 // write because the fresh payload's own tags could not be trusted: the
@@ -286,7 +292,7 @@ var errExcludedAtWrite = errors.New("movie carries the exclusion tag as of the p
 // fetch is refused this way would otherwise report unmonitored=0 with every
 // other counter also at zero, leaving no number in the summary that explains
 // where the promised writes went.
-var errTagsUnverifiable = errors.New("movie tags in the pre-write fetch could not be verified against the exclusion tag")
+var errTagsUnverifiable = errors.New("the tags in the pre-write fetch could not be verified against the exclusion tag")
 
 // errAlreadyUnmonitoredAtWrite marks the scan-to-write race: the fresh
 // pre-write fetch shows the movie is already unmonitored, so
@@ -315,7 +321,7 @@ var errTagsUnverifiable = errors.New("movie tags in the pre-write fetch could no
 // somewhere countable", which one refusal counter answers. The distinct causes
 // live where a human actually diagnoses them — the per-movie log line each
 // branch writes at the moment it refuses.
-var errAlreadyUnmonitoredAtWrite = errors.New("movie is already unmonitored as of the pre-write fetch")
+var errAlreadyUnmonitoredAtWrite = errors.New("already unmonitored as of the pre-write fetch")
 
 // errMonitoredUnverifiable marks the pre-write fetch's own "monitored" field
 // being unreadable: the key absent (this Radarr version may not have the field
@@ -329,7 +335,7 @@ var errAlreadyUnmonitoredAtWrite = errors.New("movie is already unmonitored as o
 // way (writesRefused) for the same reason: no PUT was ever sent, so nothing
 // Radarr did can have failed, and reporting these as writeErrors would tell a
 // human that N writes were rejected by a server that never saw them.
-var errMonitoredUnverifiable = errors.New("the movie's monitored field in the pre-write fetch could not be verified")
+var errMonitoredUnverifiable = errors.New("the monitored field in the pre-write fetch could not be verified")
 
 // isWriteRefusal reports whether err is one of the write paths' refusals: a
 // would-unmonitor decision the write path declined to act on before any HTTP

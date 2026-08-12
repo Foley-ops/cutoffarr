@@ -1190,6 +1190,16 @@ func (f *statefulSonarrFake) wantedCutoffJSON() string {
 	return fmt.Sprintf(`{"page":1,"pageSize":100,"totalRecords":%d,"records":[%s]}`, len(recs), strings.Join(recs, ","))
 }
 
+// all returns a copy of every request the fake received, under the mutex the
+// handler goroutines append with. Reading f.requests directly from a test is a
+// data race — one the suite really carried, in the allowlist test that bounds
+// this project's entire Sonarr API surface.
+func (f *statefulSonarrFake) all() []recordedRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]recordedRequest(nil), f.requests...)
+}
+
 // writes returns every non-GET request the fake received. Anything that is
 // not a GET counts — the same "all non-GET, never a PUT-only filter" rule
 // statefulRadarrFake's writes() applies.

@@ -1790,7 +1790,10 @@ func TestRun_WriteMode_SonarrInstance_TouchesOnlyItsAllowlistedPaths(t *testing.
 		"/api/v3/episode/monitor": true,
 		"/api/v3/series/1":        true,
 	}
-	for _, r := range fake.requests {
+	// fake.all(), not fake.requests: the slice is appended to by handler
+	// goroutines under the fake's mutex, and this was the suite's one
+	// unsynchronized read of it.
+	for _, r := range fake.all() {
 		switch r.method {
 		case http.MethodGet:
 			if !allowedGET[r.path] {
@@ -1844,7 +1847,13 @@ func TestTree_HasExactlyThreeWriteVerbCallSites(t *testing.T) {
 		}
 		body := string(src)
 
-		if n := strings.Count(body, "client.DoJSON("); n > 0 {
+		// ".DoJSON(", not "client.DoJSON(": the guarantee is about the write
+		// verb, not about what a variable happens to be named, and an innocent
+		// receiver rename (c := client; c.DoJSON(...)) made a fourth write site
+		// invisible to the count that is supposed to be the tree's write-surface
+		// audit. The method name is the thing that cannot be renamed without
+		// changing client.go.
+		if n := strings.Count(body, ".DoJSON("); n > 0 {
 			gotCallSites[name] = n
 			total += n
 		}

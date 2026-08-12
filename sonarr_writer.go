@@ -303,7 +303,7 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 	if !ok {
 		return false, false, fmt.Errorf("%s: fresh episode data could not be fetched before the write", subject)
 	}
-	seasonEpisodes := episodesOfSeason(episodes, seasonNumber)
+	seasonEpisodes := episodesOfSeason(logger, episodes, seasonNumber, attrs)
 	if err := verifySeasonStillWritable(logger, targetSeason, seasonEpisodes, subject, attrs); err != nil {
 		return false, false, err
 	}
@@ -449,10 +449,23 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 // same way it is excluded from every season's evaluation at decision time —
 // and the completeness check that follows is what turns that exclusion into a
 // refusal rather than a silently short episode set.
-func episodesOfSeason(episodes []episodeElement, seasonNumber int) []episodeElement {
+//
+// The drop WARNs, naming the episode, exactly as the structurally identical
+// decision-time drop does (REVIEW FIX). It used to be silent, which left the
+// count guard to report the SYMPTOM — "the fresh episode list has 2 episodes
+// but statistics claims 3" — with nothing anywhere naming the cause, so an
+// operator saw an unexplained refusal repeat every cycle. Worse, a season
+// whose statistics happen to match absorbs the drop entirely and the guard
+// never fires at all.
+func episodesOfSeason(logger *slog.Logger, episodes []episodeElement, seasonNumber int, attrs []any) []episodeElement {
 	var out []episodeElement
 	for _, e := range episodes {
-		if e.SeasonNumber == nil || *e.SeasonNumber != seasonNumber {
+		if e.SeasonNumber == nil {
+			logger.Warn("episode missing seasonNumber field in the pre-write fetch; excluded from this season's episode set",
+				append(append([]any(nil), attrs...), "episodeId", derefOrAbsent(e.ID))...)
+			continue
+		}
+		if *e.SeasonNumber != seasonNumber {
 			continue
 		}
 		out = append(out, e)
@@ -738,6 +751,16 @@ func verifyEpisodeMonitorEcho(echo []byte, episodeIDs []int) error {
 				monitored = nil
 			}
 		}
+		// REVIEW FIX: this map used to be last-wins, so an echo naming episode
+		// 100 twice — once monitored:true, once monitored:false — settled the
+		// question in whichever order the server happened to serialize them.
+		// This is the ONLY evidence this project accepts that the episode half
+		// landed, and locateTargetSeason already refuses the identical ambiguity
+		// on the way IN; an echo that says two different things about one
+		// episode cannot confirm anything, so it does not get to.
+		if _, duplicate := monitoredByID[*id]; duplicate {
+			return fmt.Errorf("the episode monitor response mentions episode %d more than once, so it cannot confirm what happened to it: %s", *id, bodySnippet(echo))
+		}
 		monitoredByID[*id] = monitored
 	}
 	for _, id := range episodeIDs {
@@ -786,23 +809,36 @@ func verifySeasonWriteEcho(echo []byte, seriesID, seasonNumber, status int, subj
 	if err := json.Unmarshal(rawSeasons, &elems); err != nil {
 		return fmt.Errorf("%s: the write returned %d but %q in the response could not be read, so the change is unconfirmed (%w): %s", subject, status, seasonsKey, errWriteUnverified, bodySnippet(echo))
 	}
-	for _, s := range elems {
+	// The WHOLE array is scanned, not just up to the first element carrying the
+	// target season number (REVIEW FIX). Returning on the first match resolved
+	// a contradictory duplicate — season 1 appearing twice, monitored:false
+	// then monitored:true — in the server's favour, on the sole evidence this
+	// project accepts that a write landed, while locateTargetSeason refuses the
+	// identical ambiguity on the way in. An echo that says two things about one
+	// season confirms neither of them.
+	matchIdx := -1
+	for i, s := range elems {
 		if s.SeasonNumber == nil || *s.SeasonNumber != seasonNumber {
 			continue
 		}
-		// *bool, not bool: a "monitored": null in the echo would decode into a
-		// plain bool as false with NO error, and this function would then
-		// report a CONFIRMED write on a server that said nothing about the
-		// field at all.
-		if s.Monitored == nil {
-			return fmt.Errorf("%s: the write returned %d but the returned season's %q is absent or JSON null, which does not confirm the change (%w): %s", subject, status, monitoredKey, errWriteUnverified, bodySnippet(echo))
+		if matchIdx != -1 {
+			return fmt.Errorf("%s: the write returned %d but the returned object contains this season more than once, so the change is unconfirmed (%w): %s", subject, status, errWriteUnverified, bodySnippet(echo))
 		}
-		if *s.Monitored {
-			return fmt.Errorf("%s: the write returned %d but the returned object still has the season %q: true; the season was NOT unmonitored: %s", subject, status, monitoredKey, bodySnippet(echo))
-		}
-		return nil
+		matchIdx = i
 	}
-	return fmt.Errorf("%s: the write returned %d but the returned object does not mention this season, so the change is unconfirmed (%w): %s", subject, status, errWriteUnverified, bodySnippet(echo))
+	if matchIdx == -1 {
+		return fmt.Errorf("%s: the write returned %d but the returned object does not mention this season, so the change is unconfirmed (%w): %s", subject, status, errWriteUnverified, bodySnippet(echo))
+	}
+	// *bool, not bool: a "monitored": null in the echo would decode into a
+	// plain bool as false with NO error, and this function would then report a
+	// CONFIRMED write on a server that said nothing about the field at all.
+	if elems[matchIdx].Monitored == nil {
+		return fmt.Errorf("%s: the write returned %d but the returned season's %q is absent or JSON null, which does not confirm the change (%w): %s", subject, status, monitoredKey, errWriteUnverified, bodySnippet(echo))
+	}
+	if *elems[matchIdx].Monitored {
+		return fmt.Errorf("%s: the write returned %d but the returned object still has the season %q: true; the season was NOT unmonitored: %s", subject, status, monitoredKey, bodySnippet(echo))
+	}
+	return nil
 }
 
 // verifySeriesIdentity confirms an object claimed to be a given series really
