@@ -159,9 +159,15 @@ func newDebounceQueue(limit int) *debounceQueue {
 // *arr, a mass import, or a misconfigured hook could otherwise grow it without
 // limit. When a NEW key arrives at a full queue, the entry with the EARLIEST
 // deadline is dropped — the one that has been settling longest, and therefore
-// the one closest to being evaluated anyway. Nothing is lost permanently:
-// every dropped key is covered by the reconciliation sweep, which is the same
-// guarantee that makes losing the whole queue on restart acceptable.
+// the one closest to being evaluated anyway.
+//
+// WHAT COMES BACK FOR A DROPPED KEY depends on the configuration, and the
+// caller's WARN says which (see handleWebhook). With a reconciliation sweep
+// configured, nothing is lost for longer than one poll_interval. With
+// poll_interval 0 — the legal, documented webhooks-only daemon — nothing is
+// scheduled that would revisit it, and the key is gone until the process
+// restarts and its startup scan reads the whole library again. That is a real
+// difference in consequence, so it is never papered over with one message.
 func (q *debounceQueue) add(key queueKey, seasons []int, now time.Time, debounce time.Duration) (deadline time.Time, dropped *queueKey) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -256,6 +262,13 @@ type webhookServer struct {
 	// instances maps a configured instance NAME to its type, resolved once at
 	// startup. A name that is not in here is an unknown instance.
 	instances map[string]string
+
+	// pollInterval is cfg.PollInterval, and the handler needs it for exactly
+	// one thing: the overflow WARN promises a recovery, and whether that
+	// recovery EXISTS depends on this value. 0 is the legal, documented
+	// webhooks-only daemon, and in that configuration a dropped key is gone
+	// until the process restarts. See the drop path in handleWebhook.
+	pollInterval time.Duration
 }
 
 // newWebhookHandler builds the mux serving the webhook endpoint.
@@ -379,8 +392,22 @@ func (s *webhookServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	s.logger.Debug("webhook queued; the debounce timer for this item was reset", attrs...)
 
 	if dropped != nil {
-		s.logger.Warn("the webhook debounce queue is full; the longest-settling item was dropped and will be picked up by the next reconciliation sweep instead",
-			"instance", name, "droppedKey", dropped.String(), "queueLimit", s.queue.limit)
+		// The message states the RECOVERY, and the recovery is not the same in
+		// both supported configurations — so the message is not either. A
+		// daemon with a reconciliation sweep really will come back for the
+		// dropped item; a webhooks-only daemon (poll_interval 0, which
+		// config.go documents as legal) has nothing scheduled that would, and
+		// the item is gone until the process restarts and its startup scan
+		// covers the whole library again. Telling an operator that a sweep will
+		// pick it up when no sweep exists is the misdirecting error path this
+		// project refuses everywhere else: they would read the WARN, conclude
+		// the item is covered, and stop looking.
+		msg := "the webhook debounce queue is full; the longest-settling item was dropped and will be picked up by the next reconciliation sweep instead"
+		if s.pollInterval <= 0 {
+			msg = "the webhook debounce queue is full; the longest-settling item was dropped and NOTHING will revisit it until this daemon is restarted, because poll_interval is 0 and this daemon therefore has no reconciliation sweep"
+		}
+		s.logger.Warn(msg,
+			"instance", name, "droppedKey", dropped.String(), "queueLimit", s.queue.limit, "pollInterval", s.pollInterval)
 	}
 
 	writeWebhookAccepted(w)

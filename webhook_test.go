@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -20,20 +21,42 @@ import (
 // disable a hook that keeps failing), and an evaluation would make an import
 // wait on a full library scan.
 
+// webhookTestOptions are the two seams a handler test may need to move off the
+// production values: the queue bound (1024 distinct keys is unreachable from a
+// handler test) and the reconciliation interval, which is what decides whether
+// a dropped item has anything at all coming back for it.
+//
+// pollInterval carries the CONFIG's own semantics rather than a helper-local
+// remapping: 0 means the webhooks-only daemon, exactly as config.go documents
+// it, so a test naming 0 here is naming the setup a human can really deploy.
+type webhookTestOptions struct {
+	queueLimit   int
+	pollInterval time.Duration
+}
+
 // newWebhookTestServer builds the handler under test with a fake clock and an
-// in-memory queue, returning both so a test can assert on what was queued.
+// in-memory queue, returning both so a test can assert on what was queued. It
+// is the ordinary case: the production queue bound, and a daemon that does have
+// a reconciliation sweep.
 func newWebhookTestServer(t *testing.T, instances map[string]string, debounce time.Duration, level slog.Level) (http.Handler, *debounceQueue, *bytes.Buffer, *fakeClock) {
+	t.Helper()
+	return newWebhookTestServerWith(t, instances, debounce, level,
+		webhookTestOptions{queueLimit: webhookQueueLimit, pollInterval: time.Hour})
+}
+
+func newWebhookTestServerWith(t *testing.T, instances map[string]string, debounce time.Duration, level slog.Level, opts webhookTestOptions) (http.Handler, *debounceQueue, *bytes.Buffer, *fakeClock) {
 	t.Helper()
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: level}))
 	clock := newFakeClock()
-	queue := newDebounceQueue(webhookQueueLimit)
+	queue := newDebounceQueue(opts.queueLimit)
 	handler := newWebhookHandler(&webhookServer{
-		logger:    logger,
-		queue:     queue,
-		debounce:  debounce,
-		now:       clock.Now,
-		instances: instances,
+		logger:       logger,
+		queue:        queue,
+		debounce:     debounce,
+		now:          clock.Now,
+		instances:    instances,
+		pollInterval: opts.pollInterval,
 	})
 	return handler, queue, &buf, clock
 }
@@ -372,6 +395,85 @@ func TestDebounceQueue_SeasonNumbersAccumulateAcrossEventsForOneKey(t *testing.T
 	}
 	if got := joinInts(seasons[due[0]]); got != "2,3" {
 		t.Errorf("accumulated seasons = %q, want %q", got, "2,3")
+	}
+}
+
+// --- overflow, through the handler ------------------------------------------
+//
+// The queue's own overflow behavior is unit-tested above, but the WARN that
+// TELLS A HUMAN about it lives in the handler, and until these two tests
+// existed nothing executed it: every handler test built the queue with the
+// production limit of 1024, which no handler test can reach. Deleting the
+// entire `if dropped != nil { ... }` block left the suite green — turning a
+// queue overflow into a silent drop, which is the one thing the bound must
+// never be.
+
+// TestWebhookHandler_QueueOverflow_WarnsAndNamesTheSweepThatWillCoverIt is the
+// ordinary daemon: something was dropped, and the reconciliation sweep really
+// is coming for it.
+func TestWebhookHandler_QueueOverflow_WarnsAndNamesTheSweepThatWillCoverIt(t *testing.T) {
+	const limit = 3
+	handler, queue, buf, clock := newWebhookTestServerWith(t, map[string]string{"radarr-main": "radarr"}, 45*time.Second, slog.LevelInfo,
+		webhookTestOptions{queueLimit: limit, pollInterval: time.Hour})
+
+	// limit+1 DISTINCT items: the first `limit` fill the queue, the last one
+	// evicts the longest-settling entry (movie 1, whose deadline is earliest).
+	// The clock moves between events because that is what makes one of them the
+	// longest-settling: events that share a timestamp to the nanosecond are all
+	// equally old, and which of THOSE is dropped is not a property worth
+	// asserting.
+	for id := 1; id <= limit+1; id++ {
+		body := fmt.Sprintf(`{"eventType":"Download","movie":{"id":%d,"title":"Film %d"}}`, id, id)
+		if rec := postWebhook(t, handler, "radarr-main", body); rec.Code != http.StatusOK {
+			t.Fatalf("movie %d: status = %d, want 200 — an overflow is OUR capacity problem, never the sender's", id, rec.Code)
+		}
+		clock.Advance(time.Second)
+	}
+
+	if queue.size() != limit {
+		t.Errorf("queue size = %d, want the limit of %d", queue.size(), limit)
+	}
+	out := buf.String()
+	if n := strings.Count(out, "the webhook debounce queue is full"); n != 1 {
+		t.Fatalf("expected exactly one overflow WARN, got %d:\n%s", n, out)
+	}
+	for _, want := range []string{"level=WARN", "droppedKey=radarr-main/movie/1", "queueLimit=3", "reconciliation sweep"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the overflow WARN must carry %q — a human needs to know WHAT was dropped and what is coming back for it:\n%s", want, out)
+		}
+	}
+}
+
+// TestWebhookHandler_QueueOverflow_WithNoReconciliationSweep_SaysNothingWillRevisitIt
+// is the same overflow in the configuration config.go explicitly permits:
+// poll_interval 0, the webhooks-only daemon. There IS no reconciliation sweep,
+// so the comforting half of the ordinary message would be a lie — the dropped
+// key really is gone until the process restarts, and an operator who reads
+// "the next sweep will pick it up" would close the log and move on.
+func TestWebhookHandler_QueueOverflow_WithNoReconciliationSweep_SaysNothingWillRevisitIt(t *testing.T) {
+	const limit = 2
+	handler, _, buf, clock := newWebhookTestServerWith(t, map[string]string{"sonarr-main": "sonarr"}, 45*time.Second, slog.LevelInfo,
+		webhookTestOptions{queueLimit: limit, pollInterval: 0})
+
+	for id := 1; id <= limit+1; id++ {
+		body := fmt.Sprintf(`{"eventType":"Download","series":{"id":%d}}`, id)
+		if rec := postWebhook(t, handler, "sonarr-main", body); rec.Code != http.StatusOK {
+			t.Fatalf("series %d: status = %d, want 200", id, rec.Code)
+		}
+		clock.Advance(time.Second)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "droppedKey=sonarr-main/series/1") {
+		t.Fatalf("the overflow must still warn and name the key it dropped:\n%s", out)
+	}
+	if strings.Contains(out, "reconciliation sweep instead") {
+		t.Errorf("with poll_interval 0 there is no sweep; promising one is the misdirecting error path this project refuses everywhere else:\n%s", out)
+	}
+	for _, want := range []string{"restarted", "poll_interval is 0"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the webhooks-only overflow WARN must say %q — that the item is gone until a restart, and why:\n%s", want, out)
+		}
 	}
 }
 

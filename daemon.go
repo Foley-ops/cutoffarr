@@ -149,8 +149,11 @@ func (s *systemTimer) Stop()               { s.t.Stop() }
 // webhookQueueLimit bounds the number of distinct items the debounce queue
 // holds. Well above any plausible real burst (a season pack is ONE key, since
 // the key is the series), and low enough that a runaway sender cannot grow the
-// process's memory through it. See debounceQueue.add for what overflow does and
-// why dropping is safe.
+// process's memory through it. See debounceQueue.add for what overflow does,
+// and handleWebhook's drop path for the one thing that is NOT uniform about it:
+// what comes back for a dropped key is the reconciliation sweep, and a
+// poll_interval-0 daemon has none, so the warning says so rather than promising
+// a recovery that configuration does not have.
 const webhookQueueLimit = 1024
 
 // webhookShutdownGrace bounds how long the HTTP server is given to finish
@@ -254,11 +257,12 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		Handler: newWebhookHandler(&webhookServer{
-			logger:    logger,
-			queue:     d.queue,
-			debounce:  cfg.WebhookDebounce,
-			now:       clk.Now,
-			instances: instanceTypes,
+			logger:       logger,
+			queue:        d.queue,
+			debounce:     cfg.WebhookDebounce,
+			now:          clk.Now,
+			instances:    instanceTypes,
+			pollInterval: cfg.PollInterval,
 		}),
 	}
 
@@ -457,7 +461,15 @@ func (d *daemon) runWebhookCycles(ctx context.Context, due []queueKey, seasons m
 
 	for _, name := range order {
 		if ctx.Err() != nil {
-			d.logger.Info("shutdown requested: the remaining webhook-triggered evaluations are dropped and the next startup scan will cover them",
+			// Unlike the queue-overflow WARN in handleWebhook, this recovery
+			// claim does NOT depend on poll_interval, and the difference is
+			// worth stating because the two lines look alike. An overflow drop
+			// happens in a daemon that keeps running, so what comes back for it
+			// is the reconciliation sweep — which a poll_interval-0 daemon does
+			// not have. This drop happens on the way out: the loop is returning
+			// and the process is exiting, and EVERY start begins with a
+			// full-library startup scan (see runDaemon), sweep or no sweep.
+			d.logger.Info("shutdown requested: the remaining webhook-triggered evaluations are dropped; this daemon is exiting, and every start begins with a full-library startup scan that covers them (this does not depend on poll_interval)",
 				"instance", name)
 			return
 		}
