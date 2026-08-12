@@ -89,7 +89,8 @@ func episodeFileJSON(id, season, cfScore int, qualityCutoffNotMet bool) string {
 // --- evaluateSeries: series-level checks ------------------------------------
 
 func TestEvaluateSeries_SeriesLevelTagExcluded_AllMonitoredSeasonsSkipped(t *testing.T) {
-	srv := sonarrEpisodeFileServer(t, `[]`, `[]`, nil, nil)
+	var gotEp, gotEf []string
+	srv := sonarrEpisodeFileServer(t, `[]`, `[]`, &gotEp, &gotEf)
 	defer srv.Close()
 	logger, _ := newDecisionTestLogger(slog.LevelInfo)
 	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
@@ -98,6 +99,17 @@ func TestEvaluateSeries_SeriesLevelTagExcluded_AllMonitoredSeasonsSkipped(t *tes
 	s := testSeries(1, "Excluded Show", true, 1, []int{9}, testSeason(1, true, 10, 10), testSeason(2, true, 5, 5))
 	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, true, map[seasonKey]bool{})
 
+	// The binding evaluation-order resolution's whole point: a series-level
+	// failure costs ZERO per-series fetches. The /episodefile half was already
+	// pinned here; the /episode half was not, so a hoisted or eagerly-issued
+	// episode fetch would have multiplied this project's API call count
+	// against a large library with nothing in the suite noticing.
+	if len(gotEp) != 0 {
+		t.Errorf("expected zero /episode requests for a series excluded at the series level, got %v", gotEp)
+	}
+	if len(gotEf) != 0 {
+		t.Errorf("expected zero /episodefile requests, got %v", gotEf)
+	}
 	if len(eval.decisions) != 2 {
 		t.Fatalf("expected 2 season decisions, got %d", len(eval.decisions))
 	}
@@ -237,7 +249,10 @@ func TestEvaluateSeries_SeasonMonitoredAbsent_ExcludedNotCountedWarns(t *testing
 	if len(eval.decisions) != 0 {
 		t.Errorf("expected zero decisions (series has no monitored seasons), got %+v", eval.decisions)
 	}
-	if !strings.Contains(buf.String(), "level=WARN") || !strings.Contains(buf.String(), "field=monitored") {
+	// The generic warnIfFieldAbsent line ("field=monitored") was replaced by
+	// an explicit, traceable warn naming the series — see
+	// TestEvaluateSeries_SeasonMonitoredAbsent_WarnNamesTheSeries.
+	if !strings.Contains(buf.String(), "level=WARN") || !strings.Contains(buf.String(), "skipping season: missing monitored field") {
 		t.Errorf("expected a warning about the absent season monitored field:\n%s", buf.String())
 	}
 }
@@ -568,28 +583,6 @@ func TestEvaluateSeries_AiringSeason_ValidFutureDate_NoWarnLogged(t *testing.T) 
 	}
 	if strings.Contains(buf.String(), "level=WARN") {
 		t.Errorf("a genuinely future-dated (valid, parseable) airDateUtc must never warn:\n%s", buf.String())
-	}
-}
-
-func TestEpisodeHasAired_TableDriven(t *testing.T) {
-	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
-	cases := []struct {
-		name string
-		e    episodeElement
-		want bool
-	}{
-		{"past date", episodeElement{AirDateUtc: strPtr("2020-01-01T00:00:00Z")}, true},
-		{"future date", episodeElement{AirDateUtc: strPtr("2030-01-01T00:00:00Z")}, false},
-		{"absent", episodeElement{}, false},
-		{"unparseable", episodeElement{AirDateUtc: strPtr("garbage")}, false},
-		{"exactly now is not before now", episodeElement{AirDateUtc: strPtr("2025-01-01T00:00:00Z")}, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := episodeHasAired(tc.e, now); got != tc.want {
-				t.Errorf("episodeHasAired(%+v) = %v, want %v", tc.e, got, tc.want)
-			}
-		})
 	}
 }
 
@@ -1221,7 +1214,12 @@ func TestRunSonarrCrossCheck_ZeroCandidates_PassesWithZeroItems(t *testing.T) {
 	if cc.verified != 0 || cc.unverifiable != 0 {
 		t.Errorf("verified/unverifiable = %d/%d, want 0/0", cc.verified, cc.unverifiable)
 	}
-	_ = buf
+	// Nothing was sampled, so nothing can have been unverifiable: a
+	// zero-candidate cross-check must be silent rather than warning about a
+	// sample it never took.
+	if strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("a zero-candidate cross-check must produce no warnings:\n%s", buf.String())
+	}
 }
 
 func TestRunSonarrCrossCheck_AgreeingSamples_Passes(t *testing.T) {
@@ -1373,6 +1371,13 @@ func TestRunSonarrCrossCheck_AllUnverifiable_ReturnsInconclusive(t *testing.T) {
 	if cc.unverifiable != 1 || cc.verified != 0 {
 		t.Errorf("verified/unverifiable = %d/%d, want 0/1", cc.verified, cc.unverifiable)
 	}
+	// The write gate (writeGateBlockReason) reads the would-unmonitor pool's
+	// own counts, not the aggregate: a sampled would-unmonitor season that
+	// could not be verified must land in writeUnverifiable, or the gate would
+	// be asked to authorize writes on evidence nobody counted.
+	if cc.writeUnverifiable != 1 || cc.writeVerified != 0 {
+		t.Errorf("writeVerified/writeUnverifiable = %d/%d, want 0/1 — the write gate reads these", cc.writeVerified, cc.writeUnverifiable)
+	}
 }
 
 // TestRunSonarrCrossCheck_NoEpisodeFileDataAtAll_TreatedAsUnverifiable pins
@@ -1500,18 +1505,12 @@ func TestRunSonarrCrossCheck_PerEpisodeLineDemotedToDebug_SeasonAggregateAtInfo(
 }
 
 func TestRunSonarrDecisionEngine_CrossCheckDisagreement_SummaryStatesFailed(t *testing.T) {
-	// Series 1 has an episode in the wanted set (rule 4 fails, skip
-	// reason=quality cutoff not met) whose file claims qualityCutoffNotMet
-	// is false — a genuine disagreement once this season becomes a
-	// candidate. To reach the cross-check with crossCheckEpisodes populated,
-	// the season must actually become a rule-7 candidate; use two seasons in
-	// the same series so the second's cutoff-met candidacy triggers the
-	// /episodefile fetch that also covers season 1's (already-decided) data.
-	//
-	// Simpler and sufficient: build the decisions directly and drive
-	// runSonarrDecisionEngine's summary rendering via a small series/episode
-	// set that reaches candidacy, then assert the rendered summary states
-	// FAILED once a disagreement is deliberately engineered into the fixture.
+	// The season passes every rule and becomes a would-unmonitor candidate,
+	// so the /episodefile fetch happens and crossCheckEpisodes is populated —
+	// but the file it returns claims qualityCutoffNotMet=true while the
+	// (empty) wanted set says the episode is not below cutoff. Two Sonarr
+	// code paths disagreeing is exactly what the cross-check exists to catch,
+	// and the summary must render it as FAILED.
 	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "]"
 	filesJSON := "[" + episodeFileJSON(500, 1, 200, true) + "]" // qualityCutoffNotMet=true but NOT in wanted set: disagreement
 	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
@@ -1595,5 +1594,280 @@ func TestRunSonarrDecisionEngine_SkipSideCrossCheck_RuleFourSkip_BecomesVerifiab
 	}
 	if episodefileRequests != 1 {
 		t.Errorf("expected exactly 1 /episodefile request (the cross-check's on-demand fetch), got %d:\n%+v", episodefileRequests, fake.all())
+	}
+}
+
+// ============================================================================
+// Phase 7: Phase 6 branch-review carry-over minors (binding)
+// ============================================================================
+
+// TestEvaluateSeries_EpisodeFileMissingSeasonNumber_WarnsNamingTheFile pins
+// the FIX-IN-PASSING at decision.go's filesBySeason build: an /episodefile
+// record with an absent seasonNumber is dropped from the ONLY input rule 7
+// has, with no log line of any level — while the structurally identical
+// episode drop three hundred lines above it warns. The file-count guard
+// usually catches the resulting shortfall, but it names the symptom
+// ("fewer episode files returned than statistics claims") rather than the
+// cause, and a season carrying an extra correctly-labelled file absorbs the
+// drop entirely.
+func TestEvaluateSeries_EpisodeFileMissingSeasonNumber_WarnsNamingTheFile(t *testing.T) {
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "]"
+	// File 501 has no seasonNumber at all: silently dropped from filesBySeason.
+	filesJSON := `[` + episodeFileJSON(500, 1, 200, false) + `,{"id": 501, "customFormatScore": 200, "qualityCutoffNotMet": false}]`
+	srv := sonarrEpisodeFileServer(t, episodesJSON, filesJSON, nil, nil)
+	defer srv.Close()
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	s := testSeries(1, "Dropped File Show", true, 1, []int{}, testSeason(1, true, 1, 1))
+	evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+
+	out := buf.String()
+	if !strings.Contains(out, "episode file missing seasonNumber") {
+		t.Errorf("expected a WARN naming the dropped episode file, got:\n%s", out)
+	}
+	if !strings.Contains(out, "fileId=501") {
+		t.Errorf("the warn must name the file id so the cause is traceable:\n%s", out)
+	}
+}
+
+// TestEvaluateSeries_DuplicateSeasonNumber_WarnsAndExcludesTheDuplicate pins
+// the FIX-IN-PASSING at decision.go's candidateIndex/statsFileCountFor/
+// seasonEpisodesFor maps: they are keyed on the bare season number, so a
+// duplicated seasonNumber among a series' monitored seasons leaves the FIRST
+// decision's reason empty — reported as msg=skip reason="" at INFO with no
+// warn at all, and counted under an empty-string key in skipReasons. A skip
+// with no reason, produced from untrusted input, is the exact shape §2.6
+// forbids.
+func TestEvaluateSeries_DuplicateSeasonNumber_WarnsAndExcludesTheDuplicate(t *testing.T) {
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "]"
+	filesJSON := "[" + episodeFileJSON(500, 1, 200, false) + "]"
+	srv := sonarrEpisodeFileServer(t, episodesJSON, filesJSON, nil, nil)
+	defer srv.Close()
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	// Two monitored seasons both claiming to be season 1.
+	s := testSeries(1, "Duplicate Season Show", true, 1, []int{}, testSeason(1, true, 1, 1), testSeason(1, true, 1, 1))
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+
+	if len(eval.decisions) != 1 {
+		t.Fatalf("expected exactly 1 decision (the duplicate excluded), got %d: %+v", len(eval.decisions), eval.decisions)
+	}
+	if eval.decisions[0].reason == "" {
+		t.Errorf("a decision must never carry an empty reason: %+v", eval.decisions[0])
+	}
+	if !strings.Contains(buf.String(), "duplicate seasonNumber") {
+		t.Errorf("expected a WARN naming the duplicate season number:\n%s", buf.String())
+	}
+}
+
+// TestEvaluateSeries_EpisodeCountMismatch_NotSkipPoolEligible pins the third
+// evidence-touching Phase 6 minor: completeOnDisk was set before the episode-
+// count guard and never cleared, so an "episode data inconsistent" season
+// entered the cross-check's skip pool carrying NEITHER crossCheckEpisodes NOR
+// rawEpisodesForCrossCheck — unverifiable by construction, consuming one of
+// only 10 skip-side sample slots, always adding a second WARN, and pushing
+// the verdict toward inconclusive. The write gate reads that verdict, so this
+// must be closed before the gate goes live.
+func TestEvaluateSeries_EpisodeCountMismatch_NotSkipPoolEligible(t *testing.T) {
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "]" // 1 of 3
+	filesJSON := "[" + episodeFileJSON(500, 1, 200, false) + "]"
+	srv := sonarrEpisodeFileServer(t, episodesJSON, filesJSON, nil, nil)
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	s := testSeries(1, "Inconsistent Show", true, 1, []int{}, testSeason(1, true, 3, 3))
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+
+	if len(eval.decisions) != 1 {
+		t.Fatalf("expected 1 decision, got %d", len(eval.decisions))
+	}
+	if eval.decisions[0].completeOnDisk {
+		t.Errorf("a season whose episode data is inconsistent must not be skip-pool eligible: it can never be verified, so it would consume a sample slot and produce nothing but a WARN")
+	}
+}
+
+// TestEvaluateSeries_FileCountMismatch_StillCarriesCrossCheckEpisodes is the
+// same minor's other half: a file-count-mismatch season DOES have a validated
+// episode list and a fetched /episodefile map in scope, so it can be made
+// verifiable at zero additional API cost rather than being left unverifiable
+// by construction in the skip pool.
+func TestEvaluateSeries_FileCountMismatch_StillCarriesCrossCheckEpisodes(t *testing.T) {
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "," + episodeJSON(101, 1, 2, pastAirDate, 501) + "]"
+	filesJSON := "[" + episodeFileJSON(500, 1, 200, false) + "]" // statistics claims 2
+	srv := sonarrEpisodeFileServer(t, episodesJSON, filesJSON, nil, nil)
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	s := testSeries(1, "File Count Mismatch Show", true, 1, []int{}, testSeason(1, true, 2, 2))
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+
+	if len(eval.decisions) != 1 {
+		t.Fatalf("expected 1 decision, got %d", len(eval.decisions))
+	}
+	d := eval.decisions[0]
+	if d.reason != ReasonSeasonFileCountMismatch {
+		t.Fatalf("reason = %q, want %q", d.reason, ReasonSeasonFileCountMismatch)
+	}
+	if len(d.crossCheckEpisodes) == 0 {
+		t.Errorf("a file-count-mismatch season already has both halves of the join in scope; leaving it with no cross-check data makes it unverifiable by construction in the skip pool")
+	}
+}
+
+// TestEvaluateSeries_UntrustedAirDateAfterAFutureOne_StillWarns pins the
+// FIX-IN-PASSING at rule 3's loop: it breaks on the FIRST not-aired episode,
+// so the untrusted-airDateUtc WARN fires only when the untrusted episode
+// happens to precede every validly-future one. A genuinely airing season that
+// also carries one TBA/undated episode therefore skips silently at INFO —
+// exactly the ambiguity the round-1 fix was meant to remove.
+func TestEvaluateSeries_UntrustedAirDateAfterAFutureOne_StillWarns(t *testing.T) {
+	// Episode 100 is validly future-dated (healthy "still airing"); episode
+	// 101 is undated (untrusted). Order matters: 100 is seen first and breaks
+	// the pre-fix loop before 101 is ever examined.
+	episodesJSON := "[" + episodeJSON(100, 1, 1, futureAirDate, 500) + "," + episodeJSON(101, 1, 2, "", 501) + "]"
+	srv := sonarrEpisodeFileServer(t, episodesJSON, "[]", nil, nil)
+	defer srv.Close()
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	s := testSeries(1, "Mixed Airing Show", true, 1, []int{}, testSeason(1, true, 2, 2))
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+
+	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonSeasonNotFullyAired {
+		t.Fatalf("decisions = %+v, want one airing skip", eval.decisions)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "airDateUtc is absent or unparseable") {
+		t.Errorf("the undated episode must still be warned about even though a validly-future episode was seen first:\n%s", out)
+	}
+	if !strings.Contains(out, "episodeId=101") {
+		t.Errorf("the warn must name the untrusted episode:\n%s", out)
+	}
+}
+
+// TestEpisodeAiringStatus_TableDriven replaces the old
+// TestEpisodeHasAired_TableDriven: episodeHasAired had zero production
+// callers (rule 3 uses episodeAiringStatus) and survived only via that test,
+// so it is deleted and the table is retargeted at the function production
+// actually calls — asserting BOTH return values, which pins the untrusted bit
+// at unit level for the first time.
+func TestEpisodeAiringStatus_TableDriven(t *testing.T) {
+	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name          string
+		e             episodeElement
+		wantAired     bool
+		wantUntrusted bool
+	}{
+		{"past date", episodeElement{AirDateUtc: strPtr("2020-01-01T00:00:00Z")}, true, false},
+		{"future date", episodeElement{AirDateUtc: strPtr("2030-01-01T00:00:00Z")}, false, false},
+		{"absent", episodeElement{}, false, true},
+		{"unparseable", episodeElement{AirDateUtc: strPtr("garbage")}, false, true},
+		{"exactly now is not before now", episodeElement{AirDateUtc: strPtr("2025-01-01T00:00:00Z")}, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			aired, untrusted := episodeAiringStatus(tc.e, now)
+			if aired != tc.wantAired || untrusted != tc.wantUntrusted {
+				t.Errorf("episodeAiringStatus(%+v) = (%v, %v), want (%v, %v)", tc.e, aired, untrusted, tc.wantAired, tc.wantUntrusted)
+			}
+		})
+	}
+}
+
+// TestRunSonarrCrossCheck_EpisodeMonitoredNil_WarnsAndCountsUnverifiable pins
+// the Phase 6 minor at the cross-check's per-episode monitored filter:
+// ep.monitored == nil (a shape never observed live) was folded into the same
+// silent exclusion as monitored == false, so an untrusted shape was discarded
+// with no warn and no unverifiable count while the season could still render
+// "verified" on its remaining episodes.
+func TestRunSonarrCrossCheck_EpisodeMonitoredNil_WarnsAndCountsUnverifiable(t *testing.T) {
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr"}
+
+	decisions := []seasonDecision{
+		sonarrCandidateDecision(1, 1, false, []seasonCrossCheckEpisode{
+			{episodeID: 100, monitored: nil, qualityCutoffNotMet: boolPtr(false)},
+			{episodeID: 101, monitored: boolPtr(true), qualityCutoffNotMet: boolPtr(false)},
+		}),
+	}
+	runSonarrCrossCheck(context.Background(), logger, nil, inst, decisions, map[int]bool{})
+
+	out := buf.String()
+	if !strings.Contains(out, "monitored is absent") {
+		t.Errorf("an episode whose own monitored field could not be read is untrusted input and must warn, not vanish:\n%s", out)
+	}
+	if !strings.Contains(out, "unverifiable=1") {
+		t.Errorf("the season aggregate must count the untrusted episode as unverifiable:\n%s", out)
+	}
+}
+
+// TestRunSonarrCrossCheck_WantedButUnmonitoredEpisode_InWouldUnmonitorSeason_IsADisagreement
+// pins the hoist: the would-unmonitor/wanted-set contradiction check sat
+// AFTER the monitored filter, so the one shape it could not see was a
+// wanted-set episode that /episode reports unmonitored — precisely two-fetch
+// drift. Wanted-set membership contradicts rule 4 regardless of the episode's
+// own monitored flag.
+func TestRunSonarrCrossCheck_WantedButUnmonitoredEpisode_InWouldUnmonitorSeason_IsADisagreement(t *testing.T) {
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr"}
+
+	decisions := []seasonDecision{
+		sonarrCandidateDecision(1, 1, true, []seasonCrossCheckEpisode{
+			{episodeID: 100, monitored: boolPtr(false), qualityCutoffNotMet: boolPtr(true)},
+			{episodeID: 101, monitored: boolPtr(true), qualityCutoffNotMet: boolPtr(false)},
+		}),
+	}
+	cc := runSonarrCrossCheck(context.Background(), logger, nil, inst, decisions, map[int]bool{100: true})
+
+	if cc.status != crossCheckStatusFailed {
+		t.Fatalf("status = %q, want %q: an episode of a would-unmonitor season being in the wanted set flatly contradicts rule 4:\n%s", cc.status, crossCheckStatusFailed, buf.String())
+	}
+	if !strings.Contains(buf.String(), "contains an episode in the wanted/cutoff set") {
+		t.Errorf("expected the contradiction ERROR line:\n%s", buf.String())
+	}
+}
+
+// TestEvaluateSeries_SeasonMonitoredAbsent_WarnNamesTheSeries pins the
+// traceability minor: the season-level warnIfFieldAbsent emitted only
+// instance/type/endpoint/field, so the warning could not be traced to a
+// series at all — unlike the explicit missing-seasonNumber warn three lines
+// below it, which names seriesId and series.
+func TestEvaluateSeries_SeasonMonitoredAbsent_WarnNamesTheSeries(t *testing.T) {
+	srv := sonarrEpisodeFileServer(t, `[]`, `[]`, nil, nil)
+	defer srv.Close()
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	s := testSeries(1, "Untraceable Warn Show", true, 1, []int{},
+		seriesSeasonElement{SeasonNumber: intPtr(1), Statistics: &seasonStatisticsElement{EpisodeFileCount: intPtr(1), TotalEpisodeCount: intPtr(1)}})
+	evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+
+	// Isolate the season-monitored warn itself. The buffer also carries the
+	// "monitored series produced no season decisions" warn, which DOES name
+	// the series — asserting on the whole buffer would pass vacuously on that
+	// line while the traceability hole stayed wide open.
+	line := ""
+	for _, l := range strings.Split(buf.String(), "\n") {
+		if strings.Contains(l, "level=WARN") && strings.Contains(l, "season") && strings.Contains(l, "monitored") &&
+			!strings.Contains(l, "produced no season decisions") {
+			line = l
+			break
+		}
+	}
+	if line == "" {
+		t.Fatalf("expected a WARN about the season's absent monitored field:\n%s", buf.String())
+	}
+	if !strings.Contains(line, "seriesId=1") || !strings.Contains(line, `series="Untraceable Warn Show"`) {
+		t.Errorf("the season-level monitored-absent warn must name the series it belongs to, got %q", line)
 	}
 }

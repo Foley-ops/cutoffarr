@@ -1375,7 +1375,7 @@ type seriesEvaluation struct {
 	alreadyUnmonitored int
 }
 
-// episodeHasAired reports whether an episode's airDateUtc is in the past
+// episodeAiringStatus reports whether an episode's airDateUtc is in the past
 // relative to now, treating an absent OR unparseable airDateUtc as NOT
 // aired. This is rule 3's fail-safe contract verbatim (binding controller
 // resolution #2: "an episode with absent airDateUtc key counts as NOT
@@ -1385,13 +1385,8 @@ type seriesEvaluation struct {
 // as "probably aired" would be exactly the untrusted-input route to a
 // would-unmonitor decision on a still-airing season that §2.6 forbids — the
 // single most important Sonarr guard this whole engine exists to protect.
-func episodeHasAired(e episodeElement, now time.Time) bool {
-	aired, _ := episodeAiringStatus(e, now)
-	return aired
-}
-
-// episodeAiringStatus is episodeHasAired's finer-grained sibling: it
-// separately reports whether the airing status could not be determined at
+//
+// It separately reports whether the airing status could not be determined at
 // all — airDateUtc absent (JSON key missing, or present-but-null, either of
 // which decodes to a nil *string) or present but not a valid RFC3339
 // timestamp — as opposed to a valid, parseable date that simply lies in the
@@ -1399,10 +1394,17 @@ func episodeHasAired(e episodeElement, now time.Time) bool {
 // data-quality problem worth a WARN (REVIEW FIX, appended controller note
 // 2: "airDateUtc absent OR JSON-null on any episode = untrusted -> skip
 // season with warn"); a genuinely future-dated episode is the guard doing
-// exactly its job on healthy data; every other untrusted-input path in this
-// function warns (statistics missing, zero/short episode list, file-count
-// mismatch, missing CF score) — this one must too, distinguishably from the
-// "still airing" case it must never be confused with in the log stream.
+// exactly its job on healthy data; every other untrusted-input path in
+// evaluateSeries warns (statistics missing, zero/short episode list,
+// file-count mismatch, missing CF score) — this one must too, distinguishably
+// from the "still airing" case it must never be confused with in the log
+// stream.
+//
+// REVIEW FIX (Phase 6 branch review): a bool-only episodeHasAired wrapper
+// used to sit here as well. It had zero production callers — rule 3 has
+// always used this function — and survived only via its own table test, so
+// it is deleted and the table retargeted here, asserting BOTH return values
+// (which pins the untrusted bit at unit level for the first time).
 func episodeAiringStatus(e episodeElement, now time.Time) (aired bool, untrusted bool) {
 	if e.AirDateUtc == nil {
 		return false, true
@@ -1444,9 +1446,18 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 	// record missing its id).
 	var monitoredSeasons []seriesSeasonElement
 	var explicitlyUnmonitored []seriesSeasonElement
+	seenSeasonNumbers := make(map[int]bool)
 	for _, season := range seasons {
-		warnIfFieldAbsent(logger, inst, "season", "monitored", season.Monitored == nil)
+		// REVIEW FIX (Phase 6 branch review): warnIfFieldAbsent's generic
+		// wording carries only instance/type/endpoint/field, so this warning
+		// could not be traced back to a series at all — unlike the explicit
+		// missing-seasonNumber warn a few lines below, which names both. An
+		// untraceable warning about a load-bearing field is a warning nobody
+		// can act on.
 		if season.Monitored == nil {
+			logger.Warn("skipping season: missing monitored field",
+				"instance", inst.Name, "type", inst.Type, "seriesId", seriesID, "series", seriesTitle,
+				"season", derefOrAbsent(season.SeasonNumber))
 			continue
 		}
 		if !*season.Monitored {
@@ -1458,6 +1469,22 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 				"instance", inst.Name, "type", inst.Type, "seriesId", seriesID, "series", seriesTitle)
 			continue
 		}
+		// REVIEW FIX (Phase 6 branch review): every per-season map below
+		// (candidateIndex, statsFileCountFor, seasonEpisodesFor) is keyed on
+		// the bare season number, so a series listing the same seasonNumber
+		// twice among its monitored seasons left the FIRST decision's reason
+		// empty — reported as msg=skip reason="" at INFO, with no warn, and
+		// counted under an empty-string key in skipReasons. A skip with no
+		// reason, produced from untrusted input, is the exact shape §2.6
+		// forbids. Both entries describe the same real season, so excluding
+		// the repeat loses nothing; it is warned about for the same reason
+		// the missing-seasonNumber case is.
+		if seenSeasonNumbers[*season.SeasonNumber] {
+			logger.Warn("skipping season: duplicate seasonNumber in this series' seasons list",
+				"instance", inst.Name, "type", inst.Type, "seriesId", seriesID, "series", seriesTitle, "season", *season.SeasonNumber)
+			continue
+		}
+		seenSeasonNumbers[*season.SeasonNumber] = true
 		monitoredSeasons = append(monitoredSeasons, season)
 	}
 
@@ -1623,6 +1650,17 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 				"instance", inst.Name, "type", inst.Type, "seriesId", seriesID, "series", seriesTitle, "season", sn,
 				"episodesReturned", len(seasonEpisodes), "totalEpisodeCount", *stats.TotalEpisodeCount)
 			d.reason = ReasonSeasonEpisodeDataInconsistent
+			// REVIEW FIX (Phase 6 branch review, evidence-touching — the
+			// write gate reads this verdict): completeOnDisk was set by rule
+			// 2 just above and never cleared, so this season entered the
+			// cross-check's skip pool carrying NEITHER crossCheckEpisodes nor
+			// rawEpisodesForCrossCheck — unverifiable by construction. It
+			// would consume one of only 10 skip-side sample slots, always add
+			// a second WARN, and push the verdict toward inconclusive, purely
+			// because its own episode data could not be trusted. A season
+			// whose episode set is untrusted has nothing to contribute as
+			// evidence, so it is not sample-eligible at all.
+			d.completeOnDisk = false
 			decisions = append(decisions, d)
 			continue
 		}
@@ -1645,6 +1683,17 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 		// missing, episode count mismatch, file-count mismatch, missing CF
 		// score) does warn. Appended controller note 2 is explicit on this
 		// exact shape.
+		//
+		// REVIEW FIX (Phase 6 branch review): the loop used to break on the
+		// first not-aired episode, so the untrusted-airDateUtc WARN fired
+		// only when the untrusted episode happened to PRECEDE every validly-
+		// future one. A genuinely airing season that also carried one
+		// TBA/undated episode then skipped silently at INFO — byte-identical
+		// to a healthy still-airing season, which is exactly the ambiguity
+		// the warn was added to remove. The decision is the same either way
+		// (allAired is false as soon as any episode is not aired), so the
+		// whole season is scanned and the warn is emitted after the scan
+		// rather than the scan being cut short before it can be earned.
 		allAired := true
 		for _, e := range seasonEpisodes {
 			aired, untrusted := episodeAiringStatus(e, now)
@@ -1654,7 +1703,6 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 			}
 			if !aired {
 				allAired = false
-				break
 			}
 		}
 		if !allAired {
@@ -1712,7 +1760,18 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 	filesBySeason := make(map[int][]episodeFileElement)
 	filesByID := make(map[int]episodeFileElement, len(files))
 	for _, f := range files {
-		if f.SeasonNumber != nil {
+		if f.SeasonNumber == nil {
+			// REVIEW FIX (Phase 6 branch review): this drop used to be
+			// silent, while the structurally identical episode drop above
+			// warns. filesBySeason is rule 7's ONLY input, so a file lost
+			// here is a file whose custom-format score is never compared; the
+			// file-count guard below usually catches the resulting shortfall
+			// but names the symptom rather than the cause, and a season
+			// carrying an extra correctly-labelled file absorbs the drop
+			// entirely.
+			logger.Warn("episode file missing seasonNumber field; excluded from every season's evaluation",
+				"instance", inst.Name, "type", inst.Type, "seriesId", seriesID, "series", seriesTitle, "fileId", derefOrAbsent(f.ID))
+		} else {
 			filesBySeason[*f.SeasonNumber] = append(filesBySeason[*f.SeasonNumber], f)
 		}
 		if f.ID != nil {
@@ -1723,6 +1782,22 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 	for _, sn := range candidateSeasons {
 		idx := candidateIndex[sn]
 		seasonFiles := filesBySeason[sn]
+
+		// Cross-check data: pair each episode's own id (wanted-set membership
+		// is looked up from it later, by runSonarrCrossCheck) with its file's
+		// qualityCutoffNotMet and its own monitored flag — shared join logic
+		// (buildSeasonCrossCheckEpisodes) with the cross-check's own
+		// on-demand fetch for skip-side seasons, rather than a second copy of
+		// it.
+		//
+		// REVIEW FIX (Phase 6 branch review, evidence-touching): this used to
+		// sit at the END of the loop body, after the file-count guard's
+		// `continue`, so a file-count-mismatch season entered the skip pool
+		// (completeOnDisk is true — rule 2 genuinely passed) with no
+		// cross-check data at all: unverifiable by construction, consuming a
+		// sample slot and adding a WARN, even though BOTH halves of the join
+		// it needed were already in scope and cost nothing more to build.
+		decisions[idx].crossCheckEpisodes = buildSeasonCrossCheckEpisodes(seasonEpisodesFor[sn], filesByID)
 
 		// Binding controller resolution #3: fewer files than statistics
 		// claimed is untrusted, not "some files are just missing".
@@ -1760,14 +1835,6 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 			decisions[idx].wouldUnmonitor = true
 			decisions[idx].reason = ReasonCutoffMet
 		}
-
-		// Cross-check data: pair each episode's own id (wanted-set membership
-		// is looked up from it later, by runSonarrCrossCheck) with its
-		// file's qualityCutoffNotMet and its own monitored flag — shared
-		// join logic (buildSeasonCrossCheckEpisodes) with the cross-check's
-		// own on-demand fetch for skip-side seasons, rather than a second
-		// copy of it.
-		decisions[idx].crossCheckEpisodes = buildSeasonCrossCheckEpisodes(seasonEpisodesFor[sn], filesByID)
 	}
 
 	return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored)}
@@ -2004,13 +2071,6 @@ func runSonarrCrossCheck(ctx context.Context, logger *slog.Logger, client *APICl
 		seasonFinalDisagreed := 0
 		seasonUnverifiableEpisodes := 0
 		for _, ep := range crossCheckEpisodes {
-			if ep.monitored == nil || !*ep.monitored {
-				// IMPORTANT REVIEW FIX: excluded from the comparison
-				// entirely, not counted toward verified or unverifiable —
-				// see the function doc comment, shape (a).
-				continue
-			}
-
 			inWantedSet := wantedEpisodeIDs[ep.episodeID]
 
 			// IMPORTANT REVIEW FIX: a would-unmonitor season is rule 4's own
@@ -2024,13 +2084,43 @@ func runSonarrCrossCheck(ctx context.Context, logger *slog.Logger, client *APICl
 			// qualityCutoffNotMet comparison below can explain away (in the
 			// qualityCutoffNotMet==true case it would otherwise fall straight
 			// through as a "verified" agreement). Check and flag it BEFORE
-			// the nil/CF-only continues below so no per-field shape can ever
-			// suppress it.
+			// every continue below so no per-field shape can ever suppress
+			// it.
+			//
+			// REVIEW FIX (Phase 6 branch review): this check used to sit
+			// AFTER the monitored filter, so the one shape it could not see
+			// was a wanted-set episode that /episode reports unmonitored —
+			// precisely the two-fetch drift a cross-check exists to catch.
+			// Wanted-set membership contradicts rule 4 regardless of the
+			// episode's own monitored flag, so the check is hoisted above the
+			// filter entirely.
 			if d.wouldUnmonitor && inWantedSet {
 				disagreementFound = true
 				logger.Error("cross-check disagreement: a would-unmonitor season contains an episode in the wanted/cutoff set",
 					"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season,
 					"episodeId", ep.episodeID, "inWantedSet", inWantedSet, "qualityCutoffNotMet", derefOrAbsent(ep.qualityCutoffNotMet))
+			}
+
+			// REVIEW FIX (Phase 6 branch review): monitored == nil used to
+			// share this exclusion with monitored == false, so an untrusted
+			// shape (never observed live) was discarded with no warn and no
+			// unverifiable count, while the season could still render
+			// "verified" on its remaining episodes. A false monitored flag is
+			// a fact that legitimately removes the episode from the
+			// comparable population (shape (a) in the doc comment); an
+			// unreadable one is missing evidence, and this project counts
+			// missing evidence.
+			if ep.monitored == nil {
+				seasonUnverifiableEpisodes++
+				logger.Warn("cross-check: episode monitored is absent or JSON null; cannot tell whether this episode belongs in the comparable population",
+					"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season, "episodeId", ep.episodeID)
+				continue
+			}
+			if !*ep.monitored {
+				// IMPORTANT REVIEW FIX: excluded from the comparison
+				// entirely, not counted toward verified or unverifiable —
+				// see the function doc comment, shape (a).
+				continue
 			}
 
 			// REVIEW FIX (Phase 6 final round, F3): demoted from Info to

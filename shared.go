@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // errNullTagElement marks decodeTagIDs's new failure mode specifically (a
@@ -108,11 +109,29 @@ func decodeTagIDs(raw []byte) ([]int, error) {
 // not carry key, reports found=false: callers treat that as "nothing more
 // to check here" rather than as a new error, since the earlier typed decode
 // is what is authoritative for "is this a well-formed object".
+//
+// The lookup deliberately mirrors encoding/json's own key matching — exact
+// match first, then a case-insensitive scan (REVIEW FIX, Phase 6 branch
+// review, carried into Phase 7). This function's whole job is to re-inspect
+// the SAME bytes a struct decode already consumed, and encoding/json matches
+// field names case-insensitively when no exact match exists: a payload
+// spelling the key "Tags" populated movieListElement.Tags (turning
+// [3, null, 9] into [3, 0, 9] with no error) while an exact-only lookup here
+// reported found=false, skipped the null-element re-check entirely, and left
+// the corrupted array trusted — the one hole the re-check exists to close,
+// open for any differently-cased key.
 func rawObjectField(raw json.RawMessage, key string) (json.RawMessage, bool) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return nil, false
 	}
-	v, found := obj[key]
-	return v, found
+	if v, found := obj[key]; found {
+		return v, true
+	}
+	for k, v := range obj {
+		if strings.EqualFold(k, key) {
+			return v, true
+		}
+	}
+	return nil, false
 }

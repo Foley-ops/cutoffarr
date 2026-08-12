@@ -610,7 +610,9 @@ func TestInspectSonarrLibrary_SeriesFetchFailure_ReturnsNotOK(t *testing.T) {
 	if wantedHit {
 		t.Error("wanted/cutoff must not be fetched when /series already failed")
 	}
-	_ = buf
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("a skipped instance must say so (§2.6: warn and skip):\n%s", buf.String())
+	}
 }
 
 func TestInspectSonarrLibrary_WantedCutoffFailure_ReturnsNotOK(t *testing.T) {
@@ -634,7 +636,9 @@ func TestInspectSonarrLibrary_WantedCutoffFailure_ReturnsNotOK(t *testing.T) {
 	if series != nil || episodeIDs != nil || seasons != nil {
 		t.Error("expected all return values nil on failure")
 	}
-	_ = buf
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("a skipped instance must say so (§2.6: warn and skip):\n%s", buf.String())
+	}
 }
 
 // --- Phase 6: decision engine wiring into main.go's run() -------------------
@@ -1355,5 +1359,107 @@ instances:
 	}
 	if strings.Contains(out, "msg=would-unmonitor") {
 		t.Errorf("a currently-airing season must NEVER appear as would-unmonitor, per the phase's accept criterion:\n%s", out)
+	}
+}
+
+// ============================================================================
+// Phase 7: Phase 6 branch-review carry-over minors (binding)
+// ============================================================================
+
+// TestFetchSeriesLibrary_TagsKeyDifferentlyCased_NullElementStillCaught pins
+// the case-sensitivity hole the null-tag-element fix left open: the struct
+// decode that populates Tags matches JSON keys case-INsensitively (that is
+// encoding/json's documented behavior), while rawObjectField's re-check did
+// an exact, case-sensitive map lookup. A payload spelling the key "Tags"
+// therefore decoded [3, null, 9] into [3, 0, 9], rawObjectField reported
+// found=false, the re-check was skipped entirely, and the corrupted array —
+// the one shape this whole fix exists to catch — was trusted.
+func TestFetchSeriesLibrary_TagsKeyDifferentlyCased_NullElementStillCaught(t *testing.T) {
+	seriesJSON := `[{"id": 1, "title": "Oddly Cased Tags Show", "monitored": true, "qualityProfileId": 1, "Tags": [3, null, 9], "seasons": []}]`
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/series", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(seriesJSON))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	series, ok := fetchSeriesLibrary(context.Background(), logger, client, inst)
+	if !ok {
+		t.Fatalf("fetchSeriesLibrary returned ok=false, want true:\n%s", buf.String())
+	}
+	if len(series) != 1 {
+		t.Fatalf("expected 1 series, got %d", len(series))
+	}
+	if series[0].Tags != nil {
+		t.Errorf("a corrupted tags array must be normalized to nil regardless of how the JSON key is cased, got %v", *series[0].Tags)
+	}
+}
+
+// TestFetchEpisodes_ForeignSeriesIdRecord_WarnedAndExcluded pins the
+// seriesId echo-check: episodeElement did not decode seriesId at all, so the
+// code trusted the server to have honoured ?seriesId=X. A proxy or routing
+// mistake would feed rules 3 and 7 another series' episodes with only the
+// incidental count comparisons as backstop.
+func TestFetchEpisodes_ForeignSeriesIdRecord_WarnedAndExcluded(t *testing.T) {
+	episodesJSON := `[
+		{"id": 100, "seriesId": 1, "seasonNumber": 1, "episodeNumber": 1, "monitored": true, "hasFile": true, "airDateUtc": "2015-01-01T00:00:00Z", "episodeFileId": 500},
+		{"id": 999, "seriesId": 2, "seasonNumber": 1, "episodeNumber": 2, "monitored": true, "hasFile": true, "airDateUtc": "2015-01-01T00:00:00Z", "episodeFileId": 999}
+	]`
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/episode", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(episodesJSON))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	episodes, ok := fetchEpisodes(context.Background(), logger, client, inst, 1)
+	if !ok {
+		t.Fatalf("fetchEpisodes returned ok=false, want true:\n%s", buf.String())
+	}
+	if len(episodes) != 1 || episodes[0].ID == nil || *episodes[0].ID != 100 {
+		t.Fatalf("expected only the requested series' episode to survive, got %d: %+v", len(episodes), episodes)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "episodeId=999") {
+		t.Errorf("expected a WARN naming the foreign episode record:\n%s", out)
+	}
+}
+
+// TestFetchEpisodeFiles_ForeignSeriesIdRecord_WarnedAndExcluded is the same
+// guard on the endpoint that feeds rule 7's custom-format comparison.
+func TestFetchEpisodeFiles_ForeignSeriesIdRecord_WarnedAndExcluded(t *testing.T) {
+	filesJSON := `[
+		{"id": 500, "seriesId": 1, "seasonNumber": 1, "customFormatScore": 200, "qualityCutoffNotMet": false},
+		{"id": 999, "seriesId": 2, "seasonNumber": 1, "customFormatScore": 0, "qualityCutoffNotMet": true}
+	]`
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/episodefile", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(filesJSON))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	files, ok := fetchEpisodeFiles(context.Background(), logger, client, inst, 1)
+	if !ok {
+		t.Fatalf("fetchEpisodeFiles returned ok=false, want true:\n%s", buf.String())
+	}
+	if len(files) != 1 || files[0].ID == nil || *files[0].ID != 500 {
+		t.Fatalf("expected only the requested series' file to survive, got %d: %+v", len(files), files)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "fileId=999") {
+		t.Errorf("expected a WARN naming the foreign episode file record:\n%s", out)
 	}
 }

@@ -1152,3 +1152,30 @@ instances:
 		t.Errorf("expected the configured exclusion_tag label to reach the decision engine's tag resolution:\n%s", out)
 	}
 }
+
+// TestInspectRadarrLibrary_TagsKeyDifferentlyCased_NullElementStillCaught is
+// the Radarr half of the case-sensitivity hole (see the Sonarr twin in
+// sonarr_test.go): encoding/json matches "Tags" to the movieListElement.Tags
+// field case-insensitively, while the raw re-check looked the key up exactly,
+// so a differently-cased key silently skipped the null-element check and the
+// corrupted array [3, null, 9] was trusted as [3, 0, 9].
+func TestInspectRadarrLibrary_TagsKeyDifferentlyCased_NullElementStillCaught(t *testing.T) {
+	moviesJSON := `[{"id": 1, "title": "Oddly Cased Tags Movie", "monitored": true, "hasFile": true, "qualityProfileId": 1, "Tags": [3, null, 9]}]`
+	var gotRequests []string
+	srv := radarrTestServer(t, http.StatusOK, moviesJSON, staticWantedCutoffHandler(http.StatusOK, emptyWantedCutoffJSON), &gotRequests)
+	defer srv.Close()
+
+	logger, buf := newRadarrTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	movies, _, ok := inspectRadarrLibrary(context.Background(), logger, inst, nil)
+	if !ok {
+		t.Fatalf("inspectRadarrLibrary returned ok=false, want true:\n%s", buf.String())
+	}
+	if len(movies) != 1 {
+		t.Fatalf("expected 1 movie, got %d", len(movies))
+	}
+	if movies[0].Tags != nil {
+		t.Errorf("a corrupted tags array must be normalized to nil regardless of how the JSON key is cased, got %v", *movies[0].Tags)
+	}
+}

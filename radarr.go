@@ -246,13 +246,26 @@ func fetchMovies(ctx context.Context, logger *slog.Logger, client *APIClient, in
 		// flows into decision.go rule 4's already-correct, already-tested
 		// untrusted-tags handling instead of silently trusting a corrupted
 		// array.
+		//
+		// found==false while m.Tags is non-nil is itself impossible to
+		// explain innocently, and is therefore treated as untrusted rather
+		// than ignored (REVIEW FIX, carried into Phase 7): Tags is *[]int, so
+		// a non-nil pointer means the struct decode DID see the key, and a
+		// re-check that cannot see it is a re-check that verified nothing.
+		// rawObjectField now mirrors encoding/json's case-insensitive
+		// matching, so this branch should be unreachable — which is exactly
+		// why it must normalize rather than silently trust an array no second
+		// pair of eyes ever looked at.
 		if m.Tags != nil {
-			if rawTags, found := rawObjectField(raw, "tags"); found {
-				if _, err := decodeTagIDs(rawTags); err != nil {
-					logger.Warn("movie tags array contains an unusable element (e.g. JSON null); treating tags as unverifiable",
-						"instance", inst.Name, "type", inst.Type, "title", titleOrAbsent(m.Title), "error", err)
-					m.Tags = nil
-				}
+			rawTags, found := rawObjectField(raw, "tags")
+			if !found {
+				logger.Warn("movie tags decoded but could not be located in the raw payload for re-checking; treating tags as unverifiable",
+					"instance", inst.Name, "type", inst.Type, "title", titleOrAbsent(m.Title))
+				m.Tags = nil
+			} else if _, err := decodeTagIDs(rawTags); err != nil {
+				logger.Warn("movie tags array contains an unusable element (e.g. JSON null); treating tags as unverifiable",
+					"instance", inst.Name, "type", inst.Type, "title", titleOrAbsent(m.Title), "error", err)
+				m.Tags = nil
 			}
 		}
 
