@@ -1768,7 +1768,15 @@ func TestDaemon_WebhookCycle_RunsNoReversePass(t *testing.T) {
 	})
 	h.clock.Advance(45 * time.Second)
 	h.awaitLogCount("webhook debounce expired; evaluating", 1)
-	time.Sleep(20 * time.Millisecond)
+	// FLAKE FIX: this was a fixed 20ms sleep, the pattern the older webhook
+	// tests use for "let the cycle finish". Every assertion below is about what
+	// that cycle logged, and under load 20ms is not always enough for it to log
+	// anything — observed once as the fatal below, on a machine running six
+	// suites at once. The summary line is the cycle's own last word, so waiting
+	// for it is the synchronization point that was missing.
+	eventually(t, "the webhook cycle to finish", func() bool {
+		return strings.Contains(h.since(mark), "radarr decision summary")
+	})
 	h.stop()
 
 	cycle := h.since(mark)

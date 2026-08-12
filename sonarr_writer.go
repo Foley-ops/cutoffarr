@@ -48,6 +48,12 @@ import (
 //     season would go unmonitored, rule 1 would exclude it from every future
 //     cycle, and nothing would ever revisit the episodes left behind.
 //
+//     Phase 10's REVERSE direction reaches that same stranded shape by the
+//     other road — its episode write sets true, so a failed season PUT leaves
+//     an unmonitored season full of monitored episodes — which is why the
+//     reverse scan reports exactly that state (ReasonSeasonMonitorMismatch)
+//     rather than the direction relying on a convergence it would not have had.
+//
 //  3. Pre-write re-verification has one more moving part than Radarr's,
 //     because the season's most important guard (rule 3, the airing guard)
 //     depends on data that lives at a different endpoint. A fresh
@@ -81,9 +87,11 @@ const (
 )
 
 // episodeMonitorRequest is the body of PUT /api/v3/episode/monitor. Monitored
-// is a plain bool rather than a constant because the field must be present in
-// the JSON; it is only ever set to false by this project — nothing here ever
-// re-monitors anything.
+// is a plain bool because the field must be present in the JSON and, since
+// Phase 10, really does take both values: false on the forward path, true on
+// the reverse one (monitoredWriteTarget decides, from the direction, in one
+// place). It was documented here as "only ever false — nothing here ever
+// re-monitors anything", which the reverse scan's write half made untrue.
 type episodeMonitorRequest struct {
 	EpisodeIDs []int `json:"episodeIds"`
 	Monitored  bool  `json:"monitored"`
@@ -120,8 +128,9 @@ var errSeasonUnverifiableAtWrite = errors.New("the season's own state in the pre
 var errSeasonAiringAtWrite = errors.New("the season is no longer fully aired as of the pre-write fetch")
 
 // errEpisodeMonitorContradicted marks the episode half of the write being
-// told, by the server itself, that it did NOT happen: a 2xx whose echo names
-// an episode this write asked to unmonitor and says it is still monitored.
+// told, by the server itself, that it did NOT happen: a 2xx whose echo names an
+// episode this write asked to change and reports it still in the state the
+// write was trying to leave.
 //
 // It is a CONFIRMED FAILURE, not a failure to confirm — the exact line
 // verifySeasonWriteEcho draws on the season half, drawn here too because the
@@ -129,7 +138,12 @@ var errSeasonAiringAtWrite = errors.New("the season is no longer fully aired as 
 // deliberately NOT errWriteUnverified: that class means "probably applied,
 // treat it as done, the next cycle will reconcile it", and this shape is the
 // server saying the opposite.
-var errEpisodeMonitorContradicted = errors.New("the episode monitor response says an episode this write asked to unmonitor is still monitored")
+//
+// Its wording is direction-neutral (Phase 10 round 3): it used to say "asked to
+// unmonitor ... is still monitored", which is the forward half of a check that
+// has been symmetric in the requested value since the reverse write path
+// existed, and which read as the opposite of what happened on a reverse write.
+var errEpisodeMonitorContradicted = errors.New("the episode monitor response says an episode this write named is still in the state the write was trying to change")
 
 // errEpisodeMonitorUnconfirmed marks a 2xx from the episode write whose body
 // cannot settle whether it landed: an unrecognized shape, a requested id the
@@ -140,13 +154,19 @@ var errEpisodeMonitorContradicted = errors.New("the episode monitor response say
 // (CRITICAL review fix), and for the same reason: the season PUT is the step
 // that makes the season invisible to rule 1 forever, so it may only follow an
 // episode write the server CONFIRMED. Aborting strands nothing — the season
-// stays monitored, so the next cycle re-reads /episode, drops whatever really
+// flag is untouched, so the next cycle re-reads /episode, drops whatever really
 // landed from the id list, and retries. Abort converges whether or not the
 // episodes changed; proceeding strands them in the branch where they did not.
 //
+// Going forward the season is left monitored, which is what keeps it in every
+// future cycle's forward pass. Coming back it is left unmonitored, and any
+// episode that really did land inside it is what the reverse pass now reports as
+// ReasonSeasonMonitorMismatch — so "the next cycle sees it" is true in both
+// directions rather than only the one this was first written for.
+//
 // It is also not errWriteUnverified, because no season write was even
-// attempted: the season is definitively still monitored, and reporting it as
-// accepted-but-unconfirmed would tell a human the opposite of what happened.
+// attempted: the season's own flag is definitively unchanged, and reporting it
+// as accepted-but-unconfirmed would tell a human the opposite of what happened.
 var errEpisodeMonitorUnconfirmed = errors.New("the episode monitor write was accepted but its response could not confirm it")
 
 // errNotRecoveryAtWrite marks a season the RECOVERY pass admitted on
@@ -491,12 +511,20 @@ func writeSeasonMonitored(ctx context.Context, logger *slog.Logger, client *APIC
 			// still-monitored episode ends up inside a season nothing will
 			// ever evaluate again, which is the stranded state the binding
 			// episodes-first order exists to prevent, reached by the one road
-			// left open. Aborting strands nothing: the season stays monitored,
-			// the next cycle re-reads /episode, and the retry is smaller by
-			// whatever really landed.
+			// left open. Aborting strands nothing: the season's own flag is
+			// untouched, the next cycle re-reads /episode, and the retry is
+			// smaller by whatever really landed.
 			if err := putEpisodeMonitor(ctx, logger, client, inst, seriesID, episodeIDs, subject, attrs, rev); err != nil {
-				logger.Warn("episode monitor write could not be confirmed; the season write is withheld and the season is left monitored so the next cycle can retry it",
-					append(append([]any(nil), attrs...), "episodeIds", len(episodeIDs), "error", err)...)
+				// The message says which state the season was left in, because
+				// the two directions leave opposite ones and a human reading
+				// this line is reading it to find that out (Phase 10 round 3 —
+				// it used to say "left monitored" in both, which is the
+				// opposite of the truth on a reverse write).
+				msg := "episode monitor write could not be confirmed; the season write is withheld and the season is left monitored so the next cycle can retry it"
+				if rev != nil {
+					msg = "episode monitor write could not be confirmed; the season write is withheld and the season is left unmonitored so the next cycle can retry it — if any episode did land, that cycle sees the season as an unmonitored season with monitored episodes"
+				}
+				logger.Warn(msg, append(append([]any(nil), attrs...), "episodeIds", len(episodeIDs), "error", err)...)
 				return false, recovery, err
 			}
 			episodesWritten = true

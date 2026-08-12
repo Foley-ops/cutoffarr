@@ -832,10 +832,14 @@ func TestUnmonitorSeason_EpisodeEchoDoesNotConfirm_WithholdsTheSeasonWrite(t *te
 		{
 			// The shape the whole finding is about: Sonarr answered 200 and
 			// said, in the same breath, that the episodes are STILL monitored.
+			// The phrase asserted here is the sentinel's, and it is
+			// direction-neutral since Phase 10 round 3 — the same echo check
+			// serves the reverse write, where "still monitored" would have named
+			// the state the write was asking FOR.
 			name:        "the echo says the episodes are still monitored",
 			echo:        `[{"id":100,"monitored":true},{"id":101,"monitored":true}]`,
 			contradicts: true,
-			wantInError: []string{"100", "still monitored"},
+			wantInError: []string{"100", "still in the state the write was trying to change"},
 		},
 		{
 			name:        "the echo does not mention a requested episode",
