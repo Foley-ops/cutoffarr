@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -564,4 +567,155 @@ func TestInspectSonarrLibrary_WantedCutoffFailure_ReturnsNotOK(t *testing.T) {
 		t.Error("expected all return values nil on failure")
 	}
 	_ = buf
+}
+
+// --- Phase 6: decision engine wiring into main.go's run() -------------------
+
+// fullSonarrPipelineMux wires a mux serving every endpoint a full
+// connectivity + library inspection + season decision engine pass touches:
+// system/status, qualityprofile (hit twice: once by checkInstanceConnectivity,
+// once by the decision engine's own fetchQualityProfiles), series,
+// wanted/cutoff, tag, episode, and episodefile.
+func fullSonarrPipelineMux(seriesJSON, wantedCutoffJSON, tagsJSON, episodeJSON, episodefileJSON string) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/system/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"appName": "Sonarr", "version": "4.0.19.2979"}`))
+	})
+	mux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[{"id": 1, "name": "HD-1080p", "upgradeAllowed": true, "cutoff": 7, "cutoffFormatScore": 100}]`))
+	})
+	mux.HandleFunc("/api/v3/series", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(seriesJSON))
+	})
+	mux.HandleFunc("/api/v3/wanted/cutoff", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(wantedCutoffJSON))
+	})
+	mux.HandleFunc("/api/v3/tag", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(tagsJSON))
+	})
+	mux.HandleFunc("/api/v3/episode", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(episodeJSON))
+	})
+	mux.HandleFunc("/api/v3/episodefile", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(episodefileJSON))
+	})
+	return mux
+}
+
+// TestRun_SonarrInstance_DecisionEngineProducesReportLines proves the full
+// pipeline is wired end to end through run(): connectivity succeeds,
+// inspectSonarrLibrary's returned series/wantedEpisodeIDs/wantedSeasons are
+// handed to runSonarrDecisionEngine, which fetches profiles/tag/episode/
+// episodefile and emits would-unmonitor/skip report lines per season.
+func TestRun_SonarrInstance_DecisionEngineProducesReportLines(t *testing.T) {
+	seriesJSON := `[
+		{"id": 1, "title": "Would Unmonitor Show", "monitored": true, "qualityProfileId": 1, "tags": [],
+		 "seasons": [{"seasonNumber": 1, "monitored": true, "statistics": {"episodeFileCount": 1, "totalEpisodeCount": 1}}]},
+		{"id": 2, "title": "Incomplete Show", "monitored": true, "qualityProfileId": 1, "tags": [],
+		 "seasons": [{"seasonNumber": 1, "monitored": true, "statistics": {"episodeFileCount": 0, "totalEpisodeCount": 5}}]}
+	]`
+	episodeJSON := `[{"id": 100, "seasonNumber": 1, "episodeNumber": 1, "monitored": true, "hasFile": true, "airDateUtc": "2015-01-01T00:00:00Z", "episodeFileId": 500}]`
+	episodefileJSON := `[{"id": 500, "seasonNumber": 1, "customFormatScore": 200, "qualityCutoffNotMet": false}]`
+	mux := fullSonarrPipelineMux(seriesJSON, `{"page":1,"pageSize":100,"totalRecords":0,"records":[]}`, `[]`, episodeJSON, episodefileJSON)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := `
+instances:
+  - name: sonarr-main
+    type: sonarr
+    url: ` + srv.URL + `
+    api_key: key1
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "msg=would-unmonitor") || !strings.Contains(out, `series="Would Unmonitor Show"`) {
+		t.Errorf("expected a would-unmonitor line for the passing season:\n%s", out)
+	}
+	if !strings.Contains(out, "msg=skip") || !strings.Contains(out, `series="Incomplete Show"`) || !strings.Contains(out, `reason="season incomplete on disk"`) {
+		t.Errorf("expected a skip line for the incomplete season:\n%s", out)
+	}
+	if !strings.Contains(out, `msg="sonarr decision summary"`) {
+		t.Errorf("expected the end-of-instance decision summary:\n%s", out)
+	}
+}
+
+// TestRun_SonarrInstance_IncompleteWantedCutoff_DecisionEngineNeverRuns
+// mirrors TestRun_RadarrInstance_IncompleteWantedCutoff_DecisionEngineNeverRuns:
+// a partial wanted/cutoff result must prevent the season decision engine
+// from running at all — no report lines, and the decision engine's own
+// endpoints (qualityprofile's SECOND hit, tag, episode, episodefile) never
+// reached.
+func TestRun_SonarrInstance_IncompleteWantedCutoff_DecisionEngineNeverRuns(t *testing.T) {
+	seriesJSON := `[{"id": 1, "title": "Some Show", "monitored": true, "qualityProfileId": 1, "tags": [], "seasons": [{"seasonNumber": 1, "monitored": true, "statistics": {"episodeFileCount": 1, "totalEpisodeCount": 1}}]}]`
+	incompleteWantedCutoffJSON := `{"page": 1, "pageSize": 100, "totalRecords": 50, "records": []}`
+
+	var gotTagRequests, gotEpisodeRequests, gotProfileRequests []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/system/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"appName": "Sonarr", "version": "4.0.19.2979"}`))
+	})
+	mux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
+		gotProfileRequests = append(gotProfileRequests, r.URL.Path)
+		w.Write([]byte(`[{"id": 1, "name": "HD-1080p", "upgradeAllowed": true, "cutoff": 7, "cutoffFormatScore": 100}]`))
+	})
+	mux.HandleFunc("/api/v3/series", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(seriesJSON))
+	})
+	mux.HandleFunc("/api/v3/wanted/cutoff", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(incompleteWantedCutoffJSON))
+	})
+	mux.HandleFunc("/api/v3/tag", func(w http.ResponseWriter, r *http.Request) {
+		gotTagRequests = append(gotTagRequests, r.URL.Path)
+		w.Write([]byte(`[]`))
+	})
+	mux.HandleFunc("/api/v3/episode", func(w http.ResponseWriter, r *http.Request) {
+		gotEpisodeRequests = append(gotEpisodeRequests, r.URL.Path)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := `
+instances:
+  - name: sonarr-main
+    type: sonarr
+    url: ` + srv.URL + `
+    api_key: key1
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	out := stdout.String()
+	if strings.Contains(out, "msg=would-unmonitor") || strings.Contains(out, "msg=skip") {
+		t.Errorf("a partial wanted/cutoff result must prevent the season decision engine from running at all:\n%s", out)
+	}
+	if len(gotProfileRequests) != 1 {
+		t.Errorf("expected qualityprofile hit only once (by connectivity), got %d", len(gotProfileRequests))
+	}
+	if len(gotTagRequests) != 0 {
+		t.Errorf("expected zero /tag requests, got %d", len(gotTagRequests))
+	}
+	if len(gotEpisodeRequests) != 0 {
+		t.Errorf("expected zero /episode requests, got %d", len(gotEpisodeRequests))
+	}
 }

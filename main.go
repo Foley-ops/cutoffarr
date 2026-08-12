@@ -176,6 +176,23 @@ func run(args []string, stdout, stderr io.Writer) int {
 					runRadarrDecisionEngine(context.Background(), logger, inst, movies, wantedIDs, cfg.ExclusionTag, *onlyID, cfg.DryRun)
 				}
 			}
+			// Phase 6: the Sonarr equivalent of the two Radarr steps above —
+			// read the library (series + paged wanted/cutoff), then evaluate
+			// every monitored series' monitored seasons against the season
+			// decision rule and report. Unlike Radarr, there is no write
+			// pass and no --only-id/dry-run threading here at all: Sonarr
+			// writes arrive in Phase 7, and this phase's binding scope guard
+			// is that no code path may compose a write, series-level or
+			// otherwise. cfg.DryRun and *onlyID are therefore never passed
+			// to runSonarrDecisionEngine's signature — a bug that made this
+			// phase write anything would have to fight the type system to
+			// do it, not merely forget a check.
+			if ok && inst.Type == "sonarr" {
+				series, wantedEpisodeIDs, wantedSeasons, dataOK := inspectSonarrLibrary(context.Background(), logger, inst)
+				if dataOK {
+					runSonarrDecisionEngine(context.Background(), logger, inst, series, wantedEpisodeIDs, wantedSeasons, cfg.ExclusionTag)
+				}
+			}
 		}
 	} else {
 		if onlyIDSet {
