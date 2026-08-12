@@ -633,3 +633,335 @@ func logFileReportFinding(ctx context.Context, logger *slog.Logger, itemLevel sl
 	}
 	logger.Log(ctx, itemLevel, "file-report finding", attrs...)
 }
+
+// --- Radarr tracked-set -------------------------------------------------
+
+// buildRadarrTrackedSet builds this instance's whole tracked-file/folder
+// picture from the ALREADY-FETCHED movie library (binding controller
+// resolution 8: "reuse fetched movies... do not refetch what the cycle
+// already holds") — Radarr embeds both movie.path and movieFile.path
+// directly on /api/v3/movie, so this makes zero additional API calls.
+//
+// A movie's folder and its file are tracked INDEPENDENTLY of each other
+// (deliberately, see the design note on FileSkipReasonUntrackedPath's uses
+// below): each is added to the set if its own path was readable, regardless
+// of whether the other one was. This bounds the damage an untrusted field on
+// one movie can do — a movie with a known file path but an unknown folder
+// path still has that exact file protected from being reported as its OWN
+// orphan, even though its folder cannot be protected from a false-duplicate
+// (really: false-orphan-of-a-sibling) misclassification. The alternative —
+// refusing to track anything about a movie unless BOTH paths are known — is
+// safer in one narrow sense and strictly worse in the sense that matters
+// most (§2.6's "never manufacture a false orphan"): it would make the movie's
+// OWN tracked file report itself as an orphan, which a human reading the
+// report would reasonably read as "delete this", the one class of mistake
+// this whole feature exists to never make.
+func buildRadarrTrackedSet(logger *slog.Logger, inst Instance, roots []mediaRoot, movies []movieListElement) instanceTrackedSet {
+	set := instanceTrackedSet{files: map[string]bool{}, folders: map[string]string{}}
+
+	for _, m := range movies {
+		title := titleOrAbsent(m.Title)
+
+		if m.Path != nil && strings.TrimSpace(*m.Path) != "" {
+			if diskFolder, ok := mapArrPathToAnyRoot(*m.Path, roots); ok {
+				set.folders[diskFolder] = title
+			}
+		} else {
+			logger.Warn("file report: movie path absent; its folder cannot be protected from false-orphan classification for any extra files sitting in it",
+				"instance", inst.Name, "type", inst.Type, "title", title, "id", derefOrAbsent(m.ID))
+		}
+
+		if m.HasFile != nil && *m.HasFile {
+			if m.MovieFile != nil && m.MovieFile.Path != nil && strings.TrimSpace(*m.MovieFile.Path) != "" {
+				if diskFile, ok := mapArrPathToAnyRoot(*m.MovieFile.Path, roots); ok {
+					set.files[diskFile] = true
+				}
+			} else {
+				logger.Warn("file report: movie has a file but its path is unreadable; it cannot be added to the tracked set, and the file itself risks being reported as an orphan",
+					"instance", inst.Name, "type", inst.Type, "title", title, "id", derefOrAbsent(m.ID))
+			}
+		}
+	}
+
+	return set
+}
+
+// --- scheduling + the off/skipped/ran summary vocabulary --------------------
+
+// fileReportOptions is what a CYCLE says about the file report: whether to
+// run it at all. It is the same zero-value-off shape as reverseOptions
+// (reverse.go), for the same reason (binding controller resolution 8): the
+// zero value is "do not run", which is what a webhook cycle or a --only-id
+// scoped run gets simply by never setting this field, and what a caller that
+// forgot about this phase entirely gets too.
+//
+// Unlike reverseOptions there is no second field for a write switch: this
+// pass never writes anything, ever, so there is nothing for a cycle to
+// authorize beyond running it at all.
+type fileReportOptions struct {
+	enabled bool
+}
+
+// fullScanFileReportOptions is what a FULL-LIBRARY cycle asks for: the
+// startup scan, the reconciliation sweep, and a full (non---only-id) --once
+// run. It takes no config, unlike fullScanReverseOptions: per-instance
+// opt-in lives entirely in Instance.MediaRootMap, discovered fresh every
+// cycle from cfg.Instances, so there is nothing else here to gate on.
+func fullScanFileReportOptions() fileReportOptions {
+	return fileReportOptions{enabled: true}
+}
+
+// fileReportCounts is one instance's Phase 11 accounting for one cycle.
+//
+// configured records whether media_root_map was present for this instance at
+// all — the "off" half of resolution 1's three-way state. anySkipped records
+// whether ANY configured root aborted (the mount-problem heuristic, or a
+// walk error) — resolution 4's "one root aborting never affects other
+// roots/instances" means duplicates/orphans still reflect whatever roots DID
+// complete, even on a partially-skipped instance; anySkipped exists so the
+// human reading the summary knows the totals are not the WHOLE story.
+type fileReportCounts struct {
+	configured bool
+	anySkipped bool
+
+	duplicates  int
+	orphans     int
+	skipReasons map[string]int
+}
+
+// state renders the three-way distinction the binding resolution requires to
+// be tellable apart at a glance: "off" (never configured, so this cycle
+// looked at nothing), "skipped" (configured, but at least one root could not
+// be trusted this cycle), and "ran" (every configured root completed,
+// whether or not it found anything — a clean duplicates=0 orphans=0 line IS
+// evidence the report ran, not silence).
+func (c fileReportCounts) state() string {
+	if !c.configured {
+		return "off"
+	}
+	if c.anySkipped {
+		return "skipped"
+	}
+	return "ran"
+}
+
+// logFileReportSummary logs the per-instance summary line, msg="file
+// report", per binding controller resolution 7's frozen vocabulary
+// (fileReport=ran|skipped|off, duplicates=N, orphans=N, fileSkipReasons=).
+//
+// The off state is deliberately a SEPARATE, lower-severity log call rather
+// than the same INFO line with different attrs (binding controller
+// resolution 1: "off is logged once per full cycle at debug ... distinct
+// from skipped ... and from duplicates=0 orphans=0"): an instance that never
+// configured media_root_map should never see a line about a feature it did
+// not opt into at its everyday log level, and — because this is a single
+// call per instance per cycle, never a per-item loop — "once per full cycle"
+// falls out for free rather than needing its own dedup bookkeeping. ran and
+// skipped are both INFO (Phase 8's noise budget: "summary always INFO"):
+// skipped's own per-root cause was already WARNed about by
+// evaluateFileReportRoot the moment it happened, so the summary line itself
+// only needs to be visible, not alarming twice.
+func logFileReportSummary(logger *slog.Logger, inst Instance, c fileReportCounts) {
+	state := c.state()
+	attrs := []any{"instance", inst.Name, "type", inst.Type, "fileReport", state}
+	if state == "off" {
+		logger.Debug("file report", attrs...)
+		return
+	}
+	attrs = append(attrs, "duplicates", c.duplicates, "orphans", c.orphans, "fileSkipReasons", formatSkipCounts(c.skipReasons))
+	logger.Info("file report", attrs...)
+}
+
+// runRadarrFileReport is the Radarr entry point for one instance's file
+// report: build the tracked set from the already-fetched library (no extra
+// API calls), then evaluate every configured root in turn. One root's
+// mount-problem abort never stops the others (resolution 4) — the loop
+// simply keeps going and folds the aborted root's contribution to
+// c.anySkipped, while every OTHER root's duplicates/orphans/skipReasons are
+// still added to the total.
+func runRadarrFileReport(ctx context.Context, logger *slog.Logger, itemLevel slog.Level, inst Instance, movies []movieListElement) fileReportCounts {
+	roots := mediaRootsFor(inst)
+	if len(roots) == 0 {
+		return fileReportCounts{}
+	}
+
+	set := buildRadarrTrackedSet(logger, inst, roots, movies)
+
+	c := fileReportCounts{configured: true, skipReasons: map[string]int{}}
+	for _, root := range roots {
+		if ctx.Err() != nil {
+			logger.Info("shutdown requested: abandoning this instance's file report; the remaining roots are not evaluated this cycle",
+				"instance", inst.Name, "type", inst.Type)
+			c.anySkipped = true
+			break
+		}
+		outcome := evaluateFileReportRoot(ctx, logger, itemLevel, inst, root, set)
+		mergeFileReportOutcome(&c, outcome)
+	}
+	return c
+}
+
+// mergeFileReportOutcome folds one root's outcome into the instance-wide
+// accounting, shared by both the Radarr and Sonarr entry points so the two
+// cannot drift on how a skipped root, or a duplicate-vs-orphan split, is
+// counted.
+func mergeFileReportOutcome(c *fileReportCounts, outcome fileReportRootOutcome) {
+	if outcome.skipped {
+		c.anySkipped = true
+		return
+	}
+	for _, f := range outcome.findings {
+		if f.kind == fileKindDuplicate {
+			c.duplicates++
+		} else {
+			c.orphans++
+		}
+	}
+	for reason, n := range outcome.skipReasons {
+		c.skipReasons[reason] += n
+	}
+}
+
+// --- Sonarr tracked-set -------------------------------------------------
+
+// buildSonarrTrackedSet builds this instance's tracked-file/folder picture
+// from the already-fetched series library PLUS one fresh /api/v3/episodefile
+// fetch per relevant series — unlike Radarr, Sonarr never embeds a file's
+// path anywhere but that endpoint (see episodeFileElement's doc comment,
+// sonarr.go), and the forward decision engine's own /episodefile fetch is
+// lazy and conditional (only series with a rule-1-6-passing candidate
+// season), so it cannot be reused here: this report needs a COMPLETE
+// tracked-file picture across the whole library, monitored or not, which the
+// forward engine's optimization never builds.
+//
+// "Relevant" is decided per series BEFORE spending a fetch on it: a series
+// whose own path is KNOWN and maps to none of the configured roots
+// contributes nothing regardless of what its episode files say, so the
+// fetch is skipped entirely (bounding the added API cost to series that
+// could plausibly matter). A series whose path is unknown is fetched
+// defensively — see buildRadarrTrackedSet's identical reasoning for why an
+// unreadable folder path must never silently drop the file-level protection
+// that only needs the SERIES ID, not the folder, to obtain.
+//
+// mismatchedSeasons is keyed by seriesID -> season number (built by the
+// caller from this cycle's own forward decisions, binding controller
+// resolution 5); this function re-keys it onto the series' DISK folder path,
+// which is the key classifyFileReportPath actually looks up by.
+//
+// ok=false means the tracked set could not be completely built — an
+// /episodefile fetch failed, or a shutdown interrupted the loop — and the
+// caller must not report anything for this instance this cycle: the same
+// completeness contract fetchWantedCutoffPages (radarr.go) applies to a
+// partial wanted set applies here to a partial tracked set, and for the same
+// reason (a partial tracked set manufactures false orphans).
+func buildSonarrTrackedSet(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, roots []mediaRoot, series []seriesElement, mismatchedSeasons map[int]map[int]bool) (instanceTrackedSet, bool) {
+	set := instanceTrackedSet{
+		files:             map[string]bool{},
+		folders:           map[string]string{},
+		seriesFolder:      map[string]bool{},
+		mismatchedSeasons: map[string]map[int]bool{},
+	}
+
+	for _, s := range series {
+		if ctx.Err() != nil {
+			logger.Info("shutdown requested: abandoning this instance's file-report tracked-set build",
+				"instance", inst.Name, "type", inst.Type)
+			return set, false
+		}
+
+		title := titleOrAbsent(s.Title)
+
+		// relevant defaults true (fetch defensively) and is narrowed to false
+		// ONLY when the series' path is both known and confirmed to map to
+		// none of this instance's configured roots.
+		relevant := true
+		if s.Path != nil && strings.TrimSpace(*s.Path) != "" {
+			diskFolder, ok := mapArrPathToAnyRoot(*s.Path, roots)
+			relevant = ok
+			if ok {
+				set.folders[diskFolder] = title
+				set.seriesFolder[diskFolder] = true
+				if s.ID != nil {
+					if bySeason := mismatchedSeasons[*s.ID]; len(bySeason) > 0 {
+						set.mismatchedSeasons[diskFolder] = bySeason
+					}
+				}
+			}
+		} else {
+			logger.Warn("file report: series path absent; its folder cannot be protected from false-orphan classification for any extra files sitting in it",
+				"instance", inst.Name, "type", inst.Type, "title", title, "seriesId", derefOrAbsent(s.ID))
+		}
+
+		if s.ID == nil || !relevant {
+			continue
+		}
+
+		files, ok := fetchEpisodeFiles(ctx, logger, client, inst, *s.ID)
+		if !ok {
+			logger.Warn("file report: skipping this instance: an episodefile fetch failed, and a partial tracked set would manufacture false orphans",
+				"instance", inst.Name, "type", inst.Type, "series", title, "seriesId", *s.ID)
+			return set, false
+		}
+		for _, f := range files {
+			if f.Path == nil || strings.TrimSpace(*f.Path) == "" {
+				logger.Warn("file report: episode file path absent; it cannot be added to the tracked set, and the file itself risks being reported as an orphan",
+					"instance", inst.Name, "type", inst.Type, "series", title, "seriesId", *s.ID, "fileId", derefOrAbsent(f.ID))
+				continue
+			}
+			if diskFile, ok := mapArrPathToAnyRoot(*f.Path, roots); ok {
+				set.files[diskFile] = true
+			}
+		}
+	}
+
+	return set, true
+}
+
+// runSonarrFileReport is the Sonarr entry point for one instance's file
+// report: build the tracked set (the one part of this pass that costs extra
+// API calls — see buildSonarrTrackedSet), then evaluate every configured
+// root exactly like the Radarr entry point does.
+func runSonarrFileReport(ctx context.Context, logger *slog.Logger, itemLevel slog.Level, client *APIClient, inst Instance, series []seriesElement, mismatchedSeasons map[int]map[int]bool) fileReportCounts {
+	roots := mediaRootsFor(inst)
+	if len(roots) == 0 {
+		return fileReportCounts{}
+	}
+
+	set, ok := buildSonarrTrackedSet(ctx, logger, client, inst, roots, series, mismatchedSeasons)
+	c := fileReportCounts{configured: true, skipReasons: map[string]int{}}
+	if !ok {
+		c.anySkipped = true
+		return c
+	}
+
+	for _, root := range roots {
+		if ctx.Err() != nil {
+			logger.Info("shutdown requested: abandoning this instance's file report; the remaining roots are not evaluated this cycle",
+				"instance", inst.Name, "type", inst.Type)
+			c.anySkipped = true
+			break
+		}
+		outcome := evaluateFileReportRoot(ctx, logger, itemLevel, inst, root, set)
+		mergeFileReportOutcome(&c, outcome)
+	}
+	return c
+}
+
+// buildMismatchedSeasonsIndex folds this cycle's forward Sonarr decisions
+// into the seriesID -> season-number index buildSonarrTrackedSet needs
+// (binding controller resolution 5): seasons the forward engine already
+// distrusted for an episode-file-count mismatch are excluded from duplicate
+// candidacy, never guessed either way.
+func buildMismatchedSeasonsIndex(decisions []seasonDecision) map[int]map[int]bool {
+	index := map[int]map[int]bool{}
+	for _, d := range decisions {
+		if d.reason != ReasonSeasonFileCountMismatch {
+			continue
+		}
+		if index[d.seriesID] == nil {
+			index[d.seriesID] = map[int]bool{}
+		}
+		index[d.seriesID][d.season] = true
+	}
+	return index
+}
