@@ -2640,6 +2640,50 @@ func twoWritableSeasonsSonarrFake(t *testing.T) *statefulSonarrFake {
 	)
 }
 
+// threeWritableSeasonsSonarrFake is the fixture the (seriesID, seasonNumber)
+// write-scope pins need, and the reason it is not twoWritableSeasonsSonarrFake
+// is that two seasons cannot tell a SET of seasons from a RANGE of them.
+//
+// One series with THREE fully eligible seasons (1, 2 and 3) plus a fourth that
+// is still airing. Season 3 carries two episodes, one of them episode 5, so a
+// webhook can name S03E05 the way a real import does. What the third eligible
+// season buys is the two questions a two-season fixture cannot ask:
+//
+//   - a payload naming season 3 must leave BOTH earlier seasons monitored, not
+//     merely "the other one" — an off-by-one in the season filter that wrote
+//     everything up to the named season would pass a two-season test;
+//   - a burst naming seasons 1 and 3 must write exactly those two and leave the
+//     season BETWEEN them alone, which is what makes the accumulated scope a set
+//     rather than a span.
+func threeWritableSeasonsSonarrFake(t *testing.T) *statefulSonarrFake {
+	t.Helper()
+	return newStatefulSonarrFake(t,
+		[]*statefulSonarrSeries{
+			{id: 1, title: "Write Three", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{
+					{number: 1, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1},
+					{number: 2, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1},
+					{number: 3, monitored: true, episodeFileCount: 2, totalEpisodeCount: 2},
+					{number: 4, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1},
+				}},
+		},
+		[]*statefulSonarrEpisode{
+			{id: 100, seriesID: 1, seasonNumber: 1, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 500},
+			{id: 200, seriesID: 1, seasonNumber: 2, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 600},
+			{id: 300, seriesID: 1, seasonNumber: 3, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 700},
+			{id: 305, seriesID: 1, seasonNumber: 3, episodeNumber: 5, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 705},
+			{id: 400, seriesID: 1, seasonNumber: 4, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: futureAirDate, episodeFileID: 800},
+		},
+		[]*statefulSonarrEpisodeFile{
+			{id: 500, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
+			{id: 600, seasonNumber: 2, customFormatScore: 200, qualityCutoffNotMet: false},
+			{id: 700, seasonNumber: 3, customFormatScore: 200, qualityCutoffNotMet: false},
+			{id: 705, seasonNumber: 3, customFormatScore: 200, qualityCutoffNotMet: false},
+			{id: 800, seasonNumber: 4, customFormatScore: 200, qualityCutoffNotMet: false},
+		},
+	)
+}
+
 // TestRun_SonarrWriteMode_TwoSeasonsOfOneSeries_NeitherWriteRevertsTheOther is
 // the central correctness consequence of choosing the SEASON as the write unit:
 // writing season 2 means PUTting the whole series object back, so if that

@@ -1214,6 +1214,138 @@ func TestDaemon_Sonarr_WebhookNamingOneSeason_WritesThatSeasonAndNeverItsSibling
 	}
 }
 
+// TestDaemon_Sonarr_WebhookNamingSeasonThree_WritesOnlyThatSeason is the same
+// sentence as the test above, asked of a library where it can actually fail.
+//
+// The write scope is a set of (seriesID, seasonNumber) PAIRS, and the two ways
+// that can quietly degrade both survive a two-season fixture: a scope that
+// resolved to "the series" would write every eligible season, and a scope that
+// resolved to "up to the named season" would write the ones before it. Three
+// eligible seasons and a payload naming the LAST of them separates all three
+// behaviors — only the pair-scoped one leaves seasons 1 and 2 monitored.
+//
+// The payload is the real shape: Sonarr's On Import for S03E05 carries that one
+// episode record, and the write it authorizes is season 3's alone.
+func TestDaemon_Sonarr_WebhookNamingSeasonThree_WritesOnlyThatSeason(t *testing.T) {
+	fake := threeWritableSeasonsSonarrFake(t)
+	eligible := []int{100, 200, 300, 305}
+	for _, ep := range eligible {
+		fake.setEpisodeWanted(ep, true) // below cutoff: the startup scan writes nothing
+	}
+	h := startDaemon(t, writeDaemonConfig(t, "sonarr", fake.srv.URL, false, "debug", "0", "45s"))
+	h.waitReady()
+
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("the startup scan should have had nothing to write, got %+v", writes)
+	}
+
+	// The import completes. All three seasons are now eligible; the event names
+	// season 3 and nothing else.
+	for _, ep := range eligible {
+		fake.setEpisodeWanted(ep, false)
+	}
+	h.post("sonarr-main", `{"eventType":"Download","series":{"id":1,"title":"Write Three"},"episodes":[{"seasonNumber":3,"episodeNumber":5}]}`)
+	h.clock.Advance(45 * time.Second)
+	h.awaitLogCount("webhook debounce expired; evaluating", 1)
+	eventually(t, "season 3's write to land", func() bool { return len(fake.writes()) == 2 })
+	// Room for a wider write to appear before anything is asserted absent.
+	h.clock.Advance(10 * time.Minute)
+	time.Sleep(20 * time.Millisecond)
+	h.stop()
+
+	if fake.seasonMonitored(1, 3) {
+		t.Error("season 3 — the season the webhook named — must be unmonitored")
+	}
+	if fake.episodeMonitored(300) || fake.episodeMonitored(305) {
+		t.Error("season 3's episodes must be unmonitored with it: a season write is two calls and both must have landed")
+	}
+	for _, season := range []int{1, 2} {
+		if !fake.seasonMonitored(1, season) {
+			t.Errorf("season %d was unmonitored by an import that named season 3; the write scope is the (series, season) pair the payload named, not the series and not everything up to it", season)
+		}
+	}
+	for _, ep := range []int{100, 200} {
+		if !fake.episodeMonitored(ep) {
+			t.Errorf("episode %d, of a season the payload never named, was unmonitored", ep)
+		}
+	}
+	if writes := fake.writes(); len(writes) != 2 {
+		t.Errorf("expected exactly the 2 calls of ONE season write, got %d: %+v", len(writes), writes)
+	}
+	out := h.out.String()
+	if !strings.Contains(out, "unmonitored=1") {
+		t.Errorf("exactly one season must be counted as written:\n%s", out)
+	}
+	if !strings.Contains(out, "scopeSeasons=1:3") {
+		t.Errorf("the cycle must SAY which (series, season) pair it narrowed to:\n%s", out)
+	}
+}
+
+// TestDaemon_Sonarr_BurstNamingSeasonsOneAndThree_WritesExactlyThoseTwo is the
+// accumulation half: a debounce burst collects the seasons its events named into
+// ONE evaluation, and what it collects is a SET.
+//
+// Two seasons of one show finish importing inside one debounce window — the
+// ordinary shape of a backfill — and the events name seasons 1 and 3. Season 2
+// is equally eligible and was named by nothing, so it must still be monitored
+// when the cycle ends. The repeated season-1 event is in the burst because the
+// accumulated scope must dedupe rather than write its season twice.
+func TestDaemon_Sonarr_BurstNamingSeasonsOneAndThree_WritesExactlyThoseTwo(t *testing.T) {
+	fake := threeWritableSeasonsSonarrFake(t)
+	eligible := []int{100, 200, 300, 305}
+	for _, ep := range eligible {
+		fake.setEpisodeWanted(ep, true)
+	}
+	h := startDaemon(t, writeDaemonConfig(t, "sonarr", fake.srv.URL, false, "debug", "0", "45s"))
+	h.waitReady()
+
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("the startup scan should have had nothing to write, got %+v", writes)
+	}
+	for _, ep := range eligible {
+		fake.setEpisodeWanted(ep, false)
+	}
+
+	h.post("sonarr-main", `{"eventType":"Download","series":{"id":1},"episodes":[{"seasonNumber":1,"episodeNumber":1}]}`)
+	h.post("sonarr-main", `{"eventType":"Download","series":{"id":1},"episodes":[{"seasonNumber":3,"episodeNumber":5}]}`)
+	h.post("sonarr-main", `{"eventType":"Download","series":{"id":1},"episodes":[{"seasonNumber":1,"episodeNumber":1}]}`)
+	eventually(t, "all three events to be queued as one key", func() bool {
+		return strings.Count(h.out.String(), "webhook queued") == 3
+	})
+
+	h.clock.Advance(45 * time.Second)
+	h.awaitLogCount("webhook debounce expired; evaluating", 1)
+	eventually(t, "both named seasons' writes to land", func() bool { return len(fake.writes()) == 4 })
+	h.clock.Advance(10 * time.Minute)
+	time.Sleep(20 * time.Millisecond)
+	h.stop()
+
+	for _, season := range []int{1, 3} {
+		if fake.seasonMonitored(1, season) {
+			t.Errorf("season %d was named by the burst and must be unmonitored", season)
+		}
+	}
+	if !fake.seasonMonitored(1, 2) {
+		t.Error("season 2 sits BETWEEN the two the burst named and was named by neither; an accumulated scope is a set of seasons, never the span they cover")
+	}
+	if !fake.episodeMonitored(200) {
+		t.Error("season 2's episode was unmonitored by a burst that never named season 2")
+	}
+	if !fake.seasonMonitored(1, 4) {
+		t.Error("season 4 is still airing; the decision rules exclude it, whatever the scope says")
+	}
+	if writes := fake.writes(); len(writes) != 4 {
+		t.Errorf("expected exactly the 4 calls of TWO season writes, got %d: %+v", len(writes), writes)
+	}
+	out := h.out.String()
+	if !strings.Contains(out, "unmonitored=2") {
+		t.Errorf("exactly two seasons must be counted as written:\n%s", out)
+	}
+	if !strings.Contains(out, "scopeSeasons=1:1,3") {
+		t.Errorf("the accumulated scope must be logged as the deduplicated set it is:\n%s", out)
+	}
+}
+
 // TestDaemon_Sonarr_WebhookWithNoEpisodes_EvaluatesEverySeasonOfTheSeries is the
 // other half of binding resolution 2: "absent/empty episodes array → evaluate
 // all seasons of the series". Not every event that names a series can say which
