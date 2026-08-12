@@ -18,6 +18,16 @@
 # Authentication is GITHUB_TOKEN — no secret is created or stored for this,
 # and nothing in this workflow ever echoes it; docker/login-action consumes it
 # as a masked input, the one supported way to hand it to `docker login`.
+#
+# `test` (branch review fix) is a `needs:` dependency of `build-and-push`, not
+# a separate workflow left to run on its own timeline: before this fix, a tag
+# push fired test.yml and release.yml as two independent, concurrent
+# workflows with nothing tying them together, so a failing test suite did not
+# block the publish — it only produced a failed check alongside a
+# successfully published image, discoverable only by a human who went
+# looking. `test` reuses test.yml itself (`uses:`), the exact go vet + go
+# test -race gate every push and PR already runs, so `build-and-push` cannot
+# start until that gate has actually passed on this tagged commit.
 
 name: release
 
@@ -34,7 +44,15 @@ permissions:
   packages: write
 
 jobs:
+  # Reuses test.yml's own job (not a duplicated copy of its steps) so the
+  # gate a release depends on is byte-identical to the gate every ordinary
+  # push and PR already runs — it cannot drift out of sync with what "green"
+  # means anywhere else in this project.
+  test:
+    uses: ./.github/workflows/test.yml
+
   build-and-push:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Check out

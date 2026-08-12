@@ -5,12 +5,22 @@
 # recipe: `go-version-file: go.mod` reads the toolchain version from the
 # module itself, so this workflow can never drift from the version the
 # Dockerfile (and container_test.go's pin on it) also read from go.mod.
-
-name: test
-
+#
+# `workflow_call` (branch review fix) makes this workflow reusable: release.yml
+# calls it as a `needs:` job rather than relying on test.yml's own `on: push`
+# trigger to fire in parallel. Before this fix, a `v*` tag push fired test.yml
+# and release.yml as two independent, concurrent workflows — nothing in
+# release.yml depended on test.yml's outcome, so a red suite (a broken
+# TestTree_HasExactlyThreeWriteVerbCallSites audit, a failing dry-run pin)
+# would not stop `docker buildx build --push` from publishing the image; it
+# would only leave a failed check next to a successful release. Reusing this
+# exact job — not a duplicated copy of its steps — means the gate release.yml
+# depends on is the same gate every push and PR already runs, so it can never
+# drift out of sync with what "green" means elsewhere in this project.
 on:
   push:
   pull_request:
+  workflow_call:
 
 # Read-only: this workflow only builds and tests, so it needs nothing beyond
 # checking out the code.
