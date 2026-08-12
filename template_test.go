@@ -142,7 +142,7 @@ func TestTemplate_AgreesWithComposeExample_WebhookPort(t *testing.T) {
 	}
 
 	compose := readRepoFile(t, "docker-compose.example.yml")
-	if !strings.Contains(compose, want+":"+want) {
+	if !strings.Contains(uncommented(compose), want+":"+want) {
 		t.Errorf("docker-compose.example.yml no longer publishes %s:%s; the template's port Config must be updated to match whatever it publishes instead", want, want)
 	}
 }
@@ -161,7 +161,7 @@ func TestTemplate_AgreesWithComposeExample_ConfigPath(t *testing.T) {
 	}
 
 	compose := readRepoFile(t, "docker-compose.example.yml")
-	if !strings.Contains(compose, ":/config:ro") {
+	if !strings.Contains(uncommented(compose), ":/config:ro") {
 		t.Errorf("docker-compose.example.yml no longer mounts /config read-only; the template's Path Config Mode must be updated to match")
 	}
 }
@@ -177,7 +177,7 @@ func TestTemplate_AgreesWithComposeExample_UnraidUIDGID(t *testing.T) {
 	}
 
 	compose := readRepoFile(t, "docker-compose.example.yml")
-	if !strings.Contains(compose, `user: "99:100"`) {
+	if !strings.Contains(uncommented(compose), `user: "99:100"`) {
 		t.Errorf(`docker-compose.example.yml no longer sets user: "99:100"; the template's ExtraParams must be updated to match`)
 	}
 }
@@ -191,7 +191,7 @@ func TestTemplate_AgreesWithComposeExample_RestartPolicy(t *testing.T) {
 	}
 
 	compose := readRepoFile(t, "docker-compose.example.yml")
-	if !strings.Contains(compose, "restart: unless-stopped") {
+	if !strings.Contains(uncommented(compose), "restart: unless-stopped") {
 		t.Errorf("docker-compose.example.yml no longer sets restart: unless-stopped; the template's ExtraParams must be updated to match")
 	}
 }
@@ -284,7 +284,7 @@ func TestTemplate_AgreesWithComposeExample_Network(t *testing.T) {
 	}
 
 	compose := readRepoFile(t, "docker-compose.example.yml")
-	if !strings.Contains(compose, "media-net") {
+	if !strings.Contains(uncommented(compose), "media-net") {
 		t.Errorf("docker-compose.example.yml no longer uses the media-net placeholder; the template's Network must be updated to match")
 	}
 }

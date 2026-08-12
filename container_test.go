@@ -60,22 +60,36 @@ func TestDockerfile_BuildsWithTheModulesOwnGoVersion(t *testing.T) {
 func TestDockerfile_CrossBuildsForTARGETARCH(t *testing.T) {
 	dockerfile := readRepoFile(t, "Dockerfile")
 
+	// Checked with comments stripped (uncommented, defined below for the
+	// compose-file checks but equally valid here — both files use `#`
+	// comments): this Dockerfile's own explanatory comment ABOUT
+	// GOARCH=$TARGETARCH contains that exact substring in prose, directly
+	// above the real RUN line that uses it. A raw strings.Contains over the
+	// full file text is satisfied by the comment alone, so deleting
+	// GOARCH=$TARGETARCH from the real `go build` line — while leaving the
+	// comment explaining why it's there untouched, exactly the edit a future
+	// "tidy the build line" pass would make — would leave this test green
+	// with the actual plumbing gone. Stripping comments first closes that
+	// gap: only the live RUN line can satisfy the check afterward.
+	stripped := uncommented(dockerfile)
+
 	for _, want := range []string{
 		"ARG TARGETARCH",
 		"GOARCH=$TARGETARCH",
 	} {
-		if !strings.Contains(dockerfile, want) {
-			t.Errorf("Dockerfile must contain %q so buildx's per-platform build arg reaches `go build`:\n%s", want, dockerfile)
+		if !strings.Contains(stripped, want) {
+			t.Errorf("Dockerfile must contain %q OUTSIDE a comment so buildx's per-platform build arg reaches `go build`:\n%s", want, dockerfile)
 		}
 	}
 
 	// ARG TARGETARCH must be declared in the BUILD stage (before the RUN that
 	// consumes it), not merely present anywhere in the file — a bare mention
 	// in a comment or the final stage would satisfy the substring check above
-	// without actually wiring anything.
-	argIdx := strings.Index(dockerfile, "ARG TARGETARCH")
-	buildIdx := strings.Index(dockerfile, "AS build")
-	useIdx := strings.Index(dockerfile, "GOARCH=$TARGETARCH")
+	// without actually wiring anything. Indices are taken from the
+	// comment-stripped text for the same reason as above.
+	argIdx := strings.Index(stripped, "ARG TARGETARCH")
+	buildIdx := strings.Index(stripped, "AS build")
+	useIdx := strings.Index(stripped, "GOARCH=$TARGETARCH")
 	if argIdx == -1 || buildIdx == -1 || useIdx == -1 || !(buildIdx < argIdx && argIdx < useIdx) {
 		t.Errorf("ARG TARGETARCH must be declared inside the build stage, before the go build line that consumes it:\n%s", dockerfile)
 	}
