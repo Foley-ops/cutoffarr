@@ -21,6 +21,7 @@ enforced and checked.
 - [Configuration reference](#configuration-reference)
 - [Safety and dry-run](#safety-and-dry-run)
 - [The reverse scan](#the-reverse-scan)
+- [The file report](#the-file-report)
 - [Known limitations](#known-limitations)
 - [Webhook setup](#webhook-setup)
 - [FAQ](#faq)
@@ -129,6 +130,7 @@ blank.
 | `instances[].type` | — | `radarr` or `sonarr`. |
 | `instances[].url` | — | The instance's base URL, e.g. `http://radarr:7878` — must be an absolute `http://` or `https://` URL. |
 | `instances[].api_key` | — | The instance's API key. Always reference this as `${ENV_VAR}`; never write a literal key into a committed or shared config file. |
+| `instances[].media_root_map` | *(absent = off)* | Opt-in switch for [the file report](#the-file-report): a map of the `*arr`'s root folder path to the same root as cutoffarr's own filesystem sees it, e.g. `/movies: /data/media/Movies`. Absent entirely means the file report never runs for that instance — no disk access of any kind. If present, every key and value must be a non-empty absolute path, or the config is a fatal error at startup; an explicitly empty map (`{}`) is accepted and behaves exactly like absent. |
 
 See [`config.example.yml`](config.example.yml) for a complete, commented
 file in this exact shape — it is the canonical example, not a summary of
@@ -219,6 +221,19 @@ deliberately small and independently checked, not just documented:
   timeout, plus a 5-second drain of the webhook listener: 80 seconds
   worst-case, 90 for headroom. **Don't lower `stop_grace_period` below that
   without understanding why it's there.**
+- **The file report never writes, deletes, moves, or renames a file, and it
+  never gains an option to.** It is off by default (opt-in per instance via
+  `media_root_map`) and, unlike the reverse scan, has no write switch at all
+  to turn on: it only reads `/movie`, `/series`, and `/episodefile`, and
+  walks the mapped media directories with `fs.WalkDir` and `os.Stat` —
+  nothing that creates, removes, or renames anything. This is enforced by a
+  test the same way the API write surface is:
+  `TestTree_BansFilesystemMutationAPIsEverywhere` in `filereport_test.go`
+  greps every non-test file in the tree for `os.Remove`, `os.Rename`,
+  `os.Create`, `os.WriteFile`, `os.OpenFile`, `os.Mkdir`/`os.MkdirAll`, and a
+  handful of other filesystem-mutation calls, and fails unless the file is on
+  an allowlist that is empty by design. See
+  [The file report](#the-file-report).
 
 ## The reverse scan
 
@@ -358,6 +373,133 @@ carries `reverseFindings=N` and nothing else; with it on, `remonitored`,
 reads `reverseScan=skipped` in place of the finding count (a number that
 cycle is in no position to state) with those three counters still beside it.
 
+## The file report
+
+The *arrs only know about files they imported. A stray extra copy sitting
+next to a tracked episode, or a whole file dropped straight into the media
+folder from outside the *arr, is invisible to both of them forever — nothing
+in Radarr or Sonarr's own UI will ever mention it. The file report finds
+these by walking your media directories and comparing what's actually there
+against exactly what each `*arr` says it tracks.
+
+**It is read-only, permanently, with no flag to change that.** See the
+[Safety and dry-run](#safety-and-dry-run) bullet above for how that is
+enforced by a test rather than merely documented. Findings are reported;
+nothing is ever deleted, moved, or renamed. Acting on a finding — deleting
+the extra file, investigating the orphan — is always a decision you make by
+hand, outside cutoffarr, after reading the report.
+
+### Turning it on
+
+It's off by default, per instance. To enable it for an instance, add
+`media_root_map` mapping the `*arr`'s own root folder path to the same path
+as cutoffarr's own filesystem sees it, and mount that path into the
+container **read-only**:
+
+```yaml
+instances:
+  - name: radarr-main
+    type: radarr
+    url: http://radarr:7878
+    api_key: ${RADARR_MAIN_API_KEY}
+    media_root_map:
+      /movies: /data/media/Movies
+```
+
+```yaml
+# docker-compose.yml
+volumes:
+  - /mnt/user/data/media/Movies:/data/media/Movies:ro
+```
+
+If cutoffarr's container mounts media at the *exact same path* the `*arr`
+itself uses (the TRaSH-guides convention — every container in the stack
+sharing `/data/media/...`), the map is trivial (`/data/media/Movies:
+/data/media/Movies`) but still required: an absent `media_root_map` means
+off, on purpose, so a config written before this phase existed keeps
+touching zero bytes of your disk.
+
+An instance with no `media_root_map` never calls `os.Stat`, never opens a
+directory, never reads a single byte from disk — the feature does not exist
+for it as far as your filesystem is concerned.
+
+### Method
+
+For every configured root, cutoffarr builds the set of files the `*arr`
+actually tracks (Radarr: each movie's own folder plus its `movieFile.path`;
+Sonarr: each series' own folder plus every `episodeFile.path`, fetched per
+series), maps that set onto disk through `media_root_map`, then walks the
+disk root and classifies every file it finds by **location alone** — never
+by filename:
+
+- The exact tracked path → not reported (it's supposed to be there).
+- Anywhere else inside a tracked movie/series folder → **duplicate**, grouped
+  and counted (Sonarr additionally tries to label the group from an
+  `SxxEyy`-shaped filename or a `Season NN` folder, for display only — an
+  unparseable name groups under its containing folder instead of guessing,
+  and never changes whether something is a duplicate in the first place).
+- Anywhere else under the mapped root → **orphan**.
+
+Non-video extensions, `-trailer`/`-sample`-suffixed files, and Plex-style
+extras subfolders (`Featurettes`, `Behind The Scenes`, `Trailers`, `Extras`,
+`Other`, `Specials Extras`, `Deleted Scenes`, `Interviews`, `Scenes`,
+`Shorts`, `Featurette`) are excluded from candidacy entirely — never reported
+as either kind of finding.
+
+```
+level=INFO msg="file-report finding" kind=duplicate instance=radarr-main root=/data/media/Movies path="/data/media/Movies/Some Film (2020)/Some Film (2020) (2).mkv" title="Some Film (2020)" groupCount=1
+level=INFO msg="file-report finding" kind=orphan instance=radarr-main root=/data/media/Movies path="/data/media/Movies/Stray Folder/something.mkv"
+level=INFO msg="file report" instance=radarr-main type=radarr fileReport=ran duplicates=1 orphans=1 fileSkipReasons="none"
+```
+
+Exactly like reverse-scan findings, individual `file-report finding` lines
+print in full on the startup scan and on `--once`, and demote to `debug` on
+the daemon's repeating reconciliation sweeps — where the summary's
+`duplicates=N orphans=N` is what stays visible.
+
+`fileReport` on that summary line is always one of three values, and the
+three are deliberately never confusable with each other:
+
+- **`off`** — `media_root_map` isn't configured for this instance. Logged
+  once per cycle at `debug`, so a user who never opted in sees nothing about
+  this feature at the default log level.
+- **`skipped`** — it's configured, but at least one mapped root could not be
+  trusted this cycle (see below) and was aborted with its own `WARN` naming
+  it. `duplicates`/`orphans` still reflect whatever roots *did* complete —
+  one root's problem never hides another root's real findings.
+- **`ran`** — every configured root completed. `duplicates=0 orphans=0` is a
+  real, positive statement that the report ran and found nothing, not
+  silence.
+
+### Multi-episode files
+
+A Sonarr season already excluded from the forward scan for an
+[episode-file-count mismatch](#known-limitations) has its folder excluded
+from duplicate candidacy too, for the same reason: cutoffarr cannot trust
+which files in that season are "extra" when it already couldn't trust the
+count. Such files are counted under `fileSkipReasons`, never guessed at.
+
+### The mount-problem safeguard
+
+The single most dangerous failure mode here isn't a bug in the matching
+logic — it's a **half-mounted or unmounted media share** silently turning a
+perfectly healthy library into what looks like thousands of missing files
+(mass false "duplicates" from a stale bind mount) or an empty directory that
+reads as every tracked file having vanished. Before trusting anything a walk
+finds, cutoffarr checks, per root:
+
+1. The mapped path exists and is a readable directory.
+2. Of a sample of up to 100 of that root's own tracked files, at least 90%
+   actually exist on disk.
+3. If the root tracks any files at all, the walk finds *at least one* video
+   file somewhere under it.
+
+Any one of these failing aborts **that root's** report with a `WARN` naming
+it — never a flood of false findings. One root failing never affects any
+other root or any other instance. A walk error partway through a root (e.g.
+a permission problem on a subdirectory) aborts that root's report the same
+way, for the same reason: a partial walk is not a report, it's a guess.
+
 ## Known limitations
 
 Honest gaps found during live testing, carried forward rather than hidden:
@@ -386,6 +528,16 @@ Honest gaps found during live testing, carried forward rather than hidden:
   unmonitored seasons — one extra `/episode` read. On a large library with
   many unmonitored items this is the most expensive part of a full cycle. It
   runs only on full cycles, never per webhook.
+- **The file report's Sonarr side costs one `/episodefile` fetch per series.**
+  Radarr's tracked-file paths are already embedded on the `/movie` response
+  cutoffarr fetches anyway, so enabling the file report there costs nothing
+  extra. Sonarr never exposes a file's path anywhere but `/episodefile`, and
+  a complete, accurate tracked-file set needs every series' files regardless
+  of monitored state — not just the ones the forward scan happened to touch
+  — so this is a genuine per-series API cost on top of everything else a full
+  cycle already does. Like the reverse scan, it runs only on full cycles
+  (never per webhook, never on a `--only-id` scoped run) and is entirely
+  opt-in per instance via `media_root_map`.
 - **macOS + Docker Desktop can block LAN access entirely.** If you develop
   or test on macOS, Docker Desktop's containers can be silently prevented
   from reaching other devices on your LAN (including a `*arr` on another
