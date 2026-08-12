@@ -2266,6 +2266,14 @@ type statefulRadarrMovie struct {
 	cfScore             int
 	qualityCutoffNotMet bool
 	inWantedSet         bool
+
+	// path/movieFilePath are Phase 11 (file report) only: both are omitted
+	// from the JSON entirely (matching every pre-Phase-11 caller's
+	// expectations, which decode to Path/MovieFile.Path == nil either way)
+	// unless a test explicitly sets them, e.g. to give a file-report
+	// wiring test a fully-mapped, fully-trackable movie.
+	path          string
+	movieFilePath string
 }
 
 // wouldUnmonitorStatefulMovie builds a statefulRadarrMovie shaped to pass
@@ -2416,10 +2424,23 @@ func (f *statefulRadarrFake) handle(next http.HandlerFunc) http.HandlerFunc {
 // project's write path ever changes, and therefore the only one that can
 // differ between a fake's first and second run), hasFile, qualityProfileId,
 // tags, and the movieFile subset the decision engine and cross-check need.
+// path/movieFile.path (Phase 11 only) are included only when the fixture
+// set them — every pre-existing caller leaves them at "", so their JSON is
+// byte-identical to before this field existed.
 func libraryElementJSON(m *statefulRadarrMovie) string {
 	tagsJSON, _ := json.Marshal(m.tags)
-	return fmt.Sprintf(`{"id":%d,"title":%q,"monitored":%t,"hasFile":%t,"qualityProfileId":%d,"tags":%s,"movieFile":{"id":%d,"qualityCutoffNotMet":%t}}`,
-		m.id, m.title, m.monitored, m.hasFile, m.qualityProfileID, tagsJSON, m.movieFileID, m.qualityCutoffNotMet)
+	pathJSON := ""
+	if m.path != "" {
+		p, _ := json.Marshal(m.path)
+		pathJSON = fmt.Sprintf(`,"path":%s`, p)
+	}
+	movieFilePathJSON := ""
+	if m.movieFilePath != "" {
+		p, _ := json.Marshal(m.movieFilePath)
+		movieFilePathJSON = fmt.Sprintf(`,"path":%s`, p)
+	}
+	return fmt.Sprintf(`{"id":%d,"title":%q,"monitored":%t,"hasFile":%t,"qualityProfileId":%d,"tags":%s%s,"movieFile":{"id":%d,"qualityCutoffNotMet":%t%s}}`,
+		m.id, m.title, m.monitored, m.hasFile, m.qualityProfileID, tagsJSON, pathJSON, m.movieFileID, m.qualityCutoffNotMet, movieFilePathJSON)
 }
 
 func (f *statefulRadarrFake) libraryJSON() string {

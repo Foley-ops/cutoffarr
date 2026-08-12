@@ -534,6 +534,18 @@ other root or any other instance. A walk error partway through a root (e.g.
 a permission problem on a subdirectory) aborts that root's report the same
 way, for the same reason: a partial walk is not a report, it's a guess.
 
+One more check runs before any of the above, for the whole instance rather
+than one root: if the library is non-empty but **not a single tracked path
+mapped to any configured root** — a `media_root_map` key typo (matching is
+case-sensitive) is the most common cause — the per-root checks above never
+even get a chance to run, because there is nothing tracked to sample. The
+whole instance is aborted with a `WARN` naming `media_root_map` rather than
+walking a root with an empty tracked set and reporting every real file as an
+orphan. A `media_root_map` typo, or a legitimately unmapped tracked path,
+that affects only *some* of the library (not all of it) is counted under
+`fileSkipReasons` and also gets one `WARN` per instance — never a flood, one
+line, however many paths it affects.
+
 ## Known limitations
 
 Honest gaps found during live testing, carried forward rather than hidden:
