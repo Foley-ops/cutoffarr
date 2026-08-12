@@ -56,10 +56,13 @@ func TestFetchSeriesLibrary_HappyPath_ReturnsDecodedElements(t *testing.T) {
 	if s.ID == nil || *s.ID != 1 || s.Title == nil || *s.Title != "Show One" {
 		t.Errorf("series[0] id/title = %v/%v, want 1/Show One", derefOrAbsent(s.ID), derefOrAbsent(s.Title))
 	}
-	if len(s.Seasons) != 2 {
-		t.Fatalf("series[0] has %d seasons, want 2", len(s.Seasons))
+	if s.Seasons == nil {
+		t.Fatalf("series[0].Seasons is nil, want a non-nil slice of 2 elements")
 	}
-	season1 := s.Seasons[0]
+	if len(*s.Seasons) != 2 {
+		t.Fatalf("series[0] has %d seasons, want 2", len(*s.Seasons))
+	}
+	season1 := (*s.Seasons)[0]
 	if season1.SeasonNumber == nil || *season1.SeasonNumber != 1 || season1.Monitored == nil || !*season1.Monitored {
 		t.Errorf("season[0] = %+v, want seasonNumber=1 monitored=true", season1)
 	}
@@ -1039,5 +1042,81 @@ instances:
 	out := stdout.String()
 	if !strings.Contains(out, "crossCheck=\"passed (1 verified, 0 unverifiable)\"") {
 		t.Errorf("expected crossCheck=\"passed (1 verified, 0 unverifiable)\" in the summary:\n%s", out)
+	}
+}
+
+// TestRun_SonarrInstance_WantedSeasonLookup_PerSeasonNotPerSeries is the
+// IMPORTANT review fix's discriminating coverage for rule 4: one series
+// (id 7) with TWO monitored seasons, only one of which (season 2) has an
+// episode in the wanted set. Driven end to end through run() so the
+// producer (statefulSonarrFake's own inWantedSet field, via
+// wantedCutoffJSON) and the consumer (fetchSonarrWantedCutoff's
+// (seriesId, seasonNumber) lookup, via evaluateSeries' rule 4) are
+// exercised together, in the same pass, for the first time: every prior
+// test either used an empty wantedSeasons map or the single fixed key
+// {seriesID: 1, seasonNumber: 1}, so the seriesId/seasonNumber fields of
+// the key were indistinguishable and a swapped or per-SERIES-instead-of-
+// per-SEASON lookup would have passed the whole suite undetected.
+func TestRun_SonarrInstance_WantedSeasonLookup_PerSeasonNotPerSeries(t *testing.T) {
+	fake := newStatefulSonarrFake(t,
+		[]*statefulSonarrSeries{
+			{id: 7, title: "Mixed Wanted Show", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{
+					{number: 2, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1},
+					{number: 3, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1},
+				}},
+		},
+		[]*statefulSonarrEpisode{
+			// Season 2's only episode IS in the wanted set: rule 4 must skip season 2.
+			{id: 200, seriesID: 7, seasonNumber: 2, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: "2015-01-01T00:00:00Z", episodeFileID: 700, inWantedSet: true},
+			// Season 3's only episode is NOT in the wanted set: rule 4 must let season 3 through.
+			{id: 300, seriesID: 7, seasonNumber: 3, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: "2015-01-01T00:00:00Z", episodeFileID: 800, inWantedSet: false},
+		},
+		[]*statefulSonarrEpisodeFile{
+			{id: 700, seasonNumber: 2, customFormatScore: 200, qualityCutoffNotMet: true},
+			{id: 800, seasonNumber: 3, customFormatScore: 200, qualityCutoffNotMet: false},
+		},
+	)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := `
+instances:
+  - name: sonarr-main
+    type: sonarr
+    url: ` + fake.srv.URL + `
+    api_key: key1
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, "msg=skip") && !strings.Contains(line, "msg=would-unmonitor") {
+			continue // report lines only — the cross-check's own "cross-check" lines also carry seriesId/season attrs.
+		}
+		if strings.Contains(line, "seriesId=7") && strings.Contains(line, "season=2") {
+			if !strings.Contains(line, "msg=skip") || !strings.Contains(line, `reason="quality cutoff not met"`) {
+				t.Errorf("season 2 (in the wanted set) line = %q, want msg=skip reason=\"quality cutoff not met\"", line)
+			}
+		}
+		if strings.Contains(line, "seriesId=7") && strings.Contains(line, "season=3") {
+			if !strings.Contains(line, "msg=would-unmonitor") || !strings.Contains(line, `reason="cutoff met"`) {
+				t.Errorf("season 3 (NOT in the wanted set) line = %q, want msg=would-unmonitor reason=\"cutoff met\"", line)
+			}
+		}
+	}
+	if !strings.Contains(out, `reason="quality cutoff not met"`) {
+		t.Errorf("expected season 2's skip line:\n%s", out)
+	}
+	if !strings.Contains(out, "msg=would-unmonitor") {
+		t.Errorf("expected season 3's would-unmonitor line:\n%s", out)
 	}
 }

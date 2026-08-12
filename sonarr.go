@@ -30,17 +30,24 @@ import (
 // convention as movieListElement.Tags in radarr.go) so "key absent from the
 // JSON" can be told apart from "key present with the zero value" — see
 // systemStatusResponse (connectivity.go) for why that distinction matters.
-// Seasons is not a pointer: an entirely absent "seasons" key and a
-// present-but-empty "seasons": [] both mean "nothing to evaluate for this
-// series", a distinction with no behavioral difference here (unlike Tags,
-// where "absent" is untrusted input under an active exclusion tag).
+// Seasons IS a pointer (REVIEW FIX, Phase 6 branch review): it was
+// originally a bare slice on the theory that "seasons key absent" and
+// "seasons": [] both mean "nothing to evaluate", which is true, but misses
+// the binding note that "All load-bearing Sonarr fields decode through
+// pointers" for a reason independent of that theory — a monitored series
+// whose seasons key is absent (a field-name drift, a truncated/malformed
+// response body that still happens to parse) must be told apart from one
+// that genuinely has zero seasons, so evaluateSeries can warn on the absent
+// case via warnIfFieldAbsent exactly like every other load-bearing field,
+// instead of silently producing zero decisions and zero log lines for a
+// series still counted in totalSeriesMonitored.
 type seriesElement struct {
-	ID               *int                  `json:"id"`
-	Title            *string               `json:"title"`
-	Monitored        *bool                 `json:"monitored"`
-	QualityProfileID *int                  `json:"qualityProfileId"`
-	Tags             *[]int                `json:"tags"`
-	Seasons          []seriesSeasonElement `json:"seasons"`
+	ID               *int                   `json:"id"`
+	Title            *string                `json:"title"`
+	Monitored        *bool                  `json:"monitored"`
+	QualityProfileID *int                   `json:"qualityProfileId"`
+	Tags             *[]int                 `json:"tags"`
+	Seasons          *[]seriesSeasonElement `json:"seasons"`
 }
 
 // seriesSeasonElement decodes one element of a series's "seasons" array —
@@ -211,11 +218,15 @@ type episodeFileElement struct {
 
 // fetchEpisodeFiles fetches GET /api/v3/episodefile?seriesId=<seriesID> —
 // every episode file for the series, across every season, in one call.
-// Used only for a series with at least one season that has already passed
-// rules 1-6 of the STRICT decision rule (binding evaluation-order
-// resolution: this is the most expensive fetch to avoid making needlessly,
-// fetched lazily and at most once per series). A request or decode failure
-// is per-series, not instance-fatal (§2.6).
+// evaluateSeries calls this for a series with at least one season that has
+// already passed rules 1-6 of the STRICT decision rule (binding
+// evaluation-order resolution: this is the most expensive fetch to avoid
+// making needlessly, fetched lazily and at most once per series during
+// evaluation). runSonarrCrossCheck (decision.go) is the one other caller
+// (REVIEW FIX): it makes its own small, bounded, on-demand call to this
+// same function for sampled skip-side seasons that never reached rule 7 at
+// all, so their skip reason can still be independently verified. A request
+// or decode failure is per-series, not instance-fatal (§2.6).
 func fetchEpisodeFiles(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, seriesID int) ([]episodeFileElement, bool) {
 	query := url.Values{"seriesId": {strconv.Itoa(seriesID)}}
 	body, err := fetchBody(ctx, client, "/api/v3/episodefile", query)
