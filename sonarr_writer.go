@@ -978,9 +978,25 @@ func runSonarrWritePass(ctx context.Context, logger *slog.Logger, client *APICli
 		}
 		attrs := []any{"instance", inst.Name, "type", inst.Type, "crossCheck", cc.status}
 		attrs = append(attrs, cc.logAttrs()...)
-		attrs = append(attrs, "withheldWrites", pending-recovering, "recoveryWrites", recovering, "dryRun", dryRun)
 		msg := "writes withheld for this instance: " + gateBlocked
-		if recovering > 0 {
+		switch {
+		case recovering == 0:
+			attrs = append(attrs, "withheldWrites", pending, "recoveryWrites", 0, "dryRun", dryRun)
+		case dryRun:
+			// A rehearsal writes NOTHING, so nothing on this line may say a
+			// write happened: the allowance ADMITS the season (its rehearsal
+			// is real — unmonitorSeason takes the same fresh look at the world
+			// before withholding at its own §2.1 gates) but it writes none of
+			// it. Both keys are renamed rather than reused, because in this
+			// mode every pending season ends the pass withheld, so a
+			// "withheldWrites" here would be a DIFFERENT number from the
+			// summary's counter of the same name — and "recoveryWrites" would
+			// count writes that were never sent. Same reason the summary swaps
+			// writeErrors for writeRehearsalErrors in dry-run.
+			attrs = append(attrs, "gateWithheldWrites", pending-recovering, "recoveryAdmitted", recovering, "dryRun", dryRun)
+			msg = "dry-run: cross-check gate shut (" + gateBlocked + "); the recovery allowance would admit the season(s) whose every episode is already unmonitored — which cannot strand anything — and withhold the rest; no write is sent, this is a rehearsal"
+		default:
+			attrs = append(attrs, "withheldWrites", pending-recovering, "recoveryWrites", recovering, "dryRun", dryRun)
 			msg = "cross-check gate shut (" + gateBlocked + "); writing ONLY the season(s) whose every episode is already unmonitored — which cannot strand anything — and withholding the rest"
 		}
 		// Same noise-budget rule the Radarr pass applies: blocking a pass that

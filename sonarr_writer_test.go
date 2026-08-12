@@ -67,6 +67,17 @@ type sonarrWriterFake struct {
 // string it encodes, including inside a json.RawMessage. Without them the
 // byte-for-byte assertion would pass while being false for a large share of a
 // real library.
+//
+// The SEASON objects carry them too, and that placement is load-bearing rather
+// than decorative. §2.4's surgery re-encodes the seasons array through
+// encodeRawArray, one level below the top-level object encodePayload handles,
+// so escapable bytes at the top level say nothing about whether that second
+// encoder escapes. Real Sonarr seasons routinely carry escapable strings —
+// images[].remoteUrl query strings, statistics.releaseGroups — so without a
+// season-level "&" or "<" here, deleting encodeRawArray's SetEscapeHTML(false)
+// leaves the whole suite green while the write path silently rewrites bytes
+// Sonarr never sent. Both the sibling-season byte comparison and the whole-body
+// \u00xx scan bite on these members; neither bites without them.
 const sonarrWriterSeriesJSON = `{
 	"id": 3,
 	"title": "Mr. & Mrs. Smith <Special Edition>",
@@ -75,12 +86,39 @@ const sonarrWriterSeriesJSON = `{
 	"tags": [3, 9],
 	"sizeOnDisk": 9876543210123,
 	"overview": "Cheech & Chong: 4 < 5 > 3",
-	"seasons": [
-		{"seasonNumber": 1, "monitored": true, "statistics": {"episodeFileCount": 2, "totalEpisodeCount": 2, "sizeOnDisk": 9876543210123}},
-		{"seasonNumber": 2, "monitored": true, "statistics": {"episodeFileCount": 1, "totalEpisodeCount": 1}}
-	],
+	` + sonarrWriterSeasonsBlock + `
 	"someFutureField": {"nested": ["a", "b"], "flag": true}
 }`
+
+// The fixture's two season objects and the array that holds them, named so
+// that the tests which swap one out for a broken variant can NAME the bytes
+// they replace instead of transcribing them. A transcribed copy stops matching
+// the moment the fixture grows a field, and strings.Replace reports a miss by
+// returning the input unchanged — which is exactly how adding the
+// images/releaseGroups members above turned three refusal tests into
+// happy-path tests that still passed. See mustReplace, which turns that miss
+// into a failure.
+const (
+	sonarrWriterSeason1JSON = `{"seasonNumber": 1, "monitored": true, "images": [{"coverType": "poster", "remoteUrl": "https://img/s1?a=1&b=2&c=<d>"}], "statistics": {"episodeFileCount": 2, "totalEpisodeCount": 2, "sizeOnDisk": 9876543210123, "releaseGroups": ["Cheech & Chong <RAW>"]}}`
+	sonarrWriterSeason2JSON = `{"seasonNumber": 2, "monitored": true, "images": [{"coverType": "poster", "remoteUrl": "https://img/s2?a=1&b=2&c=<d>"}], "statistics": {"episodeFileCount": 1, "totalEpisodeCount": 1, "releaseGroups": ["Mr. & Mrs. <Group>"]}}`
+
+	sonarrWriterSeasonsBlock = `"seasons": [
+		` + sonarrWriterSeason1JSON + `,
+		` + sonarrWriterSeason2JSON + `
+	],`
+)
+
+// mustReplace is strings.Replace(…, 1) with its silent-miss failure mode
+// removed: a fixture surgery that matches nothing must fail the test loudly,
+// not hand back an untouched fixture that quietly makes the test assert
+// something else.
+func mustReplace(t *testing.T, s, old, replacement string) string {
+	t.Helper()
+	if !strings.Contains(s, old) {
+		t.Fatalf("fixture surgery matched nothing — the fixture and this test have drifted apart.\nlooking for:\n%s\nin:\n%s", old, s)
+	}
+	return strings.Replace(s, old, replacement, 1)
+}
 
 // sonarrWriterEpisodesJSON is the matching /api/v3/episode?seriesId=3
 // response: season 1 has the two aired, monitored episodes its statistics
@@ -404,6 +442,20 @@ func TestUnmonitorSeason_WriteMode_PutsFullObjectWithOnlyTheTargetSeasonChanged(
 	}
 }
 
+// assertNoHTMLEscapes fails when a body carries any of the three escapes
+// encoding/json writes by default. The escape sequences are BUILT rather than
+// written out, so the assertion cannot be defeated by this file being edited
+// into the very characters it is looking for (the Radarr twin's construction).
+func assertNoHTMLEscapes(t *testing.T, what string, body []byte) {
+	t.Helper()
+	for _, r := range []rune{'&', '<', '>'} {
+		escaped := fmt.Sprintf("\\u%04x", r)
+		if strings.Contains(string(body), escaped) {
+			t.Errorf("%s contains the HTML-escaped sequence %s for %q; the fetched bytes must go back unmodified:\n%s", what, escaped, r, body)
+		}
+	}
+}
+
 // TestUnmonitorSeason_WriteMode_SendsUnescapedBytesForHTMLSensitiveCharacters
 // mirrors the Radarr twin: json.Marshal rewrites "&", "<" and ">" into
 // six-character unicode escapes inside every string it encodes — including
@@ -422,17 +474,17 @@ func TestUnmonitorSeason_WriteMode_SendsUnescapedBytesForHTMLSensitiveCharacters
 			continue
 		}
 		body := string(w.body)
-		// The escape sequences are built rather than written out, so the
-		// assertion cannot be defeated by the test source itself being edited
-		// into the very characters it is looking for (same construction as the
-		// Radarr twin).
-		for _, r := range []rune{'&', '<', '>'} {
-			escaped := fmt.Sprintf("\\u%04x", r)
-			if strings.Contains(body, escaped) {
-				t.Errorf("PUT body contains the HTML-escaped sequence %s for %q; the fetched bytes must go back unmodified:\n%s", escaped, r, body)
-			}
-		}
-		for _, literal := range []string{"Mr. & Mrs. Smith <Special Edition>", "Cheech & Chong: 4 < 5 > 3"} {
+		assertNoHTMLEscapes(t, "PUT body", w.body)
+		// Two of these live INSIDE season objects, which the write re-encodes
+		// through a second encoder (encodeRawArray) one level below the one
+		// that handles the top-level object. Without them this test passes
+		// with that encoder's SetEscapeHTML(false) deleted.
+		for _, literal := range []string{
+			"Mr. & Mrs. Smith <Special Edition>",
+			"Cheech & Chong: 4 < 5 > 3",
+			"https://img/s1?a=1&b=2&c=<d>",
+			"Mr. & Mrs. <Group>",
+		} {
 			if !strings.Contains(body, literal) {
 				t.Errorf("PUT body does not carry %q verbatim:\n%s", literal, body)
 			}
@@ -825,7 +877,7 @@ func TestUnmonitorSeason_EpisodeMonitorBodyUnreadable_WithholdsTheSeasonWrite(t 
 // --- pre-write re-verification refusals ------------------------------------
 
 func TestUnmonitorSeason_FreshPayloadCarriesExclusionTag_Refuses(t *testing.T) {
-	seriesJSON := strings.Replace(sonarrWriterSeriesJSON, `"tags": [3, 9],`, `"tags": [3, 42, 9],`, 1)
+	seriesJSON := mustReplace(t, sonarrWriterSeriesJSON, `"tags": [3, 9],`, `"tags": [3, 42, 9],`)
 	fake := newSonarrWriterFake(t, seriesJSON, sonarrWriterEpisodesJSON)
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
@@ -849,10 +901,10 @@ func TestUnmonitorSeason_FreshPayloadTagsUnverifiable_Refuses(t *testing.T) {
 		name       string
 		seriesJSON string
 	}{
-		{"tags absent", strings.Replace(sonarrWriterSeriesJSON, `"tags": [3, 9],`, ``, 1)},
-		{"tags JSON null", strings.Replace(sonarrWriterSeriesJSON, `"tags": [3, 9],`, `"tags": null,`, 1)},
-		{"tags not an array", strings.Replace(sonarrWriterSeriesJSON, `"tags": [3, 9],`, `"tags": "3,9",`, 1)},
-		{"tags contain a null element", strings.Replace(sonarrWriterSeriesJSON, `"tags": [3, 9],`, `"tags": [3, null, 9],`, 1)},
+		{"tags absent", mustReplace(t, sonarrWriterSeriesJSON, `"tags": [3, 9],`, ``)},
+		{"tags JSON null", mustReplace(t, sonarrWriterSeriesJSON, `"tags": [3, 9],`, `"tags": null,`)},
+		{"tags not an array", mustReplace(t, sonarrWriterSeriesJSON, `"tags": [3, 9],`, `"tags": "3,9",`)},
+		{"tags contain a null element", mustReplace(t, sonarrWriterSeriesJSON, `"tags": [3, 9],`, `"tags": [3, null, 9],`)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -882,9 +934,9 @@ func TestUnmonitorSeason_FreshPayloadTagsUnverifiable_Refuses(t *testing.T) {
 // state can no longer be read as evidence of anything the decision was based
 // on.
 func TestUnmonitorSeason_SeriesNoLongerMonitored_RefusesAsARace(t *testing.T) {
-	seriesJSON := strings.Replace(sonarrWriterSeriesJSON, `"monitored": true,
+	seriesJSON := mustReplace(t, sonarrWriterSeriesJSON, `"monitored": true,
 	"qualityProfileId"`, `"monitored": false,
-	"qualityProfileId"`, 1)
+	"qualityProfileId"`)
 	fake := newSonarrWriterFake(t, seriesJSON, sonarrWriterEpisodesJSON)
 	logger, _ := newDecisionTestLogger(slog.LevelInfo)
 
@@ -901,7 +953,7 @@ func TestUnmonitorSeason_SeriesNoLongerMonitored_RefusesAsARace(t *testing.T) {
 }
 
 func TestUnmonitorSeason_SeasonAlreadyUnmonitored_RefusesAsARace(t *testing.T) {
-	seriesJSON := strings.Replace(sonarrWriterSeriesJSON, `{"seasonNumber": 1, "monitored": true,`, `{"seasonNumber": 1, "monitored": false,`, 1)
+	seriesJSON := mustReplace(t, sonarrWriterSeriesJSON, `{"seasonNumber": 1, "monitored": true,`, `{"seasonNumber": 1, "monitored": false,`)
 	fake := newSonarrWriterFake(t, seriesJSON, sonarrWriterEpisodesJSON)
 	logger, _ := newDecisionTestLogger(slog.LevelInfo)
 
@@ -933,9 +985,7 @@ func TestUnmonitorSeason_SeasonMonitoredUnreadable_Refuses(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			seriesJSON := strings.Replace(sonarrWriterSeriesJSON,
-				`{"seasonNumber": 1, "monitored": true, "statistics": {"episodeFileCount": 2, "totalEpisodeCount": 2, "sizeOnDisk": 9876543210123}}`,
-				tc.season, 1)
+			seriesJSON := mustReplace(t, sonarrWriterSeriesJSON, sonarrWriterSeason1JSON, tc.season)
 			fake := newSonarrWriterFake(t, seriesJSON, sonarrWriterEpisodesJSON)
 			logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
@@ -965,21 +1015,11 @@ func TestUnmonitorSeason_SeasonVanishedOrDuplicated_Refuses(t *testing.T) {
 		name       string
 		seriesJSON string
 	}{
-		{"season vanished", strings.Replace(sonarrWriterSeriesJSON,
-			`{"seasonNumber": 1, "monitored": true, "statistics": {"episodeFileCount": 2, "totalEpisodeCount": 2, "sizeOnDisk": 9876543210123}},`, ``, 1)},
-		{"season duplicated", strings.Replace(sonarrWriterSeriesJSON,
-			`{"seasonNumber": 1, "monitored": true, "statistics": {"episodeFileCount": 2, "totalEpisodeCount": 2, "sizeOnDisk": 9876543210123}},`,
-			`{"seasonNumber": 1, "monitored": true, "statistics": {"episodeFileCount": 2, "totalEpisodeCount": 2}},{"seasonNumber": 1, "monitored": true, "statistics": {"episodeFileCount": 2, "totalEpisodeCount": 2}},`, 1)},
-		{"seasons key absent", strings.Replace(sonarrWriterSeriesJSON,
-			`"seasons": [
-		{"seasonNumber": 1, "monitored": true, "statistics": {"episodeFileCount": 2, "totalEpisodeCount": 2, "sizeOnDisk": 9876543210123}},
-		{"seasonNumber": 2, "monitored": true, "statistics": {"episodeFileCount": 1, "totalEpisodeCount": 1}}
-	],`, ``, 1)},
-		{"seasons JSON null", strings.Replace(sonarrWriterSeriesJSON,
-			`"seasons": [
-		{"seasonNumber": 1, "monitored": true, "statistics": {"episodeFileCount": 2, "totalEpisodeCount": 2, "sizeOnDisk": 9876543210123}},
-		{"seasonNumber": 2, "monitored": true, "statistics": {"episodeFileCount": 1, "totalEpisodeCount": 1}}
-	],`, `"seasons": null,`, 1)},
+		{"season vanished", mustReplace(t, sonarrWriterSeriesJSON, sonarrWriterSeason1JSON+`,`, ``)},
+		{"season duplicated", mustReplace(t, sonarrWriterSeriesJSON, sonarrWriterSeason1JSON+`,`,
+			`{"seasonNumber": 1, "monitored": true, "statistics": {"episodeFileCount": 2, "totalEpisodeCount": 2}},{"seasonNumber": 1, "monitored": true, "statistics": {"episodeFileCount": 2, "totalEpisodeCount": 2}},`)},
+		{"seasons key absent", mustReplace(t, sonarrWriterSeriesJSON, sonarrWriterSeasonsBlock, ``)},
+		{"seasons JSON null", mustReplace(t, sonarrWriterSeriesJSON, sonarrWriterSeasonsBlock, `"seasons": null,`)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1087,7 +1127,7 @@ func TestUnmonitorSeason_FreshEpisodeSetIncomplete_Refuses(t *testing.T) {
 // monitored:false onto the wrong show is precisely the mistake this project
 // must never make.
 func TestUnmonitorSeason_FreshGetIdMismatch_RefusesToWrite(t *testing.T) {
-	seriesJSON := strings.Replace(sonarrWriterSeriesJSON, `"id": 3,`, `"id": 4,`, 1)
+	seriesJSON := mustReplace(t, sonarrWriterSeriesJSON, `"id": 3,`, `"id": 4,`)
 	fake := newSonarrWriterFake(t, seriesJSON, sonarrWriterEpisodesJSON)
 	logger, _ := newDecisionTestLogger(slog.LevelInfo)
 
@@ -1285,6 +1325,118 @@ func TestRunSonarrWritePass_GateBlocked_RecoverySeasonIsStillWritten(t *testing.
 	}
 	if !strings.Contains(unmonitorLine, "season=1") {
 		t.Errorf("the allowance write's line must name WHICH season it wrote:\n%s", unmonitorLine)
+	}
+}
+
+// TestRunSonarrWritePass_DryRun_GateBlocked_RecoverySeasonIsRehearsedNotWritten
+// is the §2.1 half of the allowance, and it is the one that most needed a test.
+//
+// The recovery allowance is the ONLY path in this project that reaches
+// unmonitorSeason without cross-check authorization; it deliberately bypasses
+// one gate, which makes it the likeliest place for a future edit to hoist a
+// write above the OTHER gate too. Everything that keeps the dry-run promise on
+// this path lives inside unmonitorSeason, and nothing asserted that the promise
+// actually holds end-to-end here: the brief's "dry-run zero-write guarantee"
+// would have been false on the one write path that matters most and the suite
+// would have stayed green.
+//
+// So: a SHUT gate, an ADMITTED recovery season, dryRun=true. Both seasons must
+// be counted withheld, the catch-all writes() must be empty, and the
+// blocked-gate line must not claim a write it did not make.
+func TestRunSonarrWritePass_DryRun_GateBlocked_RecoverySeasonIsRehearsedNotWritten(t *testing.T) {
+	fake := sonarrRecoveryFixture(t)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	// Byte-identical to the write-mode test above except for the last argument.
+	cc := crossCheckResult{status: crossCheckStatusInconclusive, unverifiable: 1, writeUnverifiable: 1}
+	unmonitored, writeErrors, echoUnverified, refused, withheld := runSonarrWritePass(
+		context.Background(), logger, fake.client(), fake.instance(), sonarrRecoveryDecisions(), cc, 0, false, true)
+
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("a dry run must send ZERO write requests of any method to any path, even for an allowance season: %+v\n%s", writes, buf.String())
+	}
+	if unmonitored != 0 {
+		t.Errorf("unmonitored = %d, want 0 — a rehearsal unmonitors nothing:\n%s", unmonitored, buf.String())
+	}
+	if withheld != 2 {
+		t.Errorf("withheld = %d, want 2 — the allowance season is withheld at unmonitorSeason's own §2.1 gates, exactly like the ordinary one:\n%s", withheld, buf.String())
+	}
+	if writeErrors+echoUnverified+refused != 0 {
+		t.Errorf("writeErrors/echoUnverified/refused = %d/%d/%d, want 0/0/0:\n%s", writeErrors, echoUnverified, refused, buf.String())
+	}
+	if unmonitored+writeErrors+echoUnverified+refused+withheld != 2 {
+		t.Errorf("the accounting identity must hold over both pending seasons in dry-run too:\n%s", buf.String())
+	}
+
+	out := buf.String()
+	// The rehearsal is REAL: the allowance season was admitted and its fresh
+	// GETs went out. Without this, "zero writes" would also be satisfied by an
+	// allowance that never ran at all, which would prove nothing about the gate.
+	sawSeriesGet, sawEpisodeGet := false, false
+	for _, r := range fake.all() {
+		if r.method != http.MethodGet {
+			continue
+		}
+		switch r.path {
+		case "/api/v3/series/3":
+			sawSeriesGet = true
+		case "/api/v3/episode":
+			sawEpisodeGet = true
+		}
+	}
+	if !sawSeriesGet || !sawEpisodeGet {
+		t.Errorf("the dry-run rehearsal must still take the fresh look at the world (series=%t episode=%t):\n%+v", sawSeriesGet, sawEpisodeGet, fake.all())
+	}
+
+	// No write happened, so no write may be reported. In write mode this line
+	// is the allowance's per-season audit trail; in dry-run its absence is the
+	// assertion.
+	if strings.Contains(out, "msg=unmonitor ") {
+		t.Errorf("a dry run must not log a completed unmonitor:\n%s", out)
+	}
+	if strings.Contains(out, "recovery=true") {
+		t.Errorf("a dry run must not mark an allowance write that never happened:\n%s", out)
+	}
+
+	blocked := ""
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "cross-check gate shut") {
+			blocked = line
+		}
+	}
+	if blocked == "" {
+		t.Fatalf("expected the blocked-gate line:\n%s", out)
+	}
+	if !strings.Contains(blocked, "dryRun=true") {
+		t.Errorf("the blocked-gate line must say which mode it is in:\n%s", blocked)
+	}
+	// The message claimed "writing ONLY the season(s) ..." and counted
+	// recoveryWrites=1 in dry-run. Both are untrue in that mode: nothing is
+	// written. An operator reading a rehearsal log must never be told a write
+	// happened, least of all on the one path that bypasses the cross-check.
+	if strings.Contains(blocked, "writing ONLY") {
+		t.Errorf("the blocked-gate line claims a write this dry run never made:\n%s", blocked)
+	}
+	if strings.Contains(blocked, "recoveryWrites=") {
+		t.Errorf("a rehearsal makes no recovery WRITES; the count must name what was admitted:\n%s", blocked)
+	}
+	if !strings.Contains(blocked, "dry-run") {
+		t.Errorf("the blocked-gate line must mark itself a rehearsal:\n%s", blocked)
+	}
+	// The allowance still ADMITTED the season — the rehearsal is real, which
+	// the fresh GETs above prove — so the count is of admissions, not writes.
+	if !strings.Contains(blocked, "recoveryAdmitted=1") {
+		t.Errorf("the blocked-gate line must say how many seasons the allowance admitted:\n%s", blocked)
+	}
+	// In dry-run every pending season ends withheld, so this line must not
+	// reuse the summary's counter name for the gate's own smaller number: a
+	// reader seeing withheldWrites=1 here and withheldWrites=2 in the summary
+	// has been told two different things by the same word.
+	if strings.Contains(blocked, " withheldWrites=") {
+		t.Errorf("the blocked-gate line must not reuse the summary's withheldWrites for a different number (the summary reports %d):\n%s", withheld, blocked)
+	}
+	if !strings.Contains(blocked, "gateWithheldWrites=1") {
+		t.Errorf("the blocked-gate line must still say how many seasons the GATE itself withheld:\n%s", blocked)
 	}
 }
 
@@ -1880,10 +2032,13 @@ func TestRun_SonarrWriteMode_UnmonitorsTheSeasonAndNeverTheSeries(t *testing.T) 
 	}
 
 	// The byte-preservation mandate, at run() level: the unknown field the
-	// fake's detail body carries must come back untouched.
+	// fake's detail body carries must come back untouched, and the escapable
+	// characters inside the fake's SEASON objects must not be rewritten by the
+	// second encoder the seasons array goes through.
 	if !strings.Contains(string(writes[1].body), statefulSonarrExtraField) {
 		t.Errorf("the season PUT dropped or rewrote a field this codebase knows nothing about:\n%s", writes[1].body)
 	}
+	assertNoHTMLEscapes(t, "the season PUT", writes[1].body)
 	if !strings.Contains(out, "unmonitored=1") {
 		t.Errorf("expected unmonitored=1 in the summary (SEASONS, the decision unit):\n%s", out)
 	}
@@ -2028,6 +2183,7 @@ func TestRun_SonarrWriteMode_TwoSeasonsOfOneSeries_NeitherWriteRevertsTheOther(t
 		if !strings.Contains(string(writes[i*2+1].body), statefulSonarrExtraField) {
 			t.Errorf("series PUT %d dropped a field this codebase knows nothing about: %s", i, writes[i*2+1].body)
 		}
+		assertNoHTMLEscapes(t, fmt.Sprintf("series PUT %d", i), writes[i*2+1].body)
 	}
 
 	if !strings.Contains(out, "unmonitored=2") {
@@ -2221,9 +2377,8 @@ instances:
 // check. Rule 2 requires totalEpisodeCount > 0 at decision time for exactly
 // that reason, and the fresh payload has to clear the same bar.
 func TestUnmonitorSeason_FreshStatisticsClaimNoEpisodes_Refuses(t *testing.T) {
-	seriesJSON := strings.Replace(sonarrWriterSeriesJSON,
-		`{"seasonNumber": 1, "monitored": true, "statistics": {"episodeFileCount": 2, "totalEpisodeCount": 2, "sizeOnDisk": 9876543210123}}`,
-		`{"seasonNumber": 1, "monitored": true, "statistics": {"episodeFileCount": 0, "totalEpisodeCount": 0}}`, 1)
+	seriesJSON := mustReplace(t, sonarrWriterSeriesJSON, sonarrWriterSeason1JSON,
+		`{"seasonNumber": 1, "monitored": true, "statistics": {"episodeFileCount": 0, "totalEpisodeCount": 0}}`)
 	fake := newSonarrWriterFake(t, seriesJSON, `[]`)
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
@@ -2389,9 +2544,8 @@ func TestUnmonitorSeason_EpisodeWithUnreadableStateAtWriteTime_Refuses(t *testin
 // ever notice the gap. The value is already decoded from the same statistics
 // object the completeness check reads.
 func TestUnmonitorSeason_SeasonNoLongerCompleteOnDisk_Refuses(t *testing.T) {
-	seriesJSON := strings.Replace(sonarrWriterSeriesJSON,
-		`"statistics": {"episodeFileCount": 2, "totalEpisodeCount": 2, "sizeOnDisk": 9876543210123}`,
-		`"statistics": {"episodeFileCount": 1, "totalEpisodeCount": 2}`, 1)
+	seriesJSON := mustReplace(t, sonarrWriterSeriesJSON, sonarrWriterSeason1JSON,
+		`{"seasonNumber": 1, "monitored": true, "statistics": {"episodeFileCount": 1, "totalEpisodeCount": 2}}`)
 	fake := newSonarrWriterFake(t, seriesJSON, sonarrWriterEpisodesJSON)
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 

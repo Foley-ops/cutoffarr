@@ -969,6 +969,14 @@ const statefulSonarrExtraField = `"someFutureField":{"nested":["a","b"],"flag":t
 // carries more than the library element does (a path, a large sizeOnDisk, and
 // an unknown nested object) precisely so the byte-preservation mandate has
 // something to preserve.
+//
+// Every SEASON object carries an images[].remoteUrl holding "&" and "<", the
+// characters encoding/json escapes by default. §2.4's surgery re-encodes the
+// seasons array through its own encoder (encodeRawArray), so escapable bytes
+// at the top level of this body prove nothing about that second encoder; a
+// season without them lets an escaping regression one level down pass every
+// byte-preservation assertion in the suite. Real seasons carry exactly this
+// (poster URLs with query strings, statistics.releaseGroups).
 func (f *statefulSonarrFake) seriesDetailJSON(id int) (string, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -978,8 +986,8 @@ func (f *statefulSonarrFake) seriesDetailJSON(id int) (string, bool) {
 	}
 	var seasons []string
 	for _, season := range s.seasons {
-		seasons = append(seasons, fmt.Sprintf(`{"seasonNumber":%d,"monitored":%t,"statistics":{"episodeFileCount":%d,"totalEpisodeCount":%d}}`,
-			season.number, season.monitored, season.episodeFileCount, season.totalEpisodeCount))
+		seasons = append(seasons, fmt.Sprintf(`{"seasonNumber":%d,"monitored":%t,"images":[{"coverType":"poster","remoteUrl":"https://img/s%d?a=1&b=2&c=<d>"}],"statistics":{"episodeFileCount":%d,"totalEpisodeCount":%d}}`,
+			season.number, season.monitored, season.number, season.episodeFileCount, season.totalEpisodeCount))
 	}
 	tagsJSON, _ := json.Marshal(s.tags)
 	return fmt.Sprintf(`{"id":%d,"title":%q,"monitored":%t,"qualityProfileId":%d,"tags":%s,"path":"/tv/%s","sizeOnDisk":9876543210123,"seasons":[%s],%s}`,
