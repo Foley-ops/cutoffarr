@@ -313,9 +313,11 @@ Because it's genuinely quiet, not broken: cutoffarr answers every webhook
 event `200 OK` (the `*arr` side always shows success), but an event type it
 doesn't act on is logged only at `log_level: debug` — the default (`info`)
 prints nothing at all for it. That is different from the "Test" button
-specifically, which always logs at `info` regardless of `log_level` (see
-[Webhook setup](#webhook-setup)). Set `log_level: debug` temporarily if you
-need to see exactly which event type an `*arr` sent.
+specifically, which always logs at `info` — visible at the default log level
+and at `debug`, but like any other `info` line it is suppressed if you've set
+`log_level: warn` or `error` (see [Webhook setup](#webhook-setup)). Set
+`log_level: debug` temporarily if you need to see exactly which event type an
+`*arr` sent.
 
 ## License
 
