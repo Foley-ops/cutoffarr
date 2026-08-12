@@ -579,3 +579,84 @@ instances: []
 		t.Errorf("WebhookDebounce = %v, want 0", cfg.WebhookDebounce)
 	}
 }
+
+// --- reverse_scan_remonitor (Phase 10) -------------------------------------
+//
+// The reverse scan is report-only by default and its writes live behind this
+// one flag, so "absent means false" is the safety property the whole phase
+// rests on: a config written before Phase 10 existed, or one that simply never
+// mentions the key, must never re-monitor anything. It is a *bool in rawConfig
+// for exactly the reason dry_run is — "absent" has to be tellable from
+// "explicitly set" — even though this flag's default happens to coincide with
+// Go's zero value, because a future default change must not silently depend on
+// that coincidence.
+
+func TestLoadConfig_ReverseScanRemonitorDefaultsFalseWhenAbsent(t *testing.T) {
+	path := writeConfig(t, `
+instances: []
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	if cfg.ReverseScanRemonitor {
+		t.Errorf("ReverseScanRemonitor = true, want false when reverse_scan_remonitor is absent from config")
+	}
+}
+
+func TestLoadConfig_ReverseScanRemonitorHonorsExplicitTrue(t *testing.T) {
+	path := writeConfig(t, `
+reverse_scan_remonitor: true
+instances: []
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	if !cfg.ReverseScanRemonitor {
+		t.Errorf("ReverseScanRemonitor = false, want true when reverse_scan_remonitor: true is set explicitly")
+	}
+}
+
+func TestLoadConfig_ReverseScanRemonitorHonorsExplicitFalse(t *testing.T) {
+	path := writeConfig(t, `
+reverse_scan_remonitor: false
+instances: []
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	if cfg.ReverseScanRemonitor {
+		t.Errorf("ReverseScanRemonitor = true, want false when reverse_scan_remonitor: false is set explicitly")
+	}
+}
+
+// TestLoadConfig_ReverseScanRemonitorNonBoolean_IsFatal is the
+// present-but-invalid rule this project applies to every other typed field: a
+// value yaml cannot read as a bool must stop the process, never fall back to
+// the safe-looking default. "reverse_scan_remonitor: yes please" silently
+// meaning false would be a configuration the human believes is ON while the
+// program behaves as though it were off — and unlike most misconfigurations,
+// that one is invisible precisely because its symptom is that nothing happens.
+//
+// The error is yaml.v3's own, surfaced verbatim under this project's "config:
+// parsing yaml" prefix, exactly as a non-boolean dry_run or a non-integer
+// webhook_port already is: it locates the value by LINE and states the type it
+// could not be read as, rather than naming the key. This test pins fatality and
+// that locating information, not a wording this package does not own.
+func TestLoadConfig_ReverseScanRemonitorNonBoolean_IsFatal(t *testing.T) {
+	path := writeConfig(t, `
+reverse_scan_remonitor: "yes please"
+instances: []
+`)
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("LoadConfig returned nil error, want a fatal error for a non-boolean reverse_scan_remonitor")
+	}
+	for _, want := range []string{"parsing yaml", "line 2", "bool"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error must locate the offending value (%q missing): %v", want, err)
+		}
+	}
+}

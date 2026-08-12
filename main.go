@@ -296,13 +296,14 @@ func slogLevel(level string) slog.Level {
 func printRedactedConfig(w io.Writer, cfg Config) {
 	redacted := cfg.Redacted()
 
-	fmt.Fprintf(w, "configuration loaded: dry_run=%t poll_interval=%s webhook_port=%d webhook_debounce=%s log_level=%s exclusion_tag=%s instance_count=%d\n",
+	fmt.Fprintf(w, "configuration loaded: dry_run=%t poll_interval=%s webhook_port=%d webhook_debounce=%s log_level=%s exclusion_tag=%s reverse_scan_remonitor=%t instance_count=%d\n",
 		redacted.DryRun,
 		redacted.PollInterval,
 		redacted.WebhookPort,
 		redacted.WebhookDebounce,
 		redacted.LogLevel,
 		redacted.ExclusionTag,
+		redacted.ReverseScanRemonitor,
 		len(redacted.Instances),
 	)
 

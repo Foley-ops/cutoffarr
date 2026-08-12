@@ -20,6 +20,12 @@ const (
 	defaultWebhookDebounce = 45 * time.Second
 	defaultLogLevel        = "info"
 	defaultExclusionTag    = "cutoffarr-exclude"
+
+	// defaultReverseScanRemonitor is spelled out as a named constant rather
+	// than left implicit in Go's bool zero value, because "the reverse scan
+	// writes nothing unless asked" is a safety decision, not an accident of
+	// the language.
+	defaultReverseScanRemonitor = false
 )
 
 const redactedPlaceholder = "<redacted>"
@@ -32,7 +38,22 @@ type Config struct {
 	WebhookDebounce time.Duration
 	LogLevel        string
 	ExclusionTag    string
-	Instances       []Instance
+
+	// ReverseScanRemonitor is the Phase 10 reverse scan's write switch, and
+	// the ONLY thing that lets that scan write anything at all. Default false
+	// (report-only): the reverse scan reports items that are unmonitored while
+	// still failing the criteria, and composes no write call whatsoever. With
+	// it true, re-monitoring obeys dry_run and the exclusion tag exactly like
+	// the forward path.
+	//
+	// It defaults to false rather than to the ordinary "absent means the safe
+	// value" reasoning alone: an existing config written before this phase
+	// existed must keep behaving exactly as it did, and re-monitoring is a
+	// write in the opposite direction from everything this project did before,
+	// so it is opt-in in the strongest sense the config has.
+	ReverseScanRemonitor bool
+
+	Instances []Instance
 }
 
 // Instance is a single Sonarr or Radarr instance to reconcile against.
@@ -68,13 +89,14 @@ func (c Config) Redacted() Config {
 // undecoded Node has a zero Kind, which is how we detect "absent from file"
 // without an extra nil check.
 type rawConfig struct {
-	DryRun          *bool         `yaml:"dry_run"`
-	PollInterval    yaml.Node     `yaml:"poll_interval"`
-	WebhookPort     *int          `yaml:"webhook_port"`
-	WebhookDebounce yaml.Node     `yaml:"webhook_debounce"`
-	LogLevel        *string       `yaml:"log_level"`
-	ExclusionTag    *string       `yaml:"exclusion_tag"`
-	Instances       []rawInstance `yaml:"instances"`
+	DryRun               *bool         `yaml:"dry_run"`
+	PollInterval         yaml.Node     `yaml:"poll_interval"`
+	WebhookPort          *int          `yaml:"webhook_port"`
+	WebhookDebounce      yaml.Node     `yaml:"webhook_debounce"`
+	LogLevel             *string       `yaml:"log_level"`
+	ExclusionTag         *string       `yaml:"exclusion_tag"`
+	ReverseScanRemonitor *bool         `yaml:"reverse_scan_remonitor"`
+	Instances            []rawInstance `yaml:"instances"`
 }
 
 type rawInstance struct {
@@ -155,16 +177,21 @@ func LoadConfig(path string) (*Config, error) {
 // fields, producing a Config ready for validation.
 func (r rawConfig) toConfig() (*Config, error) {
 	cfg := &Config{
-		DryRun:          true,
-		PollInterval:    defaultPollInterval,
-		WebhookPort:     defaultWebhookPort,
-		WebhookDebounce: defaultWebhookDebounce,
-		LogLevel:        defaultLogLevel,
-		ExclusionTag:    defaultExclusionTag,
+		DryRun:               true,
+		PollInterval:         defaultPollInterval,
+		WebhookPort:          defaultWebhookPort,
+		WebhookDebounce:      defaultWebhookDebounce,
+		LogLevel:             defaultLogLevel,
+		ExclusionTag:         defaultExclusionTag,
+		ReverseScanRemonitor: defaultReverseScanRemonitor,
 	}
 
 	if r.DryRun != nil {
 		cfg.DryRun = *r.DryRun
+	}
+
+	if r.ReverseScanRemonitor != nil {
+		cfg.ReverseScanRemonitor = *r.ReverseScanRemonitor
 	}
 
 	if r.PollInterval.Kind != 0 {
