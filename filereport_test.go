@@ -1412,3 +1412,90 @@ func TestTree_BansFilesystemMutationAPIsEverywhere(t *testing.T) {
 		t.Fatalf("walking the tree: %v", err)
 	}
 }
+
+// --- the plan's verbatim acceptance scenario (Phase 11, HUMAN GATE) --------
+//
+// "drop a spare .mkv copy next to one tracked episode and one stray .mkv in
+// an untracked location under a root -> sweep reports exactly one duplicate
+// (grouped) and one orphan; delete nothing; unmount test triggers the
+// mount-problem abort."
+//
+// Run as a Sonarr fixture (an "episode" is the plan's own noun, and Sonarr's
+// grouping-by-S01E05 display convenience is the more demanding of the two
+// engines to get right), through runSonarrFileReport end to end: tracked-set
+// build, mount-problem heuristic, walk, classification, and grouping all in
+// one pass, exactly as a real reconciliation sweep would run it.
+func TestAcceptance_Phase11_DuplicateAndOrphanScenario(t *testing.T) {
+	dir := t.TempDir()
+	trackedRel := filepath.Join("Show", "Show.S01E05.mkv")
+	duplicateRel := filepath.Join("Show", "Show.S01E05 (2).mkv")
+	orphanRel := filepath.Join("Untracked Location", "stray.mkv")
+	written := writeFixtureFiles(t, dir, trackedRel, duplicateRel, orphanRel)
+
+	fake := newEpisodeFileFakeServer(t, map[string]string{
+		"1": fmt.Sprintf(`[{"id":500,"seriesId":1,"seasonNumber":1,"path":"/tv_shows/Show/Show.S01E05.mkv"}]`),
+	})
+	client := NewAPIClient(fake.srv.URL, "key")
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: fake.srv.URL, APIKey: "key",
+		MediaRootMap: map[string]string{"/tv_shows": dir}}
+	series := []seriesElement{{ID: intPtr(1), Title: strPtr("Show"), Path: strPtr("/tv_shows/Show")}}
+
+	logger, buf := newFileReportTestLogger(slog.LevelInfo)
+	c := runSonarrFileReport(context.Background(), logger, slog.LevelInfo, client, inst, series, nil)
+
+	if c.state() != "ran" {
+		t.Fatalf("state() = %q, want ran:\n%s", c.state(), buf.String())
+	}
+	if c.duplicates != 1 {
+		t.Errorf("duplicates = %d, want exactly 1", c.duplicates)
+	}
+	if c.orphans != 1 {
+		t.Errorf("orphans = %d, want exactly 1", c.orphans)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, `kind=duplicate`) || !strings.Contains(out, `group=S01E05`) {
+		t.Errorf("expected a grouped duplicate finding naming S01E05:\n%s", out)
+	}
+	if !strings.Contains(out, `kind=orphan`) || !strings.Contains(out, "Untracked Location") {
+		t.Errorf("expected an orphan finding naming the untracked location:\n%s", out)
+	}
+
+	// "delete nothing": every fixture file must still be exactly where it was
+	// written — the strongest form of "read-only" this test can check.
+	for _, p := range written {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("file report must never delete anything, but %s: %v", p, err)
+		}
+	}
+}
+
+// TestAcceptance_Phase11_UnmountTriggersTheMountProblemAbort is the
+// scenario's second half: pointing media_root_map at a path that does not
+// exist — the file-report analogue of an unmounted share — must abort that
+// root's report rather than report the tracked episode (and everything else
+// that would have been under it) as a flood of false orphans.
+func TestAcceptance_Phase11_UnmountTriggersTheMountProblemAbort(t *testing.T) {
+	unmounted := filepath.Join(t.TempDir(), "not-actually-mounted")
+
+	fake := newEpisodeFileFakeServer(t, map[string]string{
+		"1": `[{"id":500,"seriesId":1,"seasonNumber":1,"path":"/tv_shows/Show/Show.S01E05.mkv"}]`,
+	})
+	client := NewAPIClient(fake.srv.URL, "key")
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: fake.srv.URL, APIKey: "key",
+		MediaRootMap: map[string]string{"/tv_shows": unmounted}}
+	series := []seriesElement{{ID: intPtr(1), Title: strPtr("Show"), Path: strPtr("/tv_shows/Show")}}
+
+	logger, buf := newFileReportTestLogger(slog.LevelInfo)
+	c := runSonarrFileReport(context.Background(), logger, slog.LevelInfo, client, inst, series, nil)
+
+	if c.state() != "skipped" {
+		t.Fatalf("state() = %q, want skipped: the mount-problem heuristic must abort an unmounted root", c.state())
+	}
+	if c.duplicates != 0 || c.orphans != 0 {
+		t.Errorf("an aborted root must report zero findings, got duplicates=%d orphans=%d — never a flood of false orphans from an unmounted share", c.duplicates, c.orphans)
+	}
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("expected a WARN naming the aborted root:\n%s", buf.String())
+	}
+}
