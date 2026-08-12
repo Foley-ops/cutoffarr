@@ -153,16 +153,20 @@ var errEpisodeMonitorContradicted = errors.New("the episode monitor response say
 // Like the contradicted case it stops the write before the season PUT
 // (CRITICAL review fix), and for the same reason: the season PUT is the step
 // that makes the season invisible to rule 1 forever, so it may only follow an
-// episode write the server CONFIRMED. Aborting strands nothing — the season
-// flag is untouched, so the next cycle re-reads /episode, drops whatever really
-// landed from the id list, and retries. Abort converges whether or not the
-// episodes changed; proceeding strands them in the branch where they did not.
+// episode write the server CONFIRMED. Aborting strands nothing in either
+// direction — the season's own flag is untouched, so nothing has been made
+// invisible and the next cycle looks at this season again whatever happened.
 //
-// Going forward the season is left monitored, which is what keeps it in every
-// future cycle's forward pass. Coming back it is left unmonitored, and any
-// episode that really did land inside it is what the reverse pass now reports as
-// ReasonSeasonMonitorMismatch — so "the next cycle sees it" is true in both
-// directions rather than only the one this was first written for.
+// What that next cycle DOES differs by direction, and the difference is worth
+// stating. Going forward the season is left monitored, so the forward pass
+// re-reads /episode, drops whatever really landed from the id list, and retries
+// a smaller write: it converges. Coming back the season is left unmonitored, so
+// if nothing landed it is still a clean finding and is retried in full — but if
+// some episodes DID land, the reverse pass reports it as
+// ReasonSeasonMonitorMismatch and writes nothing, because a season with
+// monitored episodes already inside it is not this program's to resolve
+// (errSeasonNotCleanlyUnmonitored, ruling R2). Seen every cycle in both
+// directions; repaired automatically in one.
 //
 // It is also not errWriteUnverified, because no season write was even
 // attempted: the season's own flag is definitively unchanged, and reporting it
@@ -936,9 +940,10 @@ func assembleSeasonWrite(payload map[string]json.RawMessage, seasonElems []json.
 // is the one way left to strand a monitored episode inside a season nothing
 // will ever look at again. And the stated rationale — "aborting would strand
 // the episodes it probably already changed" — is inverted: aborting leaves the
-// season MONITORED, so the next cycle re-reads /episode, drops whatever really
-// landed from the id list, and retries. Abort converges in both branches;
-// proceeding strands in one.
+// season's own flag untouched, so the next cycle looks at the season again
+// either way. Abort strands nothing in either branch; proceeding strands in
+// one. (Going forward that next cycle also finishes the job; coming back it may
+// only report what a partial write left — see errEpisodeMonitorUnconfirmed.)
 //
 // Every returned error carries the offending episode id where there is one and
 // a bounded snippet of the body, because this is the failure the first live
