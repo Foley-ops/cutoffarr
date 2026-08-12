@@ -32,6 +32,13 @@ func readRepoFile(t *testing.T, name string) string {
 // TestDockerfile_BuildsWithTheModulesOwnGoVersion: a build stage pinned to an
 // older Go than go.mod requires fails at `go build` with a message about the
 // toolchain, in a build nobody runs until deploy day.
+//
+// The FROM line is matched with an optional `--platform=...` flag between
+// `FROM` and `golang:`, rather than requiring the two to be adjacent: the
+// round-2 branch review fix added `--platform=$BUILDPLATFORM` to that line
+// (see TestDockerfile_CrossBuildsForTARGETARCH), which a literal
+// `"FROM golang:" + version` substring check would no longer find even
+// though the stage is still correctly pinned.
 func TestDockerfile_BuildsWithTheModulesOwnGoVersion(t *testing.T) {
 	dockerfile := readRepoFile(t, "Dockerfile")
 	gomod := readRepoFile(t, "go.mod")
@@ -40,23 +47,38 @@ func TestDockerfile_BuildsWithTheModulesOwnGoVersion(t *testing.T) {
 	if m == nil {
 		t.Fatalf("go.mod has no go directive:\n%s", gomod)
 	}
-	want := "FROM golang:" + m[1]
-	if !strings.Contains(dockerfile, want) {
-		t.Errorf("the build stage must pin the module's own Go version (%q from go.mod); Dockerfile:\n%s", want, dockerfile)
+	version := m[1]
+	fromLine := regexp.MustCompile(`(?m)^FROM(?:\s+--platform=\S+)?\s+golang:` + regexp.QuoteMeta(version) + `\b`)
+	if !fromLine.MatchString(uncommented(dockerfile)) {
+		t.Errorf("the build stage must pin the module's own Go version (golang:%s from go.mod), with or without a --platform=... flag; Dockerfile:\n%s", version, dockerfile)
 	}
 }
 
 // TestDockerfile_CrossBuildsForTARGETARCH pins Phase 9's release-workflow
 // requirement: the build stage must be buildable for linux/amd64 AND
 // linux/arm64 from a single `docker buildx build --platform
-// linux/amd64,linux/arm64 .` invocation. Before this phase the build stage
-// hardcoded GOOS=linux with no GOARCH at all, so every cross-arch build
-// silently produced an amd64 binary (Go defaults GOARCH to the host
-// toolchain's arch when unset) regardless of which platform buildx thought it
-// was building — the image would report as arm64 in the manifest and fail
-// immediately on any actual arm64 host. buildx auto-populates a TARGETARCH
-// build arg per platform, but only a Dockerfile that ARGs it in and threads it
-// into GOARCH ever sees it.
+// linux/amd64,linux/arm64 .` invocation, and must do so as a genuine native
+// cross-compile rather than an emulated one.
+//
+// Round-2 branch review correction: this test (and the Dockerfile comments
+// it pins) used to claim that a missing GOARCH made the arm64 leg silently
+// produce an amd64 binary under an arm64 manifest tag. That claim is false
+// for a Dockerfile built via buildx, which is what release.yml does: without
+// `--platform=$BUILDPLATFORM` on the build stage's FROM line, BuildKit
+// resolves the STAGE's own base image per TARGET platform too — the arm64
+// leg already pulls an arm64 golang:alpine and runs every RUN line under
+// QEMU (release.yml's docker/setup-qemu-action exists for exactly that), and
+// Go's own GOARCH default already tracks the host it finds itself running
+// on. So even with no GOARCH set at all, that leg's binary comes out the
+// correct architecture — just compiled slowly, under full emulation, for no
+// reason: the actual bottleneck in every future release. `GOARCH=$TARGETARCH`
+// only becomes load-bearing — the thing that actually selects the output
+// arch, rather than a no-op that happens to already agree with Go's own
+// default — once the build stage is ALSO pinned to `--platform=$BUILDPLATFORM`
+// (the runner's own native platform, for every leg), which is what turns the
+// arm64 leg into a genuine native cross-compile instead of an emulated one.
+// Both pins are asserted together below, since neither is meaningful without
+// the other.
 func TestDockerfile_CrossBuildsForTARGETARCH(t *testing.T) {
 	dockerfile := readRepoFile(t, "Dockerfile")
 
@@ -74,11 +96,12 @@ func TestDockerfile_CrossBuildsForTARGETARCH(t *testing.T) {
 	stripped := uncommented(dockerfile)
 
 	for _, want := range []string{
+		"FROM --platform=$BUILDPLATFORM golang:",
 		"ARG TARGETARCH",
 		"GOARCH=$TARGETARCH",
 	} {
 		if !strings.Contains(stripped, want) {
-			t.Errorf("Dockerfile must contain %q OUTSIDE a comment so buildx's per-platform build arg reaches `go build`:\n%s", want, dockerfile)
+			t.Errorf("Dockerfile must contain %q OUTSIDE a comment so buildx's per-platform build arg reaches `go build`, and so the build stage itself runs on the runner's native platform instead of under QEMU emulation:\n%s", want, dockerfile)
 		}
 	}
 

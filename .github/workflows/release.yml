@@ -5,10 +5,15 @@
 # && git push --tags`), not something that happens as a side effect of merging
 # to main. Nothing here runs until that tag exists.
 #
-# Builds both linux/amd64 and linux/arm64 from the one Dockerfile via buildx +
-# QEMU (see Dockerfile's `ARG TARGETARCH` / `GOARCH=$TARGETARCH`, which is what
-# makes the arm64 leg produce an arm64 binary instead of silently cross-arch
-# amd64), and pushes both tags: `vX.Y.Z` (this exact release) and `latest`.
+# Builds both linux/amd64 and linux/arm64 from the one Dockerfile via buildx,
+# and pushes both tags: `vX.Y.Z` (this exact release) and `latest`. QEMU
+# (docker/setup-qemu-action below) is still needed for buildx to run the
+# FINAL stage's arm64 manifest entry and any arm64-only step, but NOT for the
+# compile itself: the Dockerfile's build stage is pinned to
+# `--platform=$BUILDPLATFORM`, so it always runs natively on this runner
+# (amd64), and `ARG TARGETARCH` / `GOARCH=$TARGETARCH` is what makes that
+# native stage cross-compile the arm64 binary rather than needing QEMU to
+# emulate the Go toolchain itself.
 #
 # Authentication is GITHUB_TOKEN — no secret is created or stored for this,
 # and nothing in this workflow ever echoes it; docker/login-action consumes it
