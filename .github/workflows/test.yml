@@ -1,0 +1,37 @@
+# test.yml — the gate every phase of this project was built against: go vet
+# plus the race-enabled test suite, on every push and every pull request.
+#
+# This mirrors local development exactly rather than inventing a separate CI
+# recipe: `go-version-file: go.mod` reads the toolchain version from the
+# module itself, so this workflow can never drift from the version the
+# Dockerfile (and container_test.go's pin on it) also read from go.mod.
+
+name: test
+
+on:
+  push:
+  pull_request:
+
+# Read-only: this workflow only builds and tests, so it needs nothing beyond
+# checking out the code.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        run: go test -race ./...

@@ -1,0 +1,69 @@
+# release.yml — builds the published image and pushes it to GHCR.
+#
+# Triggered ONLY by a `vX.Y.Z`-shaped tag push, never by an ordinary commit —
+# publishing a new image is a deliberate, human-initiated act (`git tag v1.0.0
+# && git push --tags`), not something that happens as a side effect of merging
+# to main. Nothing here runs until that tag exists.
+#
+# Builds both linux/amd64 and linux/arm64 from the one Dockerfile via buildx +
+# QEMU (see Dockerfile's `ARG TARGETARCH` / `GOARCH=$TARGETARCH`, which is what
+# makes the arm64 leg produce an arm64 binary instead of silently cross-arch
+# amd64), and pushes both tags: `vX.Y.Z` (this exact release) and `latest`.
+#
+# Authentication is GITHUB_TOKEN — no secret is created or stored for this,
+# and nothing in this workflow ever echoes it; docker/login-action consumes it
+# as a masked input, the one supported way to hand it to `docker login`.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# packages: write is the one elevated permission this workflow needs, to push
+# to GHCR under this repository's own package namespace; contents: read is
+# enough to check the tagged commit out.
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # GHCR (and Docker generally) requires an all-lowercase repository path;
+      # ${{ github.repository }} is "Foley-ops/cutoffarr" (mixed case, from the
+      # GitHub org/repo name), so it cannot be used as the image name as-is.
+      - name: Compute lowercase image name
+        id: image
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          echo "name=ghcr.io/${REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ github.ref_name }}
+            ${{ steps.image.outputs.name }}:latest
