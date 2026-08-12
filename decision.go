@@ -2062,13 +2062,17 @@ func sonarrCrossCheckSampleKey(seriesID, season int) int {
 // verified everything and found no problems" rule Radarr's cross-check
 // established.
 //
-// Two per-episode shapes are excluded from comparison entirely rather than
-// flagged as disagreements (IMPORTANT REVIEW FIX, both confirmed live
-// facts): (a) an episode whose own monitored is nil or false — Sonarr's
-// /wanted/cutoff pool is filtered to monitored episodes, so an unmonitored
-// episode inside an otherwise-monitored season can never appear in the
-// wanted set regardless of its file's qualityCutoffNotMet; and (b) the
-// mirror-image shape inWantedSet=true with qualityCutoffNotMet=false —
+// Two per-episode shapes are excluded from comparison rather than flagged as
+// disagreements (IMPORTANT REVIEW FIX, both confirmed live facts): (a) an
+// UNMONITORED episode whose file says the quality cutoff is not met —
+// Sonarr's /wanted/cutoff pool is filtered to monitored episodes, so such an
+// episode's absence from the wanted set is explained by its monitoring state
+// rather than by its quality, and comparing the two would manufacture a
+// disagreement the wanted-set semantics never claimed to make (an unmonitored
+// episode whose cutoff IS met carries no such ambiguity and is compared
+// normally — see where this is applied for why that narrowing matters to
+// convergence); and (b) the mirror-image shape inWantedSet=true with
+// qualityCutoffNotMet=false —
 // /wanted/cutoff also lists episodes below the profile's custom-format
 // cutoff even when the QUALITY cutoff is met (confirmed live: anime
 // profile max ~3890, sample episodefile score 2120), which
@@ -2195,12 +2199,6 @@ func runSonarrCrossCheck(ctx context.Context, logger *slog.Logger, client *APICl
 					"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season, "episodeId", ep.episodeID)
 				continue
 			}
-			if !*ep.monitored {
-				// IMPORTANT REVIEW FIX: excluded from the comparison
-				// entirely, not counted toward verified or unverifiable —
-				// see the function doc comment, shape (a).
-				continue
-			}
 
 			// REVIEW FIX (Phase 6 final round, F3): demoted from Info to
 			// Debug. Up to 20 sampled seasons of ordinary 12-24-episode
@@ -2213,7 +2211,8 @@ func runSonarrCrossCheck(ctx context.Context, logger *slog.Logger, client *APICl
 			// available, just gated behind Debug.
 			attrs := []any{
 				"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season,
-				"episodeId", ep.episodeID, "inWantedSet", inWantedSet, "qualityCutoffNotMet", derefOrAbsent(ep.qualityCutoffNotMet),
+				"episodeId", ep.episodeID, "monitored", *ep.monitored,
+				"inWantedSet", inWantedSet, "qualityCutoffNotMet", derefOrAbsent(ep.qualityCutoffNotMet),
 			}
 			if d.wouldUnmonitor {
 				attrs = append(attrs, "cfThreshold", d.cfThreshold)
@@ -2232,6 +2231,31 @@ func runSonarrCrossCheck(ctx context.Context, logger *slog.Logger, client *APICl
 				// the function doc comment, shape (b), and the binding
 				// live-probe ruling ("classify as unverifiable, never a
 				// disagreement"). Not a disagreement.
+				seasonUnverifiableEpisodes++
+				continue
+			}
+			if !*ep.monitored && *ep.qualityCutoffNotMet {
+				// Shape (a), narrowed to the ambiguity it actually describes
+				// (REVIEW FIX, Phase 7): an unmonitored episode cannot appear
+				// in the wanted set whatever its file says, so when the file
+				// says the quality cutoff is NOT met, "absent from the wanted
+				// set" is explained by the episode being unmonitored rather
+				// than by its quality, and comparing the two would manufacture
+				// a disagreement the wanted-set semantics never claimed to
+				// make. With qualityCutoffNotMet false there is no ambiguity
+				// at all — the episode is not wanted and its file agrees it
+				// need not be — so that case falls through to the comparison
+				// below as the genuine agreement it is.
+				//
+				// The narrowing is load-bearing, not tidying. Excluding EVERY
+				// unmonitored episode left one state permanently unverifiable:
+				// a monitored season whose episodes are all unmonitored, which
+				// is exactly what a partially completed write leaves behind
+				// (the episode call landed, the season PUT failed). That season
+				// is a would-unmonitor candidate on every later cycle, and with
+				// nothing left to compare it could never earn the write gate's
+				// would-unmonitor evidence — so the partial state would persist
+				// forever instead of converging on the next cycle.
 				seasonUnverifiableEpisodes++
 				continue
 			}

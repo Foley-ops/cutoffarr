@@ -1990,3 +1990,218 @@ func TestEvaluateSeries_SeasonMonitoredAbsent_WarnNamesTheSeries(t *testing.T) {
 		t.Errorf("the season-level monitored-absent warn must name the series it belongs to, got %q", line)
 	}
 }
+
+// TestRunSonarrCrossCheck_UnmonitoredEpisodeAboveCutoff_StillVerifies narrows
+// shape (a) to the ambiguity it was actually introduced for.
+//
+// Excluding EVERY unmonitored episode from the comparison made one state
+// permanently unverifiable: a season whose episodes are all unmonitored while
+// the season itself is still monitored — precisely what a partially completed
+// write leaves behind (the episode call landed, the season PUT failed). That
+// season is a would-unmonitor candidate on every subsequent cycle, and with no
+// episode left to compare it can never earn the write gate's would-unmonitor
+// evidence, so the partial state would persist forever.
+//
+// The ambiguity shape (a) exists to suppress is specifically qualityCutoffNotMet
+// == true: "not in the wanted set" is then explained by the episode being
+// unmonitored rather than by its quality, so the comparison proves nothing.
+// With qualityCutoffNotMet == false there is no ambiguity at all — the episode
+// is not in the wanted set and its file says it does not need to be — so it is
+// a genuine agreement and counts as one.
+func TestRunSonarrCrossCheck_UnmonitoredEpisodeAboveCutoff_StillVerifies(t *testing.T) {
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr"}
+
+	decisions := []seasonDecision{
+		sonarrCandidateDecision(1, 1, true, []seasonCrossCheckEpisode{
+			{episodeID: 100, monitored: boolPtr(false), qualityCutoffNotMet: boolPtr(false)},
+		}),
+	}
+	cc := runSonarrCrossCheck(context.Background(), logger, nil, inst, decisions, map[int]bool{})
+
+	if cc.status != crossCheckStatusPassed {
+		t.Fatalf("status = %q, want %q:\n%s", cc.status, crossCheckStatusPassed, buf.String())
+	}
+	if cc.verified != 1 || cc.writeVerified != 1 {
+		t.Errorf("verified/writeVerified = %d/%d, want 1/1 — the write gate reads writeVerified, and a season stuck in this state must still be able to earn it", cc.verified, cc.writeVerified)
+	}
+	if strings.Contains(buf.String(), "level=ERROR") {
+		t.Errorf("no disagreement may be manufactured here:\n%s", buf.String())
+	}
+}
+
+// TestRunSonarrDecisionEngine_SkipSideCrossCheck_RuleThreeSkip_BecomesVerifiable
+// is the rule-4 test's missing twin (carried-forward test debt): rule 3's
+// skip side sets rawEpisodesForCrossCheck for the same reason rule 4's does —
+// an airing season never reaches rule 7, so evaluateSeries never fetches
+// /episodefile for it — but only the rule-4 path was ever exercised, so the
+// rule-3 assignment could have been deleted with the suite staying green.
+func TestRunSonarrDecisionEngine_SkipSideCrossCheck_RuleThreeSkip_BecomesVerifiable(t *testing.T) {
+	// Two episodes, one still to air: rule 3 skips the season, and the season
+	// is still complete on disk so it IS skip-pool eligible.
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "," + episodeJSON(101, 1, 2, futureAirDate, 501) + "]"
+	filesJSON := "[" + episodeFileJSON(500, 1, 200, false) + "," + episodeFileJSON(501, 1, 200, false) + "]"
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	series := []seriesElement{testSeries(1, "Airing Skip Show", true, 1, []int{}, testSeason(1, true, 2, 2))}
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
+
+	out := buf.String()
+	if !strings.Contains(out, `reason="unaired or undated episodes"`) {
+		t.Fatalf("test setup did not actually produce a rule-3 skip:\n%s", out)
+	}
+	if !strings.Contains(out, `crossCheck="passed (1 verified, 0 unverifiable)"`) {
+		t.Errorf("an airing skip must be made verifiable by the cross-check's own on-demand fetch, got:\n%s", out)
+	}
+	episodefileRequests := 0
+	for _, r := range fake.all() {
+		if r.path == "/api/v3/episodefile" {
+			episodefileRequests++
+		}
+	}
+	if episodefileRequests != 1 {
+		t.Errorf("expected exactly 1 /episodefile request (the cross-check's on-demand fetch), got %d", episodefileRequests)
+	}
+}
+
+// TestRunSonarrCrossCheck_OnDemandFetch_DeduplicatedPerSeries pins
+// fetchedFilesBySeries: two sampled skip-side seasons of the SAME series must
+// cost exactly one /episodefile request, not one each. Without the cache the
+// bound on this cross-check's extra API calls would be "up to 10 fetches per
+// instance per cycle" instead of "up to 10 SERIES".
+func TestRunSonarrCrossCheck_OnDemandFetch_DeduplicatedPerSeries(t *testing.T) {
+	filesJSON := "[" + episodeFileJSON(500, 1, 200, true) + "," + episodeFileJSON(600, 2, 200, true) + "]"
+	fake := newSonarrEngineFake(t, "[]", filesJSON)
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	client := NewAPIClient(fake.srv.URL, "key")
+
+	decisions := []seasonDecision{
+		{seriesID: 1, series: "One Series", season: 1, completeOnDisk: true, reason: ReasonQualityCutoffNotMet,
+			rawEpisodesForCrossCheck: []episodeElement{{ID: intPtr(100), Monitored: boolPtr(true), EpisodeFileID: intPtr(500)}}},
+		{seriesID: 1, series: "One Series", season: 2, completeOnDisk: true, reason: ReasonQualityCutoffNotMet,
+			rawEpisodesForCrossCheck: []episodeElement{{ID: intPtr(200), Monitored: boolPtr(true), EpisodeFileID: intPtr(600)}}},
+	}
+	cc := runSonarrCrossCheck(context.Background(), logger, client, fake.instance(), decisions, map[int]bool{100: true, 200: true})
+
+	if cc.verified != 2 {
+		t.Errorf("verified = %d, want 2 (both sampled seasons made verifiable by one fetch)", cc.verified)
+	}
+	requests := 0
+	for _, r := range fake.all() {
+		if r.path == "/api/v3/episodefile" {
+			requests++
+		}
+	}
+	if requests != 1 {
+		t.Errorf("expected exactly 1 /episodefile request for two seasons of one series, got %d", requests)
+	}
+}
+
+// TestRunSonarrCrossCheck_OnDemandFetchFails_TriedOnceAndInconclusive pins the
+// other half of the same cache: a nil map value records "already tried and
+// failed", so a failing series is not re-fetched once per sampled season, and
+// the seasons it covers stay unverifiable rather than silently verified.
+func TestRunSonarrCrossCheck_OnDemandFetchFails_TriedOnceAndInconclusive(t *testing.T) {
+	mux := http.NewServeMux()
+	requests := 0
+	mux.HandleFunc("/api/v3/episodefile", func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(srv.URL, "key")
+
+	decisions := []seasonDecision{
+		{seriesID: 1, series: "Broken Files Show", season: 1, completeOnDisk: true, reason: ReasonQualityCutoffNotMet,
+			rawEpisodesForCrossCheck: []episodeElement{{ID: intPtr(100), Monitored: boolPtr(true), EpisodeFileID: intPtr(500)}}},
+		{seriesID: 1, series: "Broken Files Show", season: 2, completeOnDisk: true, reason: ReasonQualityCutoffNotMet,
+			rawEpisodesForCrossCheck: []episodeElement{{ID: intPtr(200), Monitored: boolPtr(true), EpisodeFileID: intPtr(600)}}},
+	}
+	cc := runSonarrCrossCheck(context.Background(), logger, client, inst, decisions, map[int]bool{})
+
+	if requests != 1 {
+		t.Errorf("expected exactly 1 attempt for a failing series, got %d (a failed fetch must be cached, not retried per season)", requests)
+	}
+	if cc.status != crossCheckStatusInconclusive {
+		t.Errorf("status = %q, want %q: nothing could be verified:\n%s", cc.status, crossCheckStatusInconclusive, buf.String())
+	}
+	if cc.unverifiable != 2 {
+		t.Errorf("unverifiable = %d, want 2", cc.unverifiable)
+	}
+}
+
+// TestBuildSeasonCrossCheckEpisodes_JoinsEachEpisodeToItsOwnFile exercises the
+// join with two DISTINGUISHABLE files in one season — the case every existing
+// test avoided by using a single file, so a join that returned "the first
+// file" or "any file" would have passed the whole suite.
+func TestBuildSeasonCrossCheckEpisodes_JoinsEachEpisodeToItsOwnFile(t *testing.T) {
+	episodes := []episodeElement{
+		{ID: intPtr(100), Monitored: boolPtr(true), EpisodeFileID: intPtr(500)},
+		{ID: intPtr(101), Monitored: boolPtr(true), EpisodeFileID: intPtr(501)},
+		{ID: intPtr(102), Monitored: boolPtr(true), EpisodeFileID: intPtr(999)}, // no such file
+		{ID: intPtr(103), Monitored: boolPtr(true)},                             // no file id at all
+	}
+	filesByID := map[int]episodeFileElement{
+		500: {ID: intPtr(500), QualityCutoffNotMet: boolPtr(false)},
+		501: {ID: intPtr(501), QualityCutoffNotMet: boolPtr(true)},
+	}
+
+	got := buildSeasonCrossCheckEpisodes(episodes, filesByID)
+	if len(got) != 4 {
+		t.Fatalf("expected 4 episodes, got %d: %+v", len(got), got)
+	}
+	if got[0].qualityCutoffNotMet == nil || *got[0].qualityCutoffNotMet {
+		t.Errorf("episode 100 must carry file 500's qualityCutoffNotMet=false, got %v", got[0].qualityCutoffNotMet)
+	}
+	if got[1].qualityCutoffNotMet == nil || !*got[1].qualityCutoffNotMet {
+		t.Errorf("episode 101 must carry file 501's qualityCutoffNotMet=true, got %v", got[1].qualityCutoffNotMet)
+	}
+	if got[2].qualityCutoffNotMet != nil {
+		t.Errorf("an episode whose file id matches nothing must be unverifiable, got %v", got[2].qualityCutoffNotMet)
+	}
+	if got[3].qualityCutoffNotMet != nil {
+		t.Errorf("an episode with no file id at all must be unverifiable, got %v", got[3].qualityCutoffNotMet)
+	}
+}
+
+// TestRunSonarrDecisionEngine_UntrustedSeriesShapes_WarnAndSkipWithoutPanicking
+// pins the engine's three nil guards at once (carried-forward test debt):
+// deleting any of them turns a warn-and-skip into a nil dereference, and none
+// of the three had a test.
+func TestRunSonarrDecisionEngine_UntrustedSeriesShapes_WarnAndSkipWithoutPanicking(t *testing.T) {
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "]"
+	filesJSON := "[" + episodeFileJSON(500, 1, 200, false) + "]"
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	monitoredAbsent := seriesElement{ID: intPtr(1), Title: strPtr("No Monitored Field"), QualityProfileID: intPtr(1), Tags: &[]int{}, Seasons: &[]seriesSeasonElement{}}
+	idAbsent := seriesElement{Title: strPtr("No Id"), Monitored: boolPtr(true), QualityProfileID: intPtr(1), Tags: &[]int{}, Seasons: &[]seriesSeasonElement{}}
+	seasonNumberAbsent := seriesElement{ID: intPtr(3), Title: strPtr("Season Without Number"), Monitored: boolPtr(true), QualityProfileID: intPtr(1), Tags: &[]int{},
+		Seasons: &[]seriesSeasonElement{{Monitored: boolPtr(true), Statistics: &seasonStatisticsElement{EpisodeFileCount: intPtr(1), TotalEpisodeCount: intPtr(1)}}}}
+
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(),
+		[]seriesElement{monitoredAbsent, idAbsent, seasonNumberAbsent},
+		map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
+
+	out := buf.String()
+	for _, want := range []string{
+		"endpoint=series field=monitored",
+		"skipping series: missing id field",
+		"skipping season: missing seasonNumber field",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected a warning containing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "msg=would-unmonitor") {
+		t.Errorf("no untrusted-shaped series may reach a would-unmonitor decision:\n%s", out)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("nothing may be written for untrusted input, got %+v", writes)
+	}
+}

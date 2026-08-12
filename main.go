@@ -25,8 +25,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	once := fs.Bool("once", false, "run a single pass and exit (daemon mode arrives in a later phase)")
 	forceDryRun := fs.Bool("dry-run", false, "force dry-run mode on; cannot be used to disable dry-run set by config")
 	samplesFlag := fs.String("samples", "", "comma-separated movie titles to dump full detail for during Radarr library inspection (--once only)")
-	onlyID := fs.Int("only-id", 0, "process only the radarr movie with this id: evaluate, report, and (outside dry-run) write just that one movie (--once only)")
-	instanceName := fs.String("instance", "", "process only the configured instance with this name; required alongside --only-id when more than one radarr instance is configured (--once only)")
+	onlyID := fs.Int("only-id", 0, "process only the item with this id in the single in-scope instance's library — a radarr movie, or a sonarr series and its eligible seasons: evaluate, report, and (outside dry-run) write just that one (--once only)")
+	instanceName := fs.String("instance", "", "process only the configured instance with this name; required alongside --only-id when more than one instance is in scope (--once only)")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -50,7 +50,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 	})
 	if onlyIDSet && *onlyID <= 0 {
-		fmt.Fprintf(stderr, "cutoffarr: fatal: --only-id must be a positive radarr movie id, got %d\n", *onlyID)
+		fmt.Fprintf(stderr, "cutoffarr: fatal: --only-id must be a positive radarr movie id or sonarr series id, got %d\n", *onlyID)
 		return 2
 	}
 
@@ -79,43 +79,45 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	// A radarr movie id is per-instance: every Radarr numbers its own
-	// library from 1, so id 2 in radarr-hd and id 2 in radarr-4k are two
-	// entirely different films. Paired HD + 4K instances are an explicitly
-	// supported setup, which means an unqualified --only-id names one movie
-	// per radarr rather than one movie — and acting on all of them is the
-	// precise opposite of this phase's contract, "a single item, explicitly
-	// named". There is no safe way to guess which library the human meant,
-	// so the run refuses before contacting anything and says how to say it.
+	// An *arr id is per-instance: every Radarr numbers its own movie library
+	// from 1 and every Sonarr its own series list, so id 2 in radarr-hd, id 2
+	// in radarr-4k and id 2 in sonarr-main are three entirely different
+	// things. Paired HD + 4K instances (and a sonarr sharing the config) are
+	// explicitly supported setups, which means an unqualified --only-id names
+	// one item PER INSTANCE rather than one item — and acting on all of them
+	// is the precise opposite of this flag's contract, "a single item,
+	// explicitly named". There is no safe way to guess which library the human
+	// meant, so the run refuses before contacting anything and says how to say
+	// it.
+	//
+	// Phase 7 widened this guard from radarr instances to instances of ANY
+	// type (binding controller resolution 4). Until Sonarr had a write path,
+	// --only-id was a radarr movie id and a sonarr sharing the config made
+	// nothing ambiguous — the sonarr was simply skipped for the cycle. Now
+	// --only-id names a radarr MOVIE or a sonarr SERIES depending on which
+	// instance is in scope, so exactly one instance must be in scope for the
+	// flag to mean anything at all.
 	if onlyIDSet {
-		inScope := radarrInstancesInScope(*cfg, *instanceName)
+		inScope := instancesInScope(*cfg, *instanceName)
 		if len(inScope) > 1 {
-			fmt.Fprintf(stderr, "cutoffarr: fatal: --only-id %d is ambiguous: %d radarr instances are configured (%s) and movie ids are per-instance, so the same id names a different movie in each. Add --instance <name> to say which one.\n",
+			fmt.Fprintf(stderr, "cutoffarr: fatal: --only-id %d is ambiguous: %d instances are in scope (%s) and ids are per-instance, so the same id names a different movie or series in each. Add --instance <name> to say which one.\n",
 				*onlyID, len(inScope), strings.Join(inScope, ", "))
 			return 2
 		}
-		// The opposite failure, and the more insidious one: no radarr is in
+		// The opposite failure, and the more insidious one: nothing is in
 		// scope at all, so the id names nothing this run could act on. Left
 		// alone, the flag would simply evaporate — the ambiguity guard above
-		// does not fire (one is not more than one), the loop does whatever
-		// connectivity work the remaining instances warrant, and the process
-		// exits 0 having never mentioned the movie the human explicitly
-		// named. That is precisely the outcome the --instance check above
-		// refuses to allow ("a run that silently does nothing... is
+		// does not fire (zero is not more than one), the loop does nothing,
+		// and the process exits 0 having never mentioned the item the human
+		// explicitly named. That is precisely the outcome the --instance check
+		// above refuses to allow ("a run that silently does nothing... is
 		// indistinguishable from a run that found nothing to do"), so it is
-		// refused here on the same terms and with the same exit code. Two
-		// causes reach this point — a config with no radarr in it, and an
-		// --instance that names the sonarr beside one — and the message says
-		// which, because the remedies are different.
+		// refused here on the same terms and with the same exit code. Only one
+		// cause can reach this point, since an --instance naming nothing was
+		// already fatal above: a config with no instances in it at all.
 		if len(inScope) == 0 {
-			configured := radarrInstancesInScope(*cfg, "")
-			if instanceSet {
-				fmt.Fprintf(stderr, "cutoffarr: fatal: --only-id %d is a radarr movie id, but --instance %q scopes this run to an instance that is not a radarr, so the id could not be applied to anything (radarr instances configured: %s)\n",
-					*onlyID, *instanceName, joinOrNone(configured))
-			} else {
-				fmt.Fprintf(stderr, "cutoffarr: fatal: --only-id %d is a radarr movie id, but no radarr instance is configured, so the id could not be applied to anything (configured instances: %s)\n",
-					*onlyID, joinOrNone(instanceNames(*cfg)))
-			}
+			fmt.Fprintf(stderr, "cutoffarr: fatal: --only-id %d names an item in one instance's library, but no instance is configured, so the id could not be applied to anything (configured instances: %s)\n",
+				*onlyID, joinOrNone(instanceNames(*cfg)))
 			return 2
 		}
 	}
@@ -169,24 +171,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 			if instanceSet && inst.Name != *instanceName {
 				continue
 			}
-			// REVIEW FIX (Phase 6 final round, F4, controller ruling):
-			// --only-id is a radarr movie id in this phase (Sonarr gets its
-			// own meaning in Phase 7). Without this guard, a mixed
-			// radarr+sonarr config's --once --only-id run would still run a
-			// FULL unscoped sonarr library report for every sonarr
-			// instance — the flag silently failing to scope half the run,
-			// in a phase whose --instance/--only-id checks above go out of
-			// their way to refuse exactly that kind of silent evaporation
-			// elsewhere. Least-surprise: a targeted run must never fan out
-			// into a full unscoped Sonarr report, so the instance is
-			// skipped entirely — not contacted at all, not even for
-			// connectivity — with one INFO line saying so per sonarr
-			// instance.
-			if onlyIDSet && inst.Type == "sonarr" {
-				logger.Info("--only-id is a radarr-scoped flag; skipping this sonarr instance for the cycle",
-					"instance", inst.Name, "type", inst.Type, "onlyId", *onlyID)
-				continue
-			}
 			ok := checkInstanceConnectivity(context.Background(), logger, inst)
 			if ok && inst.Type == "radarr" {
 				movies, wantedIDs, dataOK := inspectRadarrLibrary(context.Background(), logger, inst, samples)
@@ -194,17 +178,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 					runRadarrDecisionEngine(context.Background(), logger, inst, movies, wantedIDs, cfg.ExclusionTag, *onlyID, cfg.DryRun)
 				}
 			}
-			// Phase 6: the Sonarr equivalent of the two Radarr steps above —
-			// read the library (series + paged wanted/cutoff), then evaluate
+			// Phase 6/7: the Sonarr equivalent of the two Radarr steps above
+			// — read the library (series + paged wanted/cutoff), evaluate
 			// every monitored series' monitored seasons against the season
-			// decision rule and report. Unlike Radarr, there is no write
-			// pass and no --only-id/dry-run threading here at all: Sonarr
-			// writes arrive in Phase 7, and this phase's binding scope guard
-			// is that no code path may compose a write, series-level or
-			// otherwise. cfg.DryRun and *onlyID are therefore never passed
-			// to runSonarrDecisionEngine's signature — a bug that made this
-			// phase write anything would have to fight the type system to
-			// do it, not merely forget a check.
+			// decision rule, report, and (Phase 7) run the season write pass.
+			// dry-run and --only-id are threaded down for exactly the reasons
+			// the Radarr call above threads them: §2.1 requires the dry-run
+			// flag to be checked immediately before each HTTP write call
+			// rather than once at startup, so the value has to travel all the
+			// way to the write site, and --only-id names a SERIES here whose
+			// seasons are the only ones this run may report or write.
 			if ok && inst.Type == "sonarr" {
 				series, wantedEpisodeIDs, wantedSeasons, dataOK := inspectSonarrLibrary(context.Background(), logger, inst)
 				if dataOK {
@@ -260,17 +243,14 @@ func joinOrNone(names []string) string {
 	return strings.Join(names, ", ")
 }
 
-// radarrInstancesInScope names the radarr instances a run would actually
-// process, honoring --instance. It underpins the --only-id ambiguity check,
-// which is about radarr instances specifically: --only-id is a radarr movie
-// id in this phase (Sonarr gets its own meaning in Phase 7), so a sonarr
-// instance sharing the config makes nothing ambiguous.
-func radarrInstancesInScope(cfg Config, instanceName string) []string {
+// instancesInScope names the instances a run would actually process, honoring
+// --instance. It underpins the --only-id ambiguity check, which since Phase 7
+// is about instances of every type: --only-id names a radarr MOVIE or a sonarr
+// SERIES depending on which instance is in scope, so two instances of any
+// types make the id ambiguous rather than merely mis-typed.
+func instancesInScope(cfg Config, instanceName string) []string {
 	var names []string
 	for _, inst := range cfg.Instances {
-		if inst.Type != "radarr" {
-			continue
-		}
 		if instanceName != "" && inst.Name != instanceName {
 			continue
 		}

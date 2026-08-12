@@ -1704,11 +1704,14 @@ func TestRun_OnlyID_SingleRadarrInstance_NeedsNoInstanceFlag(t *testing.T) {
 	}
 }
 
-// TestRun_OnlyID_OneRadarrAlongsideSonarr_NeedsNoInstanceFlag pins that the
-// ambiguity is about radarr instances specifically: --only-id is a radarr
-// movie id in this phase, so a sonarr instance sharing the config does not
-// make it ambiguous.
-func TestRun_OnlyID_OneRadarrAlongsideSonarr_NeedsNoInstanceFlag(t *testing.T) {
+// TestRun_OnlyID_RadarrAlongsideSonarr_RequiresInstanceFlag pins the Phase 7
+// widening of the ambiguity guard (binding controller resolution 4). While
+// --only-id was a radarr movie id, a sonarr sharing the config made nothing
+// ambiguous and this same invocation was expected to succeed. Now --only-id
+// names a radarr MOVIE or a sonarr SERIES depending on which instance is in
+// scope, so "--only-id 1" against one of each names two unrelated things and
+// must be refused — before anything is contacted, and with the remedy stated.
+func TestRun_OnlyID_RadarrAlongsideSonarr_RequiresInstanceFlag(t *testing.T) {
 	fake := newRadarrFake(t,
 		"["+libraryMovie(1, "The Only Movie", true, true)+"]",
 		map[int]string{1: monitoredMovieDetail(1, "The Only Movie")})
@@ -1733,60 +1736,139 @@ instances:
 
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"--config", path, "--once", "--only-id", "1"}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2: one radarr and one sonarr in scope makes an id ambiguous\nstdout=%s\nstderr=%s", code, stdout.String(), stderr.String())
 	}
-	if n := len(fake.puts()); n != 1 {
-		t.Errorf("expected exactly 1 PUT (one radarr in scope), got %d", n)
+	if reqs := fake.all(); len(reqs) != 0 {
+		t.Errorf("the refusal must happen before anything is contacted, got %d request(s)", len(reqs))
+	}
+	if !strings.Contains(stderr.String(), "--instance") {
+		t.Errorf("the refusal must name the flag that resolves it:\n%s", stderr.String())
 	}
 }
 
-// TestRun_WriteMode_SonarrInstanceIsNeverWritten pins the phase boundary:
-// Sonarr writes arrive in Phase 7, so a sonarr instance must still be
-// connectivity-only even with dry_run false — the library inspection, the
-// decision engine, and the write pass are all radarr-only in this phase.
+// TestRun_WriteMode_SonarrInstance_TouchesOnlyItsAllowlistedPaths is the
+// phase boundary, restated where Phase 7 moved it.
 //
-// This test used to pass --only-id alongside the sonarr config and assert
-// nothing but exit 0 and zero writes, which quietly certified the very
-// silence the review found: the flag named a movie id no instance in the run
-// could act on, and the run said nothing about it. The id belongs to the
-// scope tests above, which now assert the refusal; what is left here is the
-// phase boundary itself, unscoped.
-func TestRun_WriteMode_SonarrInstanceIsNeverWritten(t *testing.T) {
-	fake := newRadarrFake(t,
-		"["+libraryMovie(1, "Some Movie", true, true)+"]",
-		map[int]string{1: monitoredMovieDetail(1, "Some Movie")})
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yml")
-	content := fmt.Sprintf(`
-dry_run: false
-instances:
-  - name: sonarr-main
-    type: sonarr
-    url: %s
-    api_key: key1
-`, fake.srv.URL)
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatalf("writing test config: %v", err)
-	}
+// Through Phase 6 this test asserted a sonarr was never written at all, and
+// did it by rejecting requests whose path began with "/api/v3/movie" — a loop
+// that could not fail for a sonarr and quietly certified a claim
+// ("connectivity-only") that had stopped being true two phases earlier. It was
+// converted to an explicit ALLOWLIST so that Phase 7's first sonarr write
+// would trip it deliberately rather than slip past it, and this is that
+// deliberate update: the allowlist now names the two write endpoints as well,
+// and nothing else may appear.
+//
+// The point is unchanged and is the reason to keep paying for it: the exact
+// set of endpoints a write-mode sonarr run touches is a decision, not an
+// accident, and any new one — a /command refresh, a /queue poll, a second
+// write verb — has to be argued for here before it can happen anywhere.
+func TestRun_WriteMode_SonarrInstance_TouchesOnlyItsAllowlistedPaths(t *testing.T) {
+	fake := writableSonarrFake(t)
 
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"--config", path, "--once"}, &stdout, &stderr)
+	code := run([]string{"--config", writeSonarrTestConfig(t, fake.srv.URL, false, "info"), "--once"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
 	}
 
-	if writes := fake.writes(); len(writes) != 0 {
-		t.Fatalf("a sonarr instance must never be written in this phase, got %+v", writes)
+	// Reads: connectivity (system/status, qualityprofile), the library scan
+	// (series, wanted/cutoff), the decision engine (qualityprofile again, tag,
+	// episode, episodefile), and the write path's own fresh series read.
+	allowedGET := map[string]bool{
+		"/api/v3/system/status":  true,
+		"/api/v3/qualityprofile": true,
+		"/api/v3/series":         true,
+		"/api/v3/series/1":       true,
+		"/api/v3/wanted/cutoff":  true,
+		"/api/v3/tag":            true,
+		"/api/v3/episode":        true,
+		"/api/v3/episodefile":    true,
 	}
-	// Connectivity-only means exactly that: the connectivity check's own two
-	// endpoints (/system/status, /qualityprofile) and nothing further. The
-	// movie endpoints a radarr run walks — including the write path's
-	// /movie/{id} — must never be requested for a sonarr in this phase.
-	for _, r := range fake.all() {
-		if strings.HasPrefix(r.path, "/api/v3/movie") {
-			t.Errorf("a sonarr instance is connectivity-only in this phase, but %s %s was requested", r.method, r.path)
+	// Writes: exactly the two §2.2 permits for Sonarr, and no other method.
+	allowedPUT := map[string]bool{
+		"/api/v3/episode/monitor": true,
+		"/api/v3/series/1":        true,
+	}
+	for _, r := range fake.requests {
+		switch r.method {
+		case http.MethodGet:
+			if !allowedGET[r.path] {
+				t.Errorf("unexpected GET %s: a sonarr run's read surface is an allowlist, not a default", r.path)
+			}
+		case http.MethodPut:
+			if !allowedPUT[r.path] {
+				t.Errorf("unexpected PUT %s: §2.2 permits exactly two Sonarr writes", r.path)
+			}
+		default:
+			t.Errorf("unexpected %s %s: no verb but GET and PUT may ever be sent", r.method, r.path)
+		}
+	}
+}
+
+// TestTree_HasExactlyThreeWriteVerbCallSites is the write-verb audit (binding
+// controller resolution 7), pinned the way earlier phases pinned "exactly one
+// PUT": by counting, so that adding a fourth write site anywhere in the tree
+// is a decision someone has to come here and make.
+//
+// Two invariants, together, bound the whole program's write surface:
+//
+//   - DoJSON is the only client entry point that carries a request body, and
+//     every write in this project goes through it. There are exactly three
+//     call sites: the Radarr movie PUT, the Sonarr episode-monitor PUT, and the
+//     Sonarr season PUT — each in a write-path file, each immediately behind
+//     its own dry-run gate.
+//   - A write could also be smuggled through the bodyless client.Do, so no
+//     non-GET HTTP method constant may appear in ANY non-test file outside
+//     those two write-path files. (client.go names no method at all; it takes
+//     whichever its callers pass.)
+func TestTree_HasExactlyThreeWriteVerbCallSites(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("reading the package directory: %v", err)
+	}
+
+	wantCallSites := map[string]int{"writer.go": 1, "sonarr_writer.go": 2}
+	writePathFiles := map[string]bool{"writer.go": true, "sonarr_writer.go": true}
+	gotCallSites := map[string]int{}
+	total := 0
+
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("reading %s: %v", name, err)
+		}
+		body := string(src)
+
+		if n := strings.Count(body, "client.DoJSON("); n > 0 {
+			gotCallSites[name] = n
+			total += n
+		}
+		if writePathFiles[name] {
+			continue
+		}
+		for _, verb := range []string{"http.MethodPut", "http.MethodPost", "http.MethodDelete", "http.MethodPatch"} {
+			if strings.Contains(body, verb) {
+				t.Errorf("%s names %s: outside the write-path files, this project issues reads only", name, verb)
+			}
+		}
+	}
+
+	if total != 3 {
+		t.Errorf("found %d write-verb call sites, want exactly 3: %v", total, gotCallSites)
+	}
+	for file, want := range wantCallSites {
+		if gotCallSites[file] != want {
+			t.Errorf("%s has %d write-verb call sites, want %d", file, gotCallSites[file], want)
+		}
+	}
+	for file := range gotCallSites {
+		if !writePathFiles[file] {
+			t.Errorf("%s issues a write: every write call site must live in a write-path file", file)
 		}
 	}
 }
@@ -1807,53 +1889,94 @@ instances:
 // same reason. A --only-id that cannot possibly name anything this run would
 // process is now fatal too, and says which of the two causes it is.
 
-// TestRun_OnlyID_NoRadarrConfigured_IsFatalNotSilent: every configured
-// instance is a sonarr, so the movie id names nothing. Nothing is contacted
-// at all — the refusal happens before any HTTP call, like the ambiguity
-// guard next to it.
-func TestRun_OnlyID_NoRadarrConfigured_IsFatalNotSilent(t *testing.T) {
-	fake := newRadarrFake(t, "[]", nil)
+// TestRun_OnlyID_SingleSonarrConfigured_NamesASeries is the other half of the
+// same widening. An all-sonarr config with --only-id used to be FATAL ("the id
+// names nothing this run could act on") because the flag was radarr-only.
+// Phase 7 gives it a Sonarr meaning, so the very same invocation is now a
+// perfectly ordinary scoped run — and must actually scope it: the named series
+// is evaluated, reported and written, and nothing else is.
+func TestRun_OnlyID_SingleSonarrConfigured_NamesASeries(t *testing.T) {
+	fake := newStatefulSonarrFake(t,
+		[]*statefulSonarrSeries{
+			{id: 7, title: "Named Series", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 1, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1}}},
+			{id: 8, title: "Other Series", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 1, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1}}},
+		},
+		[]*statefulSonarrEpisode{
+			{id: 700, seriesID: 7, seasonNumber: 1, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 70},
+			{id: 800, seriesID: 8, seasonNumber: 1, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 80},
+		},
+		[]*statefulSonarrEpisodeFile{
+			{id: 70, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
+			{id: 80, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
+		},
+	)
 
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeSonarrTestConfig(t, fake.srv.URL, false, "info"), "--once", "--only-id", "7"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0: --only-id now names a sonarr series\nstdout=%s\nstderr=%s", code, stdout.String(), stderr.String())
+	}
+	if fake.seasonMonitored(7, 1) {
+		t.Error("the named series' season should have been unmonitored")
+	}
+	if !fake.seasonMonitored(8, 1) {
+		t.Error("a series the run did not name must never be written")
+	}
+	for _, w := range fake.writes() {
+		if w.path == "/api/v3/series/8" {
+			t.Errorf("a --only-id run wrote a series it does not name: %+v", w)
+		}
+	}
+}
+
+// TestRun_OnlyID_NoInstancesConfigured_IsFatalNotSilent is the one remaining
+// route to an empty scope now that an unknown --instance is already fatal and
+// both instance types honor the flag: a config with nothing in it at all. The
+// id could not be applied to anything, and a run that silently does nothing is
+// indistinguishable from a run that found nothing to do.
+func TestRun_OnlyID_NoInstancesConfigured_IsFatalNotSilent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
-	content := fmt.Sprintf(`
-dry_run: false
-instances:
-  - name: sonarr-main
-    type: sonarr
-    url: %s
-    api_key: key1
-`, fake.srv.URL)
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("dry_run: false\ninstances: []\n"), 0o600); err != nil {
 		t.Fatalf("writing test config: %v", err)
 	}
 
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"--config", path, "--once", "--only-id", "7"}, &stdout, &stderr)
-
 	if code != 2 {
-		t.Fatalf("exit code = %d, want 2: a --only-id no instance could act on must be a fatal flag error\nstdout=%s\nstderr=%s",
-			code, stdout.String(), stderr.String())
+		t.Fatalf("exit code = %d, want 2\nstdout=%s\nstderr=%s", code, stdout.String(), stderr.String())
 	}
-	msg := stderr.String()
-	for _, want := range []string{"--only-id", "7", "radarr"} {
-		if !strings.Contains(msg, want) {
-			t.Errorf("stderr must name %q so the human knows which id was refused and why:\n%s", want, msg)
+	for _, want := range []string{"--only-id", "7"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr must name %q so the human knows which id was refused and why:\n%s", want, stderr.String())
 		}
-	}
-	if reqs := fake.all(); len(reqs) != 0 {
-		t.Errorf("the refusal must happen before anything is contacted, got %d request(s): %+v", len(reqs), reqs)
 	}
 }
 
-// TestRun_OnlyID_InstanceFlagNamesASonarr_IsFatalNotSilent is the other
-// route to an empty scope: a radarr IS configured, but --instance points the
-// run at the sonarr beside it, so both filters together leave nothing the id
-// could apply to.
-func TestRun_OnlyID_InstanceFlagNamesASonarr_IsFatalNotSilent(t *testing.T) {
-	fake := newRadarrFake(t,
-		"["+libraryMovie(5, "Untouched Movie", true, true)+"]",
-		map[int]string{5: monitoredMovieDetail(5, "Untouched Movie")})
+// TestRun_OnlyID_InstanceFlagNamesASonarr_ScopesTheSonarrSeries is the third
+// invocation the widening reverses. "--only-id 7 --instance sonarr-main"
+// beside a configured radarr used to be fatal, because the id could only ever
+// mean a movie; it now names series 7 in that sonarr, and the radarr beside it
+// must not be contacted at all — "--instance" has to mean the run touches that
+// instance and nothing else, or it would be a weaker statement than it looks.
+func TestRun_OnlyID_InstanceFlagNamesASonarr_ScopesTheSonarrSeries(t *testing.T) {
+	radarr := newRadarrFake(t,
+		"["+libraryMovie(7, "Untouched Movie", true, true)+"]",
+		map[int]string{7: monitoredMovieDetail(7, "Untouched Movie")})
+	sonarr := newStatefulSonarrFake(t,
+		[]*statefulSonarrSeries{
+			{id: 7, title: "Scoped Series", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 1, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1}}},
+		},
+		[]*statefulSonarrEpisode{
+			{id: 700, seriesID: 7, seasonNumber: 1, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 70},
+		},
+		[]*statefulSonarrEpisodeFile{
+			{id: 70, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
+		},
+	)
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
@@ -1868,29 +1991,21 @@ instances:
     type: sonarr
     url: %s
     api_key: key2
-`, fake.srv.URL, fake.srv.URL)
+`, radarr.srv.URL, sonarr.srv.URL)
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("writing test config: %v", err)
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"--config", path, "--once", "--only-id", "5", "--instance", "sonarr-main"}, &stdout, &stderr)
-
-	if code != 2 {
-		t.Fatalf("exit code = %d, want 2: --only-id scoped to a sonarr names nothing and must not run silently\nstdout=%s\nstderr=%s",
-			code, stdout.String(), stderr.String())
+	code := run([]string{"--config", path, "--once", "--only-id", "7", "--instance", "sonarr-main"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0\nstdout=%s\nstderr=%s", code, stdout.String(), stderr.String())
 	}
-	msg := stderr.String()
-	for _, want := range []string{"--only-id", "5", "sonarr-main"} {
-		if !strings.Contains(msg, want) {
-			t.Errorf("stderr must name %q:\n%s", want, msg)
-		}
+	if sonarr.seasonMonitored(7, 1) {
+		t.Errorf("the named sonarr series' season should have been unmonitored:\n%s", stdout.String())
 	}
-	// Movie 5 exists in the radarr's library. Refusing rather than quietly
-	// widening scope is the whole point: the run must not fall back to the
-	// instance the human did not name.
-	if writes := fake.writes(); len(writes) != 0 {
-		t.Errorf("a refused run must write nothing anywhere, got %+v", writes)
+	if reqs := radarr.all(); len(reqs) != 0 {
+		t.Errorf("the radarr was contacted despite --instance sonarr-main: %+v", reqs)
 	}
 }
 

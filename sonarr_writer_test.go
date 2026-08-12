@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -1270,5 +1272,285 @@ func TestRunSonarrDecisionEngine_OnlyID_UnknownSeries_WarnsAndWritesNothing(t *t
 	}
 	if strings.Contains(out, "msg=would-unmonitor") {
 		t.Errorf("no decisions may be reported for an id this library does not contain:\n%s", out)
+	}
+}
+
+// ============================================================================
+// run()-level: the Sonarr write path against the stateful fake
+// ============================================================================
+
+// writeSonarrTestConfig writes a config pointed at one sonarr instance, with
+// dry_run and log_level explicit (the no-op test needs debug to observe the
+// mandated "already unmonitored" lines).
+func writeSonarrTestConfig(t *testing.T, url string, dryRun bool, logLevel string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := fmt.Sprintf(`
+dry_run: %t
+log_level: %s
+instances:
+  - name: sonarr-main
+    type: sonarr
+    url: %s
+    api_key: key1
+`, dryRun, logLevel, url)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+	return path
+}
+
+// writableSonarrFake builds the fixture the run()-level write tests share: one
+// series with a season that passes every rule (season 1) and a season that is
+// still airing (season 2), so exactly one season is ever written and the other
+// is proof that the write touched nothing it was not asked to.
+func writableSonarrFake(t *testing.T) *statefulSonarrFake {
+	t.Helper()
+	return newStatefulSonarrFake(t,
+		[]*statefulSonarrSeries{
+			{id: 1, title: "Write Me", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{
+					{number: 1, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1},
+					{number: 2, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1},
+				}},
+		},
+		[]*statefulSonarrEpisode{
+			{id: 100, seriesID: 1, seasonNumber: 1, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 500},
+			{id: 200, seriesID: 1, seasonNumber: 2, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: futureAirDate, episodeFileID: 600},
+		},
+		[]*statefulSonarrEpisodeFile{
+			{id: 500, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
+			{id: 600, seasonNumber: 2, customFormatScore: 200, qualityCutoffNotMet: false},
+		},
+	)
+}
+
+// TestRun_SonarrWriteMode_UnmonitorsTheSeasonAndNeverTheSeries is this phase's
+// central acceptance criterion, machine-verified end to end through run():
+// the eligible season really is unmonitored in the fake's own state, its
+// episodes with it, and the series-level monitored flag — plus every other
+// season — is exactly as it was.
+func TestRun_SonarrWriteMode_UnmonitorsTheSeasonAndNeverTheSeries(t *testing.T) {
+	fake := writableSonarrFake(t)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeSonarrTestConfig(t, fake.srv.URL, false, "info"), "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+
+	if !fake.seriesMonitored(1) {
+		t.Error("the SERIES monitored flag was changed; unmonitoring only ever happens to a season")
+	}
+	if fake.seasonMonitored(1, 1) {
+		t.Errorf("season 1 is still monitored; it should have been unmonitored:\n%s", out)
+	}
+	if !fake.seasonMonitored(1, 2) {
+		t.Error("season 2 (still airing) was unmonitored; the write must touch only the season it names")
+	}
+	if fake.episodeMonitored(100) {
+		t.Error("season 1's episode is still monitored; a season flipped without its episodes leaves episodes that can still grab")
+	}
+	if !fake.episodeMonitored(200) {
+		t.Error("season 2's episode was unmonitored; the episode write must name only the target season's episodes")
+	}
+
+	writes := fake.writes()
+	if len(writes) != 2 {
+		t.Fatalf("expected exactly 2 write requests for one season, got %d: %+v", len(writes), writes)
+	}
+	if writes[0].path != "/api/v3/episode/monitor" || writes[1].path != "/api/v3/series/1" {
+		t.Errorf("write order = %s then %s, want the episode call first", writes[0].path, writes[1].path)
+	}
+
+	// The byte-preservation mandate, at run() level: the unknown field the
+	// fake's detail body carries must come back untouched.
+	if !strings.Contains(string(writes[1].body), statefulSonarrExtraField) {
+		t.Errorf("the season PUT dropped or rewrote a field this codebase knows nothing about:\n%s", writes[1].body)
+	}
+	if !strings.Contains(out, "unmonitored=1") {
+		t.Errorf("expected unmonitored=1 in the summary (SEASONS, the decision unit):\n%s", out)
+	}
+}
+
+// TestRun_SonarrWriteMode_SecondRun_IsANoOp is the Sonarr half of Phase 5's
+// no-op contract: run 1 writes, run 2 — against the SAME fake, now reflecting
+// run 1's writes — makes ZERO write requests of any method to any path,
+// reports the season as already unmonitored, and is free of WARN and ERROR,
+// because a daemon loop repeats this cycle forever.
+func TestRun_SonarrWriteMode_SecondRun_IsANoOp(t *testing.T) {
+	fake := writableSonarrFake(t)
+	configPath := writeSonarrTestConfig(t, fake.srv.URL, false, "debug")
+
+	var stdout1, stderr1 bytes.Buffer
+	if code := run([]string{"--config", configPath, "--once"}, &stdout1, &stderr1); code != 0 {
+		t.Fatalf("run 1: exit code = %d, want 0; stderr=%s", code, stderr1.String())
+	}
+	writes1 := len(fake.writes())
+	if writes1 != 2 {
+		t.Fatalf("run 1: expected 2 writes, got %d: %+v", writes1, fake.writes())
+	}
+	if !strings.Contains(stdout1.String(), "unmonitored=1") {
+		t.Fatalf("run 1: expected unmonitored=1:\n%s", stdout1.String())
+	}
+
+	var stdout2, stderr2 bytes.Buffer
+	if code := run([]string{"--config", configPath, "--once"}, &stdout2, &stderr2); code != 0 {
+		t.Fatalf("run 2: exit code = %d, want 0; stderr=%s", code, stderr2.String())
+	}
+	if writes2 := fake.writes(); len(writes2) != writes1 {
+		t.Fatalf("run 2: made %d additional write request(s) of any method to any path, want ZERO: %+v", len(writes2)-writes1, writes2[writes1:])
+	}
+
+	out2 := stdout2.String()
+	if strings.Contains(out2, "level=WARN") || strings.Contains(out2, "level=ERROR") {
+		t.Errorf("run 2: a no-op cycle must produce no WARN or ERROR at all:\n%s", out2)
+	}
+	if strings.Contains(out2, "msg=would-unmonitor") {
+		t.Errorf("run 2: a no-op cycle must produce no would-unmonitor lines:\n%s", out2)
+	}
+	for _, want := range []string{"wouldUnmonitor=0", "unmonitored=0", "alreadyUnmonitored=1"} {
+		if !strings.Contains(out2, want) {
+			t.Errorf("run 2: expected %s in the summary:\n%s", want, out2)
+		}
+	}
+	if !strings.Contains(out2, `msg="season already unmonitored"`) {
+		t.Errorf("run 2: the season must be visible at debug and nowhere above it:\n%s", out2)
+	}
+}
+
+// TestRun_SonarrWriteMode_PartialFailure_ConvergesOnTheNextRun is controller
+// resolution 1's whole justification, machine-verified: the episode call
+// lands, the season PUT is rejected, and the season is therefore left
+// MONITORED — which is exactly why the next cycle re-evaluates it and
+// finishes the job. The retry is also smaller, not duplicated: the episodes
+// already unmonitored are excluded from the second attempt's id list, so run
+// 2 sends the season PUT alone.
+func TestRun_SonarrWriteMode_PartialFailure_ConvergesOnTheNextRun(t *testing.T) {
+	fake := writableSonarrFake(t)
+	fake.series[1].seasons = fake.series[1].seasons[:1]
+	delete(fake.episodes, 200)
+	fake.episodeOrder = []int{100}
+	fake.seriesPutStatus[1] = http.StatusInternalServerError
+	configPath := writeSonarrTestConfig(t, fake.srv.URL, false, "info")
+
+	var stdout1, stderr1 bytes.Buffer
+	if code := run([]string{"--config", configPath, "--once"}, &stdout1, &stderr1); code != 0 {
+		t.Fatalf("run 1: exit code = %d, want 0 (a per-instance write failure is not a process failure); stderr=%s", code, stderr1.String())
+	}
+	out1 := stdout1.String()
+	if !strings.Contains(out1, "writeErrors=1") || !strings.Contains(out1, "unmonitored=0") {
+		t.Errorf("run 1: a partial completion is a write error, not a write:\n%s", out1)
+	}
+	if fake.episodeMonitored(100) {
+		t.Error("run 1: the episode call landed, so the episode must be unmonitored in the fake's state")
+	}
+	if !fake.seasonMonitored(1, 1) {
+		t.Fatal("run 1: the season PUT was rejected, so the season must still be monitored — that is what makes the next cycle converge")
+	}
+
+	// The server recovers.
+	delete(fake.seriesPutStatus, 1)
+	writes1 := len(fake.writes())
+
+	var stdout2, stderr2 bytes.Buffer
+	if code := run([]string{"--config", configPath, "--once"}, &stdout2, &stderr2); code != 0 {
+		t.Fatalf("run 2: exit code = %d, want 0; stderr=%s", code, stderr2.String())
+	}
+	out2 := stdout2.String()
+	if !strings.Contains(out2, "unmonitored=1") {
+		t.Errorf("run 2 must converge and finish the write:\n%s", out2)
+	}
+	if fake.seasonMonitored(1, 1) {
+		t.Error("run 2: the season should now be unmonitored")
+	}
+	run2Writes := fake.writes()[writes1:]
+	if len(run2Writes) != 1 || run2Writes[0].path != "/api/v3/series/1" {
+		t.Errorf("run 2 must send the season PUT alone — every episode is already unmonitored, so the episode call is not needed: %+v", run2Writes)
+	}
+}
+
+// TestRun_MixedRadarrAndSonarr_BothReportAndWriteIndependently is the
+// carried-forward coexistence pin: every prior end-to-end test drove a config
+// containing exactly one instance TYPE, so nothing proved the two engines'
+// report formats and summaries coexist in one pass — one summary line each,
+// each carrying its own counters, each instance written on its own terms.
+//
+// This is also the shape §2.6's "skip that instance for the cycle" rule is
+// about, and the shape Phase 8's daemon loop will repeat forever.
+func TestRun_MixedRadarrAndSonarr_BothReportAndWriteIndependently(t *testing.T) {
+	radarr := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		wouldUnmonitorStatefulMovie(1, "Mixed Config Movie"),
+	})
+	sonarr := writableSonarrFake(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := fmt.Sprintf(`
+dry_run: false
+instances:
+  - name: radarr-main
+    type: radarr
+    url: %s
+    api_key: key1
+  - name: sonarr-main
+    type: sonarr
+    url: %s
+    api_key: key2
+`, radarr.srv.URL, sonarr.srv.URL)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--config", path, "--once"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+
+	radarrSummaries, sonarrSummaries := 0, 0
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "radarr decision summary") {
+			radarrSummaries++
+			if !strings.Contains(line, "instance=radarr-main") || !strings.Contains(line, "unmonitored=1") {
+				t.Errorf("the radarr summary must carry its own instance and counters: %s", line)
+			}
+			if strings.Contains(line, "totalSeriesMonitored") || strings.Contains(line, "seasonsEvaluated") {
+				t.Errorf("the radarr summary must not borrow the sonarr summary's attrs: %s", line)
+			}
+		}
+		if strings.Contains(line, "sonarr decision summary") {
+			sonarrSummaries++
+			if !strings.Contains(line, "instance=sonarr-main") || !strings.Contains(line, "unmonitored=1") {
+				t.Errorf("the sonarr summary must carry its own instance and counters: %s", line)
+			}
+			if strings.Contains(line, "totalMonitored=") {
+				t.Errorf("the sonarr summary must not borrow the radarr summary's attrs: %s", line)
+			}
+			if !strings.Contains(line, "totalSeriesMonitored=") || !strings.Contains(line, "seasonsEvaluated=") {
+				t.Errorf("the sonarr summary must carry its own season-granularity attrs: %s", line)
+			}
+		}
+	}
+	if radarrSummaries != 1 || sonarrSummaries != 1 {
+		t.Fatalf("expected exactly one summary line per engine, got radarr=%d sonarr=%d:\n%s", radarrSummaries, sonarrSummaries, out)
+	}
+
+	// Both report formats appear, and each engine's report lines carry the
+	// attrs of its own decision unit.
+	movieLine := reportLineWithMsg(t, out, "unmonitor")
+	if !strings.Contains(movieLine, "id=1") && !strings.Contains(movieLine, "seriesId=1") {
+		t.Errorf("expected a per-item write line: %s", movieLine)
+	}
+	if n := len(radarr.puts()); n != 1 {
+		t.Errorf("the radarr must make exactly its own 1 PUT, got %d", n)
+	}
+	if n := len(sonarr.writes()); n != 2 {
+		t.Errorf("the sonarr must make exactly its own 2 writes, got %d: %+v", n, sonarr.writes())
+	}
+	if !sonarr.seriesMonitored(1) {
+		t.Error("the sonarr's series-level monitored flag was changed")
 	}
 }
