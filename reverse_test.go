@@ -1404,24 +1404,30 @@ func TestRun_ReverseScan_Sonarr_WriteMode_RemonitorsTheSeasonEpisodesFirst(t *te
 	assertReverseIdentity(t, out)
 }
 
-// TestRun_ReverseScan_Sonarr_WriteMode_HalfDoneWrite_IsReportedAndRetried is the
-// convergence claim binding controller resolution 6 rests on, made true and then
-// pinned (REVIEW FIX, Phase 10 round 3).
+// TestRun_ReverseScan_Sonarr_WriteMode_HalfDoneWrite_IsReportedForever is what
+// happens to a season this pass left half-written, and it is deliberately NOT an
+// automatic repair (binding controller ruling R2, Phase 10 round 5).
 //
 // A season is TWO writes: the episodes first, then the season flag. When the
 // second one fails, the season is left unmonitored with MONITORED episodes
-// inside it — and resolution 6's premise ("a half-done re-monitor converges
-// naturally next cycle: still-unmonitored items re-qualify") was false for
-// exactly that state. The episodes that landed had left the monitored=false
-// wanted set, so rule 4 stopped firing; the season evaluated as "cutoff met",
-// which is not a finding; and the forward pass excludes it at rule 1 because its
-// flag is false. Nothing would ever have looked at it again, while Sonarr went
-// on upgrading its episodes forever.
+// inside it. Before round 3 that state was invisible — the episodes that landed
+// had left the monitored=false wanted set, so rule 4 stopped firing, the season
+// evaluated as "cutoff met", which is not a finding, and the forward pass
+// excludes it at rule 1 on its flag; nothing would ever have looked at it again
+// while Sonarr went on upgrading its episodes. Round 3 made it a REPORTED
+// finding (ReasonSeasonMonitorMismatch), and round 4 let the write finish the
+// flag.
 //
-// Run 1 produces that state against a server that rejects the season PUT. Run 2
-// is the next cycle, with the server healthy: the season must be REPORTED (as a
-// monitor mismatch) and finished.
-func TestRun_ReverseScan_Sonarr_WriteMode_HalfDoneWrite_IsReportedAndRetried(t *testing.T) {
+// R2 takes the write back and keeps the report. A season with monitored episodes
+// already inside it is a mixed monitored state, and this pass cannot tell OUR
+// half-done write from a human who monitored an episode by hand — the two are
+// byte-identical in the API — so it re-monitors neither and says so every cycle
+// until a human settles it. The cost is one line per cycle on a state a click
+// fixes; the alternative is guessing about somebody's deliberate choice.
+//
+// Run 1 produces the state against a server that rejects the season PUT. Run 2
+// is the next cycle, with the server healthy.
+func TestRun_ReverseScan_Sonarr_WriteMode_HalfDoneWrite_IsReportedForever(t *testing.T) {
 	fake := reverseFindingSonarrFake(t, true)
 	fake.setSeriesPutStatus(1, http.StatusInternalServerError)
 	cfg := writeReverseSonarrTestConfig(t, fake.srv.URL, false, true)
@@ -1462,16 +1468,18 @@ func TestRun_ReverseScan_Sonarr_WriteMode_HalfDoneWrite_IsReportedAndRetried(t *
 	if !strings.Contains(line, `reason="`+ReasonSeasonMonitorMismatch+`"`) {
 		t.Errorf("run 2 must report the stranded season, with the reason that describes it:\n%s", line)
 	}
-	if !fake.seasonMonitored(1, 2) {
-		t.Errorf("run 2 must finish the write the previous cycle left half-done:\n%s", out2)
+	if writes := fake.writes()[before:]; len(writes) != 0 {
+		t.Errorf("run 2 must write nothing: a season with monitored episodes inside it is reported, never repaired by guesswork, got %+v", writes)
 	}
-	writes := fake.writes()[before:]
-	if len(writes) != 1 || writes[0].path != "/api/v3/series/1" {
-		t.Errorf("run 2 needs only the season flag — every episode is already monitored — got %+v", writes)
+	if fake.seasonMonitored(1, 2) {
+		t.Errorf("the season flag must be left exactly as the half-done write left it:\n%s", out2)
+	}
+	if !strings.Contains(out2, "already has monitored episodes inside it") {
+		t.Errorf("the refusal must say what stopped it, on the cycle a human is reading to find out:\n%s", out2)
 	}
 	c2 := summaryCountersFor(t, out2, "sonarr decision summary")
-	if c2["reverseFindings"] != 1 || c2["remonitored"] != 1 {
-		t.Errorf("run 2: want reverseFindings=1 remonitored=1, got %v:\n%s", c2, out2)
+	if c2["reverseFindings"] != 1 || c2["remonitorsRefused"] != 1 || c2["remonitored"] != 0 {
+		t.Errorf("run 2: want reverseFindings=1 remonitorsRefused=1 remonitored=0, got %v:\n%s", c2, out2)
 	}
 	assertReverseIdentity(t, out2)
 }
@@ -1677,22 +1685,18 @@ func TestRunSonarrDecisionEngine_ReverseScan_SeasonThatNowMeetsCriteria_IsRefuse
 }
 
 // TestRunSonarrDecisionEngine_ReverseScan_MismatchSeasonWithUnmonitoredEpisodes_IsRefused
-// is the write mandate of the monitor-mismatch finding, which is narrower than
-// the finding itself (REVIEW FIX, Phase 10 round 4).
+// is the human whose deliberate state the clean-season mandate protects (binding
+// controller ruling R2): somebody monitored episode 1 of an otherwise-finished
+// unmonitored season by hand.
 //
 // A mismatch season MEETS every criterion — rules 4, 5 and 7 all passed — and is
 // reported for one reason only: an episode inside it is monitored while its own
-// flag is not. Re-monitoring such a season the ordinary way writes EVERY episode
-// that is currently false, and the plan's write mandate does not reach that far:
-// re-monitoring is scoped to "an unmonitored item that FAILS criteria". The
-// state the finding exists for — our own half-done reverse write — always leaves
-// every episode already monitored, so it needs no episode write at all.
-//
-// The staged season is the state this restriction protects: a human monitored
-// episode 1 of an otherwise-finished unmonitored season by hand. Writing it
-// whole would re-monitor episode 2 as well and the next forward cycle would then
-// unmonitor all of it, including the episode the human chose — a state rule 1
-// used to protect.
+// flag is not. Re-monitoring it the ordinary way writes EVERY episode that is
+// currently false, so episode 2 would be dragged along, and the next forward
+// cycle would then unmonitor the whole season, including the episode the human
+// chose — a state rule 1 used to protect. The plan's write mandate does not
+// reach that far either: re-monitoring is scoped to "an unmonitored item that
+// FAILS criteria", and this season fails none.
 func TestRunSonarrDecisionEngine_ReverseScan_MismatchSeasonWithUnmonitoredEpisodes_IsRefused(t *testing.T) {
 	// Season 2 is complete, fully aired, absent from the unmonitored wanted set
 	// and scoring 200 against the profile's 100. Episode 200 is monitored by
@@ -1730,10 +1734,10 @@ func TestRunSonarrDecisionEngine_ReverseScan_MismatchSeasonWithUnmonitoredEpisod
 		t.Fatalf("the write path was never entered, so this test says nothing about its predicate:\n%s", out)
 	}
 	if writes := fake.writes(); len(writes) != 0 {
-		t.Errorf("a mismatch season with unmonitored episodes in it may not be written at all — neither the episodes a human left alone nor the flag: %+v", writes)
+		t.Errorf("a mismatch season may not be written at all — neither the episodes a human left alone nor the flag: %+v", writes)
 	}
-	if !strings.Contains(out, "only the season flag") {
-		t.Errorf("the refusal must say what it would have had to write:\n%s", out)
+	if !strings.Contains(out, "already has monitored episodes inside it") {
+		t.Errorf("the refusal must say what stopped it:\n%s", out)
 	}
 	c := summaryCountersFor(t, out, "sonarr decision summary")
 	if c["reverseFindings"] != 1 || c["remonitorsRefused"] != 1 || c["remonitored"] != 0 {
@@ -2233,17 +2237,21 @@ func TestRunRadarrDecisionEngine_ReverseFindings_NeverEnterTheForwardCrossCheck(
 	}
 }
 
-// TestRun_ReverseScan_Sonarr_WriteMode_SeasonFlagOnly_NeedsNoEpisodeWrite is the
-// shape where only the season flag is wrong: every episode of the season is
-// already monitored, so there is nothing for the episode call to name and one
-// write is enough.
+// TestRun_ReverseScan_Sonarr_WriteMode_SeasonWhoseEpisodesAreAllMonitored_IsRefused
+// is the other half of the clean-season mandate (binding controller ruling R2),
+// and the shape that makes it a rule about STATE rather than about one reason
+// string: this season is a plain custom-format finding — it really does fail the
+// criteria — and it is still not written, because every episode inside it is
+// already monitored.
 //
-// It is worth its own test because it is the reverse mirror of the FORWARD
-// path's recovery shape, and must not be reported as one: recovery means
-// "finishing something a previous cycle left half-done", which is a claim about
-// the forward direction only. Here it is simply an ordinary re-monitor of an
-// ordinary season.
-func TestRun_ReverseScan_Sonarr_WriteMode_SeasonFlagOnly_NeedsNoEpisodeWrite(t *testing.T) {
+// That shape is the reverse mirror of the FORWARD path's recovery case, and the
+// mirror does not hold. Going forward, "every episode is already unmonitored"
+// means a previous cycle of OURS was interrupted, and the season flag is the
+// only thing left of a write this project decided on. Coming back, the identical
+// shape is produced just as easily by a human monitoring the episodes of a
+// season they left unmonitored, and nothing in the API distinguishes the two —
+// so the flag is not finished on a guess about which one happened.
+func TestRun_ReverseScan_Sonarr_WriteMode_SeasonWhoseEpisodesAreAllMonitored_IsRefused(t *testing.T) {
 	// A CF-score finding: the episode is MONITORED (so it is absent from the
 	// unmonitored wanted set and its quality cutoff counts as met) while the
 	// SEASON is not, and its file scores below the profile's cutoff of 100.
@@ -2267,19 +2275,80 @@ func TestRun_ReverseScan_Sonarr_WriteMode_SeasonFlagOnly_NeedsNoEpisodeWrite(t *
 	if !strings.Contains(out, `reason="`+ReasonCFCutoffNotMet+`"`) {
 		t.Fatalf("this test proves nothing unless the CF-score finding was made:\n%s", out)
 	}
-	writes := fake.writes()
-	if len(writes) != 1 || writes[0].path != "/api/v3/series/1" {
-		t.Fatalf("want exactly one write, the season PUT, got %+v", writes)
+	if !strings.Contains(out, `crossCheck="passed (1 verified`) {
+		t.Fatalf("nor unless the write gate really opened, leaving the mandate as the only explanation:\n%s", out)
 	}
-	if !fake.seasonMonitored(1, 2) {
-		t.Error("season 2 must be monitored after the write")
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("a season whose episodes are already monitored must not be written: %+v", writes)
+	}
+	if fake.seasonMonitored(1, 2) {
+		t.Error("season 2 must be left exactly as it was found")
+	}
+	if !strings.Contains(out, "already has monitored episodes inside it") {
+		t.Errorf("the refusal must say what stopped it:\n%s", out)
 	}
 	c := summaryCountersFor(t, out, "sonarr decision summary")
-	if c["remonitored"] != 1 {
-		t.Errorf("remonitored = %d, want 1:\n%s", c["remonitored"], out)
+	if c["reverseFindings"] != 1 || c["remonitorsRefused"] != 1 || c["remonitored"] != 0 {
+		t.Errorf("want reverseFindings=1 remonitorsRefused=1 remonitored=0, got %v:\n%s", c, out)
 	}
 	if c["recoveredWrites"] != 0 || strings.Contains(out, "completing a previously partial season unmonitor") {
-		t.Errorf("a reverse write must never be reported as a forward recovery:\n%s", out)
+		t.Errorf("nothing here is a forward recovery:\n%s", out)
+	}
+	assertReverseIdentity(t, out)
+}
+
+// TestRunSonarrDecisionEngine_ReverseScan_BelowCutoffSeasonWithOneMonitoredEpisode_IsRefused
+// is the widest case the clean-season mandate covers, and the one that could not
+// be reached through the mismatch reason at all: this season is genuinely below
+// its quality cutoff (it is in the unmonitored wanted set, so rule 4 fires and
+// rule 7 never runs), which is the plan's own "an unmonitored item that FAILS
+// criteria" — and one episode inside it is monitored anyway.
+//
+// Writing it would re-monitor the season and every other episode of it. The one
+// somebody monitored by hand tells this pass that the season's state is somebody
+// else's business; a finding that says "and it is also below cutoff" does not
+// make that any less true.
+func TestRunSonarrDecisionEngine_ReverseScan_BelowCutoffSeasonWithOneMonitoredEpisode_IsRefused(t *testing.T) {
+	// Both of season 2's files score 200 against the profile's 100, so the CF
+	// rule cannot be what reports this season: the unmonitored wanted set is.
+	episodesJSON := "[" + episodeJSON(900, 1, 1, pastAirDate, 9000) + "," +
+		episodeJSONWithMonitored(200, 2, 1, pastAirDate, 600, true) + "," +
+		episodeJSONWithMonitored(201, 2, 2, pastAirDate, 601, false) + "]"
+	filesJSON := "[" + episodeFileJSON(9000, 1, 200, true) + "," +
+		episodeFileJSON(600, 2, 200, true) + "," + episodeFileJSON(601, 2, 200, true) + "]"
+	series := []seriesElement{
+		testSeries(9, "Ordinary Monitored Show", true, 1, []int{}, testSeason(1, true, 1, 1)),
+		testSeries(1, "Below Cutoff, Hand Touched", true, 1, []int{}, testSeason(2, false, 2, 2)),
+	}
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	fake.seriesDetail[1] = sonarrWriteEngineSeriesDetail(1, "Below Cutoff, Hand Touched", 2, 2, false)
+	fake.reverseWantedJSON = `{"page":1,"pageSize":100,"totalRecords":1,"records":[{"id":201,"seriesId":1,"seasonNumber":2}]}`
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series,
+		map[int]bool{900: true}, map[seasonKey]bool{{seriesID: 9, seasonNumber: 1}: true},
+		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+
+	out := buf.String()
+	line := reverseFindingLine(t, out)
+	if !strings.Contains(line, `reason="`+ReasonQualityCutoffNotMet+`"`) {
+		t.Fatalf("this test is only about the widest case if the season really was reported as below its cutoff:\n%s", line)
+	}
+	if !strings.Contains(out, `crossCheck="passed (1 verified`) {
+		t.Fatalf("nor unless the write gate really opened:\n%s", out)
+	}
+	if n := fake.countRequests("/api/v3/series/1"); n == 0 {
+		t.Fatalf("the write path was never entered, so this test says nothing about its predicate:\n%s", out)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("a season with a hand-monitored episode inside it is reported, not written: %+v", writes)
+	}
+	if !strings.Contains(out, "already has monitored episodes inside it") {
+		t.Errorf("the refusal must say what stopped it:\n%s", out)
+	}
+	c := summaryCountersFor(t, out, "sonarr decision summary")
+	if c["reverseFindings"] != 1 || c["remonitorsRefused"] != 1 || c["remonitored"] != 0 {
+		t.Errorf("want reverseFindings=1 remonitorsRefused=1 remonitored=0, got %v:\n%s", c, out)
 	}
 	assertReverseIdentity(t, out)
 }

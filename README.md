@@ -234,9 +234,9 @@ goes on searching and upgrading those episodes, and *nothing else in
 cutoffarr can see them* — the forward scan skips the whole season on its
 flag. It is the state a season write interrupted halfway leaves behind, and
 it is also what you get by monitoring one episode of an unmonitored season by
-hand; either way the season is reported until the two agree again. Reporting
-treats the two the same; writing does not — see
-[Letting it fix them](#letting-it-fix-them).
+hand; either way the season is reported until the two agree again — and only
+reported, never re-monitored, because nothing in the API says which of the two
+you are looking at. See [Letting it fix them](#letting-it-fix-them).
 
 What is **not** a finding, deliberately:
 
@@ -273,10 +273,12 @@ forward pass, and found again by the next reverse one.)
 
 Re-monitoring a Sonarr season is two writes as well (the episodes, then the
 flag). If the second one fails, the season is left unmonitored with monitored
-episodes inside it — and that is neither silent nor permanent: the failure is
-logged as a warning naming exactly that state, and the next full cycle
-reports the season as `unmonitored season with monitored episodes` and
-finishes the flag on its own.
+episodes inside it. That is never silent — the failure is logged as a warning
+naming exactly that state, and every full cycle from then on reports the season
+as `unmonitored season with monitored episodes` — but cutoffarr will not finish
+the flag for you, because that state is indistinguishable from one you created
+yourself (see the third rule below). It is one click in Sonarr, and the finding
+keeps pointing at it until you make it.
 
 Three things it will never do:
 
@@ -289,16 +291,17 @@ Three things it will never do:
   series is a human retiring a show; such seasons are reported (with
   `seriesMonitored=false`) and left alone. cutoffarr never writes a
   series-level monitored flag in either direction.
-- Re-monitor the **episodes** of a season it reports as `unmonitored season
-  with monitored episodes`. That season meets every criterion — the only thing
-  wrong with it is that its own flag disagrees with an episode inside it — so
-  the most cutoffarr will ever write there is the season flag, and only when
-  every episode inside is already monitored, which is exactly the state its own
-  interrupted write leaves. Monitor one episode of a finished, unmonitored
-  season by hand and cutoffarr will tell you about it every cycle and touch
-  nothing: re-monitoring the season would drag the episodes you left alone with
-  it, and the next forward cycle would then unmonitor the lot, including the one
-  you chose. The refusal is logged and counted as `remonitorsRefused`.
+- Re-monitor a season that **already has monitored episodes inside it**.
+  Auto-remonitoring is for the clean case: the season flag off and every episode
+  under it off too, which is what an accidental unmonitor leaves. A season with
+  some episodes already monitored is a mixed state, and cutoffarr cannot tell
+  the two things that produce it apart — its own interrupted write, or you
+  monitoring an episode by hand — so it does neither thing to it. Writing the
+  whole season would drag along the episodes you left alone, and the next
+  forward cycle would then unmonitor the lot, including the one you chose;
+  writing just the flag would guess that the half-done write was cutoffarr's.
+  The season is reported every cycle instead, and the refusal is logged and
+  counted as `remonitorsRefused`.
 
 The summary line tells you which mode you are in: with the switch off it
 carries `reverseFindings=N` and nothing else; with it on, `remonitored`,

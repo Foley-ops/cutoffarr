@@ -186,30 +186,39 @@ var errEpisodeMonitorUnconfirmed = errors.New("the episode monitor write was acc
 // the counted side of it.
 var errNotRecoveryAtWrite = errors.New("the season the recovery pass admitted still has monitored episodes at write time")
 
-// errMismatchSeasonWouldWriteEpisodes marks the REVERSE direction refusing a
-// ReasonSeasonMonitorMismatch season whose episodes are not all monitored
-// already (REVIEW FIX, Phase 10 round 4).
+// errSeasonNotCleanlyUnmonitored marks the REVERSE direction refusing a season
+// that already has monitored episodes inside it (binding controller ruling R2,
+// Phase 10 round 5; round 4 refused a narrower version of the same shape).
 //
-// That reason is the one finding whose season MEETS every criterion: rules 4, 5
-// and 7 all passed, and it is reported solely because the season's own flag
-// disagrees with an episode inside it. Two very different states produce it:
+// Auto-remonitoring applies to CLEANLY unmonitored seasons — the season flag
+// false and every episode inside it false too — and to nothing else. That is the
+// state an accidental season-level unmonitor leaves, which is the whole subject
+// of this pass, and it is the only state where the write is unambiguous: every
+// episode needs it, so nothing is dragged along.
+//
+// A season with any monitored episode in it is a mixed state, and this pass
+// cannot tell the two things that produce it apart, because the API does not:
 //
 //   - our own half-done write — PUT /episode/monitor landed, the season PUT did
-//     not — which always leaves EVERY episode monitored, so finishing it is the
-//     season flag and nothing else;
-//   - a human who monitored one episode of an otherwise-finished unmonitored
-//     season by hand, which leaves the others false.
+//     not — which leaves every episode monitored;
+//   - a human who monitored an episode of an unmonitored season by hand, which
+//     leaves the others false.
 //
-// The ordinary episode write does not distinguish them: it names every episode
-// currently in the wrong state, so the second case is re-monitored WHOLE — and
-// the next forward cycle, seeing a monitored season that meets the criteria,
-// unmonitors all of it including the episode the human deliberately chose. Rule
-// 1 protected that episode before this phase existed. The plan scopes
-// re-monitoring to "an unmonitored item that FAILS criteria", which this season
-// does not, so the write is restricted to the shape it was added for: the season
-// flag alone. Anything wider is refused here — counted (remonitorsRefused),
-// warned once, and still reported every cycle, which is what the finding was for.
-var errMismatchSeasonWouldWriteEpisodes = errors.New("re-monitoring an unmonitored season with monitored episodes may write only the season flag, and this one has unmonitored episodes in it")
+// Writing either one guesses. The ordinary episode write names every episode
+// currently in the wrong state, so the second case is re-monitored WHOLE, and
+// the next forward cycle — seeing a monitored season that meets the criteria —
+// unmonitors all of it including the episode the human deliberately chose, a
+// state rule 1 protected before this phase existed. Finishing only the flag
+// guesses in the other direction, on a season that (in the mismatch case) fails
+// no criterion at all, which the plan's "an unmonitored item that FAILS
+// criteria" does not authorize.
+//
+// So neither is written. The refusal is loud, counted (remonitorsRefused), and
+// the finding is REPORTED again every cycle until a human settles it — which is
+// what the finding was always for, and is one click for them and no guess for
+// this program. The cost is stated where it lands: a half-done reverse write is
+// not repaired automatically (see reverseWriteGateBlockReason).
+var errSeasonNotCleanlyUnmonitored = errors.New("a season with monitored episodes already inside it is reported, never re-monitored automatically")
 
 // unmonitorSeason performs the Sonarr write operation for exactly ONE season:
 // the fresh reads, every pre-write re-verification, then PUT /episode/monitor
@@ -305,25 +314,27 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 }
 
 // remonitorSeason is the reverse direction's entry point. It has no recovery
-// path and takes no requireRecovery, because both states a half-done re-monitor
-// can leave are ordinary findings on the next cycle and are simply retried:
+// path and takes no requireRecovery, because neither state a half-done
+// re-monitor can leave is repaired by this program at all:
 //
 //   - nothing landed, so the season is still unmonitored with unmonitored
-//     episodes — still below its cutoff, still reported;
+//     episodes — still below its cutoff, still a clean season, and retried in
+//     full by the next cycle through the ordinary path;
 //   - the episode write landed and the season PUT did not, so the season is
 //     unmonitored with MONITORED episodes inside it — reported as
-//     ReasonSeasonMonitorMismatch, and finished by the next cycle's season PUT
-//     alone. "Alone" is enforced, not merely expected: a mismatch season with
-//     unmonitored episodes in it is not ours to finish and is refused
-//     (errMismatchSeasonWouldWriteEpisodes).
+//     ReasonSeasonMonitorMismatch every cycle and never written, because that
+//     shape is indistinguishable from a human's own mixed state
+//     (errSeasonNotCleanlyUnmonitored, binding controller ruling R2).
 //
-// REVIEW FIX (Phase 10 round 3): the second case used to be neither true nor
-// stated. Its episodes have left the monitored=false wanted set, so rule 4 stops
-// firing and the season evaluated as "cutoff met" — not a finding — while the
-// forward pass excluded it at rule 1 for being unmonitored. It was stranded
+// REVIEW FIX (Phase 10 round 3): the second state used to be neither repaired
+// nor SEEN. Its episodes have left the monitored=false wanted set, so rule 4
+// stops firing and the season evaluated as "cutoff met" — not a finding — while
+// the forward pass excluded it at rule 1 for being unmonitored. It was stranded
 // permanently, with Sonarr still upgrading its episodes and no line of any level
-// about it. The mismatch reason is what closed that, and it is why this function
-// still needs no recovery machinery of its own.
+// about it. The mismatch reason is what closed that; round 5 then took the
+// automatic repair back, on the grounds that this program cannot tell its own
+// half-done write from a human's deliberate one and must not guess. The
+// difference between the two is a report a human acts on, not a silence.
 func remonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, seriesID, seasonNumber, exclusionTagID int, tagActive bool, dryRun bool, rev reverseWriteContext) (written bool, err error) {
 	written, _, err = writeSeasonMonitored(ctx, logger, client, inst, seriesID, seasonNumber, exclusionTagID, tagActive, dryRun, false, &rev)
 	return written, err
@@ -426,17 +437,10 @@ func writeSeasonMonitored(ctx context.Context, logger *slog.Logger, client *APIC
 	// still FAIL the criteria as of fresh data, or re-monitoring it would undo
 	// this project's own correct work and the next forward cycle would unmonitor
 	// it again.
-	//
-	// It hands back the reason the FRESH data reached, because one of them —
-	// ReasonSeasonMonitorMismatch — is a narrower write mandate than the others
-	// and the episode list below is where that is enforced.
-	var revReason string
 	if rev != nil {
-		reason, err := verifySeasonStillAReverseFinding(ctx, logger, client, inst, body, seriesID, seasonNumber, exclusionTagID, tagActive, *rev, subject, attrs)
-		if err != nil {
+		if err := verifySeasonStillAReverseFinding(ctx, logger, client, inst, body, seriesID, seasonNumber, exclusionTagID, tagActive, *rev, subject, attrs); err != nil {
 			return false, false, err
 		}
-		revReason = reason
 	}
 
 	// The episode ids to unmonitor: ONLY episodes this fresh read says are
@@ -491,30 +495,33 @@ func writeSeasonMonitored(ctx context.Context, logger *slog.Logger, client *APIC
 		episodeIDs = append(episodeIDs, *e.ID)
 	}
 
-	// THE MISMATCH FINDING'S NARROWER WRITE MANDATE (REVIEW FIX, Phase 10 round
-	// 4), decided here because here is the first place the fresh episode set says
-	// which of the two states produced the finding.
+	// THE REVERSE DIRECTION'S CLEAN-SEASON MANDATE (binding controller ruling R2,
+	// Phase 10 round 5), decided here because here is the first place the fresh
+	// episode set says what state the season is really in.
 	//
-	// A ReasonSeasonMonitorMismatch season MEETS every criterion — that is what
-	// makes it the one finding this project may not simply re-monitor. The state
-	// the reason was added for (our own half-done write) leaves every episode
-	// monitored, so episodeIDs is empty and only the season flag is left to
-	// write: that write goes ahead below, and it is what makes the reverse
-	// direction converge. Anything else reaching this line is a season whose
-	// unmonitored episodes somebody chose, and writing them would exceed the
-	// plan's mandate ("an unmonitored item that FAILS criteria") and then be
-	// undone — the next forward cycle unmonitors the whole re-monitored season,
-	// episode the human picked included.
+	// Auto-remonitoring is for CLEANLY unmonitored seasons: the flag false and
+	// every episode inside it false, which is what an accidental season-level
+	// unmonitor leaves and the only shape where every episode needs the write.
+	// Any monitored episode already inside makes it a mixed state, which this
+	// pass may report and may not resolve — see errSeasonNotCleanlyUnmonitored
+	// for why neither writing the whole season nor finishing just its flag is
+	// something this program is in a position to choose between.
+	//
+	// Stated as "every episode needs this write" rather than as a reason string
+	// deliberately: it is a fact about the season in front of the write, so it
+	// holds for the mismatch finding, for a below-cutoff season somebody touched
+	// by hand, and for whatever produces the same shape next.
 	//
 	// The refusal is loud, counted (remonitorsRefused) and never retried within
 	// the cycle, exactly like every other refusal here; the finding itself is
-	// unaffected and is reported again next cycle, which is all the plan asks of
-	// it. Deliberately not a bare withhold: (false, nil) means "dry-run withheld
-	// at the §2.1 gate" and nothing else.
-	if rev != nil && revReason == ReasonSeasonMonitorMismatch && len(episodeIDs) > 0 {
-		logger.Warn("this season meets every criterion and is reported only because its own flag disagrees with an episode inside it; re-monitoring it may write only the season flag, but episodes of it are unmonitored — writing them would re-monitor episodes nobody asked about, so refusing to write",
-			append(append([]any(nil), attrs...), "unmonitoredEpisodes", len(episodeIDs))...)
-		return false, false, fmt.Errorf("%s: %w: %d episode(s) of it are unmonitored", subject, errMismatchSeasonWouldWriteEpisodes, len(episodeIDs))
+	// unaffected and is reported again next cycle. Deliberately not a bare
+	// withhold: (false, nil) means "dry-run withheld at the §2.1 gate" and
+	// nothing else.
+	if rev != nil && len(episodeIDs) != len(seasonEpisodes) {
+		alreadyMonitored := len(seasonEpisodes) - len(episodeIDs)
+		logger.Warn("this season already has monitored episodes inside it, so it is not the clean unmonitor this pass repairs: re-monitoring it would either drag episodes nobody asked about with it or finish a flag on a guess, and a mixed monitored state is somebody's own — reporting it is all this cycle will do",
+			append(append([]any(nil), attrs...), "alreadyMonitoredEpisodes", alreadyMonitored, "episodes", len(seasonEpisodes))...)
+		return false, false, fmt.Errorf("%s: %w: %d of its %d episodes are already monitored", subject, errSeasonNotCleanlyUnmonitored, alreadyMonitored, len(seasonEpisodes))
 	}
 
 	// THE RECOVERY VERDICT (controller ruling item 2), decided here and nowhere
@@ -531,12 +538,14 @@ func writeSeasonMonitored(ctx context.Context, logger *slog.Logger, client *APIC
 	// flag says.
 	//
 	// The reverse direction has no recovery concept at all (binding controller
-	// resolution 6), because it needs none: BOTH of its half-done states are
-	// findings on the next cycle and are retried through the ordinary path — the
-	// season is still unmonitored, or it is unmonitored with monitored episodes
-	// in it, which evaluateSeries reports as ReasonSeasonMonitorMismatch (Phase
-	// 10 round 3; before it, that second state was silent and permanent). So the
-	// verdict is only ever true going forward, and the reverse caller ignores it.
+	// resolution 6), and since round 5 it cannot reach this shape either: a
+	// reverse write whose episodeIDs is empty is a season whose episodes are all
+	// already monitored, which the clean-season mandate above has just refused.
+	// Both of its half-done states are REPORTED on the next cycle — the season is
+	// still unmonitored (a clean finding, retried in full), or it is unmonitored
+	// with monitored episodes in it (ReasonSeasonMonitorMismatch, reported and
+	// never written). So the verdict is only ever true going forward, and the
+	// reverse caller ignores it.
 	recovery = rev == nil && len(episodeIDs) == 0
 
 	// The recovery pass's precondition. It admitted this season on
@@ -565,16 +574,14 @@ func writeSeasonMonitored(ctx context.Context, logger *slog.Logger, client *APIC
 	// FIRST write call (binding order).
 	episodesWritten := false
 	if len(episodeIDs) == 0 {
-		// Every episode is already in the state this write wants, so only the
-		// season flag is left. Going FORWARD that is the recovery shape (what a
-		// partially completed unmonitor leaves behind); coming back it is
-		// ordinary — a season somebody unmonitored at the season level only —
-		// and the reverse direction has no recovery concept to claim.
-		msg := "no monitored episodes remain in this season; the episode monitor write is not needed and this is a recovery write (the season flag alone)"
-		if rev != nil {
-			msg = "every episode of this season is already monitored; the episode monitor write is not needed and only the season flag is left to write"
-		}
-		logger.Debug(msg, append(append([]any(nil), attrs...), "episodes", len(seasonEpisodes), "recovery", recovery)...)
+		// Every episode is already unmonitored, so only the season flag is left:
+		// the recovery shape, what a partially completed unmonitor leaves behind.
+		// FORWARD ONLY — the reverse direction's identical-looking shape (every
+		// episode already MONITORED) never reaches this line, because the
+		// clean-season mandate above refuses it rather than finishing a flag on a
+		// guess about who left the season that way.
+		logger.Debug("no monitored episodes remain in this season; the episode monitor write is not needed and this is a recovery write (the season flag alone)",
+			append(append([]any(nil), attrs...), "episodes", len(seasonEpisodes), "recovery", recovery)...)
 	} else {
 		// §2.1: the dry-run gate, immediately before this HTTP write call and
 		// nowhere earlier. Everything above runs identically in both modes.
@@ -629,14 +636,16 @@ func writeSeasonMonitored(ctx context.Context, logger *slog.Logger, client *APIC
 			// enforces a cutoff on those episodes while Sonarr goes on upgrading
 			// them.
 			//
-			// It converges, but only because the reverse pass now RECOGNIZES that
-			// state (ReasonSeasonMonitorMismatch) and retries the season flag; it
+			// It does not repair itself, and this line is the reason a human will
+			// know that. The reverse pass RECOGNIZES the state
+			// (ReasonSeasonMonitorMismatch, round 3) and reports it every cycle — it
 			// used to evaluate as "cutoff met", which is not a finding, and the
-			// season was stranded permanently with no line of any level about it.
-			// The warning stays regardless: an automatic retry next cycle is not a
-			// reason to leave a human unable to see that a write was left half
-			// done, and the message says which half.
-			logger.Warn("the episode monitor write landed but the season write did not: this season is left unmonitored with monitored episodes inside it, which the forward pass cannot see at all; the next reverse scan reports it as a monitor mismatch and retries the season flag",
+			// season was stranded permanently with no line of any level about it —
+			// but it will not finish the flag, because that shape is
+			// indistinguishable from a human's own mixed state (round 5, binding
+			// controller ruling R2). One click settles it; this warning and the
+			// repeating finding are what point at it.
+			logger.Warn("the episode monitor write landed but the season write did not: this season is left unmonitored with monitored episodes inside it, which the forward pass cannot see at all; every reverse scan from now on reports it as a monitor mismatch, and none of them will finish the flag for you",
 				append(append([]any(nil), attrs...), "error", err)...)
 			return false, recovery, fmt.Errorf("%s: the episode monitor write completed but the season write failed, so the season is left unmonitored with monitored episodes in it: %w", subject, err)
 		}

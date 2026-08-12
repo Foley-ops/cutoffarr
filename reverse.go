@@ -61,15 +61,14 @@ func (d scanDirection) wantsMonitored() bool { return d == directionForward }
 // review: a season whose flag says unmonitored while episodes inside it say
 // monitored. It belongs here for the same reason the other two do — nothing else
 // in this program will ever look at that season again (rule 1 excludes it from
-// every forward cycle) while Sonarr goes on upgrading its episodes — and it is
-// what makes the half-done reverse write converge, since the season is retried
-// as an ordinary finding on the next cycle.
+// every forward cycle) while Sonarr goes on upgrading its episodes.
 //
-// Reporting it is wider than WRITING it, and deliberately so (round 4): that
-// season meets every criterion, so the write side may finish its season flag and
-// may not touch its episodes — see errMismatchSeasonWouldWriteEpisodes for the
-// human whose deliberate state the difference protects. This function answers
-// only the reporting question, which is the same for all three.
+// Reporting it is wider than WRITING it, and deliberately so: that season meets
+// every criterion, and its mixed monitored state is indistinguishable from a
+// human's own, so it is REPORTED every cycle and never re-monitored (binding
+// controller ruling R2 — see errSeasonNotCleanlyUnmonitored, where the write
+// side refuses the whole shape). This function answers only the reporting
+// question, which is the same for all three.
 //
 // It is deliberately a small, explicit allowlist of EXISTING reason constants
 // rather than "anything that is not wouldUnmonitor", because most of the ways
@@ -619,21 +618,24 @@ func verifyMovieStillAReverseFinding(ctx context.Context, logger *slog.Logger, c
 //     aggregate counts that match its own question.
 //
 // There is no recovery-equivalent here, and blocking therefore costs little: a
-// withheld reverse write is retried, in full, by the next cycle whose data does
-// check out, because the item is still unmonitored and still a finding.
+// WITHHELD reverse write is retried, in full, by the next cycle whose data does
+// check out, because nothing was written and the item is still unmonitored and
+// still a finding.
 //
-// REVIEW FIX (Phase 10 round 3): that used to be stated as an unqualified "a
-// half-done re-monitor converges by itself", which was true of a movie (one
-// flag, one write) and FALSE of a Sonarr season until this round. A season is
-// two writes — the episodes, then the flag — so a failure between them leaves
-// the season unmonitored with MONITORED episodes inside it, a state whose
-// episodes have left the monitored=false wanted set (rule 4 stops firing) and
-// whose season the forward pass excludes at rule 1. It evaluated as "cutoff
-// met", which is not a finding, so nothing revisited it, ever. What makes the
-// sentence true now is ReasonSeasonMonitorMismatch (evaluateSeries rule 7): the
-// half-done state is itself a finding, so the retry is the ordinary finding
-// path, and the failure that creates it says so at WARN
-// (writeSeasonMonitored).
+// A half-done write is a different matter, and it is worth being exact about it
+// (rounds 3 and 5). A movie is one flag and one write, so there is no half. A
+// Sonarr season is two writes — the episodes, then the flag — and a failure
+// between them leaves the season unmonitored with MONITORED episodes inside it.
+// That state used to be invisible: its episodes have left the monitored=false
+// wanted set (rule 4 stops firing), the forward pass excludes the season at rule
+// 1, and it evaluated as "cutoff met", which is not a finding, so nothing
+// revisited it ever. Round 3 made it a finding (ReasonSeasonMonitorMismatch), and
+// round 5 (binding controller ruling R2) settled what happens next: it is
+// REPORTED every cycle and never re-monitored, because a mixed monitored state is
+// indistinguishable from a human's own. So the honest statement is that the
+// reverse direction never leaves anything silent, not that it always repairs
+// itself — the failure that creates the state says so at WARN
+// (writeSeasonMonitored), and every cycle after it says so again.
 func reverseWriteGateBlockReason(cc crossCheckResult) string {
 	switch cc.status {
 	case crossCheckStatusPassed:
@@ -675,15 +677,17 @@ func (c *reverseCounts) record(logger *slog.Logger, attrs []any, written bool, e
 		// counter. No HTTP write was sent, so none of them is a failed write.
 		c.refused++
 	case errors.Is(err, errWriteUnverified):
-		// "Let the next cycle reconcile it" is a promise, and it is kept in both
-		// directions: if the write did not land, the movie is still unmonitored
-		// (a finding again) and the season is either still unmonitored or
-		// unmonitored with monitored episodes inside it — which is also a finding
-		// now (ReasonSeasonMonitorMismatch). Before Phase 10 round 3 the second
-		// shape was invisible and this line misdirected a human toward a cycle
-		// that would never revisit it.
+		// "The next cycle will see it" is a promise, and it is kept in both
+		// directions: if the write did not land, the movie is still unmonitored (a
+		// finding again, and re-monitored then) and the season is either still
+		// unmonitored (the same) or unmonitored with monitored episodes inside it,
+		// which is also a finding now (ReasonSeasonMonitorMismatch) — reported
+		// every cycle, though never written, since round 5. Before round 3 that
+		// second shape was invisible and this line misdirected a human toward a
+		// cycle that would never revisit it, which is the failure mode the wording
+		// is careful about: it promises attention, not repair.
 		c.echoUnverified++
-		logger.Warn("remonitor write accepted but the response was unverifiable; treat it as applied and let the next cycle reconcile it",
+		logger.Warn("remonitor write accepted but the response was unverifiable; treat it as applied, and the next cycle will report it again if it did not land",
 			withAttrs("error", err)...)
 	case err != nil:
 		c.writeErrors++
@@ -757,21 +761,22 @@ func (p reversePass) remonitorMovies(ctx context.Context, findings []movieDecisi
 // verifyMovieStillAReverseFinding): everything but rule 4's wanted set is read
 // again here.
 //
-// On success it returns the reason the FRESH evaluation reached, and the caller
-// needs it rather than the scan-time one: ReasonSeasonMonitorMismatch carries a
-// narrower write mandate than the other two (only the season flag may be
-// written — see errMismatchSeasonWouldWriteEpisodes), and which of the three a
-// season is, is a property of the world at write time.
-func verifySeasonStillAReverseFinding(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, body []byte, seriesID, seasonNumber, exclusionTagID int, tagActive bool, rev reverseWriteContext, subject string, attrs []any) (string, error) {
+// It answers only "is this still a finding", not "which one": round 4 had it
+// hand back the fresh reason so the write side could treat
+// ReasonSeasonMonitorMismatch specially, and round 5 replaced that with a rule
+// about the season's actual episode state (errSeasonNotCleanlyUnmonitored),
+// which is what the distinction was reaching for and holds whatever reason
+// reported the season.
+func verifySeasonStillAReverseFinding(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, body []byte, seriesID, seasonNumber, exclusionTagID int, tagActive bool, rev reverseWriteContext, subject string, attrs []any) error {
 	var fresh seriesElement
 	if err := json.Unmarshal(body, &fresh); err != nil {
 		logger.Warn("the pre-write fetch could not be read as a series, so whether the season still fails the criteria cannot be determined; refusing to re-monitor",
 			append(append([]any(nil), attrs...), "error", err)...)
-		return "", fmt.Errorf("%s: %w: the pre-write fetch could not be decoded: %v", subject, errNoLongerAReverseFinding, err)
+		return fmt.Errorf("%s: %w: the pre-write fetch could not be decoded: %v", subject, errNoLongerAReverseFinding, err)
 	}
 	if fresh.ID == nil || *fresh.ID != seriesID {
 		logger.Warn("the pre-write fetch does not identify the series being re-monitored; refusing to write", attrs...)
-		return "", fmt.Errorf("%s: %w: the pre-write fetch identifies a different series", subject, errNoLongerAReverseFinding)
+		return fmt.Errorf("%s: %w: the pre-write fetch identifies a different series", subject, errNoLongerAReverseFinding)
 	}
 
 	eval := evaluateSeries(ctx, logger, client, inst, fresh, rev.profiles, exclusionTagID, tagActive, rev.wantedSeasons, directionReverse)
@@ -780,7 +785,7 @@ func verifySeasonStillAReverseFinding(ctx context.Context, logger *slog.Logger, 
 			continue
 		}
 		if isReverseFinding(d.reason) {
-			return d.reason, nil
+			return nil
 		}
 		if isUntrustedInputReason(d.reason) {
 			// The movie path's twin, and reachable by more roads here: the season
@@ -789,17 +794,17 @@ func verifySeasonStillAReverseFinding(ctx context.Context, logger *slog.Logger, 
 			// season's cutoff. See verifyMovieStillAReverseFinding.
 			logger.Warn("the finding could not be re-established from the pre-write fetch: this season's own data could not be read, which is not evidence that it now meets the criteria; refusing to re-monitor",
 				append(append([]any(nil), attrs...), "reason", d.reason)...)
-			return "", fmt.Errorf("%s: %w: it could not be re-evaluated (%s)", subject, errNoLongerAReverseFinding, d.reason)
+			return fmt.Errorf("%s: %w: it could not be re-evaluated (%s)", subject, errNoLongerAReverseFinding, d.reason)
 		}
 		logger.Info("the season no longer fails the criteria as of the pre-write fetch, skipping the re-monitor",
 			append(append([]any(nil), attrs...), "reason", d.reason)...)
-		return "", fmt.Errorf("%s: %w: it now evaluates as %q", subject, errNoLongerAReverseFinding, d.reason)
+		return fmt.Errorf("%s: %w: it now evaluates as %q", subject, errNoLongerAReverseFinding, d.reason)
 	}
 	// No decision at all for the target season: it is no longer an unmonitored
 	// season of this series, or it is no longer readable. Either way the finding
 	// this write rests on cannot be re-established, and §2.6 says never guess.
 	logger.Warn("the pre-write fetch produced no reverse decision for this season, so the finding could not be re-established; refusing to write", attrs...)
-	return "", fmt.Errorf("%s: %w: the pre-write fetch produced no decision for this season", subject, errNoLongerAReverseFinding)
+	return fmt.Errorf("%s: %w: the pre-write fetch produced no decision for this season", subject, errNoLongerAReverseFinding)
 }
 
 // remonitorSeasons is the reverse pass's write half for Sonarr. Like its Radarr

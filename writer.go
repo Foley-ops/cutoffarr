@@ -482,7 +482,7 @@ func isWriteRefusal(err error) bool {
 		errors.Is(err, errSeasonUnverifiableAtWrite) ||
 		errors.Is(err, errSeasonAiringAtWrite) ||
 		errors.Is(err, errNotRecoveryAtWrite) ||
-		errors.Is(err, errMismatchSeasonWouldWriteEpisodes)
+		errors.Is(err, errSeasonNotCleanlyUnmonitored)
 }
 
 // preWriteExclusionTagCheck re-checks the exclusion tag against a FRESH

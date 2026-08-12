@@ -2153,19 +2153,18 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 			// It is also precisely what a half-done reverse write leaves behind:
 			// writeSeasonMonitored sends PUT /episode/monitor first and the season
 			// PUT second, so a failure between them lands the episodes and not the
-			// flag. Binding controller resolution 6's premise ("a half-done
-			// re-monitor converges naturally next cycle: still-unmonitored items
-			// re-qualify") is only true because of this branch: the episodes that
-			// landed have LEFT the monitored=false wanted set, so rule 4 no longer
-			// fires for that season and nothing else would ever look at it again.
+			// flag. Without this branch that state is not merely unrepaired but
+			// UNSEEN — the episodes that landed have LEFT the monitored=false
+			// wanted set, so rule 4 no longer fires for that season and nothing
+			// else would ever look at it again.
 			//
-			// The same state is also what a human leaves by monitoring ONE episode
-			// of a finished unmonitored season, which is why this verdict is a
-			// report and not a write instruction: the write side may only finish
-			// the flag of a season whose episodes are already all monitored, and
-			// refuses anything wider (errMismatchSeasonWouldWriteEpisodes, round
-			// 4). Both shapes are worth telling a human about; only one of them is
-			// ours to complete.
+			// The same state is exactly what a human leaves by monitoring ONE
+			// episode of a finished unmonitored season, and the API does not say
+			// which happened — which is why this verdict is a report and NOTHING
+			// else: the write side refuses every season that already has monitored
+			// episodes inside it (errSeasonNotCleanlyUnmonitored, binding
+			// controller ruling R2). Both shapes are worth telling a human about;
+			// neither is this program's to resolve by guessing.
 			//
 			// Decided here rather than earlier because everything above it is a
 			// better answer: a season that is incomplete, still airing, in the
