@@ -1873,6 +1873,53 @@ func TestRunRadarrDecisionEngine_AllSkipsFileless_CrossCheckWordingDoesNotDenySk
 	}
 }
 
+// TestRunSonarrDecisionEngine_EpisodeDataInconsistentSkip_CrossCheckWordingDoesNotDenySkipsExisted
+// is the Sonarr mirror of the Radarr test directly above, pinning
+// renderCrossCheckSummary's SECOND caller (decision.go's Sonarr engine,
+// :2266) against the branch-review finding that the previous wording — "no
+// would-unmonitor decisions and no skips with a file on disk this cycle" —
+// was FALSE specifically on Sonarr's fail-safe/untrusted-data paths. Sonarr's
+// cross-check skip pool draws only from d.completeOnDisk (runSonarrCrossCheck,
+// decision.go), which rule 2 sets true for any season whose episodeFileCount
+// equals totalEpisodeCount — genuinely complete on disk — but which the
+// episode-count-mismatch guard (evaluateSeries) then explicitly CLEARS back
+// to false for a season whose own /episode data cannot be trusted
+// (ReasonSeasonEpisodeDataInconsistent), even though the season unquestionably
+// has every file the statistics claim. Such a season is a skip WITH a file on
+// disk that the old wording's "no skips with a file on disk" claim denied
+// outright — the identical self-contradiction class FIX 5 closed for Radarr's
+// "no file" skips, reappearing here on the read-failure/untrusted-data path
+// where an operator most needs the summary line to be honest. This test
+// constructs exactly that season (statistics say 2/2 episodes, complete on
+// disk; the /api/v3/episode fixture returns only 1) and asserts the summary
+// line never claims no such skip existed while skipReasons reports one.
+func TestRunSonarrDecisionEngine_EpisodeDataInconsistentSkip_CrossCheckWordingDoesNotDenySkipsExisted(t *testing.T) {
+	// Statistics claim 2 of 2 episode files present (rule 2 passes: complete
+	// on disk), but /api/v3/episode answers with only one episode for the
+	// season — the count mismatch that fires ReasonSeasonEpisodeDataInconsistent
+	// and clears completeOnDisk, even though the season IS complete on disk.
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 100) + "]"
+	filesJSON := "[" + episodeFileJSON(100, 1, 150, false) + "]"
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	series := []seriesElement{
+		testSeries(1, "Mismatched Data Show", true, 1, nil, testSeason(1, true, 2, 2)),
+	}
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
+
+	out := buf.String()
+	if !strings.Contains(out, `skipReasons="episode data inconsistent with statistics=1"`) {
+		t.Errorf("expected the summary to report the episode-data-inconsistent skip:\n%s", out)
+	}
+	if strings.Contains(out, "no skips with a file on disk") {
+		t.Errorf("crossCheck wording must not deny that a skip with a file on disk existed, on a line where skipReasons reports exactly one such skip:\n%s", out)
+	}
+	if !strings.Contains(out, `crossCheck="passed (nothing sampled:`) {
+		t.Errorf("expected the crossCheck summary to still render the nothing-sampled form:\n%s", out)
+	}
+}
+
 func TestFetchQualityProfiles_MalformedJSON_SkipsInstance(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {

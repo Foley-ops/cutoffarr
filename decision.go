@@ -1068,11 +1068,36 @@ func writeGateBlockReason(cc crossCheckResult, pendingWrites int) string {
 // (formatSkipCounts on the same summary line, e.g. skipReasons="no
 // file=300") while the pool stays empty, so the old wording denied on one
 // line what the line's own skipReasons attr asserted on the other side of
-// it. The wording below names the pool's actual membership — "skips with a
-// file on disk" — so it can never contradict a nonzero skipReasons count.
+// it.
+//
+// FIX (branch review, round 3/4): round 2's replacement — "no
+// would-unmonitor decisions and no skips with a file on disk this cycle" —
+// named the pool's membership as "skips with a file on disk", reasoning that
+// Radarr's hasFile and Sonarr's completeOnDisk were "the same 'has a file on
+// disk' concept". That holds for Radarr, where hasFile is never cleared once
+// true, but it is FALSE for Sonarr: completeOnDisk is set true by rule 2 (the
+// season's episodeFileCount really does equal totalEpisodeCount — the season
+// IS complete on disk) and then deliberately CLEARED back to false for a
+// season whose surrounding data cannot be trusted — the episode-count-
+// mismatch guard (ReasonSeasonEpisodeDataInconsistent) and the /episodefile
+// fetch-failure guard (ReasonCouldNotFetchCFScore) both do this on purpose,
+// precisely because untrusted data is not evidence even though the files
+// themselves are present. A cycle whose only skip took one of those paths
+// therefore skips a season that DOES have a file on disk while the pool
+// stays empty — the exact self-contradiction this wording class exists to
+// close, now on the read-failure/untrusted-data path where the summary
+// matters most (see
+// TestRunSonarrDecisionEngine_EpisodeDataInconsistentSkip_CrossCheckWordingDoesNotDenySkipsExisted).
+// The wording below asserts nothing about what kind of item did or did not
+// exist — only the one fact that is unconditionally true every time this
+// branch is reached, for both engines, regardless of WHY the pool ended up
+// empty: nothing was eligible to sample. That claim can never be
+// contradicted by a nonzero skipReasons count on the same line, so this
+// closes the wording class for good rather than reopening it under a new
+// pool-membership description next time an engine's eligibility rule changes.
 func renderCrossCheckSummary(status string, verified, unverifiable int) string {
 	if status == crossCheckStatusPassed && verified == 0 && unverifiable == 0 {
-		return "passed (nothing sampled: no would-unmonitor decisions and no skips with a file on disk this cycle)"
+		return "passed (nothing sampled: no item was eligible for the cross-check sample this cycle)"
 	}
 	switch status {
 	case crossCheckStatusPassed:
