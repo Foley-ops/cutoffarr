@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -1329,5 +1330,85 @@ func TestDaemon_IdleCycleWithFileReportFindings_StaysWithinTheNoiseBudget(t *tes
 	}
 	if strip2, strip3 := withoutTimestamps(dropNextSweep(cycle2)), withoutTimestamps(dropNextSweep(cycle3)); strip2 != strip3 {
 		t.Errorf("two idle cycles with nothing changed must say the same thing:\ncycle2:\n%s\ncycle3:\n%s", strip2, strip3)
+	}
+}
+
+// --- the filesystem-mutation audit (Phase 10 branch review, carried forward
+// as a binding Phase 11 requirement) -----------------------------------------
+//
+// The permanent rule stated first because it is structural, not a flag: this
+// phase (and every phase after it) never writes, deletes, moves, or renames a
+// file. TestTree_HasExactlyThreeWriteVerbCallSites (writer_test.go) has
+// audited this project's HTTP write surface since Phase 8; this is that
+// audit's filesystem twin, extended to cover the one new class of mutation
+// Phase 11 introduces the ability to make a mistake about: os package calls
+// that create, delete, rename, or truncate a file or directory.
+//
+// It is an ALLOWLIST-of-nothing rather than a forbidden-substring test for
+// the same reason idleCycleAllowedInfo (daemon_test.go) is an allowlist: the
+// failure mode this guards against is someone adding a legitimate-looking
+// os.WriteFile "just for a cache file" three phases from now, and a bare
+// substring ban is exactly as effective at stopping that as an allowlist that
+// starts empty and has to be argued into non-empty.
+
+// fsMutationAllowlist names files permitted to call a filesystem-mutation API
+// outside a test file. It is empty: nothing in this project needs to create,
+// delete, rename, or truncate anything on disk, and this phase's own
+// filereport.go — the one file with any reason to go near the media
+// filesystem at all — is walk-and-stat only, appearing here would be exactly
+// the drift the binding Phase 10 branch review ordered this test to prevent.
+var fsMutationAllowlist = map[string]bool{}
+
+// fsMutationAPIs are the os-package calls that mutate the filesystem: create,
+// delete, rename, truncate, or open for writing. Named individually (not a
+// single "Remove|Rename|..." substring) so the failure message for each is
+// unambiguous about which one fired.
+var fsMutationAPIs = []string{
+	"os.Remove(",
+	"os.RemoveAll(",
+	"os.Rename(",
+	"os.Create(",
+	"os.CreateTemp(",
+	"os.WriteFile(",
+	"os.OpenFile(",
+	"os.Mkdir(",
+	"os.MkdirAll(",
+	"os.Truncate(",
+	"os.Symlink(",
+	"os.Link(",
+	"os.Chmod(",
+	"os.Chown(",
+}
+
+func TestTree_BansFilesystemMutationAPIsEverywhere(t *testing.T) {
+	err := filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if path != "." && strings.HasPrefix(d.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		name := filepath.ToSlash(path)
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			return nil
+		}
+		src, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		body := string(src)
+
+		for _, api := range fsMutationAPIs {
+			if strings.Contains(body, api) && !fsMutationAllowlist[name] {
+				t.Errorf("%s calls %s: this project's filesystem access must stay read-only outside the (empty) allowlist — the permanent no-file-writes rule extends from the *arr APIs to the disk itself", name, api)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking the tree: %v", err)
 	}
 }
