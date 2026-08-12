@@ -88,4 +88,21 @@
   <Requires/>
   <Config Name="Config" Target="/config" Default="/mnt/user/appdata/cutoffarr" Mode="ro" Description="Directory holding config.yml (copied from this repo's config.example.yml). Mounted read-only: cutoffarr never writes to disk." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/cutoffarr</Config>
   <Config Name="Webhook Port" Target="9898" Default="9898" Mode="tcp" Description="POST /webhook/{instance-name} -- point each *arr's Settings -> Connect -> Webhook at http://cutoffarr:9898/webhook/&lt;instance-name&gt; on the shared network above; publishing this port is only needed to reach the endpoint from outside Docker." Type="Port" Display="always" Required="true" Mask="false">9898</Config>
+  <!--
+    Variable Configs below mirror docker-compose.example.yml's own
+    `environment:` block exactly (template_test.go pins the two lists against
+    each other, so they cannot silently drift apart). They exist because
+    config.yml references API keys as ${VAR}, and cutoffarr treats a
+    referenced-but-unset variable as FATAL at startup (see config.go): a CA
+    user who mounts a config.yml written against the compose example but
+    never fills in the matching Variable here gets an immediate crash-loop,
+    not a helpful default. RADARR_MAIN_API_KEY / SONARR_MAIN_API_KEY are
+    named after this repo's own example instance names, so rename them (and
+    add more, one per additional *arr instance) to match your own
+    config.yml's instances[].name values via "Add another Path, Port,
+    Variable...".
+  -->
+  <Config Name="TZ" Target="TZ" Default="America/New_York" Mode="" Description="Timezone (IANA name, e.g. America/New_York) -- used for log timestamps only; cutoffarr's own scheduling is duration-based, not wall-clock." Type="Variable" Display="always" Required="false" Mask="false">America/New_York</Config>
+  <Config Name="Radarr Main API Key" Target="RADARR_MAIN_API_KEY" Default="" Mode="" Description="Referenced in config.yml as ${RADARR_MAIN_API_KEY} for the radarr-main instance. Find it in Radarr's own Settings -> General -> Security. Rename this Variable's Target if your config.yml's instance name or ${VAR} differs." Type="Variable" Display="always" Required="false" Mask="true"></Config>
+  <Config Name="Sonarr Main API Key" Target="SONARR_MAIN_API_KEY" Default="" Mode="" Description="Referenced in config.yml as ${SONARR_MAIN_API_KEY} for the sonarr-main instance. Find it in Sonarr's own Settings -> General -> Security. Rename this Variable's Target if your config.yml's instance name or ${VAR} differs." Type="Variable" Display="always" Required="false" Mask="true"></Config>
 </Container>

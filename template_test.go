@@ -48,11 +48,14 @@ type unraidTemplate struct {
 }
 
 type unraidConfig struct {
-	Name    string `xml:"Name,attr"`
-	Target  string `xml:"Target,attr"`
-	Default string `xml:"Default,attr"`
-	Mode    string `xml:"Mode,attr"`
-	Type    string `xml:"Type,attr"`
+	Name        string `xml:"Name,attr"`
+	Target      string `xml:"Target,attr"`
+	Default     string `xml:"Default,attr"`
+	Mode        string `xml:"Mode,attr"`
+	Type        string `xml:"Type,attr"`
+	Required    string `xml:"Required,attr"`
+	Mask        string `xml:"Mask,attr"`
+	Description string `xml:"Description,attr"`
 }
 
 func parseUnraidTemplate(t *testing.T) unraidTemplate {
@@ -314,6 +317,86 @@ func TestTemplate_AgreesWithComposeExample_Network(t *testing.T) {
 	compose := readRepoFile(t, "docker-compose.example.yml")
 	if !strings.Contains(uncommented(compose), "media-net") {
 		t.Errorf("docker-compose.example.yml no longer uses the media-net placeholder; the template's Network must be updated to match")
+	}
+}
+
+// TestTemplate_AgreesWithComposeExample_Variables closes the gap the Phase 9
+// branch review found: docker-compose.example.yml's `environment:` block
+// sets TZ plus the two `${..._API_KEY}` references, but the template used to
+// carry no `<Config Type="Variable">` element at all. A CA user who follows
+// this template's own Overview ("Mount your config.yml ... API keys ... are
+// read from the container's own environment") gets a config.yml whose
+// `${RADARR_MAIN_API_KEY}` reference has nowhere to come from on Unraid,
+// and config.go's own fatal "environment variable(s) referenced in config
+// but not set" is what greets them at container start — the Overview's
+// parenthetical about "additional Variable entries" was the only thing
+// standing between the template and that outcome, and it was prose rather
+// than a pre-filled field.
+//
+// This pins full agreement, not just "at least one": every environment key
+// docker-compose.example.yml sets must have a matching Type="Variable"
+// Config (matched on Target), and the template must not carry a Variable
+// Config naming a key compose does not — the same "cannot drift apart"
+// standard the rest of this file already holds every other field to.
+func TestTemplate_AgreesWithComposeExample_Variables(t *testing.T) {
+	tmpl := parseUnraidTemplate(t)
+
+	compose := readRepoFile(t, "docker-compose.example.yml")
+	envKey := regexp.MustCompile(`(?m)^\s*-\s*([A-Z0-9_]+)=`)
+	composeKeys := map[string]bool{}
+	for _, m := range envKey.FindAllStringSubmatch(uncommented(compose), -1) {
+		composeKeys[m[1]] = true
+	}
+	if len(composeKeys) == 0 {
+		t.Fatalf("docker-compose.example.yml's environment: block must set at least one key (TZ, at minimum):\n%s", compose)
+	}
+
+	templateKeys := map[string]bool{}
+	for _, c := range tmpl.Configs {
+		if c.Type != "Variable" {
+			continue
+		}
+		if templateKeys[c.Target] {
+			t.Errorf("templates/cutoffarr.xml has more than one Variable Config with Target=%q", c.Target)
+		}
+		templateKeys[c.Target] = true
+	}
+
+	for k := range composeKeys {
+		if !templateKeys[k] {
+			t.Errorf("docker-compose.example.yml's environment: sets %s, but templates/cutoffarr.xml has no matching <Config Type=\"Variable\" Target=%q>", k, k)
+		}
+	}
+	for k := range templateKeys {
+		if !composeKeys[k] {
+			t.Errorf("templates/cutoffarr.xml has a Variable Config Target=%q that docker-compose.example.yml's environment: block does not set; they must name the same keys", k)
+		}
+	}
+
+	// TZ specifically must not be Masked (it's not a secret) and every
+	// *_API_KEY example must be — both Required=false, since a fresh
+	// deployment with dry_run left at its true default writes nothing and a
+	// human is expected to fill these in (or add more) before turning it off.
+	for _, c := range tmpl.Configs {
+		if c.Type != "Variable" {
+			continue
+		}
+		switch {
+		case c.Target == "TZ":
+			if c.Required != "false" {
+				t.Errorf("TZ Variable Config Required=%q, want %q", c.Required, "false")
+			}
+		case strings.HasSuffix(c.Target, "_API_KEY"):
+			if c.Mask != "true" {
+				t.Errorf("%s Variable Config Mask=%q, want %q (an API key must not be shown in plaintext)", c.Target, c.Mask, "true")
+			}
+			if c.Required != "false" {
+				t.Errorf("%s Variable Config Required=%q, want %q (a fresh deployment has dry_run=true and no writes to authorize yet)", c.Target, c.Required, "false")
+			}
+			if !strings.Contains(c.Description, "${"+c.Target+"}") {
+				t.Errorf("%s Variable Config Description must name the ${%s} convention config.yml expects, got %q", c.Target, c.Target, c.Description)
+			}
+		}
 	}
 }
 
