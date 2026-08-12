@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -23,12 +24,22 @@ import (
 // to milliseconds instead would make every timing assertion a race against the
 // machine's load. The clock is therefore virtual and the tests move it by hand.
 //
-// The one race that matters — the test advancing time before the daemon has
-// armed its timer — is closed by construction rather than by synchronization:
-// virtual time only ever moves forward, and NewTimer fires IMMEDIATELY for a
+// Two distinct races live here, and they are closed in two different ways.
+//
+// The ORDERING one — the test advancing time before the daemon has armed its
+// timer — is closed by construction rather than by synchronization: virtual
+// time only ever moves forward, and NewTimer fires IMMEDIATELY for a
 // non-positive duration. A daemon that arms late computes its duration from a
 // clock that has already passed the deadline, gets a non-positive number, and
 // wakes at once.
+//
+// The MEMORY one is closed by synchronization, because nothing about time
+// moving forward makes concurrent access to a bool safe. Every field the
+// daemon's goroutine and the test's goroutine both touch is either behind
+// c.mu or atomic: `now` and `timers` behind the mutex, and a timer's `done`
+// atomic because Stop is called by the DAEMON (on shutdown, and on every queue
+// notify that abandons an armed timer) while the TEST is inside Advance, which
+// reads and writes the same flag under a lock the daemon never takes.
 
 type fakeClock struct {
 	mu     sync.Mutex
@@ -37,13 +48,18 @@ type fakeClock struct {
 }
 
 type fakeTimer struct {
-	c    chan time.Time
-	at   time.Time
-	done bool
+	c  chan time.Time
+	at time.Time
+
+	// done is atomic and not merely mu-protected: Stop has no access to the
+	// clock's mutex, and a daemon calling Stop concurrently with a test
+	// calling Advance is the ordinary case, not the exotic one. See
+	// TestFakeClock_StopRacesAdvance_WithoutADataRace.
+	done atomic.Bool
 }
 
 func (t *fakeTimer) C() <-chan time.Time { return t.c }
-func (t *fakeTimer) Stop()               { t.done = true }
+func (t *fakeTimer) Stop()               { t.done.Store(true) }
 
 func newFakeClock() *fakeClock {
 	return &fakeClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
@@ -61,11 +77,35 @@ func (c *fakeClock) NewTimer(d time.Duration) daemonTimer {
 	t := &fakeTimer{c: make(chan time.Time, 1), at: c.now.Add(d)}
 	if !t.at.After(c.now) {
 		t.c <- c.now
-		t.done = true
+		t.done.Store(true)
 		return t
 	}
 	c.timers = append(c.timers, t)
 	return t
+}
+
+// TestFakeClock_StopRacesAdvance_WithoutADataRace is a test about the TEST
+// HARNESS, and it earns its place because binding controller note 6 makes
+// `-race` this phase's own concurrency gate: a race INSIDE the clock every
+// daemon test runs on would make a green -race run a weaker statement than it
+// looks, and would surface later as an intermittent CI failure in whichever
+// test happened to lose the coin toss.
+//
+// The pairing is the real one, not a contrivance. The daemon loop calls
+// timer.Stop() from its own goroutine (daemon.go, on ctx.Done and on the queue
+// notify) every time a webhook arrives while a timer is armed, and the test
+// goroutine calls Advance at the same moment — TestDaemon_DryRun_... posts a
+// webhook and then advances 45s, which is exactly this.
+func TestFakeClock_StopRacesAdvance_WithoutADataRace(t *testing.T) {
+	clock := newFakeClock()
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		timer := clock.NewTimer(time.Minute)
+		wg.Add(2)
+		go func() { defer wg.Done(); timer.Stop() }()
+		go func() { defer wg.Done(); clock.Advance(time.Second) }()
+	}
+	wg.Wait()
 }
 
 // Advance moves virtual time forward and fires every timer that comes due.
@@ -75,11 +115,11 @@ func (c *fakeClock) Advance(d time.Duration) {
 	c.now = c.now.Add(d)
 	var still []*fakeTimer
 	for _, t := range c.timers {
-		if t.done {
+		if t.done.Load() {
 			continue
 		}
 		if !t.at.After(c.now) {
-			t.done = true
+			t.done.Store(true)
 			select {
 			case t.c <- c.now:
 			default:
