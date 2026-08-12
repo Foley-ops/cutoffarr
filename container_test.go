@@ -32,6 +32,13 @@ func readRepoFile(t *testing.T, name string) string {
 // TestDockerfile_BuildsWithTheModulesOwnGoVersion: a build stage pinned to an
 // older Go than go.mod requires fails at `go build` with a message about the
 // toolchain, in a build nobody runs until deploy day.
+//
+// The FROM line is matched with an optional `--platform=...` flag between
+// `FROM` and `golang:`, rather than requiring the two to be adjacent: the
+// round-2 branch review fix added `--platform=$BUILDPLATFORM` to that line
+// (see TestDockerfile_CrossBuildsForTARGETARCH), which a literal
+// `"FROM golang:" + version` substring check would no longer find even
+// though the stage is still correctly pinned.
 func TestDockerfile_BuildsWithTheModulesOwnGoVersion(t *testing.T) {
 	dockerfile := readRepoFile(t, "Dockerfile")
 	gomod := readRepoFile(t, "go.mod")
@@ -40,9 +47,75 @@ func TestDockerfile_BuildsWithTheModulesOwnGoVersion(t *testing.T) {
 	if m == nil {
 		t.Fatalf("go.mod has no go directive:\n%s", gomod)
 	}
-	want := "FROM golang:" + m[1]
-	if !strings.Contains(dockerfile, want) {
-		t.Errorf("the build stage must pin the module's own Go version (%q from go.mod); Dockerfile:\n%s", want, dockerfile)
+	version := m[1]
+	fromLine := regexp.MustCompile(`(?m)^FROM(?:\s+--platform=\S+)?\s+golang:` + regexp.QuoteMeta(version) + `\b`)
+	if !fromLine.MatchString(uncommented(dockerfile)) {
+		t.Errorf("the build stage must pin the module's own Go version (golang:%s from go.mod), with or without a --platform=... flag; Dockerfile:\n%s", version, dockerfile)
+	}
+}
+
+// TestDockerfile_CrossBuildsForTARGETARCH pins Phase 9's release-workflow
+// requirement: the build stage must be buildable for linux/amd64 AND
+// linux/arm64 from a single `docker buildx build --platform
+// linux/amd64,linux/arm64 .` invocation, and must do so as a genuine native
+// cross-compile rather than an emulated one.
+//
+// Round-2 branch review correction: this test (and the Dockerfile comments
+// it pins) used to claim that a missing GOARCH made the arm64 leg silently
+// produce an amd64 binary under an arm64 manifest tag. That claim is false
+// for a Dockerfile built via buildx, which is what release.yml does: without
+// `--platform=$BUILDPLATFORM` on the build stage's FROM line, BuildKit
+// resolves the STAGE's own base image per TARGET platform too — the arm64
+// leg already pulls an arm64 golang:alpine and runs every RUN line under
+// QEMU emulation (release.yml carries no QEMU setup step at all — this pin
+// is what makes that emulation path unreachable), and Go's own GOARCH
+// default already tracks the host it finds itself running
+// on. So even with no GOARCH set at all, that leg's binary comes out the
+// correct architecture — just compiled slowly, under full emulation, for no
+// reason: the actual bottleneck in every future release. `GOARCH=$TARGETARCH`
+// only becomes load-bearing — the thing that actually selects the output
+// arch, rather than a no-op that happens to already agree with Go's own
+// default — once the build stage is ALSO pinned to `--platform=$BUILDPLATFORM`
+// (the runner's own native platform, for every leg), which is what turns the
+// arm64 leg into a genuine native cross-compile instead of an emulated one.
+// Both pins are asserted together below, since neither is meaningful without
+// the other.
+func TestDockerfile_CrossBuildsForTARGETARCH(t *testing.T) {
+	dockerfile := readRepoFile(t, "Dockerfile")
+
+	// Checked with comments stripped (uncommented, defined below for the
+	// compose-file checks but equally valid here — both files use `#`
+	// comments): this Dockerfile's own explanatory comment ABOUT
+	// GOARCH=$TARGETARCH contains that exact substring in prose, directly
+	// above the real RUN line that uses it. A raw strings.Contains over the
+	// full file text is satisfied by the comment alone, so deleting
+	// GOARCH=$TARGETARCH from the real `go build` line — while leaving the
+	// comment explaining why it's there untouched, exactly the edit a future
+	// "tidy the build line" pass would make — would leave this test green
+	// with the actual plumbing gone. Stripping comments first closes that
+	// gap: only the live RUN line can satisfy the check afterward.
+	stripped := uncommented(dockerfile)
+
+	for _, want := range []string{
+		"FROM --platform=$BUILDPLATFORM golang:",
+		"ARG TARGETARCH",
+		"GOARCH=$TARGETARCH",
+	} {
+		if !strings.Contains(stripped, want) {
+			t.Errorf("Dockerfile must contain %q OUTSIDE a comment so buildx's per-platform build arg reaches `go build`, and so the build stage itself runs on the runner's native platform instead of under QEMU emulation:\n%s", want, dockerfile)
+		}
+	}
+
+	// ARG TARGETARCH must be declared in the BUILD stage (before the RUN that
+	// consumes it), not merely present anywhere in the file — a bare mention
+	// in a comment or the final stage would satisfy the substring check above
+	// without actually wiring anything. Indices are taken from the
+	// comment-stripped text for the same reason as above.
+	argIdx := strings.Index(stripped, "ARG TARGETARCH")
+	buildIdx := strings.Index(stripped, "AS build")
+	useIdx := strings.Index(stripped, "GOARCH=$TARGETARCH")
+	if argIdx == -1 || buildIdx == -1 || useIdx == -1 || !(buildIdx < argIdx && argIdx < useIdx) {
+		t.Errorf("ARG TARGETARCH must be declared inside the build stage, before the go build line that consumes it:\n%s", dockerfile)
 	}
 }
 
@@ -50,8 +123,19 @@ func TestDockerfile_BuildsWithTheModulesOwnGoVersion(t *testing.T) {
 // three properties that make the image what the plan asked for: nothing in it
 // but the binary, never running as root, and no libc dependency (which is what
 // would break a distroless/static base at runtime rather than at build time).
+//
+// Checked with comments stripped (uncommented — same helper and same reason
+// as TestDockerfile_CrossBuildsForTARGETARCH above): the prose block
+// immediately preceding the real RUN line explains CGO_ENABLED=0 and
+// -trimpath in exactly those words, so a raw strings.Contains over the whole
+// file is satisfied by the comment alone. Deleting either token from the
+// live RUN line — dynamically linking libc against distroless/static, or
+// leaving local filesystem paths in the binary — left this test green before
+// this fix (reproduced with a comment-preserving mutation of the RUN line,
+// confirmed red after switching to the stripped text, then reverted).
 func TestDockerfile_FinalStageIsDistrolessNonRootAndStaticallyLinked(t *testing.T) {
 	dockerfile := readRepoFile(t, "Dockerfile")
+	stripped := uncommented(dockerfile)
 
 	for _, want := range []string{
 		"FROM gcr.io/distroless/static:nonroot",
@@ -61,12 +145,12 @@ func TestDockerfile_FinalStageIsDistrolessNonRootAndStaticallyLinked(t *testing.
 		`-ldflags "-s -w"`,
 		`ENTRYPOINT ["/cutoffarr"]`,
 	} {
-		if !strings.Contains(dockerfile, want) {
-			t.Errorf("Dockerfile must contain %q:\n%s", want, dockerfile)
+		if !strings.Contains(stripped, want) {
+			t.Errorf("Dockerfile must contain %q OUTSIDE a comment:\n%s", want, dockerfile)
 		}
 	}
 	// A shell in the final image would defeat the point of distroless.
-	if strings.Contains(dockerfile, "FROM alpine") || strings.Contains(dockerfile, "FROM debian") {
+	if strings.Contains(stripped, "FROM alpine") || strings.Contains(stripped, "FROM debian") {
 		t.Errorf("the FINAL stage must be distroless; a shell-bearing base defeats it:\n%s", dockerfile)
 	}
 }
@@ -96,8 +180,19 @@ func TestDockerfile_DefaultsMatchTheProgramsOwnDefaults(t *testing.T) {
 // TestComposeExample_MatchesThePlansDeploymentShape pins the compose example
 // against the plan's own list, item by item, plus the config path the image
 // expects.
+//
+// Checked against the UNCOMMENTED text, the same hardening
+// TestDockerfile_CrossBuildsForTARGETARCH and
+// TestDockerfile_FinalStageIsDistrolessNonRootAndStaticallyLinked apply above:
+// this file's own prose explains several of these substrings (e.g. "TZ=",
+// "restart: unless-stopped" are named in comments elsewhere in the file), so
+// a raw strings.Contains over the whole file could stay green after the real
+// setting was deleted, as long as a comment mentioning it survived. No
+// substring here false-positives on today's file — this is preventive
+// hardening against the same latent class, not a fix to an active bug.
 func TestComposeExample_MatchesThePlansDeploymentShape(t *testing.T) {
 	compose := readRepoFile(t, "docker-compose.example.yml")
+	stripped := uncommented(compose)
 
 	port := strconv.Itoa(defaultWebhookPort)
 	for _, want := range []struct{ what, substr string }{
@@ -111,8 +206,8 @@ func TestComposeExample_MatchesThePlansDeploymentShape(t *testing.T) {
 		{"the Unraid icon label", "net.unraid.docker.icon"},
 		{"the Unraid shell label", "net.unraid.docker.shell"},
 	} {
-		if !strings.Contains(compose, want.substr) {
-			t.Errorf("the compose example must carry %s (%q):\n%s", want.what, want.substr, compose)
+		if !strings.Contains(stripped, want.substr) {
+			t.Errorf("the compose example must carry %s (%q) OUTSIDE a comment:\n%s", want.what, want.substr, compose)
 		}
 	}
 

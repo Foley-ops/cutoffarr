@@ -1,0 +1,108 @@
+<?xml version="1.0"?>
+<!--
+  Unraid Community Applications template for cutoffarr.
+
+  This file is deliberately kept in field-for-field agreement with
+  docker-compose.example.yml at the repo root, which is the canonical,
+  human-verified deployment shape (port 9898, the /config volume mounted
+  read-only, the Unraid uid:gid pair 99:100, the unless-stopped restart
+  policy, the 90s stop_grace_period, the icon URL, and both Unraid labels'
+  worth of caveats). template_test.go pins the two files against each other,
+  the same way container_test.go pins the Dockerfile against the Go code it
+  packages — this file is documentation nothing in the Go build reads, and
+  is exactly the kind of thing that rots silently otherwise.
+
+  Repository intentionally points at the GHCR image release.yml publishes on
+  a tag push (ghcr.io/foley-ops/cutoffarr) — nothing about committing this
+  template pushes an image or submits it to Community Applications; that is
+  a deliberately separate, human-triggered step.
+-->
+<Container version="2">
+  <Name>cutoffarr</Name>
+  <Repository>ghcr.io/foley-ops/cutoffarr</Repository>
+  <Registry>https://github.com/Foley-ops/cutoffarr/pkgs/container/cutoffarr</Registry>
+  <Branch/>
+  <NetworkType>custom</NetworkType>
+  <!--
+    "media-net" is docker-compose.example.yml's own placeholder for "whatever
+    external network your *arr stack is actually on" — compose.yml is explicit
+    that a network Compose created for another stack is named
+    "<project>_default", not the bare name from that stack's file, and the
+    same caveat applies here. Change this to your real *arr network's name
+    (Docker Settings, or `docker network ls`) before starting the container;
+    left as "media-net", it will only work if a network with that exact name
+    already exists.
+  -->
+  <Network>media-net</Network>
+  <MyIP/>
+  <!--
+    Unraid's Console button runs whatever this names inside the container.
+    The final image is `gcr.io/distroless/static:nonroot` — no shell, no
+    package manager, nothing executable but the one binary — so the Console
+    button WILL fail no matter what this says. This is set to "sh" only
+    because Unraid requires some value here and because it matches
+    docker-compose.example.yml's own net.unraid.docker.shell label, which
+    carries the identical caveat. Diagnose with the Log button
+    (`docker logs cutoffarr`) instead — everything this program has to say is
+    on stdout.
+  -->
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/Foley-ops/cutoffarr/issues</Support>
+  <Project>https://github.com/Foley-ops/cutoffarr</Project>
+  <Overview>cutoffarr unmonitors Radarr movies and Sonarr seasons once they have genuinely finished upgrading (quality cutoff AND custom-format cutoff score both reached), so your indexers stop being asked to search for something no release will ever provide. It never deletes, moves, or renames a file, and the only field it ever writes is `monitored` -- never quality profiles, tags, or any other setting. dry_run defaults to true: a fresh deployment writes nothing until you edit config.yml and explicitly turn it off. See the README (https://github.com/Foley-ops/cutoffarr#readme) for the full config reference, the safety/dry-run guarantees, and how to point each *arr's Settings -> Connect -> Webhook at this container. Mount your config.yml (copied from config.example.yml) at the Config path below; API keys referenced in it as ${VAR} are read from the container's own environment, which you can supply with additional "Variable" entries on this template (Add another Path, Port, Variable...).</Overview>
+  <Category>Tools:</Category>
+  <!--
+    net.unraid.docker.webui / the <WebUI> element is DELIBERATELY OMITTED,
+    not forgotten: cutoffarr has no web UI at all. The one HTTP endpoint the
+    container exposes is POST /webhook/{instance-name}, which every *arr's
+    own Connect -> Webhook setting talks to directly — a human clicking
+    Unraid's "WebUI" button would only ever see a bare 405 Method Not
+    Allowed, since the endpoint accepts POST and nothing else. Leaving the
+    element out entirely is what keeps that button itself from appearing.
+  -->
+  <TemplateURL>https://raw.githubusercontent.com/Foley-ops/cutoffarr/main/templates/cutoffarr.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/Foley-ops/cutoffarr/main/icon.png</Icon>
+  <!--
+    The ExtraParams below sets three things docker-compose.example.yml also
+    sets, since Unraid's own Config fields have no equivalent for any of
+    them: the user 99:100 override, matching the compose file's
+    `user: "99:100"` (the image's own default is distroless's nonroot,
+    65532:65532; Unraid's usual nobody:users pair is what makes the
+    read-only /config mount below actually readable); restart
+    unless-stopped, matching the compose file's restart policy; and
+    stop-timeout 90, matching its stop_grace_period: 90s. See that file's
+    own long comment for why 90s specifically (a Sonarr season write is an
+    atomic pair of API calls deliberately detached from shutdown, and
+    Docker's DEFAULT stop timeout of 10s is short enough to SIGKILL the
+    process between the two, leaving one episode-level write applied and the
+    season-level write never sent). Do not shorten stop-timeout without
+    reading that comment first.
+  -->
+  <ExtraParams>--user 99:100 --restart unless-stopped --stop-timeout 90</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+  <Config Name="Config" Target="/config" Default="/mnt/user/appdata/cutoffarr" Mode="ro" Description="Directory holding config.yml (copied from this repo's config.example.yml). Mounted read-only: cutoffarr never writes to disk." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/cutoffarr</Config>
+  <Config Name="Webhook Port" Target="9898" Default="9898" Mode="tcp" Description="POST /webhook/{instance-name} -- point each *arr's Settings -> Connect -> Webhook at http://cutoffarr:9898/webhook/&lt;instance-name&gt; on the shared network above; publishing this port is only needed to reach the endpoint from outside Docker." Type="Port" Display="always" Required="true" Mask="false">9898</Config>
+  <!--
+    Variable Configs below mirror docker-compose.example.yml's own
+    `environment:` block exactly (template_test.go pins the two lists against
+    each other, so they cannot silently drift apart). They exist because
+    config.yml references API keys as ${VAR}, and cutoffarr treats a
+    referenced-but-unset variable as FATAL at startup (see config.go): a CA
+    user who mounts a config.yml written against the compose example but
+    never fills in the matching Variable here gets an immediate crash-loop,
+    not a helpful default. RADARR_MAIN_API_KEY / SONARR_MAIN_API_KEY are
+    named after this repo's own example instance names, so rename them (and
+    add more, one per additional *arr instance) to match your own
+    config.yml's instances[].name values via "Add another Path, Port,
+    Variable...".
+  -->
+  <Config Name="TZ" Target="TZ" Default="America/New_York" Mode="" Description="Timezone (IANA name, e.g. America/New_York) -- used for log timestamps only; cutoffarr's own scheduling is duration-based, not wall-clock." Type="Variable" Display="always" Required="false" Mask="false">America/New_York</Config>
+  <Config Name="Radarr Main API Key" Target="RADARR_MAIN_API_KEY" Default="" Mode="" Description="Referenced in config.yml as ${RADARR_MAIN_API_KEY} for the radarr-main instance. Find it in Radarr's own Settings -> General -> Security. Rename this Variable's Target if your config.yml's instance name or ${VAR} differs." Type="Variable" Display="always" Required="false" Mask="true"></Config>
+  <Config Name="Sonarr Main API Key" Target="SONARR_MAIN_API_KEY" Default="" Mode="" Description="Referenced in config.yml as ${SONARR_MAIN_API_KEY} for the sonarr-main instance. Find it in Sonarr's own Settings -> General -> Security. Rename this Variable's Target if your config.yml's instance name or ${VAR} differs." Type="Variable" Display="always" Required="false" Mask="true"></Config>
+</Container>

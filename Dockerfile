@@ -9,7 +9,32 @@
 # --- build stage -------------------------------------------------------------
 #
 # Pinned to the repo's own Go version (go.mod says 1.23.6). Bump both together.
-FROM golang:1.23.6-alpine AS build
+#
+# --platform=$BUILDPLATFORM pins THIS STAGE to whatever platform is actually
+# running the build (BUILDPLATFORM, buildx's other automatic per-platform
+# build arg), for every leg of release.yml's
+# `docker buildx build --platform linux/amd64,linux/arm64 .`. Without it,
+# BuildKit resolves this stage's own base image per TARGET platform too: the
+# arm64 leg would pull an arm64 golang:alpine and run every RUN line below —
+# including `go mod download` and the whole compile — under QEMU emulation.
+# release.yml carries no QEMU setup step at all, precisely because this pin
+# (plus GOARCH=$TARGETARCH below) makes that emulation path unreachable —
+# see release.yml's own header comment for the full reasoning.
+# Go's own GOARCH already defaults to the host it finds itself running on, so
+# an emulated-arm64 stage would still produce a correctly-arched arm64
+# binary even with no GOARCH set at all — just by compiling the entire
+# module, slowly, under full emulation, for no reason: the actual bottleneck
+# in every future release. With the stage pinned to BUILDPLATFORM instead,
+# both legs run natively on the build machine (amd64, on GitHub-hosted
+# runners), and GOARCH=$TARGETARCH below becomes what actually selects the
+# output arch — turning the arm64 leg into a genuine native cross-compile.
+FROM --platform=$BUILDPLATFORM golang:1.23.6-alpine AS build
+
+# TARGETARCH is buildx's other automatic per-platform build arg. With the
+# stage above pinned to BUILDPLATFORM, this is now the only thing telling
+# `go build` which architecture to actually target — but only if a stage
+# ARGs it in.
+ARG TARGETARCH
 
 WORKDIR /src
 
@@ -40,7 +65,13 @@ COPY . .
 #
 # The tests are run in CI, not here: a build stage that runs them makes every
 # image build slower and every test failure look like a Docker problem.
-RUN CGO_ENABLED=0 GOOS=linux go build \
+# GOARCH=$TARGETARCH is what makes this stage actually cross-compile: because
+# the FROM line above pins the stage to --platform=$BUILDPLATFORM, `go build`
+# would otherwise target the BUILD machine's own arch on every leg (amd64, on
+# GitHub-hosted runners), regardless of which platform buildx is producing
+# this leg for. GOOS stays hardcoded to linux — this image never targets
+# anything else, and TARGETOS would only add a second unused build arg.
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build \
         -trimpath \
         -ldflags "-s -w" \
         -o /out/cutoffarr .

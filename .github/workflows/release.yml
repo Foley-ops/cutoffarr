@@ -1,0 +1,100 @@
+# release.yml — builds the published image and pushes it to GHCR.
+#
+# Triggered ONLY by a strict `vX.Y.Z` (all-digit X, Y, Z) tag push, never by
+# an ordinary commit — publishing a new image is a deliberate, human-initiated
+# act (`git tag v1.0.0 && git push --tags`), not something that happens as a
+# side effect of merging to main. The tag filter below,
+# `v[0-9]+.[0-9]+.[0-9]+`, is anchored to the whole ref name (GitHub's
+# filter-pattern syntax, not a general glob/regex), so a prerelease-suffixed
+# tag — `v1.0.0-rc1`, `v2.0.0-beta`, a typo'd `vtest` — does NOT match and
+# does NOT trigger this workflow. That is deliberate, not an oversight: this
+# project has no prerelease channel, and the alternative (a loose `v*` glob)
+# would let a prerelease tag silently re-point `:latest` at a build nobody
+# intended to ship as the recommended image.
+#
+# Builds both linux/amd64 and linux/arm64 from the one Dockerfile via buildx,
+# and pushes both tags: `vX.Y.Z` (this exact release) and `latest`. No QEMU
+# setup step is used, and none is needed: the Dockerfile's build stage is
+# pinned to `--platform=$BUILDPLATFORM`, so it always runs natively on this
+# runner (amd64) for both legs, and `ARG TARGETARCH` / `GOARCH=$TARGETARCH`
+# is what makes that native stage cross-compile the arm64 binary rather than
+# needing QEMU to emulate the Go toolchain. The final stage (distroless base
+# + COPY/USER/EXPOSE/ENTRYPOINT/CMD) executes nothing at build time either —
+# no RUN, nothing to run under emulation — so there is no step on either leg,
+# in either stage, that QEMU would ever be asked to do. buildx itself is
+# still required below (it drives the multi-platform build and the manifest
+# list that ties both legs to one tag); only the separate QEMU emulation
+# layer is the unnecessary piece.
+#
+# Authentication is GITHUB_TOKEN — no secret is created or stored for this,
+# and nothing in this workflow ever echoes it; docker/login-action consumes it
+# as a masked input, the one supported way to hand it to `docker login`.
+#
+# `test` (branch review fix) is a `needs:` dependency of `build-and-push`, not
+# a separate workflow left to run on its own timeline: before this fix, a tag
+# push fired test.yml and release.yml as two independent, concurrent
+# workflows with nothing tying them together, so a failing test suite did not
+# block the publish — it only produced a failed check alongside a
+# successfully published image, discoverable only by a human who went
+# looking. `test` reuses test.yml itself (`uses:`), the exact go vet + go
+# test -race gate every push and PR already runs, so `build-and-push` cannot
+# start until that gate has actually passed on this tagged commit.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+# packages: write is the one elevated permission this workflow needs, to push
+# to GHCR under this repository's own package namespace; contents: read is
+# enough to check the tagged commit out.
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # Reuses test.yml's own job (not a duplicated copy of its steps) so the
+  # gate a release depends on is byte-identical to the gate every ordinary
+  # push and PR already runs — it cannot drift out of sync with what "green"
+  # means anywhere else in this project.
+  test:
+    uses: ./.github/workflows/test.yml
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # GHCR (and Docker generally) requires an all-lowercase repository path;
+      # ${{ github.repository }} is "Foley-ops/cutoffarr" (mixed case, from the
+      # GitHub org/repo name), so it cannot be used as the image name as-is.
+      - name: Compute lowercase image name
+        id: image
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          echo "name=ghcr.io/${REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ github.ref_name }}
+            ${{ steps.image.outputs.name }}:latest

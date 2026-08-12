@@ -1682,6 +1682,45 @@ func TestRenderCrossCheckSummary_Inconclusive(t *testing.T) {
 	}
 }
 
+// TestRenderCrossCheckSummary_PassedWithNothingSampled_RendersDistinctly is
+// Phase 9's one allowed code ride-along (binding controller resolution 7),
+// mirroring FIX 2's honesty rule for a second edge case in the same
+// function. crossCheckStatusPassed with verified==0 and unverifiable==0 is
+// reached only one way: nothing was even sampled, because this cycle had no
+// would-unmonitor decisions and no monitored+hasFile skip decisions to draw
+// from (an empty library, or a library where every eligible item was already
+// handled). That is a genuinely benign outcome, but left to the general
+// `passed (%d verified, %d unverifiable)` case it renders the exact string
+// "passed (0 verified, 0 unverifiable)" — a string a REAL sample can never
+// produce, since a sample that ran always has verified+unverifiable > 0 —
+// making "nothing was checked" visually indistinguishable from "a sample was
+// taken and it checked out". The zero-sample case must render as its own
+// explicit branch, not the general formatter's coincidental output.
+func TestRenderCrossCheckSummary_PassedWithNothingSampled_RendersDistinctly(t *testing.T) {
+	got := renderCrossCheckSummary(crossCheckStatusPassed, 0, 0)
+	if got == "passed (0 verified, 0 unverifiable)" {
+		t.Errorf("renderCrossCheckSummary(passed, 0, 0) = %q, must not read the same as a sample that ran and found nothing wrong", got)
+	}
+	if !strings.Contains(got, "passed") {
+		t.Errorf("renderCrossCheckSummary(passed, 0, 0) = %q, must still read as passed (it is not a failure)", got)
+	}
+	if !strings.Contains(got, "nothing") && !strings.Contains(got, "sampled") {
+		t.Errorf("renderCrossCheckSummary(passed, 0, 0) = %q, expected wording naming that nothing was sampled", got)
+	}
+}
+
+// TestRenderCrossCheckSummary_PassedWithRealZeroUnverifiable_StillUsesGeneralForm
+// pins the boundary the fix above must not blur: verified>0, unverifiable==0
+// is a REAL sample (something was actually checked and everything agreed),
+// so it must keep using the general counted form, not the nothing-sampled
+// wording.
+func TestRenderCrossCheckSummary_PassedWithRealZeroUnverifiable_StillUsesGeneralForm(t *testing.T) {
+	got := renderCrossCheckSummary(crossCheckStatusPassed, 4, 0)
+	if got != "passed (4 verified, 0 unverifiable)" {
+		t.Errorf("renderCrossCheckSummary(passed, 4, 0) = %q, want %q", got, "passed (4 verified, 0 unverifiable)")
+	}
+}
+
 // TestRenderCrossCheckSummary_UnrecognizedStatus_NeverReadsAsPassed is
 // FIX 2's core pin: feed an unrecognized status through the renderer and
 // assert the output does not contain "passed" — the exact hazard the old
@@ -1790,6 +1829,94 @@ func TestRunRadarrDecisionEngine_CrossCheckDisagreement_SummaryStatesFailed(t *t
 	}
 	if !strings.Contains(out, "crossCheck=FAILED") {
 		t.Errorf("expected the summary to state the cross-check FAILED:\n%s", out)
+	}
+}
+
+// TestRunRadarrDecisionEngine_AllSkipsFileless_CrossCheckWordingDoesNotDenySkipsExisted
+// is the fix-round pin for the branch review's finding on renderCrossCheckSummary's
+// zero-sample wording: the cross-check sample pool is narrower than "skip
+// candidates" — runCrossCheck only draws its skip half from decisions that are
+// BOTH a skip AND hasFile==true (decision.go's `else if d.hasFile`). A cycle
+// where every monitored movie fails rule 2 (no file) populates skipCounts
+// under "no file" while leaving the cross-check pool empty, so wording that
+// says "no ... skip candidates existed this cycle" is false on exactly that
+// cycle — self-contradictory on the very same summary line as
+// skipReasons="no file=1". This test pins that the corrected wording never
+// makes that claim while skipReasons simultaneously reports a nonzero skip.
+func TestRunRadarrDecisionEngine_AllSkipsFileless_CrossCheckWordingDoesNotDenySkipsExisted(t *testing.T) {
+	var gotMoviefileRequests []string
+	moviefileHandler := func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[]`))
+	}
+	srv := decisionEngineTestServer(t, decisionEngineProfilesJSON, decisionEngineNoTagsJSON, moviefileHandler, &gotMoviefileRequests)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	// Monitored, but no file: rule 2 skips it before it can ever reach the
+	// cross-check's hasFile-gated skip pool.
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("No File Movie"), Monitored: boolPtr(true), HasFile: boolPtr(false)},
+	}
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
+
+	out := buf.String()
+	if !strings.Contains(out, `skipReasons="no file=1"`) {
+		t.Errorf("expected the summary to report the no-file skip:\n%s", out)
+	}
+	if strings.Contains(out, "no would-unmonitor or skip candidates existed") {
+		t.Errorf("crossCheck wording must not deny that skip candidates existed on a line where skipReasons reports one:\n%s", out)
+	}
+	if !strings.Contains(out, `crossCheck="passed (nothing sampled:`) {
+		t.Errorf("expected the crossCheck summary to still render the nothing-sampled form:\n%s", out)
+	}
+}
+
+// TestRunSonarrDecisionEngine_EpisodeDataInconsistentSkip_CrossCheckWordingDoesNotDenySkipsExisted
+// is the Sonarr mirror of the Radarr test directly above, pinning
+// renderCrossCheckSummary's SECOND caller (decision.go's Sonarr engine,
+// :2266) against the branch-review finding that the previous wording — "no
+// would-unmonitor decisions and no skips with a file on disk this cycle" —
+// was FALSE specifically on Sonarr's fail-safe/untrusted-data paths. Sonarr's
+// cross-check skip pool draws only from d.completeOnDisk (runSonarrCrossCheck,
+// decision.go), which rule 2 sets true for any season whose episodeFileCount
+// equals totalEpisodeCount — genuinely complete on disk — but which the
+// episode-count-mismatch guard (evaluateSeries) then explicitly CLEARS back
+// to false for a season whose own /episode data cannot be trusted
+// (ReasonSeasonEpisodeDataInconsistent), even though the season unquestionably
+// has every file the statistics claim. Such a season is a skip WITH a file on
+// disk that the old wording's "no skips with a file on disk" claim denied
+// outright — the identical self-contradiction class FIX 5 closed for Radarr's
+// "no file" skips, reappearing here on the read-failure/untrusted-data path
+// where an operator most needs the summary line to be honest. This test
+// constructs exactly that season (statistics say 2/2 episodes, complete on
+// disk; the /api/v3/episode fixture returns only 1) and asserts the summary
+// line never claims no such skip existed while skipReasons reports one.
+func TestRunSonarrDecisionEngine_EpisodeDataInconsistentSkip_CrossCheckWordingDoesNotDenySkipsExisted(t *testing.T) {
+	// Statistics claim 2 of 2 episode files present (rule 2 passes: complete
+	// on disk), but /api/v3/episode answers with only one episode for the
+	// season — the count mismatch that fires ReasonSeasonEpisodeDataInconsistent
+	// and clears completeOnDisk, even though the season IS complete on disk.
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 100) + "]"
+	filesJSON := "[" + episodeFileJSON(100, 1, 150, false) + "]"
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	series := []seriesElement{
+		testSeries(1, "Mismatched Data Show", true, 1, nil, testSeason(1, true, 2, 2)),
+	}
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
+
+	out := buf.String()
+	if !strings.Contains(out, `skipReasons="episode data inconsistent with statistics=1"`) {
+		t.Errorf("expected the summary to report the episode-data-inconsistent skip:\n%s", out)
+	}
+	if strings.Contains(out, "no skips with a file on disk") {
+		t.Errorf("crossCheck wording must not deny that a skip with a file on disk existed, on a line where skipReasons reports exactly one such skip:\n%s", out)
+	}
+	if !strings.Contains(out, `crossCheck="passed (nothing sampled:`) {
+		t.Errorf("expected the crossCheck summary to still render the nothing-sampled form:\n%s", out)
 	}
 }
 

@@ -7,8 +7,13 @@
 
 services:
   cutoffarr:
-    image: cutoffarr:latest
-    # Or build it in place:
+    # The published image release.yml pushes on a tag push (README's Quick
+    # start pulls this as-is; templates/cutoffarr.xml's <Repository> names
+    # the same image, and template_test.go pins the two in agreement). Pin
+    # a specific release instead of `latest` once you've picked one, e.g.
+    # ghcr.io/foley-ops/cutoffarr:v1.0.0.
+    image: ghcr.io/foley-ops/cutoffarr:latest
+    # Or build it in place instead of pulling:
     # build: .
     container_name: cutoffarr
     restart: unless-stopped
