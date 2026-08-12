@@ -48,6 +48,18 @@ type movieListElement struct {
 	QualityProfileID *int              `json:"qualityProfileId"`
 	Tags             *[]int            `json:"tags"`
 	MovieFile        *movieFileElement `json:"movieFile"`
+
+	// Path is the movie's own root folder on the *arr's filesystem (e.g.
+	// "/movies/Some Movie (2020)"). Nothing before Phase 11 reads this field:
+	// every rule in the STRICT decision rule is about monitored/hasFile/tags/
+	// quality data, never about where a file lives on disk. It exists here,
+	// rather than as a second fetch, because /api/v3/movie already returns it
+	// on every element — the same "reuse what the cycle already fetched"
+	// principle as movieFile's quality fields. Absence is handled entirely by
+	// filereport.go, and only for instances that actually configured
+	// media_root_map: warning about a field nothing else uses would be noise
+	// for every user who never opts into the file report.
+	Path *string `json:"path"`
 }
 
 // movieFileElement decodes the subset of a movie's movieFile object that
@@ -73,6 +85,12 @@ type movieFileElement struct {
 	Quality             *movieFileQualityElement `json:"quality"`
 	CustomFormatScore   *int                     `json:"customFormatScore"`
 	QualityCutoffNotMet *bool                    `json:"qualityCutoffNotMet"`
+
+	// Path is the absolute path of this movie's tracked file on the *arr's
+	// filesystem. Phase 11 only: the file report's tracked-file set is built
+	// from exactly this field, mapped through media_root_map. See
+	// movieListElement.Path for why absence is not warned about here.
+	Path *string `json:"path"`
 }
 
 // movieFileQualityElement mirrors the expected movieFile.quality.quality.name

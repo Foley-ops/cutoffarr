@@ -660,3 +660,191 @@ instances: []
 		}
 	}
 }
+
+// --- media_root_map (Phase 11) ----------------------------------------------
+//
+// Binding controller resolution 1: media_root_map absent means the file report
+// is OFF for that instance — the feature is opt-in per instance, so an existing
+// config written before Phase 11 existed must keep behaving exactly as it did
+// (no disk access of any kind). Present-but-invalid (non-map, empty key/value,
+// relative paths) is fatal at startup, the same "never guess, refuse instead"
+// posture every other typed config field in this file already has.
+
+func TestLoadConfig_MediaRootMapAbsentLeavesInstanceMapNil(t *testing.T) {
+	path := writeConfig(t, `
+instances:
+  - name: radarr-main
+    type: radarr
+    url: http://radarr:7878
+    api_key: key1
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	if len(cfg.Instances[0].MediaRootMap) != 0 {
+		t.Errorf("MediaRootMap = %v, want empty/nil when media_root_map is absent", cfg.Instances[0].MediaRootMap)
+	}
+}
+
+func TestLoadConfig_MediaRootMapHonorsExplicitMapping(t *testing.T) {
+	path := writeConfig(t, `
+instances:
+  - name: radarr-main
+    type: radarr
+    url: http://radarr:7878
+    api_key: key1
+    media_root_map:
+      /movies: /data/media/Movies
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	got := cfg.Instances[0].MediaRootMap
+	if got["/movies"] != "/data/media/Movies" {
+		t.Errorf("MediaRootMap = %v, want {/movies: /data/media/Movies}", got)
+	}
+}
+
+func TestLoadConfig_MediaRootMapEmptyMapIsValidAndTreatedAsAbsent(t *testing.T) {
+	// An explicit empty map has nothing to report on, so it is accepted rather
+	// than treated as a malformed value: functionally identical to omitting the
+	// key altogether (see filereport.go's off-vs-configured distinction).
+	path := writeConfig(t, `
+instances:
+  - name: radarr-main
+    type: radarr
+    url: http://radarr:7878
+    api_key: key1
+    media_root_map: {}
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	if len(cfg.Instances[0].MediaRootMap) != 0 {
+		t.Errorf("MediaRootMap = %v, want empty", cfg.Instances[0].MediaRootMap)
+	}
+}
+
+func TestLoadConfig_MediaRootMapMultipleRoots(t *testing.T) {
+	path := writeConfig(t, `
+instances:
+  - name: sonarr-main
+    type: sonarr
+    url: http://sonarr:8989
+    api_key: key1
+    media_root_map:
+      /tv_shows: /data/media/TV_Shows
+      /anime: /data/media/Anime
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	got := cfg.Instances[0].MediaRootMap
+	if got["/tv_shows"] != "/data/media/TV_Shows" || got["/anime"] != "/data/media/Anime" {
+		t.Errorf("MediaRootMap = %v, want both roots", got)
+	}
+}
+
+// TestLoadConfig_MediaRootMapNonMapIsFatal is the "non-map" half of resolution
+// 1's present-but-invalid rule. It needs no bespoke validation code at all:
+// rawInstance.MediaRootMap is typed map[string]string, so yaml.v3 already
+// refuses a scalar value there the same way it refuses a non-boolean
+// reverse_scan_remonitor above — this test pins that the existing decode
+// behavior really does cover this case rather than silently ignoring it.
+func TestLoadConfig_MediaRootMapNonMapIsFatal(t *testing.T) {
+	path := writeConfig(t, `
+instances:
+  - name: radarr-main
+    type: radarr
+    url: http://radarr:7878
+    api_key: key1
+    media_root_map: "/movies"
+`)
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("LoadConfig returned nil error, want a fatal error for a non-map media_root_map")
+	}
+	if !strings.Contains(err.Error(), "parsing yaml") {
+		t.Errorf("error %q should be surfaced as a yaml parse failure", err.Error())
+	}
+}
+
+func TestLoadConfig_MediaRootMapEmptyKeyIsFatal(t *testing.T) {
+	path := writeConfig(t, `
+instances:
+  - name: radarr-main
+    type: radarr
+    url: http://radarr:7878
+    api_key: key1
+    media_root_map:
+      "": /data/media/Movies
+`)
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("LoadConfig returned nil error, want a fatal error for an empty media_root_map key")
+	}
+	if !strings.Contains(err.Error(), "radarr-main") {
+		t.Errorf("error %q does not name the offending instance", err.Error())
+	}
+}
+
+func TestLoadConfig_MediaRootMapEmptyValueIsFatal(t *testing.T) {
+	path := writeConfig(t, `
+instances:
+  - name: radarr-main
+    type: radarr
+    url: http://radarr:7878
+    api_key: key1
+    media_root_map:
+      /movies: ""
+`)
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("LoadConfig returned nil error, want a fatal error for an empty media_root_map value")
+	}
+	if !strings.Contains(err.Error(), "radarr-main") {
+		t.Errorf("error %q does not name the offending instance", err.Error())
+	}
+}
+
+func TestLoadConfig_MediaRootMapRelativeArrPathIsFatal(t *testing.T) {
+	path := writeConfig(t, `
+instances:
+  - name: radarr-main
+    type: radarr
+    url: http://radarr:7878
+    api_key: key1
+    media_root_map:
+      movies: /data/media/Movies
+`)
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("LoadConfig returned nil error, want a fatal error for a relative media_root_map key")
+	}
+	if !strings.Contains(err.Error(), "movies") {
+		t.Errorf("error %q does not name the offending relative path", err.Error())
+	}
+}
+
+func TestLoadConfig_MediaRootMapRelativeDiskPathIsFatal(t *testing.T) {
+	path := writeConfig(t, `
+instances:
+  - name: radarr-main
+    type: radarr
+    url: http://radarr:7878
+    api_key: key1
+    media_root_map:
+      /movies: data/media/Movies
+`)
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("LoadConfig returned nil error, want a fatal error for a relative media_root_map value")
+	}
+	if !strings.Contains(err.Error(), "data/media/Movies") {
+		t.Errorf("error %q does not name the offending relative path", err.Error())
+	}
+}
