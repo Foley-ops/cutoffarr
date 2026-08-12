@@ -273,7 +273,7 @@ func TestUnmonitorSeason_DryRun_MakesNoWriteRequest(t *testing.T) {
 	fake := newSonarrWriterFake(t, sonarrWriterSeriesJSON, sonarrWriterEpisodesJSON)
 	logger, _ := newDecisionTestLogger(slog.LevelDebug)
 
-	written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, true, false)
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, true, false)
 	if err != nil {
 		t.Fatalf("unmonitorSeason returned error = %v, want nil", err)
 	}
@@ -311,7 +311,7 @@ func TestUnmonitorSeason_WriteMode_EpisodesFirstThenSeries(t *testing.T) {
 	fake := newSonarrWriterFake(t, sonarrWriterSeriesJSON, sonarrWriterEpisodesJSON)
 	logger, _ := newDecisionTestLogger(slog.LevelDebug)
 
-	written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
 	if err != nil {
 		t.Fatalf("unmonitorSeason returned error = %v, want nil", err)
 	}
@@ -362,7 +362,7 @@ func TestUnmonitorSeason_WriteMode_PutsFullObjectWithOnlyTheTargetSeasonChanged(
 	fake := newSonarrWriterFake(t, sonarrWriterSeriesJSON, sonarrWriterEpisodesJSON)
 	logger, _ := newDecisionTestLogger(slog.LevelInfo)
 
-	if _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false); err != nil {
+	if _, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false); err != nil {
 		t.Fatalf("unmonitorSeason returned error = %v, want nil", err)
 	}
 
@@ -466,7 +466,7 @@ func TestUnmonitorSeason_WriteMode_SendsUnescapedBytesForHTMLSensitiveCharacters
 	fake := newSonarrWriterFake(t, sonarrWriterSeriesJSON, sonarrWriterEpisodesJSON)
 	logger, _ := newDecisionTestLogger(slog.LevelInfo)
 
-	if _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false); err != nil {
+	if _, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false); err != nil {
 		t.Fatalf("unmonitorSeason returned error = %v", err)
 	}
 	for _, w := range fake.writes() {
@@ -510,7 +510,7 @@ func TestUnmonitorSeason_NoMonitoredEpisodesLeft_SkipsTheEpisodeCallOnly(t *test
 	fake := newSonarrWriterFake(t, sonarrWriterSeriesJSON, episodes)
 	logger, buf := newDecisionTestLogger(slog.LevelDebug)
 
-	written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
 	if err != nil {
 		t.Fatalf("unmonitorSeason returned error = %v, want nil", err)
 	}
@@ -538,7 +538,7 @@ func TestUnmonitorSeason_EpisodeMonitorRejected_NeverSendsTheSeriesPut(t *testin
 	fake.episodeMonitorStatus = http.StatusInternalServerError
 	logger, _ := newDecisionTestLogger(slog.LevelInfo)
 
-	written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
 	if written {
 		t.Error("written = true, want false: nothing was written")
 	}
@@ -565,7 +565,7 @@ func TestUnmonitorSeason_SeriesPutRejectedAfterEpisodes_NamesTheCompletedHalf(t 
 	fake.seriesPutStatus = http.StatusInternalServerError
 	logger, _ := newDecisionTestLogger(slog.LevelInfo)
 
-	written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
 	if written {
 		t.Error("written = true, want false: a confirmed write requires BOTH calls")
 	}
@@ -596,7 +596,7 @@ func TestUnmonitorSeason_SeriesEchoUnverifiable_IsNotAConfirmedWrite(t *testing.
 	fake.seriesPutEcho = &empty
 	logger, _ := newDecisionTestLogger(slog.LevelInfo)
 
-	written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
 	if written {
 		t.Error("written = true, want false: only a confirmed change may be counted as one")
 	}
@@ -614,7 +614,7 @@ func TestUnmonitorSeason_SeriesEchoSaysStillMonitored_IsAWriteError(t *testing.T
 	fake.seriesPutEcho = &echo
 	logger, _ := newDecisionTestLogger(slog.LevelInfo)
 
-	written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
 	if written {
 		t.Error("written = true, want false")
 	}
@@ -687,7 +687,7 @@ func TestUnmonitorSeason_SeriesEchoShapesThatCannotConfirm(t *testing.T) {
 			fake.seriesPutEcho = &echo
 			logger, _ := newDecisionTestLogger(slog.LevelInfo)
 
-			written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+			written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
 			if written {
 				t.Error("written = true, want false: only an echo this series confirmed may be counted as a write")
 			}
@@ -777,7 +777,7 @@ func TestUnmonitorSeason_EpisodeEchoDoesNotConfirm_WithholdsTheSeasonWrite(t *te
 			fake.episodeMonitorEcho = &echo
 			logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
-			written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+			written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
 			if written {
 				t.Error("written = true, want false")
 			}
@@ -854,7 +854,7 @@ func TestUnmonitorSeason_EpisodeMonitorBodyUnreadable_WithholdsTheSeasonWrite(t 
 	fake.episodeMonitorTruncated = true
 	logger, _ := newDecisionTestLogger(slog.LevelInfo)
 
-	written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
 	if written {
 		t.Error("written = true, want false")
 	}
@@ -881,7 +881,7 @@ func TestUnmonitorSeason_FreshPayloadCarriesExclusionTag_Refuses(t *testing.T) {
 	fake := newSonarrWriterFake(t, seriesJSON, sonarrWriterEpisodesJSON)
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
-	written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 42, true, false, false)
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 42, true, false, false)
 	if written {
 		t.Error("written = true, want false")
 	}
@@ -911,7 +911,7 @@ func TestUnmonitorSeason_FreshPayloadTagsUnverifiable_Refuses(t *testing.T) {
 			fake := newSonarrWriterFake(t, tc.seriesJSON, sonarrWriterEpisodesJSON)
 			logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
-			written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 42, true, false, false)
+			written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 42, true, false, false)
 			if written {
 				t.Error("written = true, want false")
 			}
@@ -940,7 +940,7 @@ func TestUnmonitorSeason_SeriesNoLongerMonitored_RefusesAsARace(t *testing.T) {
 	fake := newSonarrWriterFake(t, seriesJSON, sonarrWriterEpisodesJSON)
 	logger, _ := newDecisionTestLogger(slog.LevelInfo)
 
-	written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
 	if written {
 		t.Error("written = true, want false")
 	}
@@ -957,7 +957,7 @@ func TestUnmonitorSeason_SeasonAlreadyUnmonitored_RefusesAsARace(t *testing.T) {
 	fake := newSonarrWriterFake(t, seriesJSON, sonarrWriterEpisodesJSON)
 	logger, _ := newDecisionTestLogger(slog.LevelInfo)
 
-	written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
 	if written {
 		t.Error("written = true, want false")
 	}
@@ -989,7 +989,7 @@ func TestUnmonitorSeason_SeasonMonitoredUnreadable_Refuses(t *testing.T) {
 			fake := newSonarrWriterFake(t, seriesJSON, sonarrWriterEpisodesJSON)
 			logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
-			written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+			written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
 			if written {
 				t.Error("written = true, want false")
 			}
@@ -1026,7 +1026,7 @@ func TestUnmonitorSeason_SeasonVanishedOrDuplicated_Refuses(t *testing.T) {
 			fake := newSonarrWriterFake(t, tc.seriesJSON, sonarrWriterEpisodesJSON)
 			logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
-			written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+			written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
 			if written {
 				t.Error("written = true, want false")
 			}
@@ -1055,7 +1055,7 @@ func TestUnmonitorSeason_SeasonStartedAiringBeforeTheWrite_Refuses(t *testing.T)
 	fake := newSonarrWriterFake(t, sonarrWriterSeriesJSON, episodes)
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
-	written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
 	if written {
 		t.Error("written = true, want false")
 	}
@@ -1082,7 +1082,7 @@ func TestUnmonitorSeason_UndatedEpisodeAtWriteTime_Refuses(t *testing.T) {
 	fake := newSonarrWriterFake(t, sonarrWriterSeriesJSON, episodes)
 	logger, _ := newDecisionTestLogger(slog.LevelInfo)
 
-	written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
 	if written {
 		t.Error("written = true, want false")
 	}
@@ -1107,7 +1107,7 @@ func TestUnmonitorSeason_FreshEpisodeSetIncomplete_Refuses(t *testing.T) {
 	fake := newSonarrWriterFake(t, sonarrWriterSeriesJSON, episodes)
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
-	written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
 	if written {
 		t.Error("written = true, want false")
 	}
@@ -1131,7 +1131,7 @@ func TestUnmonitorSeason_FreshGetIdMismatch_RefusesToWrite(t *testing.T) {
 	fake := newSonarrWriterFake(t, seriesJSON, sonarrWriterEpisodesJSON)
 	logger, _ := newDecisionTestLogger(slog.LevelInfo)
 
-	written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
 	if written {
 		t.Error("written = true, want false")
 	}
@@ -1150,7 +1150,7 @@ func TestUnmonitorSeason_NeverTouchesAnyOtherEndpoint(t *testing.T) {
 	fake := newSonarrWriterFake(t, sonarrWriterSeriesJSON, sonarrWriterEpisodesJSON)
 	logger, _ := newDecisionTestLogger(slog.LevelInfo)
 
-	if _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false); err != nil {
+	if _, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false); err != nil {
 		t.Fatalf("unmonitorSeason returned error = %v", err)
 	}
 	allowed := map[string]bool{
@@ -1174,7 +1174,7 @@ func TestUnmonitorSeason_TwoSeasonsOfOneSeries_EachWriteChangesOnlyItsOwn(t *tes
 	logger, _ := newDecisionTestLogger(slog.LevelInfo)
 
 	for _, season := range []int{1, 2} {
-		if _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, season, 0, false, false, false); err != nil {
+		if _, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, season, 0, false, false, false); err != nil {
 			t.Fatalf("season %d: unmonitorSeason returned error = %v", season, err)
 		}
 	}
@@ -1210,7 +1210,35 @@ func TestUnmonitorSeason_TwoSeasonsOfOneSeries_EachWriteChangesOnlyItsOwn(t *tes
 	}
 }
 
-// --- the write gate's narrow recovery allowance ----------------------------
+// --- the recovery path and its own gate ------------------------------------
+//
+// Binding controller ruling (Phase 7 final): recovery is a SEPARATE, named
+// write path with its OWN gate, not an allowance inside the ordinary one. A
+// pending season qualifies as a recovery iff the FRESH pre-write data shows a
+// still-monitored, complete-on-disk, fully-aired, tag-clean season every one of
+// whose episodes is already unmonitored — so only the season flag is left to
+// write, and the write cannot strand anything. The gate matrix these tests
+// walk row by row:
+//
+//	                   passed+evidence   inconclusive   FAILED / unrecognized
+//	ordinary write     written           withheld       withheld
+//	recovery write     recovered         recovered      withheld
+//
+// plus the dry-run rehearsal, which writes nothing in every cell.
+
+// logLineContaining returns the first log line containing want. Unlike
+// reportLineWithMsg it matches a substring rather than a whole msg= field, so
+// it can find a line by a message whose spaces slog quotes.
+func logLineContaining(t *testing.T, out, want string) string {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, want) {
+			return line
+		}
+	}
+	t.Fatalf("expected a log line containing %q:\n%s", want, out)
+	return ""
+}
 
 // sonarrRecoveryFixture builds the shape a partially completed write leaves
 // behind, plus an ordinary pending season beside it: series 3 season 1 is
@@ -1239,40 +1267,118 @@ func sonarrRecoveryDecisions() []seasonDecision {
 	}
 }
 
-// TestRunSonarrWritePass_GateBlocked_RecoverySeasonIsStillWritten pins the
-// explicitly named allowance that replaced Phase 7's widening of what the
-// cross-check counts as evidence.
+// TestRunSonarrWritePass_RecoveryUnderPassedGate_IsCountedSeparately is the
+// matrix's top-left cell, and it is the one the ruling changed most: a
+// recovery is a property of the SEASON (decided from fresh data), not of the
+// gate it went through. With the ordinary gate wide open, the season whose
+// episodes are all already unmonitored is still a recovery — counted as
+// recoveredWrites, never as unmonitored, and warned about by name — while the
+// ordinary season beside it is an ordinary write.
 //
-// With cross-check shape (a) whole, a would-unmonitor season whose episodes are
-// ALL unmonitored has nothing comparable left in it, so it is unverifiable by
-// construction and the gate can never authorize its retry — and that is exactly
-// the state a partially completed write leaves behind. The allowance finishes
-// that one season because unmonitoring it cannot strand anything (Sonarr cannot
-// grab an unmonitored episode whatever the season flag says). It must not open
-// the gate for anything else.
-func TestRunSonarrWritePass_GateBlocked_RecoverySeasonIsStillWritten(t *testing.T) {
+// Folding the two together is exactly what the counter exists to prevent: a
+// summary reading unmonitored=2 would claim two seasons were taken out of
+// circulation by this cycle's decisions, when one of them was finished off from
+// a previous cycle's half-done write.
+func TestRunSonarrWritePass_RecoveryUnderPassedGate_IsCountedSeparately(t *testing.T) {
 	fake := sonarrRecoveryFixture(t)
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
-	// The shape an instance recovering from a partial write really produces:
-	// nothing could be verified, so the gate is shut.
-	cc := crossCheckResult{status: crossCheckStatusInconclusive, unverifiable: 1, writeUnverifiable: 1}
-	unmonitored, writeErrors, echoUnverified, refused, withheld := runSonarrWritePass(
+	// An explicit pass with would-unmonitor evidence: the ordinary gate is OPEN.
+	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 2, writeVerified: 2}
+	unmonitored, recovered, writeErrors, echoUnverified, refused, withheld := runSonarrWritePass(
 		context.Background(), logger, fake.client(), fake.instance(), sonarrRecoveryDecisions(), cc, 0, false, false)
 
-	if unmonitored != 1 || withheld != 1 {
-		t.Fatalf("unmonitored/withheld = %d/%d, want 1/1 — the recovery season finishes, the ordinary one stays withheld:\n%s", unmonitored, withheld, buf.String())
+	out := buf.String()
+	if unmonitored != 1 || recovered != 1 {
+		t.Fatalf("unmonitored/recovered = %d/%d, want 1/1 — a recovery completion is never counted as an ordinary unmonitor:\n%s", unmonitored, recovered, out)
+	}
+	if writeErrors+echoUnverified+refused+withheld != 0 {
+		t.Errorf("writeErrors/echoUnverified/refused/withheld = %d/%d/%d/%d, want all 0:\n%s", writeErrors, echoUnverified, refused, withheld, out)
+	}
+	if unmonitored+recovered+writeErrors+echoUnverified+refused+withheld != 2 {
+		t.Errorf("the accounting identity must hold over both pending seasons:\n%s", out)
+	}
+
+	// The recovery has its own WARN, naming its season.
+	recoveryLine := logLineContaining(t, out, "completing a previously partial season unmonitor")
+	if !strings.Contains(recoveryLine, "level=WARN") {
+		t.Errorf("a recovery is warned about, not merely logged:\n%s", recoveryLine)
+	}
+	if !strings.Contains(recoveryLine, "season=1") || !strings.Contains(recoveryLine, "seriesId=3") {
+		t.Errorf("the recovery line must name WHICH season it completed:\n%s", recoveryLine)
+	}
+	// Nothing was bypassed: the ordinary gate was open, and the absence of
+	// gateBlocked= is how a reader tells that apart from a recovery that ran
+	// while the gate was shut.
+	if strings.Contains(recoveryLine, "gateBlocked=") {
+		t.Errorf("the ordinary gate was open, so no authorization was bypassed:\n%s", recoveryLine)
+	}
+	if strings.Contains(out, "writes withheld for this instance") {
+		t.Errorf("an open gate logs no withheld line at all:\n%s", out)
+	}
+
+	// The ordinary season's line stays exactly what every other Sonarr write
+	// logs, and carries no recovery marker.
+	ordinary := logLineContaining(t, out, "msg=unmonitor ")
+	if !strings.Contains(ordinary, "season=2") {
+		t.Errorf("the ordinary write's line must be season 2's:\n%s", ordinary)
+	}
+	if strings.Contains(ordinary, "recovery=") {
+		t.Errorf("an ordinary write is never marked recovery:\n%s", ordinary)
+	}
+
+	// The recovery really is the season PUT alone: there was nothing left to
+	// unmonitor at the episode level, so exactly one episode call (season 2's)
+	// may have gone out.
+	episodeCalls := 0
+	for _, w := range fake.writes() {
+		if w.path == episodeMonitorPath {
+			episodeCalls++
+			if !strings.Contains(string(w.body), "200") {
+				t.Errorf("the only episode call may be the ordinary season's: %s", w.body)
+			}
+		}
+	}
+	if episodeCalls != 1 {
+		t.Errorf("episode calls = %d, want 1 (the recovery season has no monitored episode left): %+v", episodeCalls, fake.writes())
+	}
+}
+
+// TestRunSonarrWritePass_RecoveryUnderInconclusiveGate_CompletesWhileTheRestIsWithheld
+// is the matrix's middle column, and the whole reason the recovery path has a
+// gate of its own: an instance recovering from a partial write reports
+// inconclusive BY CONSTRUCTION (the half-written season's episodes are all
+// unmonitored, so cross-check shape (a) excludes every one of them and nothing
+// remains to verify). If the ordinary gate governed the retry, the gate would
+// block its own convergence forever.
+func TestRunSonarrWritePass_RecoveryUnderInconclusiveGate_CompletesWhileTheRestIsWithheld(t *testing.T) {
+	fake := sonarrRecoveryFixture(t)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	// The shape an instance recovering from a partial write really produces.
+	cc := crossCheckResult{status: crossCheckStatusInconclusive, unverifiable: 1, writeUnverifiable: 1}
+	unmonitored, recovered, writeErrors, echoUnverified, refused, withheld := runSonarrWritePass(
+		context.Background(), logger, fake.client(), fake.instance(), sonarrRecoveryDecisions(), cc, 0, false, false)
+
+	out := buf.String()
+	if unmonitored != 0 || recovered != 1 || withheld != 1 {
+		t.Fatalf("unmonitored/recovered/withheld = %d/%d/%d, want 0/1/1 — the recovery finishes, the ordinary season stays withheld:\n%s", unmonitored, recovered, withheld, out)
 	}
 	if writeErrors+echoUnverified+refused != 0 {
-		t.Errorf("writeErrors/echoUnverified/refused = %d/%d/%d, want 0/0/0", writeErrors, echoUnverified, refused)
+		t.Errorf("writeErrors/echoUnverified/refused = %d/%d/%d, want 0/0/0:\n%s", writeErrors, echoUnverified, refused, out)
 	}
-	if unmonitored+writeErrors+echoUnverified+refused+withheld != 2 {
-		t.Errorf("the accounting identity must still hold over both pending seasons:\n%s", buf.String())
+	if unmonitored+recovered+writeErrors+echoUnverified+refused+withheld != 2 {
+		t.Errorf("the accounting identity must still hold over both pending seasons:\n%s", out)
 	}
 
 	// Season 2 — the ordinary pending season — must not have been written by
-	// the same allowance that let season 1 through.
+	// the path that let season 1 through, and its episodes must not have been
+	// touched either.
 	for _, w := range fake.writes() {
+		if w.path == episodeMonitorPath {
+			t.Errorf("no episode call may be sent under a shut ordinary gate: %+v", w)
+			continue
+		}
 		var payload map[string]json.RawMessage
 		if err := json.Unmarshal(w.body, &payload); err != nil {
 			continue
@@ -1286,92 +1392,151 @@ func TestRunSonarrWritePass_GateBlocked_RecoverySeasonIsStillWritten(t *testing.
 		}
 		for _, s := range seasons {
 			if s.SeasonNumber == 2 && !s.Monitored {
-				t.Errorf("the allowance wrote a season it does not name; only the recovery season may pass a shut gate: %s", w.body)
+				t.Errorf("only a recovery season may be written while the ordinary gate is shut: %s", w.body)
 			}
 		}
 	}
-	// No episode call: the recovery season has no monitored episode left, so
-	// the retry is the season PUT alone.
-	for _, w := range fake.writes() {
-		if w.path == episodeMonitorPath {
-			t.Errorf("the recovery retry must not send an episode call: %+v", w)
-		}
+
+	// The write that happened without ordinary authorization names itself on
+	// its OWN line: an instance-level count says how many, never which.
+	recoveryLine := logLineContaining(t, out, "completing a previously partial season unmonitor")
+	if !strings.Contains(recoveryLine, "season=1") {
+		t.Errorf("the recovery line must name WHICH season it completed:\n%s", recoveryLine)
 	}
-	if !strings.Contains(buf.String(), "recoveryWrites=1") {
-		t.Errorf("the blocked-gate line must say how many seasons the allowance admitted:\n%s", buf.String())
+	if !strings.Contains(recoveryLine, "gateBlocked=") {
+		t.Errorf("a recovery that ran while the ordinary gate was shut must name the authorization it did not have:\n%s", recoveryLine)
 	}
-	// REVIEW FIX (round 3): the instance-level count says how many, never
-	// which. The one write in this project that happens without cross-check
-	// authorization must be identifiable from its OWN line, or a run with
-	// three allowance writes among eight pending seasons proves that three
-	// happened and nothing more.
-	unmonitorLine := ""
-	for _, line := range strings.Split(buf.String(), "\n") {
-		if strings.Contains(line, "msg=unmonitor ") {
-			unmonitorLine = line
-		}
+	if !strings.Contains(recoveryLine, "recoveryReason=") {
+		t.Errorf("the recovery line must carry the justification for writing anyway:\n%s", recoveryLine)
 	}
-	if unmonitorLine == "" {
-		t.Fatalf("expected an msg=unmonitor line for the recovery season:\n%s", buf.String())
+
+	// The gate line reports what the gate ACTUALLY withheld and what the
+	// recovery path ACTUALLY completed — facts, because it is written after the
+	// pass rather than predicted before it.
+	gateLine := logLineContaining(t, out, "writes withheld for this instance")
+	if !strings.Contains(gateLine, "withheldWrites=1") {
+		t.Errorf("the gate line must report the writes it really withheld (1 of the 2 pending):\n%s", gateLine)
 	}
-	if !strings.Contains(unmonitorLine, "recovery=true") {
-		t.Errorf("the unmonitor line for an allowance write must mark itself recovery=true:\n%s", unmonitorLine)
+	if !strings.Contains(gateLine, "recoveredWrites=1") {
+		t.Errorf("the gate line must report what the recovery path completed in spite of it:\n%s", gateLine)
 	}
-	if !strings.Contains(unmonitorLine, "gateBlocked=") {
-		t.Errorf("the unmonitor line for an allowance write must name the gate reason it bypassed:\n%s", unmonitorLine)
-	}
-	if !strings.Contains(unmonitorLine, "recoveryReason=") {
-		t.Errorf("the unmonitor line for an allowance write must carry the allowance's justification:\n%s", unmonitorLine)
-	}
-	if !strings.Contains(unmonitorLine, "season=1") {
-		t.Errorf("the allowance write's line must name WHICH season it wrote:\n%s", unmonitorLine)
+	// F7: a shut gate authorized none of these writes, so nothing may claim
+	// writes "proceeded" on the strength of the cross-check it just failed.
+	if strings.Contains(out, "writes proceeding on a partially verified cross-check") {
+		t.Errorf("a shut gate must not also report writes proceeding on its own sample:\n%s", out)
 	}
 }
 
-// TestRunSonarrWritePass_DryRun_GateBlocked_RecoverySeasonIsRehearsedNotWritten
-// is the §2.1 half of the allowance, and it is the one that most needed a test.
+// TestRunSonarrWritePass_RecoveryUnderFailedOrUnrecognizedCrossCheck_IsBlocked
+// is the matrix's right-hand column: a disagreement stops this project before
+// writes, and that rule has no exceptions — a data layer with proven
+// disagreements taints every read a decision rests on, recovery-shaped or not.
+// An unrecognized status is a bug signal and is treated identically.
 //
-// The recovery allowance is the ONLY path in this project that reaches
-// unmonitorSeason without cross-check authorization; it deliberately bypasses
-// one gate, which makes it the likeliest place for a future edit to hoist a
-// write above the OTHER gate too. Everything that keeps the dry-run promise on
-// this path lives inside unmonitorSeason, and nothing asserted that the promise
-// actually holds end-to-end here: the brief's "dry-run zero-write guarantee"
-// would have been false on the one write path that matters most and the suite
-// would have stayed green.
+// Nothing is even FETCHED in this cell: with both gates shut the pass returns
+// exactly where the Radarr twin does.
+func TestRunSonarrWritePass_RecoveryUnderFailedOrUnrecognizedCrossCheck_IsBlocked(t *testing.T) {
+	for _, status := range []string{crossCheckStatusFailed, "some-future-status"} {
+		t.Run(status, func(t *testing.T) {
+			fake := sonarrRecoveryFixture(t)
+			logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+			cc := crossCheckResult{status: status, unverifiable: 1, writeUnverifiable: 1}
+			unmonitored, recovered, _, _, _, withheld := runSonarrWritePass(
+				context.Background(), logger, fake.client(), fake.instance(), sonarrRecoveryDecisions(), cc, 0, false, false)
+
+			out := buf.String()
+			if unmonitored != 0 || recovered != 0 || withheld != 2 {
+				t.Errorf("unmonitored/recovered/withheld = %d/%d/%d, want 0/0/2:\n%s", unmonitored, recovered, withheld, out)
+			}
+			if reqs := fake.all(); len(reqs) != 0 {
+				t.Errorf("a %s cross-check must not even READ, let alone write: %+v", status, reqs)
+			}
+			gateLine := logLineContaining(t, out, "writes withheld for this instance")
+			if !strings.Contains(gateLine, "the recovery path is shut too") {
+				t.Errorf("the gate line must say the recovery path was blocked as well, and why:\n%s", gateLine)
+			}
+			if !strings.Contains(gateLine, "withheldWrites=2") || !strings.Contains(gateLine, "recoveredWrites=0") {
+				t.Errorf("the gate line must account for every pending season:\n%s", gateLine)
+			}
+		})
+	}
+}
+
+// TestRunSonarrWritePass_NonRecoverySeasonUnderInconclusiveGate_IsWithheldUnfetched
+// is the matrix's ordinary/inconclusive cell on its own, with no recovery
+// season in the pass to carry it: an ordinary would-unmonitor season under a
+// shut ordinary gate is withheld, and — since the recovery path is the only
+// one open and this season is not a candidate for it — nothing is fetched for
+// it either.
+func TestRunSonarrWritePass_NonRecoverySeasonUnderInconclusiveGate_IsWithheldUnfetched(t *testing.T) {
+	fake := sonarrRecoveryFixture(t)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	ordinaryOnly := sonarrRecoveryDecisions()[1:]
+	cc := crossCheckResult{status: crossCheckStatusInconclusive, unverifiable: 1, writeUnverifiable: 1}
+	unmonitored, recovered, writeErrors, echoUnverified, refused, withheld := runSonarrWritePass(
+		context.Background(), logger, fake.client(), fake.instance(), ordinaryOnly, cc, 0, false, false)
+
+	out := buf.String()
+	if unmonitored != 0 || recovered != 0 || withheld != 1 {
+		t.Fatalf("unmonitored/recovered/withheld = %d/%d/%d, want 0/0/1:\n%s", unmonitored, recovered, withheld, out)
+	}
+	if writeErrors+echoUnverified+refused != 0 {
+		t.Errorf("writeErrors/echoUnverified/refused = %d/%d/%d, want 0/0/0:\n%s", writeErrors, echoUnverified, refused, out)
+	}
+	if reqs := fake.all(); len(reqs) != 0 {
+		t.Errorf("a season the recovery path cannot admit is withheld without a fetch: %+v", reqs)
+	}
+	gateLine := logLineContaining(t, out, "writes withheld for this instance")
+	if !strings.Contains(gateLine, "withheldWrites=1") || !strings.Contains(gateLine, "recoveredWrites=0") {
+		t.Errorf("the gate line must account for the pending season:\n%s", gateLine)
+	}
+}
+
+// TestRunSonarrWritePass_DryRun_GateBlocked_RecoveryIsRehearsedNotWritten is
+// §2.1 on the one path that bypasses the ordinary gate, and it is the test that
+// most needed writing.
 //
-// So: a SHUT gate, an ADMITTED recovery season, dryRun=true. Both seasons must
-// be counted withheld, the catch-all writes() must be empty, and the
-// blocked-gate line must not claim a write it did not make.
-func TestRunSonarrWritePass_DryRun_GateBlocked_RecoverySeasonIsRehearsedNotWritten(t *testing.T) {
+// The recovery path is the only one in this project that reaches
+// unmonitorSeason without ordinary cross-check authorization; it deliberately
+// runs where the ordinary gate says no, which makes it the likeliest place for
+// a future edit to hoist a write above the OTHER gate too. Everything that
+// keeps the dry-run promise here lives inside unmonitorSeason.
+//
+// So: a SHUT ordinary gate, an admitted recovery season, dryRun=true. Both
+// seasons must end withheld, the catch-all writes() must be empty, the fresh
+// GETs must still have happened (a rehearsal that never ran would satisfy
+// "zero writes" while proving nothing), and no line may claim a write.
+func TestRunSonarrWritePass_DryRun_GateBlocked_RecoveryIsRehearsedNotWritten(t *testing.T) {
 	fake := sonarrRecoveryFixture(t)
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	// Byte-identical to the write-mode test above except for the last argument.
 	cc := crossCheckResult{status: crossCheckStatusInconclusive, unverifiable: 1, writeUnverifiable: 1}
-	unmonitored, writeErrors, echoUnverified, refused, withheld := runSonarrWritePass(
+	unmonitored, recovered, writeErrors, echoUnverified, refused, withheld := runSonarrWritePass(
 		context.Background(), logger, fake.client(), fake.instance(), sonarrRecoveryDecisions(), cc, 0, false, true)
 
+	out := buf.String()
 	if writes := fake.writes(); len(writes) != 0 {
-		t.Errorf("a dry run must send ZERO write requests of any method to any path, even for an allowance season: %+v\n%s", writes, buf.String())
+		t.Errorf("a dry run must send ZERO write requests of any method to any path, even for a recovery season: %+v\n%s", writes, out)
 	}
-	if unmonitored != 0 {
-		t.Errorf("unmonitored = %d, want 0 — a rehearsal unmonitors nothing:\n%s", unmonitored, buf.String())
+	if unmonitored != 0 || recovered != 0 {
+		t.Errorf("unmonitored/recovered = %d/%d, want 0/0 — a rehearsal completes nothing:\n%s", unmonitored, recovered, out)
 	}
 	if withheld != 2 {
-		t.Errorf("withheld = %d, want 2 — the allowance season is withheld at unmonitorSeason's own §2.1 gates, exactly like the ordinary one:\n%s", withheld, buf.String())
+		t.Errorf("withheld = %d, want 2 — the recovery season is withheld at unmonitorSeason's own §2.1 gates, exactly like the ordinary one:\n%s", withheld, out)
 	}
 	if writeErrors+echoUnverified+refused != 0 {
-		t.Errorf("writeErrors/echoUnverified/refused = %d/%d/%d, want 0/0/0:\n%s", writeErrors, echoUnverified, refused, buf.String())
+		t.Errorf("writeErrors/echoUnverified/refused = %d/%d/%d, want 0/0/0:\n%s", writeErrors, echoUnverified, refused, out)
 	}
-	if unmonitored+writeErrors+echoUnverified+refused+withheld != 2 {
-		t.Errorf("the accounting identity must hold over both pending seasons in dry-run too:\n%s", buf.String())
+	if unmonitored+recovered+writeErrors+echoUnverified+refused+withheld != 2 {
+		t.Errorf("the accounting identity must hold over both pending seasons in dry-run too:\n%s", out)
 	}
 
-	out := buf.String()
-	// The rehearsal is REAL: the allowance season was admitted and its fresh
-	// GETs went out. Without this, "zero writes" would also be satisfied by an
-	// allowance that never ran at all, which would prove nothing about the gate.
+	// The rehearsal is REAL: the recovery season was admitted and its fresh
+	// GETs went out. Without this, "zero writes" would also be satisfied by a
+	// recovery path that never ran at all.
 	sawSeriesGet, sawEpisodeGet := false, false
 	for _, r := range fake.all() {
 		if r.method != http.MethodGet {
@@ -1388,138 +1553,116 @@ func TestRunSonarrWritePass_DryRun_GateBlocked_RecoverySeasonIsRehearsedNotWritt
 		t.Errorf("the dry-run rehearsal must still take the fresh look at the world (series=%t episode=%t):\n%+v", sawSeriesGet, sawEpisodeGet, fake.all())
 	}
 
-	// No write happened, so no write may be reported. In write mode this line
-	// is the allowance's per-season audit trail; in dry-run its absence is the
-	// assertion.
+	// No write happened, so no line may report one.
 	if strings.Contains(out, "msg=unmonitor ") {
 		t.Errorf("a dry run must not log a completed unmonitor:\n%s", out)
 	}
-	if strings.Contains(out, "recovery=true") {
-		t.Errorf("a dry run must not mark an allowance write that never happened:\n%s", out)
+	if strings.Contains(out, "completing a previously partial season unmonitor") {
+		t.Errorf("a dry run must not report a recovery that never happened:\n%s", out)
 	}
 
-	blocked := ""
-	for _, line := range strings.Split(out, "\n") {
-		if strings.Contains(line, "cross-check gate shut") {
-			blocked = line
+	gateLine := logLineContaining(t, out, "writes withheld for this instance")
+	if !strings.Contains(gateLine, "dryRun=true") {
+		t.Errorf("the gate line must say which mode it is in:\n%s", gateLine)
+	}
+	// Both numbers are facts about this pass, and both agree with the summary's
+	// counters of the same names — the previous shape had to rename them in
+	// dry-run to stop them claiming writes that were never sent.
+	if !strings.Contains(gateLine, "withheldWrites=2") {
+		t.Errorf("in dry-run every pending season ends withheld, and this line must say so:\n%s", gateLine)
+	}
+	if !strings.Contains(gateLine, "recoveredWrites=0") {
+		t.Errorf("a rehearsal completes no recovery, and the line must not imply one:\n%s", gateLine)
+	}
+}
+
+// TestUnmonitorSeason_RecoveryVerdictComesFromTheFreshData proves where the
+// recovery verdict is decided. The decision handed in says nothing at all here
+// — unmonitorSeason is called directly — and the fresh /episode read is what
+// makes this season a recovery: every episode already unmonitored, so the write
+// is the season PUT alone and the function says so on its way out.
+func TestUnmonitorSeason_RecoveryVerdictComesFromTheFreshData(t *testing.T) {
+	fake := sonarrRecoveryFixture(t)
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+
+	written, recovery, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	if err != nil {
+		t.Fatalf("unmonitorSeason returned error = %v, want nil:\n%s", err, buf.String())
+	}
+	if !written || !recovery {
+		t.Fatalf("written/recovery = %t/%t, want true/true: a season whose every episode is already unmonitored is a recovery whatever the caller believed:\n%s", written, recovery, buf.String())
+	}
+	for _, w := range fake.writes() {
+		if w.path == episodeMonitorPath {
+			t.Errorf("a recovery is the season PUT alone; there is no monitored episode to write: %+v", w)
 		}
 	}
-	if blocked == "" {
-		t.Fatalf("expected the blocked-gate line:\n%s", out)
+
+	// The ordinary shape of the same fixture is NOT a recovery, which is what
+	// makes the verdict discriminating rather than always-true.
+	ordinary := newSonarrWriterFake(t, sonarrWriterSeriesJSON, sonarrWriterEpisodesJSON)
+	written, recovery, err = unmonitorSeason(context.Background(), logger, ordinary.client(), ordinary.instance(), 3, 1, 0, false, false, false)
+	if err != nil || !written {
+		t.Fatalf("written/err = %t/%v, want true/nil", written, err)
 	}
-	if !strings.Contains(blocked, "dryRun=true") {
-		t.Errorf("the blocked-gate line must say which mode it is in:\n%s", blocked)
-	}
-	// The message claimed "writing ONLY the season(s) ..." and counted
-	// recoveryWrites=1 in dry-run. Both are untrue in that mode: nothing is
-	// written. An operator reading a rehearsal log must never be told a write
-	// happened, least of all on the one path that bypasses the cross-check.
-	if strings.Contains(blocked, "writing ONLY") {
-		t.Errorf("the blocked-gate line claims a write this dry run never made:\n%s", blocked)
-	}
-	if strings.Contains(blocked, "recoveryWrites=") {
-		t.Errorf("a rehearsal makes no recovery WRITES; the count must name what was admitted:\n%s", blocked)
-	}
-	if !strings.Contains(blocked, "dry-run") {
-		t.Errorf("the blocked-gate line must mark itself a rehearsal:\n%s", blocked)
-	}
-	// The allowance still ADMITTED the season — the rehearsal is real, which
-	// the fresh GETs above prove — so the count is of admissions, not writes.
-	if !strings.Contains(blocked, "recoveryAdmitted=1") {
-		t.Errorf("the blocked-gate line must say how many seasons the allowance admitted:\n%s", blocked)
-	}
-	// In dry-run every pending season ends withheld, so this line must not
-	// reuse the summary's counter name for the gate's own smaller number: a
-	// reader seeing withheldWrites=1 here and withheldWrites=2 in the summary
-	// has been told two different things by the same word.
-	if strings.Contains(blocked, " withheldWrites=") {
-		t.Errorf("the blocked-gate line must not reuse the summary's withheldWrites for a different number (the summary reports %d):\n%s", withheld, blocked)
-	}
-	if !strings.Contains(blocked, "gateWithheldWrites=1") {
-		t.Errorf("the blocked-gate line must still say how many seasons the GATE itself withheld:\n%s", blocked)
+	if recovery {
+		t.Error("recovery = true for a season with monitored episodes: the verdict must be the fresh data's, not a constant")
 	}
 }
 
-// TestRunSonarrWritePass_GateOpen_OrdinaryWriteIsNeverMarkedRecovery is the
-// other half of the marker's meaning. recovery=true says "this write bypassed
-// the cross-check gate" — NOT "this season matched the allowance's signature".
-// With the gate open, the same season 1 whose episodes are all unmonitored is
-// an ordinary, fully authorized write, and its line must be
-// indistinguishable from any other Sonarr write (and from the Radarr twin's).
-// Without this, a reader who greps recovery=true still could not tell an
-// unauthorized write from an authorized one.
-func TestRunSonarrWritePass_GateOpen_OrdinaryWriteIsNeverMarkedRecovery(t *testing.T) {
-	fake := sonarrRecoveryFixture(t)
-	logger, buf := newDecisionTestLogger(slog.LevelInfo)
-
-	// An explicit pass with would-unmonitor evidence: the gate is OPEN.
-	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 2, writeVerified: 2}
-	unmonitored, writeErrors, echoUnverified, refused, withheld := runSonarrWritePass(
-		context.Background(), logger, fake.client(), fake.instance(), sonarrRecoveryDecisions(), cc, 0, false, false)
-
-	if unmonitored != 2 {
-		t.Fatalf("unmonitored = %d, want 2 (an open gate writes both pending seasons):\n%s", unmonitored, buf.String())
-	}
-	if writeErrors+echoUnverified+refused+withheld != 0 {
-		t.Errorf("writeErrors/echoUnverified/refused/withheld = %d/%d/%d/%d, want all 0", writeErrors, echoUnverified, refused, withheld)
-	}
-	if strings.Contains(buf.String(), "recovery=true") {
-		t.Errorf("a gate-authorized write must never carry the allowance marker:\n%s", buf.String())
-	}
-	if strings.Contains(buf.String(), "recoveryWrites=") {
-		t.Errorf("an open gate logs no blocked-gate line at all:\n%s", buf.String())
-	}
-}
-
-// TestRunSonarrWritePass_CrossCheckFailed_AllowsNoRecoveryWrite: a
-// disagreement stops this project before writes, and that rule has no
-// exceptions. The same fixture that writes under an inconclusive cross-check
-// must write NOTHING under a failed one.
-func TestRunSonarrWritePass_CrossCheckFailed_AllowsNoRecoveryWrite(t *testing.T) {
-	for _, status := range []string{crossCheckStatusFailed, "some-future-status"} {
-		t.Run(status, func(t *testing.T) {
-			fake := sonarrRecoveryFixture(t)
-			logger, buf := newDecisionTestLogger(slog.LevelInfo)
-
-			cc := crossCheckResult{status: status, unverifiable: 1, writeUnverifiable: 1}
-			unmonitored, _, _, _, withheld := runSonarrWritePass(
-				context.Background(), logger, fake.client(), fake.instance(), sonarrRecoveryDecisions(), cc, 0, false, false)
-
-			if unmonitored != 0 || withheld != 2 {
-				t.Errorf("unmonitored/withheld = %d/%d, want 0/2:\n%s", unmonitored, withheld, buf.String())
-			}
-			if writes := fake.writes(); len(writes) != 0 {
-				t.Errorf("a %s cross-check must write nothing at all, got %+v", status, writes)
-			}
-		})
-	}
-}
-
-// TestUnmonitorSeason_RecoveryOnly_MonitoredEpisodeAtWriteTime_Refuses is what
-// keeps the allowance narrow at the moment of consequence. The allowance is
-// granted on decision-time data; the write path re-verifies it against its own
-// fresh, complete, fully-validated episode set. A season that has regained a
-// monitored episode since is an ORDINARY write, and an ordinary write needs the
-// ordinary gate — which for this instance is shut.
-func TestUnmonitorSeason_RecoveryOnly_MonitoredEpisodeAtWriteTime_Refuses(t *testing.T) {
+// TestUnmonitorSeason_RecoveryRequired_MonitoredEpisodeAtWriteTime_Refuses is
+// what keeps the recovery path narrow at the moment of consequence. The path
+// admits a season on decision-time evidence; the fresh data is the authority.
+// A season that has regained a monitored episode since is an ORDINARY write,
+// and an ordinary write needs the ordinary gate — which, whenever this
+// precondition is being enforced, is shut.
+func TestUnmonitorSeason_RecoveryRequired_MonitoredEpisodeAtWriteTime_Refuses(t *testing.T) {
 	fake := newSonarrWriterFake(t, sonarrWriterSeriesJSON, sonarrWriterEpisodesJSON)
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
-	written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, true)
-	if written {
-		t.Error("written = true, want false")
+	written, recovery, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, true)
+	if written || recovery {
+		t.Errorf("written/recovery = %t/%t, want false/false", written, recovery)
 	}
-	if !errors.Is(err, errRecoveryAllowanceViolated) {
-		t.Fatalf("err = %v, want an errRecoveryAllowanceViolated-wrapped error", err)
+	if !errors.Is(err, errNotRecoveryAtWrite) {
+		t.Fatalf("err = %v, want an errNotRecoveryAtWrite-wrapped error", err)
 	}
 	if !isWriteRefusal(err) {
 		t.Errorf("this must count as writesRefused — no write was sent and something DID need doing: %v", err)
 	}
 	if writes := fake.writes(); len(writes) != 0 {
-		t.Errorf("nothing may be written when the allowance's own promise no longer holds, got %+v", writes)
+		t.Errorf("nothing may be written when the recovery path's precondition no longer holds, got %+v", writes)
 	}
-	if !strings.Contains(buf.String(), "recovery allowance") {
-		t.Errorf("the refusal must name the allowance it belongs to:\n%s", buf.String())
+	if !strings.Contains(buf.String(), "recovery pass") {
+		t.Errorf("the refusal must name the path it belongs to:\n%s", buf.String())
+	}
+}
+
+// TestRunSonarrWritePass_GateBlocked_NonCandidateRefusesAtWriteTime_IsCounted
+// closes the loop between the two halves above: a season the recovery path
+// admits on decision-time evidence but the fresh data disqualifies must land in
+// writesRefused, not vanish. It is the identity's proof that a stale admission
+// cannot make a pending season disappear from the accounting.
+func TestRunSonarrWritePass_GateBlocked_NonCandidateRefusesAtWriteTime_IsCounted(t *testing.T) {
+	// Decision time said every episode of season 1 was unmonitored; the fresh
+	// fixture says otherwise.
+	fake := newSonarrWriterFake(t, sonarrWriterSeriesJSON, sonarrWriterEpisodesJSON)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	cc := crossCheckResult{status: crossCheckStatusInconclusive, unverifiable: 1, writeUnverifiable: 1}
+	unmonitored, recovered, writeErrors, echoUnverified, refused, withheld := runSonarrWritePass(
+		context.Background(), logger, fake.client(), fake.instance(), sonarrRecoveryDecisions()[:1], cc, 0, false, false)
+
+	out := buf.String()
+	if refused != 1 {
+		t.Fatalf("writesRefused = %d, want 1 — a stale recovery admission the fresh data disqualifies is refused, not written and not lost:\n%s", refused, out)
+	}
+	if unmonitored+recovered+writeErrors+echoUnverified+withheld != 0 {
+		t.Errorf("no other counter may move: got unmonitored=%d recovered=%d writeErrors=%d echoUnverified=%d withheld=%d:\n%s",
+			unmonitored, recovered, writeErrors, echoUnverified, withheld, out)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("nothing may be written: %+v", writes)
 	}
 }
 
@@ -1697,6 +1840,16 @@ func TestRunSonarrDecisionEngine_EveryWouldUnmonitorSeasonIsAccountedForInTheSum
 			wantCounter:  "writesRefused",
 		},
 		{
+			// The recovery path's own row: the decision was made on a monitored
+			// episode, but by write time every episode of the season is already
+			// unmonitored — so only the season flag is left to write, and the
+			// confirmed write lands in recoveredWrites rather than unmonitored.
+			name:         "a recovery completed the season",
+			detail:       map[int]string{1: sonarrWriteEngineSeriesDetail(1, "Accounted Show", 1, 1, true)},
+			episodesJSON: `[{"id": 100, "seriesId": 1, "seasonNumber": 1, "episodeNumber": 1, "monitored": false, "hasFile": true, "airDateUtc": "2015-01-01T00:00:00Z", "episodeFileId": 500}]`,
+			wantCounter:  "recoveredWrites",
+		},
+		{
 			name:        "dry-run withheld the write at the gate",
 			detail:      map[int]string{1: sonarrWriteEngineSeriesDetail(1, "Accounted Show", 1, 1, true)},
 			dryRun:      true,
@@ -1744,13 +1897,25 @@ func TestRunSonarrDecisionEngine_EveryWouldUnmonitorSeasonIsAccountedForInTheSum
 			if c[tc.wantCounter] != 1 {
 				t.Errorf("%s = %d, want 1: this outcome must be counted under that name:\n%s", tc.wantCounter, c[tc.wantCounter], out)
 			}
-			accounted := c["unmonitored"] + c["writeEchoUnverified"] + c["writeErrors"] + c["writeRehearsalErrors"] + c["writesRefused"] + c["withheldWrites"]
+			accounted := c["unmonitored"] + c["recoveredWrites"] + c["writeEchoUnverified"] + c["writeErrors"] + c["writeRehearsalErrors"] + c["writesRefused"] + c["withheldWrites"]
 			if accounted != c["wouldUnmonitor"] {
 				t.Errorf("the summary accounts for %d of %d promised writes; every would-unmonitor season must end in exactly one counted outcome:\n%s", accounted, c["wouldUnmonitor"], out)
 			}
-			for _, always := range []string{"unmonitored=", "writesRefused=", "withheldWrites=", "writeErrors="} {
-				if !strings.Contains(out, always) {
-					t.Errorf("the summary must always carry %s, including as 0:\n%s", always, out)
+			// Every counter of the identity, present in the mode that can
+			// produce it, including as 0 — an absent number must never be
+			// readable as "none happened". The two mode-specific ones were
+			// unpinned: writeEchoUnverified is printed only in write mode and
+			// writeRehearsalErrors only in dry-run, so a loop that named
+			// neither left two of the identity's terms free to disappear.
+			always := []string{"unmonitored=", "recoveredWrites=", "writesRefused=", "withheldWrites=", "writeErrors="}
+			if tc.dryRun {
+				always = append(always, "writeRehearsalErrors=")
+			} else {
+				always = append(always, "writeEchoUnverified=")
+			}
+			for _, want := range always {
+				if !strings.Contains(out, want) {
+					t.Errorf("the summary must always carry %s, including as 0:\n%s", want, out)
 				}
 			}
 		})
@@ -1789,7 +1954,7 @@ func TestRunSonarrDecisionEngine_TwoPendingSeasons_OneRefuses_IdentityStillHolds
 	if c["unmonitored"] != 1 || c["writesRefused"] != 1 {
 		t.Errorf("unmonitored/writesRefused = %d/%d, want 1/1 — the refusal must not take the other season with it:\n%s", c["unmonitored"], c["writesRefused"], out)
 	}
-	accounted := c["unmonitored"] + c["writeEchoUnverified"] + c["writeErrors"] + c["writeRehearsalErrors"] + c["writesRefused"] + c["withheldWrites"]
+	accounted := c["unmonitored"] + c["recoveredWrites"] + c["writeEchoUnverified"] + c["writeErrors"] + c["writeRehearsalErrors"] + c["writesRefused"] + c["withheldWrites"]
 	if accounted != c["wouldUnmonitor"] {
 		t.Errorf("the summary accounts for %d of %d promised writes:\n%s", accounted, c["wouldUnmonitor"], out)
 	}
@@ -2244,6 +2409,14 @@ func TestRun_SonarrWriteMode_SecondRun_IsANoOp(t *testing.T) {
 // finishes the job. The retry is also smaller, not duplicated: the episodes
 // already unmonitored are excluded from the second attempt's id list, so run
 // 2 sends the season PUT alone.
+//
+// It is also the recovery path's end-to-end proof, and the reason that path
+// has a gate of its own. Run 2's cross-check is INCONCLUSIVE by construction:
+// the season's only episode is already unmonitored, so cross-check shape (a)
+// excludes it and nothing comparable is left to verify. The ordinary gate can
+// therefore never authorize this retry — under it alone, a single 500 on the
+// season half would leave the season half-written forever — and the write that
+// converges is counted as recoveredWrites, never as unmonitored.
 func TestRun_SonarrWriteMode_PartialFailure_ConvergesOnTheNextRun(t *testing.T) {
 	fake := writableSonarrFake(t)
 	fake.series[1].seasons = fake.series[1].seasons[:1]
@@ -2276,8 +2449,20 @@ func TestRun_SonarrWriteMode_PartialFailure_ConvergesOnTheNextRun(t *testing.T) 
 		t.Fatalf("run 2: exit code = %d, want 0; stderr=%s", code, stderr2.String())
 	}
 	out2 := stdout2.String()
-	if !strings.Contains(out2, "unmonitored=1") {
-		t.Errorf("run 2 must converge and finish the write:\n%s", out2)
+	c2 := sonarrSummaryCounters(t, out2)
+	if c2["recoveredWrites"] != 1 || c2["unmonitored"] != 0 {
+		t.Errorf("run 2: recoveredWrites/unmonitored = %d/%d, want 1/0 — convergence is a recovery, and a recovery is never counted as an ordinary unmonitor:\n%s",
+			c2["recoveredWrites"], c2["unmonitored"], out2)
+	}
+	if c2["recoveredWrites"]+c2["unmonitored"]+c2["writeErrors"]+c2["writeEchoUnverified"]+c2["writesRefused"]+c2["withheldWrites"] != c2["wouldUnmonitor"] {
+		t.Errorf("run 2: the accounting identity must hold:\n%s", out2)
+	}
+	if !strings.Contains(out2, "crossCheck=inconclusive") {
+		t.Errorf("run 2's cross-check is inconclusive by construction; if it is not, this test is no longer proving the recovery path converges:\n%s", out2)
+	}
+	recoveryLine := logLineContaining(t, out2, "completing a previously partial season unmonitor")
+	if !strings.Contains(recoveryLine, "season=1") || !strings.Contains(recoveryLine, "gateBlocked=") {
+		t.Errorf("run 2: the recovery must name its season and the authorization it did not have:\n%s", recoveryLine)
 	}
 	if fake.seasonMonitored(1, 1) {
 		t.Error("run 2: the season should now be unmonitored")
@@ -2382,7 +2567,7 @@ func TestUnmonitorSeason_FreshStatisticsClaimNoEpisodes_Refuses(t *testing.T) {
 	fake := newSonarrWriterFake(t, seriesJSON, `[]`)
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
-	written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
 	if written {
 		t.Error("written = true, want false")
 	}
@@ -2456,7 +2641,7 @@ func TestUnmonitorSeason_AcrossPayloadShapes_SeriesLevelMonitoredIsAlwaysTheFetc
 			fake := newSonarrWriterFake(t, tc.seriesJSON, sonarrWriterEpisodesJSON)
 			logger, _ := newDecisionTestLogger(slog.LevelInfo)
 
-			if _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, tc.season, 42, tc.tagActive, false, false); err != nil {
+			if _, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, tc.season, 42, tc.tagActive, false, false); err != nil {
 				t.Fatalf("unmonitorSeason returned error = %v", err)
 			}
 
@@ -2518,7 +2703,7 @@ func TestUnmonitorSeason_EpisodeWithUnreadableStateAtWriteTime_Refuses(t *testin
 			fake := newSonarrWriterFake(t, sonarrWriterSeriesJSON, tc.episodes)
 			logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
-			written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+			written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
 			if written {
 				t.Error("written = true, want false")
 			}
@@ -2549,7 +2734,7 @@ func TestUnmonitorSeason_SeasonNoLongerCompleteOnDisk_Refuses(t *testing.T) {
 	fake := newSonarrWriterFake(t, seriesJSON, sonarrWriterEpisodesJSON)
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
-	written, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
 	if written {
 		t.Error("written = true, want false")
 	}

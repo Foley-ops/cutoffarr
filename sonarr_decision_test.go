@@ -2006,9 +2006,9 @@ func TestEvaluateSeries_SeasonMonitoredAbsent_WarnNamesTheSeries(t *testing.T) {
 //
 // A sample that verified nothing must never look like a sample that verified
 // everything: this shape is counted in its own bucket, never as evidence.
-// (Post-partial-write convergence is preserved by the write pass's explicitly
-// named recovery allowance instead — see
-// TestRunSonarrWritePass_GateBlocked_RecoverySeasonIsStillWritten.)
+// (Post-partial-write convergence is preserved by the write pass's separately
+// gated RECOVERY path instead — see
+// TestRunSonarrWritePass_RecoveryUnderInconclusiveGate_CompletesWhileTheRestIsWithheld.)
 func TestRunSonarrCrossCheck_UnmonitoredEpisodeAboveCutoff_IsNotEvidence(t *testing.T) {
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	inst := Instance{Name: "sonarr-main", Type: "sonarr"}

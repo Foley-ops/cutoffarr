@@ -149,18 +149,22 @@ var errEpisodeMonitorContradicted = errors.New("the episode monitor response say
 // accepted-but-unconfirmed would tell a human the opposite of what happened.
 var errEpisodeMonitorUnconfirmed = errors.New("the episode monitor write was accepted but its response could not confirm it")
 
-// errRecoveryAllowanceViolated marks a season the write pass admitted through
-// the cross-check gate's narrow recovery allowance (see
-// seasonWriteRecoverySignature) turning out, at the moment of the write, to
-// still contain monitored episodes.
+// errNotRecoveryAtWrite marks a season the RECOVERY pass admitted on
+// decision-time evidence (recoveryCandidate) failing its qualification against
+// the FRESH pre-write data: at least one episode of it is still monitored.
 //
-// The allowance exists only because unmonitoring a season whose episodes are
-// ALL already unmonitored cannot strand anything — there is nothing left to
-// strand. A season that no longer matches that description is an ordinary
-// write, and an ordinary write needs the ordinary gate, which for this
-// instance is shut. Refusing (loudly, counted, never retried) is the whole
-// point of calling the allowance narrow.
-var errRecoveryAllowanceViolated = errors.New("the season admitted by the cross-check gate's recovery allowance still has monitored episodes at write time")
+// Recovery qualification is decided by the fresh data and nothing else
+// (controller ruling item 2), and a season with a monitored episode left in it
+// is an ORDINARY write — which needs the ordinary gate, which in this
+// situation is shut. Refusing (loudly, counted, never retried) is what keeps
+// the recovery path from becoming a second way to make an ordinary write.
+//
+// It is a refusal rather than a silent withhold on purpose: a bare
+// (false, nil) return from unmonitorSeason means "dry-run withheld at the §2.1
+// gate" and nothing else, precisely so no real outcome can fall through that
+// branch uncounted. Two review rounds closed exactly that hole; this stays on
+// the counted side of it.
+var errNotRecoveryAtWrite = errors.New("the season the recovery pass admitted still has monitored episodes at write time")
 
 // unmonitorSeason performs the Sonarr write operation for exactly ONE season:
 // the fresh reads, every pre-write re-verification, then PUT /episode/monitor
@@ -217,31 +221,37 @@ var errRecoveryAllowanceViolated = errors.New("the season admitted by the cross-
 //     is what removes the season from every future cycle (rule 1), so it may
 //     only follow an episode write the server confirmed.
 //
-// recoveryOnly is set by the write pass for the one class of season it may
-// write while the cross-check gate is shut: a season all of whose episodes are
-// already unmonitored (see seasonWriteRecoverySignature). It is a promise this
-// function re-verifies against its own fresh data — if any episode of the
-// season is still monitored, the write is refused rather than performed on
-// unauthorized evidence.
+// The second return value, recovery, is this function's verdict on what the
+// FRESH data says this season is (controller ruling item 2): true when every
+// episode of the season is already unmonitored, so the season flag is the only
+// thing left to write. That is the state a partially completed write leaves
+// behind, and the one state whose season PUT cannot strand anything — there is
+// nothing left to strand. It is decided here, from the fresh /episode read,
+// and nowhere else; the caller counts a completed one as recoveredWrites.
+//
+// requireRecovery is set by the recovery pass — the write pass's second, gated
+// path, which runs when the ordinary write gate is shut. It turns the verdict
+// above into a precondition: a season that no longer qualifies is refused
+// (errNotRecoveryAtWrite) rather than written on evidence nothing authorized.
 //
 // Errors are returned, never retried (§2.6); the caller logs them and moves
 // to the next season.
-func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, seriesID, seasonNumber, exclusionTagID int, tagActive bool, dryRun bool, recoveryOnly bool) (written bool, err error) {
+func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, seriesID, seasonNumber, exclusionTagID int, tagActive bool, dryRun bool, requireRecovery bool) (written bool, recovery bool, err error) {
 	path := seriesPath(seriesID)
 	subject := fmt.Sprintf("series %d season %d", seriesID, seasonNumber)
 
 	body, err := fetchBody(ctx, client, path, nil)
 	if err != nil {
-		return false, fmt.Errorf("fetching series %d before write: %w", seriesID, err)
+		return false, false, fmt.Errorf("fetching series %d before write: %w", seriesID, err)
 	}
 
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return false, fmt.Errorf("%s: response to the pre-write fetch is not a JSON object: %w", subject, err)
+		return false, false, fmt.Errorf("%s: response to the pre-write fetch is not a JSON object: %w", subject, err)
 	}
 
 	if err := verifySeriesIdentity(payload, seriesID); err != nil {
-		return false, err
+		return false, false, err
 	}
 
 	title := titleFromPayload(payload)
@@ -251,7 +261,7 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 	// the movie path calls, not a second copy of the same four refusals.
 	if tagActive {
 		if err := preWriteExclusionTagCheck(logger, payload, "series", subject, exclusionTagID, attrs); err != nil {
-			return false, err
+			return false, false, err
 		}
 	}
 
@@ -261,27 +271,27 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 	// write nobody asked for.
 	seriesMonitored, err := readMonitoredFlag(logger, payload, "series", subject, attrs)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	if !seriesMonitored {
 		logger.Info("series is no longer monitored as of the pre-write fetch, skipping season write", attrs...)
-		return false, fmt.Errorf("%s: %w: the series itself is no longer monitored", subject, errAlreadyUnmonitoredAtWrite)
+		return false, false, fmt.Errorf("%s: %w: the series itself is no longer monitored", subject, errAlreadyUnmonitoredAtWrite)
 	}
 
 	seasonElems, targetIdx, targetSeason, err := locateTargetSeason(logger, payload, subject, seasonNumber, attrs)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 
 	// Step 5b: the season's own monitored flag, with the same null-decode
 	// discipline the series-level one just had.
 	seasonMonitored, err := readMonitoredFlag(logger, targetSeason, "season", subject, attrs)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	if !seasonMonitored {
 		logger.Info("season already unmonitored as of the pre-write fetch, skipping write", attrs...)
-		return false, fmt.Errorf("%s: %w", subject, errAlreadyUnmonitoredAtWrite)
+		return false, false, fmt.Errorf("%s: %w", subject, errAlreadyUnmonitoredAtWrite)
 	}
 
 	// Step 6: fresh episode data, then the airing guard re-run over it. A
@@ -291,11 +301,11 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 	// is on the movie path.
 	episodes, ok := fetchEpisodes(ctx, logger, client, inst, seriesID)
 	if !ok {
-		return false, fmt.Errorf("%s: fresh episode data could not be fetched before the write", subject)
+		return false, false, fmt.Errorf("%s: fresh episode data could not be fetched before the write", subject)
 	}
 	seasonEpisodes := episodesOfSeason(episodes, seasonNumber)
 	if err := verifySeasonStillWritable(logger, targetSeason, seasonEpisodes, subject, attrs); err != nil {
-		return false, err
+		return false, false, err
 	}
 
 	// The episode ids to unmonitor: ONLY episodes this fresh read says are
@@ -316,12 +326,12 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 		if e.ID == nil {
 			logger.Warn("an episode of this season has no id in the pre-write fetch; it could not be named in the episode monitor write, so unmonitoring the season would strand it, refusing to write",
 				append(append([]any(nil), attrs...), "episodeNumber", derefOrAbsent(e.EpisodeNumber))...)
-			return false, fmt.Errorf("%s: %w: an episode of this season has no id in the pre-write fetch", subject, errSeasonUnverifiableAtWrite)
+			return false, false, fmt.Errorf("%s: %w: an episode of this season has no id in the pre-write fetch", subject, errSeasonUnverifiableAtWrite)
 		}
 		if e.Monitored == nil {
 			logger.Warn("an episode of this season has an absent or JSON-null monitored field in the pre-write fetch; unmonitoring the season would strand it in an unknown state, refusing to write",
 				append(append([]any(nil), attrs...), "episodeId", *e.ID)...)
-			return false, fmt.Errorf("%s: %w: episode %d has no readable monitored field in the pre-write fetch", subject, errSeasonUnverifiableAtWrite, *e.ID)
+			return false, false, fmt.Errorf("%s: %w: episode %d has no readable monitored field in the pre-write fetch", subject, errSeasonUnverifiableAtWrite, *e.ID)
 		}
 		if !*e.Monitored {
 			continue
@@ -329,17 +339,29 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 		episodeIDs = append(episodeIDs, *e.ID)
 	}
 
-	// The recovery allowance's own promise, re-verified against the fresh,
-	// complete, fully-validated episode set this function just built (every
-	// episode's id and monitored value readable, the set matching the season's
-	// own statistics). The gate that would normally authorize this write is
-	// shut; the only reason this season got past it is that unmonitoring it
-	// cannot strand anything, and that is true only while every episode of it
-	// is already unmonitored.
-	if recoveryOnly && len(episodeIDs) > 0 {
-		logger.Warn("this season was admitted only by the cross-check gate's recovery allowance (every episode already unmonitored), but the pre-write fetch shows monitored episodes; refusing to write",
+	// THE RECOVERY VERDICT (controller ruling item 2), decided here and nowhere
+	// else, from the fresh, complete, fully-validated episode set this function
+	// just built: every episode's id and monitored value was readable, the set
+	// matches the season's own statistics, the season is still monitored,
+	// complete on disk, fully aired and tag-clean — and not one episode of it
+	// is still monitored. The only thing left to write is the season flag.
+	//
+	// That is exactly what a partially completed write leaves behind (the
+	// /episode/monitor call landed, the season PUT did not), and it is the one
+	// shape whose season PUT cannot strand anything: there is nothing left to
+	// strand, and Sonarr cannot grab an unmonitored episode whatever the season
+	// flag says.
+	recovery = len(episodeIDs) == 0
+
+	// The recovery pass's precondition. It admitted this season on
+	// decision-time evidence (recoveryCandidate); the fresh data is the
+	// authority, and it just said this is an ordinary write. An ordinary write
+	// needs the ordinary gate, which is why the recovery pass was running at
+	// all.
+	if requireRecovery && !recovery {
+		logger.Warn("the ordinary write gate is shut and this season was admitted to the recovery pass (every episode already unmonitored), but the pre-write fetch shows monitored episodes; refusing to write",
 			append(append([]any(nil), attrs...), "monitoredEpisodes", len(episodeIDs))...)
-		return false, fmt.Errorf("%s: %w: %d episode(s) are still monitored", subject, errRecoveryAllowanceViolated, len(episodeIDs))
+		return false, recovery, fmt.Errorf("%s: %w: %d episode(s) are still monitored", subject, errNotRecoveryAtWrite, len(episodeIDs))
 	}
 
 	// The season payload is assembled BEFORE either write goes out, even
@@ -351,14 +373,14 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 	// really checked, and only then withheld.
 	encoded, err := assembleSeasonWrite(payload, seasonElems, targetIdx, targetSeason, subject)
 	if err != nil {
-		return false, err
+		return false, recovery, err
 	}
 
 	// FIRST write call (binding order).
 	episodesWritten := false
 	if len(episodeIDs) == 0 {
-		logger.Debug("no monitored episodes remain in this season; the episode monitor write is not needed",
-			append(append([]any(nil), attrs...), "episodes", len(seasonEpisodes))...)
+		logger.Debug("no monitored episodes remain in this season; the episode monitor write is not needed and this is a recovery write (the season flag alone)",
+			append(append([]any(nil), attrs...), "episodes", len(seasonEpisodes), "recovery", true)...)
 	} else {
 		// §2.1: the dry-run gate, immediately before this HTTP write call and
 		// nowhere earlier. Everything above runs identically in both modes.
@@ -379,7 +401,7 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 			if err := putEpisodeMonitor(ctx, client, episodeIDs, subject); err != nil {
 				logger.Warn("episode monitor write could not be confirmed; the season write is withheld and the season is left monitored so the next cycle can retry it",
 					append(append([]any(nil), attrs...), "episodeIds", len(episodeIDs), "error", err)...)
-				return false, err
+				return false, recovery, err
 			}
 			episodesWritten = true
 		}
@@ -390,7 +412,7 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 	if dryRun {
 		logger.Debug("dry-run: write withheld immediately before the PUT",
 			append(append([]any(nil), attrs...), "method", http.MethodPut, "path", path)...)
-		return false, nil
+		return false, recovery, nil
 	}
 
 	resp, err := client.DoJSON(ctx, http.MethodPut, path, encoded)
@@ -402,24 +424,24 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 			// the state the season was actually left in — and the next cycle
 			// converges on its own, since the episodes now reading false are
 			// excluded from that attempt's id list.
-			return false, fmt.Errorf("%s: the episode monitor write completed but the season write failed, so the season is still monitored: %w", subject, err)
+			return false, recovery, fmt.Errorf("%s: the episode monitor write completed but the season write failed, so the season is still monitored: %w", subject, err)
 		}
-		return false, fmt.Errorf("writing %s: %w", subject, err)
+		return false, recovery, fmt.Errorf("writing %s: %w", subject, err)
 	}
 	defer resp.Body.Close()
 
 	echo, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 	if err != nil {
-		return false, fmt.Errorf("%s: the write returned %d but its body could not be read, so the change is unconfirmed (%w): %v", subject, resp.StatusCode, errWriteUnverified, err)
+		return false, recovery, fmt.Errorf("%s: the write returned %d but its body could not be read, so the change is unconfirmed (%w): %v", subject, resp.StatusCode, errWriteUnverified, err)
 	}
 	if err := verifySeasonWriteEcho(echo, seriesID, seasonNumber, resp.StatusCode, subject); err != nil {
-		return false, err
+		return false, recovery, err
 	}
 
 	// written=true still requires BOTH calls confirmed (controller resolution
 	// 1) — it just cannot be decided here any more, because an unconfirmed
 	// episode write already returned above without sending this PUT at all.
-	return true, nil
+	return true, recovery, nil
 }
 
 // episodesOfSeason filters a fresh /episode response down to one season.
@@ -820,20 +842,24 @@ func encodeRawArray(elems []json.RawMessage) ([]byte, error) {
 	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
-// seasonWriteRecoverySignature reports whether a season decision carries the
-// one signature the write gate's recovery allowance is named for: EVERY
-// episode of a still-monitored season explicitly reports monitored == false.
+// recoveryCandidate reports whether a season decision looks, on DECISION-time
+// evidence, like a season the recovery pass should take a fresh look at: every
+// episode of it explicitly reported monitored == false when it was evaluated.
 //
-// That is exactly what a partially completed write leaves behind — the
-// /episode/monitor call landed, the season PUT did not — and it is the state
-// the project has to be able to finish, or a single 500 on the season half
-// would leave a season half-written forever.
+// It is a cost filter and nothing more. The authority on whether a season
+// really qualifies for the recovery path is the fresh pre-write data, and it
+// lives in unmonitorSeason (see its recovery return); this exists so that a
+// shut-gate instance with two hundred pending seasons does not issue four
+// hundred fresh GETs to discover that none of them qualifies. A season that
+// became recovery-shaped between the decision and the write is simply picked
+// up by the next cycle, which is the same conservative direction every other
+// stale-decision case in this project takes.
 //
-// It is deliberately a signature and not a heuristic. An episode whose
-// monitored flag is absent or JSON null does not match (untrusted input never
-// earns an allowance), and an empty episode set does not match either (a
-// signature nothing can satisfy must not be satisfied by nothing).
-func seasonWriteRecoverySignature(d seasonDecision) bool {
+// An episode whose monitored flag is absent or JSON null does not match
+// (untrusted input is never evidence of anything), and an empty episode set
+// does not match either (a condition nothing can satisfy must not be satisfied
+// by nothing).
+func recoveryCandidate(d seasonDecision) bool {
 	if len(d.crossCheckEpisodes) == 0 {
 		return false
 	}
@@ -845,83 +871,89 @@ func seasonWriteRecoverySignature(d seasonDecision) bool {
 	return true
 }
 
-// recoveryAllowed decides whether one season may be written while the
-// instance's write gate is SHUT. It is the narrow, explicitly named exception
-// the review round directed in place of Phase 7's widening of what the
-// cross-check counts as "verified".
+// recoveryGateBlockReason is the RECOVERY pass's own gate, the counterpart of
+// writeGateBlockReason for the ordinary one: "" admits the recovery pass, any
+// other string is the reason it stays shut (binding controller ruling item 3).
 //
-// Why an exception is needed at all: with cross-check shape (a) whole again
-// (see runSonarrCrossCheck), a would-unmonitor season whose episodes are all
-// unmonitored has nothing comparable left in it, so it is unverifiable by
-// construction and can never earn the gate's would-unmonitor evidence. Since
-// that is precisely the state a partial write leaves, the gate would block its
-// own retry forever.
+// The two gates differ in exactly one place, and the reason is what the gates
+// are FOR. The ordinary gate demands evidence that the wanted-set signal
+// behind a would-unmonitor decision was corroborated, because unmonitoring a
+// season with monitored episodes in it acts on that signal. A recovery
+// season's one remaining action — the season PUT — does not: its rule-4 pass
+// is structural (Sonarr's /wanted/cutoff is filtered to monitored episodes, so
+// a season with none cannot appear in it), and rules 2, 3 and 7 read /episode
+// and /episodefile directly. There is also nothing left to strand. So an
+// inconclusive cross-check — the exact verdict a recovering instance produces,
+// since a season whose episodes are all unmonitored is unverifiable by
+// construction (see runSonarrCrossCheck's shape (a)) — does not block it.
 //
-// Why the exception is safe, and why it is drawn HERE rather than by relaxing
-// what counts as evidence: the gate exists to stop this project acting on
-// decision data it could not corroborate. For a season whose every episode is
-// already unmonitored, the write cannot be acted on wrongly — Sonarr cannot
-// grab an unmonitored episode whatever the season flag says, so flipping the
-// season changes nothing about the world except that the project stops
-// re-deciding it. The stranding hazard the gate guards is structurally absent
-// because there is nothing left to strand. Every OTHER pending season of the
-// same instance stays withheld, which is what makes this an allowance rather
-// than an open gate.
-//
-// Its three conditions, each load-bearing:
-//
-//   - The signature itself (seasonWriteRecoverySignature).
-//   - A cross-check that did not FAIL and is not unrecognized. A disagreement
-//     must stop this project before writes — that rule has no exceptions, and
-//     an unrecognized status is a bug signal, not a state to reason from.
-//     "inconclusive" IS admitted: a sample that verified nothing is exactly
-//     what an instance recovering from a partial write looks like.
-//   - unmonitorSeason re-verifies the signature against its own fresh episode
-//     data (recoveryOnly) and refuses if any episode is monitored by then, so
-//     an allowance granted on decision-time data can never authorize an
-//     ordinary write on stale evidence.
-func recoveryAllowed(cc crossCheckResult, d seasonDecision) bool {
-	if cc.status != crossCheckStatusPassed && cc.status != crossCheckStatusInconclusive {
-		return false
+// FAILED and unrecognized still block everything, and that rule has no
+// exceptions: a data layer with proven disagreements taints every read this
+// decision rests on, and an unrecognized status is a bug signal rather than a
+// state to reason from.
+func recoveryGateBlockReason(cc crossCheckResult) string {
+	switch cc.status {
+	case crossCheckStatusPassed, crossCheckStatusInconclusive:
+		return ""
+	case crossCheckStatusFailed:
+		return "the cross-check found a disagreement, which blocks every write including a recovery"
+	default:
+		return "the cross-check status is unrecognized, which blocks every write including a recovery"
 	}
-	return seasonWriteRecoverySignature(d)
 }
 
-// runSonarrWritePass is the Sonarr engine's third pass, and the exact
-// counterpart of runWritePass (decision.go) — same two gates, same five
-// outcomes, same reconciliation identity, same §2.6 "log it, count it, move
-// on" posture. Only the unit differs: a SEASON, not a movie.
+// runSonarrWritePass is the Sonarr engine's third pass, and the counterpart of
+// runWritePass (decision.go) — same outcomes, same reconciliation identity,
+// same §2.6 "log it, count it, move on" posture. Only the unit differs (a
+// SEASON, not a movie) and one path is added that Radarr has no equivalent of.
 //
-// The two gates in front of every write:
+// TWO GATED PATHS, not one gate with an exception (binding controller ruling,
+// Phase 7 final):
 //
-//   - The cross-check must have authorized writes, judged by the same
-//     evidence-based rule the Radarr pass uses (writeGateBlockReason, shared
-//     rather than reimplemented): an explicit PASS, plus evidence that the
-//     pass says something about the would-unmonitor decisions this pass is
-//     about to act on. FAILED and inconclusive — and any status a future
-//     change might add — block the entire pass, loudly.
+//   - The ORDINARY write path, gated exactly as Radarr's is by the shared
+//     writeGateBlockReason: an explicit cross-check PASS, plus evidence that
+//     the pass says something about the would-unmonitor decisions this pass is
+//     about to act on. FAILED, inconclusive, and any status a future change
+//     might add block it, loudly, with the withheld accounting.
 //
-//     A shut gate has exactly ONE exception, and it is named rather than
-//     implied: a season whose every episode is already unmonitored
-//     (recoveryAllowed). It exists because that state is what a partially
-//     completed write leaves behind and is unverifiable by construction, so
-//     the gate would otherwise block its own retry forever; it is safe
-//     because unmonitoring such a season cannot strand anything. Every other
-//     pending season of the instance is still withheld, and every write the
-//     allowance admits names itself on its own msg=unmonitor line
-//     (recovery=true, the gate reason it bypassed, and why) — a write made
-//     without cross-check authorization must be identifiable per season, not
-//     only counted per instance.
+//   - The RECOVERY path, gated by recoveryGateBlockReason, for the one season
+//     shape whose remaining action does not depend on the signal the ordinary
+//     gate exists to validate: a still-monitored, complete, fully-aired,
+//     tag-clean season every one of whose episodes is ALREADY unmonitored, so
+//     only the season flag is left to write. unmonitorSeason decides that from
+//     FRESH data and returns it (recovery); recoveryCandidate is only a cost
+//     filter in front of it. Such a season's rule-4 pass is structural
+//     (/wanted/cutoff is filtered to monitored episodes), rules 2/3/7 read
+//     /episode and /episodefile directly, and the write cannot strand anything
+//     — there is nothing left to strand. It is therefore permitted under an
+//     inconclusive cross-check as well as a passed one, and blocked absolutely
+//     under FAILED or an unrecognized status.
 //
-//   - The decision's wouldUnmonitor bool. Never its reason text.
+//     This is what a partially completed write leaves behind (the episode call
+//     landed, the season PUT did not) — and, because such a season is
+//     unverifiable by construction under cross-check shape (a), it is also the
+//     one state the ordinary gate could never authorize the retry of. Without
+//     this path a single 500 on the season half would leave a season
+//     half-written forever.
 //
-// The five outcomes, and why five (see runWritePass's own doc comment for the
-// two review rounds that produced them):
+// The second gate in front of every write, on both paths, is the decision's
+// wouldUnmonitor bool. Never its reason text.
+//
+// The six outcomes (see runWritePass's own doc comment for the two review
+// rounds that produced the first five):
 //
 //   - unmonitored: BOTH write calls were made and BOTH were confirmed by the
 //     server's own response. The only outcome that logs msg=unmonitor.
 //     Counted in SEASONS, the decision unit — never episodes, whose count is
 //     an implementation detail of how a season is unmonitored.
+//
+//   - recoveredWrites: a confirmed write on the recovery path — the season PUT
+//     alone, because there was no monitored episode left to write. Counted
+//     separately from unmonitored and never folded into it: it is a different
+//     event (finishing something already half-done, on a season no cross-check
+//     sample can speak for), and a human who sees writes on a line that also
+//     says crossCheck=inconclusive must be able to find the number that
+//     explains the pairing. Each one also warns, naming its season.
 //
 //   - writeErrors: something was rejected or could not be read. Includes the
 //     partial completion controller resolution 1 defines — episode call done,
@@ -945,17 +977,17 @@ func recoveryAllowed(cc crossCheckResult, d seasonDecision) bool {
 //     the exclusion tag reappeared, tags or monitored could not be read, the
 //     series or season was already unmonitored (a race), the season's own
 //     state could not be verified, the season started airing since the
-//     decision, or a season admitted by the recovery allowance turned out to
-//     have monitored episodes after all. Each logs its specific reason at the
-//     moment it refuses.
+//     decision, or the recovery path's precondition no longer held. Each logs
+//     its specific reason at the moment it refuses.
 //
-//   - withheld: no attempt was made at all — the gate blocked the pass, or a
+//   - withheld: no attempt was made at all — a gate blocked the season, or a
 //     dry-run stopped at the gate immediately before the PUT.
 //
-//     wouldUnmonitor == unmonitored + echoUnverified + writeErrors
+// Every pending season ends in exactly one of them:
 //
-//   - writesRefused + withheld
-func runSonarrWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, decisions []seasonDecision, cc crossCheckResult, exclusionTagID int, tagActive bool, dryRun bool) (unmonitored, writeErrors, echoUnverified, writesRefused, withheld int) {
+//	wouldUnmonitor == unmonitored + recoveredWrites + echoUnverified
+//	                  + writeErrors + writesRefused + withheld
+func runSonarrWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, decisions []seasonDecision, cc crossCheckResult, exclusionTagID int, tagActive bool, dryRun bool) (unmonitored, recovered, writeErrors, echoUnverified, writesRefused, withheld int) {
 	pending := 0
 	for _, d := range decisions {
 		if d.wouldUnmonitor {
@@ -963,57 +995,26 @@ func runSonarrWritePass(ctx context.Context, logger *slog.Logger, client *APICli
 		}
 	}
 
-	// gateBlocked == "" is the ordinary authorization: every pending write may
-	// go ahead. When it is shut, the only seasons that still get written are
-	// the ones the recovery allowance names one at a time by signature (see
-	// recoveryAllowed) — every other pending season is withheld exactly as
-	// before.
 	gateBlocked := writeGateBlockReason(cc, pending)
-	recovering := 0
-	if gateBlocked != "" {
-		for _, d := range decisions {
-			if d.wouldUnmonitor && recoveryAllowed(cc, d) {
-				recovering++
-			}
-		}
-		attrs := []any{"instance", inst.Name, "type", inst.Type, "crossCheck", cc.status}
-		attrs = append(attrs, cc.logAttrs()...)
-		msg := "writes withheld for this instance: " + gateBlocked
-		switch {
-		case recovering == 0:
-			attrs = append(attrs, "withheldWrites", pending, "recoveryWrites", 0, "dryRun", dryRun)
-		case dryRun:
-			// A rehearsal writes NOTHING, so nothing on this line may say a
-			// write happened: the allowance ADMITS the season (its rehearsal
-			// is real — unmonitorSeason takes the same fresh look at the world
-			// before withholding at its own §2.1 gates) but it writes none of
-			// it. Both keys are renamed rather than reused, because in this
-			// mode every pending season ends the pass withheld, so a
-			// "withheldWrites" here would be a DIFFERENT number from the
-			// summary's counter of the same name — and "recoveryWrites" would
-			// count writes that were never sent. Same reason the summary swaps
-			// writeErrors for writeRehearsalErrors in dry-run.
-			attrs = append(attrs, "gateWithheldWrites", pending-recovering, "recoveryAdmitted", recovering, "dryRun", dryRun)
-			msg = "dry-run: cross-check gate shut (" + gateBlocked + "); the recovery allowance would admit the season(s) whose every episode is already unmonitored — which cannot strand anything — and withhold the rest; no write is sent, this is a rehearsal"
-		default:
-			attrs = append(attrs, "withheldWrites", pending-recovering, "recoveryWrites", recovering, "dryRun", dryRun)
-			msg = "cross-check gate shut (" + gateBlocked + "); writing ONLY the season(s) whose every episode is already unmonitored — which cannot strand anything — and withholding the rest"
-		}
-		// Same noise-budget rule the Radarr pass applies: blocking a pass that
-		// had nothing to write anyway is a health signal, not an alarm — but
-		// an UNRECOGNIZED status is itself a bug signal and stays WARN however
-		// little was pending.
-		if pending > 0 || !isKnownCrossCheckStatus(cc.status) {
-			logger.Warn(msg, attrs...)
-		} else {
-			logger.Info(msg, attrs...)
-		}
-		if recovering == 0 {
-			return 0, 0, 0, 0, pending
-		}
+	recoveryBlocked := recoveryGateBlockReason(cc)
+
+	// Both gates shut: nothing is written, nothing is even FETCHED, and the
+	// pass returns exactly as the Radarr twin does. An open ordinary gate
+	// implies an open recovery gate (writeGateBlockReason only opens on an
+	// explicit pass, which recoveryGateBlockReason also admits), so this is the
+	// only combination that ends the pass here.
+	if gateBlocked != "" && recoveryBlocked != "" {
+		logGateWithheld(logger, inst, cc, gateBlocked, recoveryBlocked, pending, pending, 0, dryRun)
+		return 0, 0, 0, 0, 0, pending
 	}
 
-	if pending > 0 && cc.unverifiable > 0 {
+	// The ordinary gate opened, but "opened" is not the same as "the sample was
+	// clean": anything the cross-check could not verify is named here, at the
+	// moment of consequence, with the ratio. It is deliberately NOT logged when
+	// the ordinary gate is shut — an inconclusive cross-check always has
+	// unverifiable samples, and a line saying writes "proceed" on a pass that
+	// authorized none of them would contradict the gate line itself.
+	if gateBlocked == "" && pending > 0 && cc.unverifiable > 0 {
 		attrs := []any{"instance", inst.Name, "type", inst.Type}
 		attrs = append(attrs, cc.logAttrs()...)
 		attrs = append(attrs, "pendingWrites", pending, "dryRun", dryRun)
@@ -1029,16 +1030,16 @@ func runSonarrWritePass(ctx context.Context, logger *slog.Logger, client *APICli
 			continue
 		}
 
-		recoveryOnly := false
-		if gateBlocked != "" {
-			if !recoveryAllowed(cc, d) {
-				withheld++
-				continue
-			}
-			recoveryOnly = true
+		// With the ordinary gate shut, the recovery path is the only one left,
+		// so a season that does not even look like a recovery candidate is
+		// withheld without a fetch.
+		requireRecovery := gateBlocked != ""
+		if requireRecovery && !recoveryCandidate(d) {
+			withheld++
+			continue
 		}
 
-		written, err := unmonitorSeason(ctx, logger, client, inst, d.seriesID, d.season, exclusionTagID, tagActive, dryRun, recoveryOnly)
+		written, recovery, err := unmonitorSeason(ctx, logger, client, inst, d.seriesID, d.season, exclusionTagID, tagActive, dryRun, requireRecovery)
 		if isWriteRefusal(err) {
 			// unmonitorSeason already logged the specific reason at the point
 			// it refused, so nothing more is logged here and no cause is lost
@@ -1073,31 +1074,75 @@ func runSonarrWritePass(ctx context.Context, logger *slog.Logger, client *APICli
 			continue
 		}
 
-		unmonitored++
-		writeAttrs := []any{"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season, "reason", d.reason, "profile", d.profileName}
-		if recoveryOnly {
-			// REVIEW FIX (round 3): the allowance is the ONE path in this
-			// project that writes without cross-check authorization, so it
-			// must be the best-attributed, not the worst. The blocked-gate
-			// WARN above carries recoveryWrites=N — a count, which on a run
-			// with three allowance writes among eight pending seasons proves
-			// that three happened and never which three. The marker goes on
-			// the write's own line, together with the gate reason it bypassed
-			// and why bypassing it was permitted, so one grep separates every
-			// unauthorized write from every authorized one.
-			//
-			// It marks the BYPASS, not the signature: a season matching
-			// seasonWriteRecoverySignature written through an OPEN gate is an
-			// ordinary write and its line stays identical to the Radarr twin's.
-			writeAttrs = append(writeAttrs,
-				"recovery", true,
-				"gateBlocked", gateBlocked,
-				"recoveryReason", "the cross-check gate was shut; this season was admitted by the recovery allowance because every one of its episodes was already unmonitored, so unmonitoring it cannot strand anything")
+		if recovery {
+			recovered++
+			// One WARN per recovery, naming its season (binding). A recovery is
+			// rarer and more consequential than an ordinary write: it finishes
+			// something a previous cycle left half-done, and — when the
+			// ordinary gate is shut — it is the one write in this project that
+			// happens without cross-check authorization, so it must be
+			// identifiable per season rather than only counted per instance.
+			// gateBlocked names the authorization it did not have; its absence
+			// says the ordinary gate was open and this season simply had
+			// nothing left but its flag.
+			recoveryAttrs := []any{"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season,
+				"reason", d.reason, "profile", d.profileName, "recovery", true, "crossCheck", cc.status}
+			if gateBlocked != "" {
+				recoveryAttrs = append(recoveryAttrs, "gateBlocked", gateBlocked,
+					"recoveryReason", "the ordinary write gate was shut; every episode of this season was already unmonitored, so only the season flag remained to write and it cannot strand anything")
+			}
+			logger.Warn("completing a previously partial season unmonitor", recoveryAttrs...)
+			continue
 		}
-		logger.Info("unmonitor", writeAttrs...)
+
+		unmonitored++
+		logger.Info("unmonitor",
+			"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season, "reason", d.reason, "profile", d.profileName)
 	}
 
-	return unmonitored, writeErrors, echoUnverified, writesRefused, withheld
+	// The gate line comes AFTER the pass, not before it, so every number on it
+	// is a fact rather than a prediction: withheldWrites is what this pass
+	// really withheld (in dry-run, that is everything) and recoveredWrites is
+	// what really completed. The previous shape logged its counts up front and
+	// had to rename both keys in dry-run to stop them claiming writes that were
+	// never sent — a line that has to disclaim itself is a line reporting the
+	// wrong thing.
+	if gateBlocked != "" {
+		logGateWithheld(logger, inst, cc, gateBlocked, recoveryBlocked, pending, withheld, recovered, dryRun)
+	}
+
+	return unmonitored, recovered, writeErrors, echoUnverified, writesRefused, withheld
+}
+
+// logGateWithheld reports a shut ordinary write gate: what it withheld, what
+// the recovery path completed in spite of it, and — when the recovery path was
+// shut too — why nothing at all could run.
+//
+// "nothing was written" and "nothing needed writing" must never look the same
+// in the log, which is why this line exists at all; the level rule is the
+// Radarr pass's own (Phase 5 noise-budget fix, carried forward): blocking a
+// pass that had nothing to write anyway is a health signal rather than an
+// alarm, but an UNRECOGNIZED status is itself a bug signal and stays WARN
+// however little was pending.
+func logGateWithheld(logger *slog.Logger, inst Instance, cc crossCheckResult, gateBlocked, recoveryBlocked string, pending, withheld, recovered int, dryRun bool) {
+	attrs := []any{"instance", inst.Name, "type", inst.Type, "crossCheck", cc.status}
+	attrs = append(attrs, cc.logAttrs()...)
+	attrs = append(attrs, "withheldWrites", withheld, "recoveredWrites", recovered, "dryRun", dryRun)
+	msg := "writes withheld for this instance: " + gateBlocked
+	if withheld == 0 && recovered > 0 {
+		// Nothing was left for the gate to withhold — every pending season of
+		// this instance turned out to be a recovery. "writes withheld" beside
+		// withheldWrites=0 would be a line contradicting its own number.
+		msg = "the ordinary write gate is shut (" + gateBlocked + ") but withheld nothing: every pending season was completed by the recovery path"
+	}
+	if recoveryBlocked != "" {
+		msg += "; the recovery path is shut too: " + recoveryBlocked
+	}
+	if pending > 0 || !isKnownCrossCheckStatus(cc.status) {
+		logger.Warn(msg, attrs...)
+		return
+	}
+	logger.Info(msg, attrs...)
 }
 
 // seriesLibraryContainsID reports whether any series in the library carries

@@ -1969,15 +1969,23 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	cc := runSonarrCrossCheck(ctx, logger, client, inst, allDecisions, wantedEpisodeIDs)
 	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
 
-	unmonitoredCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount := runSonarrWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun)
+	unmonitoredCount, recoveredWriteCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount := runSonarrWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun)
 
 	attrs := []any{"instance", inst.Name, "type", inst.Type}
 	if onlyID != 0 {
 		attrs = append(attrs, "onlyId", onlyID)
 	}
+	// recoveredWrites is the sonarr-only sixth counter (binding controller
+	// ruling item 4): a confirmed write on the write pass's recovery path — a
+	// season whose every episode was already unmonitored, so only the season
+	// flag remained. It is never folded into unmonitored, and it is always
+	// present including as 0, for the same reason every other counter here is:
+	// a run that shows writes beside crossCheck=inconclusive must carry the one
+	// number on the same line that explains how that is possible.
 	attrs = append(attrs,
 		"totalSeriesMonitored", totalSeriesMonitored, "seasonsEvaluated", seasonsEvaluated,
-		"wouldUnmonitor", wouldUnmonitorCount, "unmonitored", unmonitoredCount, "alreadyUnmonitored", alreadyUnmonitoredCount)
+		"wouldUnmonitor", wouldUnmonitorCount, "unmonitored", unmonitoredCount, "recoveredWrites", recoveredWriteCount,
+		"alreadyUnmonitored", alreadyUnmonitoredCount)
 
 	// The same mode-dependent split the Radarr summary makes, for the same
 	// reasons (see runRadarrDecisionEngine): writeErrors counts failed WRITES,
@@ -1998,8 +2006,9 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// number must never be readable as "none happened". Together with the
 	// above they satisfy the binding accounting identity
 	//
-	//	wouldUnmonitor == unmonitored + writeEchoUnverified + writeErrors
-	//	                  + writeRehearsalErrors + writesRefused + withheldWrites
+	//	wouldUnmonitor == unmonitored + recoveredWrites + writeEchoUnverified
+	//	                  + writeErrors + writeRehearsalErrors + writesRefused
+	//	                  + withheldWrites
 	//
 	// pinned by
 	// TestRunSonarrDecisionEngine_EveryWouldUnmonitorSeasonIsAccountedForInTheSummary.
@@ -2247,9 +2256,10 @@ func runSonarrCrossCheck(ctx context.Context, logger *slog.Logger, client *APICl
 			// This exclusion is what makes a would-unmonitor season whose
 			// episodes are ALL unmonitored land as unverifiable — the state a
 			// partially completed write leaves behind. Its retry is
-			// authorized by the write pass's explicitly named recovery
-			// allowance (seasonWriteRecoverySignature), not by weakening what
-			// "verified" means here.
+			// authorized by the write pass's separately gated RECOVERY path
+			// (recoveryGateBlockReason, sonarr_writer.go), not by weakening
+			// what "verified" means here. A comparison that cannot fail must
+			// never count as evidence, whatever depends on it downstream.
 			if !*ep.monitored {
 				seasonAlreadyUnmonitoredEpisodes++
 				continue
