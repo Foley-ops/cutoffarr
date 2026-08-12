@@ -451,6 +451,7 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 // checkInstanceConnectivity and inspectRadarrLibrary, the binding
 // error-handling rule (§2.6) is "skip that instance for the cycle and log a
 // warning" with no further work for a caller to gate on.
+//
 // reverse (Phase 10) is the fourth pass, and it runs AFTER the write pass
 // rather than beside the evaluation, deliberately: it is a second, independent
 // question about the same library ("what is unmonitored that should not be"),
@@ -2145,6 +2146,7 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 // runRadarrDecisionEngine, it never returns anything: the binding
 // error-handling rule (§2.6) is "skip that instance for the cycle and log a
 // warning", with no further work for a caller to gate on.
+//
 // reverse (Phase 10) is the fourth pass, run after the write pass for the same
 // reasons the Radarr engine runs it there: it is a separate question about the
 // same library, its findings must never enter the forward cross-check's pools,

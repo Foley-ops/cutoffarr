@@ -1159,6 +1159,12 @@ func TestDaemon_IdleCycleWithReverseFindings_StaysWithinTheNoiseBudget(t *testin
 	if n := strings.Count(startup, `msg="reverse-scan finding"`); n != 2 {
 		t.Fatalf("the startup scan must report both findings in full, got %d:\n%s", n, startup)
 	}
+	// The loop announces its schedule once, asynchronously, after the startup
+	// scan returns; waiting for it keeps that one-off line out of the cycles
+	// being compared (the same wait the existing idle-cycle tests make).
+	eventually(t, "the reconciliation schedule to be announced", func() bool {
+		return strings.Contains(h.out.String(), "reconciliation sweep scheduled")
+	})
 
 	mark := h.mark()
 	h.clock.Advance(time.Hour)
@@ -1456,4 +1462,56 @@ func TestRunRadarrDecisionEngine_ReverseFindings_NeverEnterTheForwardCrossCheck(
 	if !strings.Contains(out, `crossCheck="passed (nothing sampled`) {
 		t.Errorf("the forward cross-check had nothing to sample this cycle and must say so:\n%s", out)
 	}
+}
+
+// TestRun_ReverseScan_Sonarr_WriteMode_SeasonFlagOnly_NeedsNoEpisodeWrite is the
+// shape where only the season flag is wrong: every episode of the season is
+// already monitored, so there is nothing for the episode call to name and one
+// write is enough.
+//
+// It is worth its own test because it is the reverse mirror of the FORWARD
+// path's recovery shape, and must not be reported as one: recovery means
+// "finishing something a previous cycle left half-done", which is a claim about
+// the forward direction only. Here it is simply an ordinary re-monitor of an
+// ordinary season.
+func TestRun_ReverseScan_Sonarr_WriteMode_SeasonFlagOnly_NeedsNoEpisodeWrite(t *testing.T) {
+	// A CF-score finding: the episode is MONITORED (so it is absent from the
+	// unmonitored wanted set and its quality cutoff counts as met) while the
+	// SEASON is not, and its file scores below the profile's cutoff of 100.
+	fake := newStatefulSonarrFake(t,
+		[]*statefulSonarrSeries{
+			{id: 1, title: "Season Flag Only", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 2, monitored: false, episodeFileCount: 1, totalEpisodeCount: 1}}},
+		},
+		[]*statefulSonarrEpisode{
+			{id: 200, seriesID: 1, seasonNumber: 2, episodeNumber: 1, monitored: true, hasFile: true,
+				airDateUtc: pastAirDate, episodeFileID: 600, inWantedSet: false},
+		},
+		[]*statefulSonarrEpisodeFile{{id: 600, seasonNumber: 2, customFormatScore: 10, qualityCutoffNotMet: false}},
+	)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--config", writeReverseSonarrTestConfig(t, fake.srv.URL, false, true), "--once"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code; stderr=%s", stderr.String())
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, `reason="`+ReasonCFCutoffNotMet+`"`) {
+		t.Fatalf("this test proves nothing unless the CF-score finding was made:\n%s", out)
+	}
+	writes := fake.writes()
+	if len(writes) != 1 || writes[0].path != "/api/v3/series/1" {
+		t.Fatalf("want exactly one write, the season PUT, got %+v", writes)
+	}
+	if !fake.seasonMonitored(1, 2) {
+		t.Error("season 2 must be monitored after the write")
+	}
+	c := summaryCountersFor(t, out, "sonarr decision summary")
+	if c["remonitored"] != 1 {
+		t.Errorf("remonitored = %d, want 1:\n%s", c["remonitored"], out)
+	}
+	if c["recoveredWrites"] != 0 || strings.Contains(out, "completing a previously partial season unmonitor") {
+		t.Errorf("a reverse write must never be reported as a forward recovery:\n%s", out)
+	}
+	assertReverseIdentity(t, out)
 }

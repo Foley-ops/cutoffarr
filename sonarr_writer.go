@@ -449,8 +449,16 @@ func writeSeasonMonitored(ctx context.Context, logger *slog.Logger, client *APIC
 	// FIRST write call (binding order).
 	episodesWritten := false
 	if len(episodeIDs) == 0 {
-		logger.Debug("no monitored episodes remain in this season; the episode monitor write is not needed and this is a recovery write (the season flag alone)",
-			append(append([]any(nil), attrs...), "episodes", len(seasonEpisodes), "recovery", true)...)
+		// Every episode is already in the state this write wants, so only the
+		// season flag is left. Going FORWARD that is the recovery shape (what a
+		// partially completed unmonitor leaves behind); coming back it is
+		// ordinary — a season somebody unmonitored at the season level only —
+		// and the reverse direction has no recovery concept to claim.
+		msg := "no monitored episodes remain in this season; the episode monitor write is not needed and this is a recovery write (the season flag alone)"
+		if rev != nil {
+			msg = "every episode of this season is already monitored; the episode monitor write is not needed and only the season flag is left to write"
+		}
+		logger.Debug(msg, append(append([]any(nil), attrs...), "episodes", len(seasonEpisodes), "recovery", recovery)...)
 	} else {
 		// §2.1: the dry-run gate, immediately before this HTTP write call and
 		// nowhere earlier. Everything above runs identically in both modes.
@@ -863,7 +871,8 @@ func confirmEpisodeMonitorByReRead(ctx context.Context, logger *slog.Logger, cli
 		case e.Monitored == nil:
 			return fmt.Errorf("%s: the re-read does not say whether episode %d is monitored, so the episode write remains unconfirmed: %w", subject, id, unconfirmed)
 		case *e.Monitored != monitoredWriteTarget(rev):
-			return fmt.Errorf("%s: the re-read says episode %d is still monitored=%t, so the episode write did not land: %w", subject, id, *e.Monitored, unconfirmed)
+			return fmt.Errorf("%s: the re-read says episode %d still reads monitored=%t rather than %t, so the episode write did not land: %w",
+				subject, id, *e.Monitored, monitoredWriteTarget(rev), unconfirmed)
 		}
 	}
 

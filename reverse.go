@@ -52,15 +52,6 @@ const (
 // evaluators: rule 1's expectation, and nothing else.
 func (d scanDirection) wantsMonitored() bool { return d == directionForward }
 
-// String makes a direction printable in a log attribute without a switch at
-// the call site.
-func (d scanDirection) String() string {
-	if d == directionReverse {
-		return "reverse"
-	}
-	return "forward"
-}
-
 // isReverseFinding reports whether a decision reason means "this item is
 // unmonitored AND still fails the criteria" — the one thing the reverse scan
 // reports.
@@ -117,6 +108,17 @@ type reverseOptions struct {
 	remonitor bool
 }
 
+// fullScanReverseOptions is what a FULL-LIBRARY cycle asks for: run the reverse
+// scan, and let it write only if the config says so.
+//
+// It exists so the three full-scan call sites — the startup scan, the
+// reconciliation sweep, and a --once run — cannot drift apart from each other,
+// and so that the scoped cycles' "no reverse pass" stays the plain zero value
+// rather than something they have to spell.
+func fullScanReverseOptions(cfg Config) reverseOptions {
+	return reverseOptions{enabled: true, remonitor: cfg.ReverseScanRemonitor}
+}
+
 // reverseCounts is one instance's reverse-scan accounting for one cycle.
 //
 // findings is what the report-only default produces. The five write counters
@@ -159,7 +161,12 @@ type reverseCounts struct {
 //   - the pass did not run (a webhook or --only-id cycle): NOTHING is printed.
 //     A reverseFindings=0 on a cycle that never looked would be a false
 //     all-clear, and those cycles are the majority in a busy daemon.
-//   - the pass ran but could not be trusted: reverseScan=skipped, and no count.
+//   - the pass ran but could not be trusted: reverseScan=skipped, and no count
+//     — not even the write counters, with the switch on. "Always present
+//     including as 0" exists so an absent number cannot be read as "none
+//     happened"; here the line says in one token that NOTHING happened, which
+//     is the same guarantee stated more strongly, and a row of zeroes beside it
+//     would invite the reading that a pass ran and found nothing.
 //   - the pass ran: reverseFindings=N, plus — only when the write switch is on
 //     — the five write counters, always present including as 0.
 //
@@ -311,17 +318,6 @@ func (p reversePass) runRadarr(ctx context.Context, movies []movieListElement) r
 		p.remonitorMovies(ctx, findings, reverseWriteContext{profiles: p.profiles, wantedIDs: wantedIDs}, &c)
 	}
 	return c
-}
-
-// fullScanReverseOptions is what a FULL-LIBRARY cycle asks for: run the reverse
-// scan, and let it write only if the config says so.
-//
-// It exists so the three full-scan call sites — the startup scan, the
-// reconciliation sweep, and a --once run — cannot drift apart from each other,
-// and so that the scoped cycles' "no reverse pass" stays the plain zero value
-// rather than something they have to spell.
-func fullScanReverseOptions(cfg Config) reverseOptions {
-	return reverseOptions{enabled: true, remonitor: cfg.ReverseScanRemonitor}
 }
 
 // reverseSeasonFinding pairs a reported season with the one fact about it the
