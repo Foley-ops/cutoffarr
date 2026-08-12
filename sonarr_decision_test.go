@@ -27,7 +27,7 @@ var sonarrDecisionTestProfiles = map[int]qualityProfile{
 }
 
 // pastAirDate / futureAirDate are safely distant from any real test-run
-// time (episodeHasAired compares against time.Now()), so no clock injection
+// time (rule 3 resolves episodeAiringStatus against time.Now()), so no clock injection
 // is needed: 2015 is always in the past and 2099 is always in the future for
 // any foreseeable run of this suite.
 const pastAirDate = "2015-01-01T00:00:00Z"
@@ -82,6 +82,35 @@ func episodeJSON(id, season, episodeNum int, airDate string, episodeFileID int) 
 	}
 	return fmt.Sprintf(`{"id": %d, "seasonNumber": %d, "episodeNumber": %d, "monitored": true, "hasFile": true, "airDateUtc": %s, "episodeFileId": %d}`,
 		id, season, episodeNum, airDateJSON, episodeFileID)
+}
+
+// stampSeriesID adds "seriesId": seriesID to every element of an /api/v3/episode
+// fixture that does not already state one, leaving an element that DOES state
+// one exactly as written (so a test can still hand back foreign or absent
+// provenance deliberately, by spelling a different id — an absent one has to be
+// built without this helper).
+//
+// It exists because episodeJSON's fixtures are shared across a fake's whole
+// library while the field is per-series: baking an id into the text would be
+// wrong for every series but one, and omitting it entirely made the write path
+// refuse (Phase 8: an episode of the target season must prove it belongs to the
+// series before its id can be named in a write).
+func stampSeriesID(t *testing.T, episodesJSON string, seriesID int) string {
+	t.Helper()
+	var elems []map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(episodesJSON), &elems); err != nil {
+		t.Fatalf("episode fixture is not a JSON array of objects: %v\n%s", err, episodesJSON)
+	}
+	for _, e := range elems {
+		if _, present := e["seriesId"]; !present {
+			e["seriesId"] = json.RawMessage(strconv.Itoa(seriesID))
+		}
+	}
+	out, err := json.Marshal(elems)
+	if err != nil {
+		t.Fatalf("re-encoding the episode fixture: %v", err)
+	}
+	return string(out)
 }
 
 // episodeFileJSON renders one /api/v3/episodefile array element.
@@ -957,7 +986,16 @@ func newSonarrEngineFake(t *testing.T, episodeJSON, fileJSON string) *sonarrEngi
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		w.Write([]byte(f.episodesFor()))
+		// stampSeriesID: a real Sonarr always states each episode's own
+		// seriesId, and since Phase 8 the WRITE path requires it (an episode
+		// of the target season that cannot prove it belongs to this series is
+		// refused rather than named in PUT /episode/monitor — see
+		// episodesOfSeason). This fake's shared per-test fixture is served for
+		// every ?seriesId=N, so the id cannot be baked into the fixture text
+		// for a multi-series test; stamping it here is what makes the fake
+		// faithful instead of exercising a refusal no live instance produces.
+		seriesID, _ := strconv.Atoi(r.URL.Query().Get("seriesId"))
+		w.Write([]byte(stampSeriesID(t, f.episodesFor(), seriesID)))
 	}))
 	mux.HandleFunc("/api/v3/episode/monitor", f.handle(f.serveEpisodeMonitor))
 	mux.HandleFunc("/api/v3/series/", f.handle(f.serveSeriesDetail))
@@ -1319,6 +1357,11 @@ func sonarrCandidateDecision(seriesID, season int, wouldUnmonitor bool, episodes
 	return seasonDecision{
 		seriesID: seriesID, series: fmt.Sprintf("Series %d", seriesID), season: season,
 		wouldUnmonitor: wouldUnmonitor, completeOnDisk: true, crossCheckEpisodes: episodes, cfThreshold: 100,
+		// The episode set a real evaluation hands the write pass is complete
+		// unless an episode of the season had no id at all (see
+		// buildSeasonCrossCheckEpisodes); the incomplete case has its own
+		// dedicated tests rather than being every fixture's default.
+		crossCheckEpisodesComplete: true,
 	}
 }
 
@@ -2241,7 +2284,12 @@ func TestBuildSeasonCrossCheckEpisodes_JoinsEachEpisodeToItsOwnFile(t *testing.T
 		501: {ID: intPtr(501), QualityCutoffNotMet: boolPtr(true)},
 	}
 
-	got := buildSeasonCrossCheckEpisodes(episodes, filesByID)
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: "http://sonarr.invalid", APIKey: "key"}
+	got, complete := buildSeasonCrossCheckEpisodes(logger, inst, 7, 1, episodes, filesByID)
+	if !complete {
+		t.Error("complete = false, want true: every episode here is nameable, so nothing was dropped")
+	}
 	if len(got) != 4 {
 		t.Fatalf("expected 4 episodes, got %d: %+v", len(got), got)
 	}
@@ -2293,5 +2341,54 @@ func TestRunSonarrDecisionEngine_UntrustedSeriesShapes_WarnAndSkipWithoutPanicki
 	}
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Errorf("nothing may be written for untrusted input, got %+v", writes)
+	}
+}
+
+// TestBuildSeasonCrossCheckEpisodes_EpisodeWithoutID_WarnsAndReportsIncomplete
+// clears DEFERRED DEBT from the Phase 7 branch review. An episode with no id
+// was dropped silently, and the resulting set was then handed to the recovery
+// gate (recoveryCandidate), which asks "is EVERY episode of this season already
+// unmonitored?" — a question no incomplete set can answer. The drop is now
+// warned about, exactly as every other structurally identical drop in this
+// engine is, and the set says whether it is complete so its one dangerous
+// consumer can refuse it.
+func TestBuildSeasonCrossCheckEpisodes_EpisodeWithoutID_WarnsAndReportsIncomplete(t *testing.T) {
+	episodes := []episodeElement{
+		{ID: intPtr(100), Monitored: boolPtr(false), EpisodeFileID: intPtr(500)},
+		{Monitored: boolPtr(true), EpisodeFileID: intPtr(501)}, // no id: unnameable
+	}
+	filesByID := map[int]episodeFileElement{500: {ID: intPtr(500), QualityCutoffNotMet: boolPtr(false)}}
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: "http://sonarr.invalid", APIKey: "key"}
+
+	got, complete := buildSeasonCrossCheckEpisodes(logger, inst, 7, 1, episodes, filesByID)
+	if len(got) != 1 {
+		t.Fatalf("expected the one nameable episode, got %d: %+v", len(got), got)
+	}
+	if complete {
+		t.Error("complete = true, want false: an episode of this season was dropped, so the set does not describe the whole season")
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "season=1") {
+		t.Errorf("the drop must be warned about and name its season:\n%s", out)
+	}
+}
+
+// TestBuildSeasonCrossCheckEpisodes_AllEpisodesNameable_ReportsComplete is the
+// complement: nothing was dropped, so the set really does describe the season.
+func TestBuildSeasonCrossCheckEpisodes_AllEpisodesNameable_ReportsComplete(t *testing.T) {
+	episodes := []episodeElement{
+		{ID: intPtr(100), Monitored: boolPtr(false), EpisodeFileID: intPtr(500)},
+		{ID: intPtr(101), Monitored: boolPtr(false), EpisodeFileID: intPtr(501)},
+	}
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: "http://sonarr.invalid", APIKey: "key"}
+
+	got, complete := buildSeasonCrossCheckEpisodes(logger, inst, 7, 1, episodes, map[int]episodeFileElement{})
+	if len(got) != 2 {
+		t.Fatalf("expected 2 episodes, got %d", len(got))
+	}
+	if !complete {
+		t.Errorf("complete = false, want true: no episode was dropped\n%s", buf.String())
 	}
 }

@@ -1257,9 +1257,12 @@ func selectMovieFile(files []movieFileDetail, wantID *int) (movieFileDetail, boo
 // driven sequence than the plan's rule numbering.
 //
 // Never at the series level: unmonitoring only ever happens to a season (and
-// implicitly its episodes); no code path in this engine composes a
-// series-level monitored write, and there is no Sonarr write path in this
-// phase at all (Phase 7).
+// implicitly its episodes). No code path in this engine composes a
+// series-level monitored write, and the Sonarr write path added in Phase 7
+// (sonarr_writer.go, called from runSonarrDecisionEngine below) enforces the
+// same thing from the other side: it READS the series-level monitored flag as
+// a race guard and assembleSeasonWrite refuses to emit a payload whose
+// series-level monitored differs from the fresh GET.
 
 // seasonDecision is the outcome of evaluating one monitored season against
 // the Sonarr season decision rule.
@@ -1309,6 +1312,16 @@ type seasonDecision struct {
 	// needed for the same season.
 	rawEpisodesForCrossCheck []episodeElement
 
+	// crossCheckEpisodesComplete says whether crossCheckEpisodes describes
+	// EVERY episode of the season or lost one on the way in (an episode with
+	// no id, which cannot be joined to anything — see
+	// buildSeasonCrossCheckEpisodes). It exists for exactly one consumer:
+	// recoveryCandidate, whose whole question is "is every episode of this
+	// season already unmonitored?", which an incomplete set cannot answer in
+	// the safe direction. It is false for a season whose set was never built
+	// at all, which is the same conservative answer.
+	crossCheckEpisodesComplete bool
+
 	// cfThreshold is populated once the series' profile is resolved (the
 	// series-level profile check passed, or failed only on upgradeAllowed —
 	// mirrors evaluateMovie's own asymmetry, where cfThreshold is set before
@@ -1346,10 +1359,34 @@ type seasonCrossCheckEpisode struct {
 // own rule-7 candidate path, whose /episodefile fetch already happened
 // during evaluation, and runSonarrCrossCheck's on-demand fetch for sampled
 // skip-side seasons that never reached rule 7 at all.
-func buildSeasonCrossCheckEpisodes(episodes []episodeElement, filesByID map[int]episodeFileElement) []seasonCrossCheckEpisode {
-	var out []seasonCrossCheckEpisode
+//
+// An episode with no id cannot be joined to anything (wanted-set membership is
+// looked up BY id) and is dropped. Two things changed about that drop in Phase
+// 8, clearing DEFERRED DEBT from the Phase 7 branch review:
+//
+//   - It WARNs, naming the season, exactly as every other structurally
+//     identical drop in this engine does (episodesOfSeason's missing
+//     seasonNumber, the episode-file missing seasonNumber). It used to be
+//     silent, so a season quietly missing an episode from every piece of
+//     evidence about it looked identical to a season that had none.
+//   - It is REPORTED, via the second return value. The set's one dangerous
+//     consumer is recoveryCandidate, which asks "is EVERY episode of this
+//     season already unmonitored?" — a question no incomplete set can answer,
+//     because the dropped episode is precisely the one that might still be
+//     monitored. complete=false makes that unanswerable rather than
+//     accidentally answered "yes".
+//
+// The cross-check's own use of the set is unaffected either way: it compares
+// whatever episodes it can see and counts the rest as unverifiable, which is
+// already the conservative direction.
+func buildSeasonCrossCheckEpisodes(logger *slog.Logger, inst Instance, seriesID, seasonNumber int, episodes []episodeElement, filesByID map[int]episodeFileElement) (out []seasonCrossCheckEpisode, complete bool) {
+	complete = true
 	for _, e := range episodes {
 		if e.ID == nil {
+			complete = false
+			logger.Warn("episode of this season has no id; it cannot be joined to its file or to the wanted set, so this season's episode evidence is incomplete",
+				"instance", inst.Name, "type", inst.Type, "seriesId", seriesID, "season", seasonNumber,
+				"episodeNumber", derefOrAbsent(e.EpisodeNumber))
 			continue
 		}
 		var qcnm *bool
@@ -1360,7 +1397,7 @@ func buildSeasonCrossCheckEpisodes(episodes []episodeElement, filesByID map[int]
 		}
 		out = append(out, seasonCrossCheckEpisode{episodeID: *e.ID, monitored: e.Monitored, qualityCutoffNotMet: qcnm})
 	}
-	return out
+	return out, complete
 }
 
 // seriesEvaluation is evaluateSeries's full result for one series: the
@@ -1373,6 +1410,19 @@ type seriesEvaluation struct {
 	// alreadyUnmonitoredCount, scoped to a single series here so the caller
 	// can sum it across the whole library.
 	alreadyUnmonitored int
+
+	// unmonitoredSeasons are those same seasons, handed back for the CALLER to
+	// log one line each — but only when reporting them individually is what the
+	// noise budget calls for. It is empty for a series with zero monitored
+	// seasons, where the binding rule is a single bulk debug line instead.
+	//
+	// The list exists so the fan-out can be scoped, which is the whole point:
+	// evaluateSeries has no idea whether this series is in the report's scope
+	// (--only-id names one, a webhook cycle names a set), and it used to emit
+	// one line per unmonitored season of EVERY series in the library regardless
+	// — the one place the Sonarr engine's logging diverged from its own,
+	// correctly-scoped counters.
+	unmonitoredSeasons []seriesSeasonElement
 }
 
 // episodeAiringStatus reports whether an episode's airDateUtc is in the past
@@ -1511,16 +1561,23 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 			logger.Warn("monitored series produced no season decisions: no seasons, or none had a usable monitored/seasonNumber field",
 				"instance", inst.Name, "type", inst.Type, "seriesId", seriesID, "series", seriesTitle)
 		}
+		// unmonitoredSeasons is deliberately left EMPTY on this path: the
+		// binding noise-budget rule for a series with zero monitored seasons is
+		// one bulk debug line (just logged above), never one line per season.
 		return seriesEvaluation{alreadyUnmonitored: len(explicitlyUnmonitored)}
 	}
 
-	// The complementary case: at least one season IS monitored, so the
-	// individual "already unmonitored" debug lines for the OTHER seasons are
-	// exactly as informative as Radarr's per-movie equivalent, not spam.
-	for _, season := range explicitlyUnmonitored {
-		logger.Debug("season already unmonitored",
-			"instance", inst.Name, "type", inst.Type, "seriesId", seriesID, "series", seriesTitle, "season", derefOrAbsent(season.SeasonNumber))
-	}
+	// The complementary case — at least one season IS monitored, so the
+	// individual "already unmonitored" lines for the OTHER seasons are exactly
+	// as informative as Radarr's per-movie equivalent rather than spam — is
+	// REPORTED BY THE CALLER, not logged here (DEFERRED DEBT from the Phase 7
+	// branch review, cleared in Phase 8). This function used to emit the fan-out
+	// itself, for every series in the library, even on a run scoped to one
+	// series: the counter beside it was correctly scoped, so only the log
+	// diverged, and it diverged from the Radarr precedent (decision.go's
+	// alreadyUnmonitoredCount branch) that was deliberately fixed the same way.
+	// Handing the seasons back instead of logging them puts the reporting
+	// decision where the scope is known.
 
 	// Series-level cheap checks (binding evaluation-order resolution):
 	// profile display-name resolution happens eagerly (mirrors evaluateMovie
@@ -1567,7 +1624,7 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 				reason: seriesLevelReason, profileName: profileName, cfThreshold: threshold,
 			})
 		}
-		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored)}
+		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored), unmonitoredSeasons: explicitlyUnmonitored}
 	}
 
 	// The series survived every series-level check: exactly one
@@ -1582,7 +1639,7 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 				reason: ReasonSeasonEpisodesUnavailable, profileName: profileName, cfThreshold: profile.CutoffFormatScore,
 			})
 		}
-		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored)}
+		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored), unmonitoredSeasons: explicitlyUnmonitored}
 	}
 
 	episodesBySeason := make(map[int][]episodeElement, len(monitoredSeasons))
@@ -1743,7 +1800,7 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 	}
 
 	if len(candidateSeasons) == 0 {
-		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored)}
+		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored), unmonitoredSeasons: explicitlyUnmonitored}
 	}
 
 	// The most expensive fetch, made at most once per series, and only for
@@ -1774,7 +1831,7 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 			// read side.
 			decisions[candidateIndex[sn]].completeOnDisk = false
 		}
-		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored)}
+		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored), unmonitoredSeasons: explicitlyUnmonitored}
 	}
 
 	filesBySeason := make(map[int][]episodeFileElement)
@@ -1817,7 +1874,7 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 		// cross-check data at all: unverifiable by construction, consuming a
 		// sample slot and adding a WARN, even though BOTH halves of the join
 		// it needed were already in scope and cost nothing more to build.
-		decisions[idx].crossCheckEpisodes = buildSeasonCrossCheckEpisodes(seasonEpisodesFor[sn], filesByID)
+		decisions[idx].crossCheckEpisodes, decisions[idx].crossCheckEpisodesComplete = buildSeasonCrossCheckEpisodes(logger, inst, seriesID, sn, seasonEpisodesFor[sn], filesByID)
 
 		// Binding controller resolution #3: fewer files than statistics
 		// claimed is untrusted, not "some files are just missing".
@@ -1857,7 +1914,7 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 		}
 	}
 
-	return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored)}
+	return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored), unmonitoredSeasons: explicitlyUnmonitored}
 }
 
 // runSonarrDecisionEngine is the entry point for a single sonarr instance.
@@ -1960,6 +2017,16 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		totalSeriesMonitored++
 		alreadyUnmonitoredCount += eval.alreadyUnmonitored
 		reported = append(reported, eval.decisions...)
+
+		// The per-season "already unmonitored" fan-out, logged HERE — inside
+		// the scope check — rather than inside evaluateSeries, which cannot
+		// know the scope. Same placement, and same reason, as the Radarr
+		// engine's own alreadyUnmonitored debug line.
+		for _, season := range eval.unmonitoredSeasons {
+			logger.Debug("season already unmonitored",
+				"instance", inst.Name, "type", inst.Type, "seriesId", *s.ID, "series", titleOrAbsent(s.Title),
+				"season", derefOrAbsent(season.SeasonNumber))
+		}
 
 		for _, d := range eval.decisions {
 			seasonsEvaluated++
@@ -2149,7 +2216,12 @@ func runSonarrCrossCheck(ctx context.Context, logger *slog.Logger, client *APICl
 				fetchedFilesBySeries[d.seriesID] = filesByID
 			}
 			if filesByID != nil {
-				crossCheckEpisodes = buildSeasonCrossCheckEpisodes(d.rawEpisodesForCrossCheck, filesByID)
+				// The completeness bit is deliberately discarded here: this
+				// on-demand set exists only to let the cross-check compare what
+				// it can see (an episode it cannot see is already counted as
+				// unverifiable), and it is never the input to recoveryCandidate
+				// — a skip-side season sampled here has no pending write at all.
+				crossCheckEpisodes, _ = buildSeasonCrossCheckEpisodes(logger, inst, d.seriesID, d.season, d.rawEpisodesForCrossCheck, filesByID)
 			}
 		}
 

@@ -1136,8 +1136,14 @@ func (f *statefulSonarrFake) episodesJSON(seriesID int) string {
 		if e.airDateUtc != "" {
 			airDateJSON = strconv.Quote(e.airDateUtc)
 		}
-		elems = append(elems, fmt.Sprintf(`{"id":%d,"seasonNumber":%d,"episodeNumber":%d,"monitored":%t,"hasFile":%t,"airDateUtc":%s,"episodeFileId":%d}`,
-			e.id, e.seasonNumber, e.episodeNumber, e.monitored, e.hasFile, airDateJSON, e.episodeFileID))
+		// seriesId is emitted because a real Sonarr always emits it, and since
+		// Phase 8 the WRITE path requires it: an episode of the target season
+		// that does not state its provenance cannot be named in PUT
+		// /episode/monitor (see episodesOfSeason). A fake that omitted it made
+		// every write-mode end-to-end test pass through a code path no real
+		// instance would take.
+		elems = append(elems, fmt.Sprintf(`{"id":%d,"seriesId":%d,"seasonNumber":%d,"episodeNumber":%d,"monitored":%t,"hasFile":%t,"airDateUtc":%s,"episodeFileId":%d}`,
+			e.id, e.seriesID, e.seasonNumber, e.episodeNumber, e.monitored, e.hasFile, airDateJSON, e.episodeFileID))
 	}
 	return "[" + strings.Join(elems, ",") + "]"
 }

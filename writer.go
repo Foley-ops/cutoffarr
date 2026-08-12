@@ -375,8 +375,21 @@ func isWriteRefusal(err error) bool {
 // summary. noun names the thing for the human-facing log line ("movie",
 // "series"); subject prefixes the error ("movie 7", "series 3 season 1").
 func preWriteExclusionTagCheck(logger *slog.Logger, payload map[string]json.RawMessage, noun, subject string, exclusionTagID int, attrs []any) error {
-	rawTags, tagsPresent := payload["tags"]
-	if !tagsPresent {
+	// rawMapField (shared.go), not payload["tags"]: the lookup has to match
+	// the decode it is re-checking. encoding/json matches JSON keys to struct
+	// fields case-INsensitively, so the read path was made case-insensitive
+	// with an ambiguity refusal in Phase 6/7 — while this, the check §2.5 says
+	// always wins, was still an exact map index (DEFERRED DEBT from the Phase 7
+	// branch review, cleared in Phase 8). See rawMapField's doc comment for the
+	// two shapes that mismatch produced; the ambiguous one let a payload
+	// carrying the exclusion tag under the other spelling pass this check.
+	rawTags, tagMatches := rawMapField(payload, "tags")
+	if tagMatches > 1 {
+		logger.Warn(noun+" carries more than one differently-cased tags key in the pre-write fetch; either could be the authoritative field, so the exclusion tag cannot be verified, refusing to write",
+			append(append([]any(nil), attrs...), "tagsKeyMatches", tagMatches)...)
+		return fmt.Errorf("%s: %w: %d differently-cased %q keys in the pre-write fetch, so the field's provenance is ambiguous", subject, errTagsUnverifiable, tagMatches, "tags")
+	}
+	if tagMatches == 0 {
 		logger.Warn(noun+" tags absent from the pre-write fetch; cannot verify the exclusion tag is not present, refusing to write", attrs...)
 		return fmt.Errorf("%s: %w: %q key absent from the pre-write fetch", subject, errTagsUnverifiable, "tags")
 	}
