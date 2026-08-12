@@ -2,7 +2,9 @@ package main
 
 import (
 	"os"
+	"path"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -170,6 +172,98 @@ func TestComposeExample_StopGracePeriodOutlastsASeasonWrite(t *testing.T) {
 	if !strings.Contains(compose, "_default") {
 		t.Errorf("the external network must carry the <project>_default caveat, which is the likeliest deployment failure:\n%s", compose)
 	}
+}
+
+// --- the build context ------------------------------------------------------
+
+// TestDockerignore_KeepsTheWorkingTreesSecretsOutOfTheBuildContext is the
+// packaging invariant with the largest blast radius, and the one nothing else
+// in this file can see.
+//
+// The FINAL image is clean by construction: it is `FROM scratch`-shaped and
+// only /out/cutoffarr is copied forward. The BUILD STAGE is not. `COPY . .`
+// copies whatever the build context holds, and this working tree holds the
+// operator's live config.yml (real *arr API keys), a .env, .git, and agent
+// scratch. Those land in the build-stage layer, and a build-stage layer is not
+// a private thing: `docker build --target build`, `docker buildx -o
+// type=local`, `docker history` on the cached stage, and the BuildKit cache on
+// whatever host ran the build all still hold it. The deployment plan puts that
+// host on the server, so without a .dockerignore, `docker build` ships the
+// developer's credentials there as a side effect.
+//
+// TestComposeExample_CarriesNoRealCredentials guards a COMMITTED file and by
+// construction cannot catch this: the danger here is precisely the files that
+// are NOT committed.
+func TestDockerignore_KeepsTheWorkingTreesSecretsOutOfTheBuildContext(t *testing.T) {
+	patterns := ignorePatterns(readRepoFile(t, ".dockerignore"))
+
+	// The named entries, each one a file that exists in a working tree of this
+	// project and must never enter a build context.
+	for _, want := range []string{
+		".git",                             // the entire history, including any key ever committed by mistake
+		".env*",                            // compose's own credential file
+		"config.yml",                       // the live config: api_key per instance
+		"config.yaml",                      // ... under its other legal name
+		".superpowers/",                    // agent scratch
+		"/cutoffarr",                       // a stale host-built binary, ~9 MB of nothing the build needs
+		"cutoffarr-implementation-plan.md", // private planning doc
+	} {
+		if !patterns[want] {
+			t.Errorf(".dockerignore must exclude %q from the build context; it has:\n%s", want, strings.Join(sortedSet(patterns), "\n"))
+		}
+	}
+
+	// And the rule that keeps the list from rotting: .gitignore is this repo's
+	// existing statement of "must never leave this machine", so anything added
+	// there has to be added here too. A new secret file is otherwise protected
+	// from git and handed straight to Docker.
+	for _, p := range sortedSet(ignorePatterns(readRepoFile(t, ".gitignore"))) {
+		if !patterns[p] {
+			t.Errorf("%q is gitignored but not dockerignored: git refuses to track it, and `docker build` would copy it into the build stage anyway", p)
+		}
+	}
+}
+
+// TestDockerignore_DoesNotExcludeWhatTheBuildNeeds is the other half: an
+// exclusion list broad enough to drop the sources builds an image that is
+// wrong rather than one that fails to build, if the failure is subtle enough
+// (a missing _test.go file is invisible; a missing .go file is not). This is
+// cheap insurance against a future `*` or `**` that someone adds meaning "then
+// re-include what I need" and gets slightly wrong.
+func TestDockerignore_DoesNotExcludeWhatTheBuildNeeds(t *testing.T) {
+	needed := []string{"go.mod", "go.sum", "main.go", "daemon.go", "webhook.go"}
+	for pattern := range ignorePatterns(readRepoFile(t, ".dockerignore")) {
+		clean := strings.TrimSuffix(strings.TrimPrefix(pattern, "/"), "/")
+		for _, name := range needed {
+			if ok, err := path.Match(clean, name); err == nil && ok {
+				t.Errorf(".dockerignore pattern %q excludes %s, which the build stage needs", pattern, name)
+			}
+		}
+	}
+}
+
+// ignorePatterns reads a .gitignore/.dockerignore into a set, dropping comments
+// and blank lines. Both formats agree on those two rules, which is what lets
+// one file be checked against the other.
+func ignorePatterns(contents string) map[string]bool {
+	out := map[string]bool{}
+	for _, line := range strings.Split(contents, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		out[line] = true
+	}
+	return out
+}
+
+func sortedSet(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // TestComposeExample_CarriesNoRealCredentials is a guard on a committed file

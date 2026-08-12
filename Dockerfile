@@ -19,6 +19,13 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
+# What this copies is the build context AFTER .dockerignore has filtered it,
+# and that filter is load-bearing rather than cosmetic: a working tree of this
+# project holds the operator's live config.yml (a real api_key per instance), a
+# .env, and .git. The final image would never carry them — only /out/cutoffarr
+# is copied forward — but THIS stage would, and a build stage is readable from
+# the BuildKit cache, from `--target build`, and from `docker history`. See
+# .dockerignore, whose contents container_test.go pins.
 COPY . .
 
 # CGO_ENABLED=0 is what makes the binary runnable on `distroless/static`: with
