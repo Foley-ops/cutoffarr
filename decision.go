@@ -1422,7 +1422,7 @@ func episodeAiringStatus(e episodeElement, now time.Time) (aired bool, untrusted
 // that is not monitored produces no seasonDecision at all, for any of its
 // seasons. Rule 1's SEASON-level half (season.monitored == true) IS handled
 // here, since it is intrinsically about this series' own season list.
-func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, s seriesElement, profiles map[int]qualityProfile, exclusionTagID int, tagActive bool, wantedEpisodeIDs map[int]bool, wantedSeasons map[seasonKey]bool) seriesEvaluation {
+func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, s seriesElement, profiles map[int]qualityProfile, exclusionTagID int, tagActive bool, wantedSeasons map[seasonKey]bool) seriesEvaluation {
 	seriesID := *s.ID // caller guarantees non-nil
 	seriesTitle := titleOrAbsent(s.Title)
 
@@ -1835,7 +1835,7 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		}
 		totalSeriesMonitored++
 
-		eval := evaluateSeries(ctx, logger, client, inst, s, profiles, exclusionTagID, tagActive, wantedEpisodeIDs, wantedSeasons)
+		eval := evaluateSeries(ctx, logger, client, inst, s, profiles, exclusionTagID, tagActive, wantedSeasons)
 		alreadyUnmonitoredCount += eval.alreadyUnmonitored
 		allDecisions = append(allDecisions, eval.decisions...)
 
