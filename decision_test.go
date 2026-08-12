@@ -2576,11 +2576,12 @@ func summaryCounters(t *testing.T, output string) map[string]int {
 	return summaryCountersFor(t, output, "radarr decision summary")
 }
 
-// summaryCountersFor is summaryCounters generalized over which engine's
-// summary line to parse, so the Sonarr write pass's own accounting-identity
-// test (sonarr_writer_test.go) reads its counters through exactly the same
-// parser rather than a second copy that could drift from it.
-func summaryCountersFor(t *testing.T, output, msg string) map[string]int {
+// summaryLineFor returns the run's single summary line for an engine, and
+// fails if there is not exactly one. It is split out of summaryCountersFor
+// because some summary attrs are deliberately NOT integers — reverseScan=skipped
+// is the whole subject of one Phase 10 pin — and a test about the line's
+// vocabulary has to read the line itself rather than the integers parsed off it.
+func summaryLineFor(t *testing.T, output, msg string) string {
 	t.Helper()
 	var line string
 	for _, l := range strings.Split(output, "\n") {
@@ -2595,6 +2596,16 @@ func summaryCountersFor(t *testing.T, output, msg string) map[string]int {
 	if line == "" {
 		t.Fatalf("no %q line in the output:\n%s", msg, output)
 	}
+	return line
+}
+
+// summaryCountersFor is summaryCounters generalized over which engine's
+// summary line to parse, so the Sonarr write pass's own accounting-identity
+// test (sonarr_writer_test.go) reads its counters through exactly the same
+// parser rather than a second copy that could drift from it.
+func summaryCountersFor(t *testing.T, output, msg string) map[string]int {
+	t.Helper()
+	line := summaryLineFor(t, output, msg)
 	counters := make(map[string]int)
 	for _, field := range strings.Fields(line) {
 		key, value, found := strings.Cut(field, "=")

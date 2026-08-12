@@ -569,7 +569,14 @@ instances:
 // pre-write fetches: the write path is never entered, so there is nothing to
 // gate.
 func TestRun_ReverseScan_RemonitorFlagOff_ComposesNoWriteAtAll(t *testing.T) {
-	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{reverseFindingStatefulMovie(7, "Accidentally Unmonitored")})
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		// The witness makes the flag the ONLY thing standing between this
+		// finding and a write: the cycle's cross-check verifies a real forward
+		// sample, so the write gate would have opened. Without it, "nothing was
+		// written" would have a second possible explanation.
+		crossCheckWitnessStatefulMovie(5, "Ordinary Monitored"),
+		reverseFindingStatefulMovie(7, "Accidentally Unmonitored"),
+	})
 
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"--config", writeReverseTestConfig(t, fake.srv.URL, false, false), "--once"}, &stdout, &stderr)
@@ -580,6 +587,9 @@ func TestRun_ReverseScan_RemonitorFlagOff_ComposesNoWriteAtAll(t *testing.T) {
 	out := stdout.String()
 	if !strings.Contains(out, `msg="reverse-scan finding"`) {
 		t.Fatalf("this test proves nothing unless the finding really was made:\n%s", out)
+	}
+	if !strings.Contains(out, `crossCheck="passed (1 verified`) {
+		t.Fatalf("nor unless the write gate would have opened, leaving the flag as the only explanation:\n%s", out)
 	}
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Errorf("report-only must compose no write of any method: got %+v", writes)
@@ -605,7 +615,10 @@ func TestRun_ReverseScan_RemonitorFlagOff_ComposesNoWriteAtAll(t *testing.T) {
 // before the PUT, which is what makes a dry-run a rehearsal rather than a
 // different code path.
 func TestRun_ReverseScan_RemonitorFlagOn_DryRun_RehearsesAndWritesNothing(t *testing.T) {
-	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{reverseFindingStatefulMovie(7, "Accidentally Unmonitored")})
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		crossCheckWitnessStatefulMovie(5, "Ordinary Monitored"),
+		reverseFindingStatefulMovie(7, "Accidentally Unmonitored"),
+	})
 
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"--config", writeReverseTestConfig(t, fake.srv.URL, true, true), "--once"}, &stdout, &stderr)
@@ -634,6 +647,9 @@ func TestRun_ReverseScan_RemonitorFlagOn_DryRun_RehearsesAndWritesNothing(t *tes
 // changes.
 func TestRun_ReverseScan_RemonitorFlagOn_WriteMode_RemonitorsExactlyTheFinding(t *testing.T) {
 	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		// The cycle's evidence: an ordinary monitored movie for the forward
+		// cross-check to verify, without which the reverse gate stays shut.
+		crossCheckWitnessStatefulMovie(5, "Ordinary Monitored"),
 		reverseFindingStatefulMovie(7, "Accidentally Unmonitored"),
 		// A correctly unmonitored movie, which must be left alone.
 		{id: 8, title: "Correctly Unmonitored", monitored: false, hasFile: true, qualityProfileID: 1,
@@ -647,6 +663,11 @@ func TestRun_ReverseScan_RemonitorFlagOn_WriteMode_RemonitorsExactlyTheFinding(t
 	}
 
 	out := stdout.String()
+	// The write gate opened on real evidence, not on an empty sample pool:
+	// stated here because it is a precondition of everything below it.
+	if !strings.Contains(out, `crossCheck="passed (1 verified`) {
+		t.Fatalf("the cycle must have verified something for its reverse writes to be authorized:\n%s", out)
+	}
 	puts := fake.puts()
 	if len(puts) != 1 {
 		t.Fatalf("want exactly 1 PUT (the one finding), got %d: %+v", len(puts), puts)
@@ -679,7 +700,10 @@ func TestRun_ReverseScan_RemonitorFlagOn_WriteMode_RemonitorsExactlyTheFinding(t
 // pass must not immediately unmonitor it again. A pair of passes that disagreed
 // would flap the same movie on every cycle forever.
 func TestRun_ReverseScan_WriteMode_SecondRunIsANoOp(t *testing.T) {
-	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{reverseFindingStatefulMovie(7, "Accidentally Unmonitored")})
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		crossCheckWitnessStatefulMovie(5, "Ordinary Monitored"),
+		reverseFindingStatefulMovie(7, "Accidentally Unmonitored"),
+	})
 	cfg := writeReverseTestConfig(t, fake.srv.URL, false, true)
 
 	var run1, stderr bytes.Buffer
@@ -712,7 +736,12 @@ func TestRun_ReverseScan_WriteMode_SecondRunIsANoOp(t *testing.T) {
 // §2.5 end to end, in write mode, with the flag on: the strongest form of the
 // exclusion tag's promise.
 func TestRun_ReverseScan_WriteMode_ExcludedMovieIsNeitherReportedNorWritten(t *testing.T) {
-	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{reverseFindingStatefulMovie(7, "Excluded Finding")})
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		// As on the flag-off pin: with the gate provably open, §2.5 is the only
+		// thing that can account for the silence.
+		crossCheckWitnessStatefulMovie(5, "Ordinary Monitored"),
+		reverseFindingStatefulMovie(7, "Excluded Finding"),
+	})
 	fake.movie(7).tags = []int{42}
 	fake.tagsJSON = `[{"id": 42, "label": "cutoffarr-exclude"}]`
 
@@ -722,6 +751,9 @@ func TestRun_ReverseScan_WriteMode_ExcludedMovieIsNeitherReportedNorWritten(t *t
 	}
 
 	out := stdout.String()
+	if !strings.Contains(out, `crossCheck="passed (1 verified`) {
+		t.Fatalf("this test proves nothing unless the write gate would have opened:\n%s", out)
+	}
 	if strings.Contains(out, "reverse-scan finding") {
 		t.Errorf("an excluded movie must never be reported:\n%s", out)
 	}
@@ -773,6 +805,160 @@ func TestRunRadarrDecisionEngine_ReverseScan_CrossCheckNotPassed_WithholdsEveryW
 	assertReverseIdentity(t, out)
 }
 
+// TestReverseWriteGateBlockReason_OpensOnlyForAnEvidencedPass is the reverse
+// write gate, tested directly and exhaustively, because the two engine tests
+// that exercise it can only ever reach one status each.
+//
+// Binding controller resolution 6 names three blocking statuses (FAILED,
+// inconclusive, unrecognized) and one that admits a write, and the project's own
+// forward precedent — writeGateBlockReason, hardened in the phase-4 round-2
+// review — established that the PASSED status alone is far weaker evidence than
+// it reads: "passed" is awarded whenever nothing disagreed, including when
+// nothing was compared at all. Both holes are checked here, in one table, so
+// that rewriting the switch as `if failed { block }` (inconclusive is the COMMON
+// degraded state) or dropping the evidence conditions fails immediately.
+func TestReverseWriteGateBlockReason_OpensOnlyForAnEvidencedPass(t *testing.T) {
+	cases := []struct {
+		name     string
+		cc       crossCheckResult
+		wantOpen bool
+	}{
+		{
+			name:     "passed, on a sample that verified something",
+			cc:       crossCheckResult{status: crossCheckStatusPassed, verified: 1},
+			wantOpen: true,
+		},
+		{
+			name:     "passed, most of the sample verified",
+			cc:       crossCheckResult{status: crossCheckStatusPassed, verified: 6, unverifiable: 4},
+			wantOpen: true,
+		},
+		{
+			// The pseudo-pass: no would-unmonitor decision and no
+			// sample-eligible skip existed, so nothing was compared and
+			// nothing was verified — yet the status reads "passed".
+			name: "passed, but nothing at all was sampled",
+			cc:   crossCheckResult{status: crossCheckStatusPassed},
+		},
+		{
+			name: "passed on one verified item out of twenty",
+			cc:   crossCheckResult{status: crossCheckStatusPassed, verified: 1, unverifiable: 19},
+		},
+		{
+			name: "failed",
+			cc:   crossCheckResult{status: crossCheckStatusFailed, verified: 10},
+		},
+		{
+			name: "inconclusive",
+			cc:   crossCheckResult{status: crossCheckStatusInconclusive, unverifiable: 10},
+		},
+		{
+			name: "a status nobody has written yet",
+			cc:   crossCheckResult{status: "some-future-status", verified: 10},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reason := reverseWriteGateBlockReason(tc.cc)
+			if tc.wantOpen && reason != "" {
+				t.Errorf("the gate must open for %+v, but it blocked: %s", tc.cc, reason)
+			}
+			if !tc.wantOpen && reason == "" {
+				t.Errorf("the gate must block %+v, and say why", tc.cc)
+			}
+		})
+	}
+}
+
+// crossCheckWitnessMovie is an ORDINARY monitored movie that is still below its
+// quality cutoff: it is in the FORWARD wanted set and its own
+// movieFile.qualityCutoffNotMet agrees with that. Its forward decision is a
+// plain skip, so it is never written in either direction — what it contributes
+// is evidence: it is what the cycle's cross-check samples, compares, and
+// verifies, which is what a reverse write pass now needs before its gate will
+// open (see reverseWriteGateBlockReason).
+//
+// Every reverse write test needs one, and that is the point: a library made
+// only of unmonitored movies gives the cross-check nothing to sample, and a
+// cycle that verified nothing may not write.
+func crossCheckWitnessMovie(id int, title string) movieListElement {
+	return movieListElement{
+		ID: intPtr(id), Title: strPtr(title), Monitored: boolPtr(true), HasFile: boolPtr(true),
+		QualityProfileID: intPtr(1), Tags: &noTags,
+		MovieFile: &movieFileElement{ID: intPtr(1), QualityCutoffNotMet: boolPtr(true)},
+	}
+}
+
+// TestRunRadarrDecisionEngine_ReverseWriteGate_NeedsAVerifiedForwardSample is
+// the "nothing sampled" pseudo-pass, end to end through the engine, in the one
+// shape the reverse direction makes easy to build by accident: a library whose
+// only interesting items are UNMONITORED produces no forward decision to sample,
+// so the cross-check compares nothing, reports `passed (nothing sampled: ...)`,
+// and — before this fix — authorized re-monitor PUTs on the strength of it.
+//
+// The second case is the same cycle with one ordinary monitored movie added, and
+// it is the only thing that differs: the cross-check now has something real to
+// verify, so the gate opens and the finding is written.
+func TestRunRadarrDecisionEngine_ReverseWriteGate_NeedsAVerifiedForwardSample(t *testing.T) {
+	const findingID = 7
+	reverseWanted := `{"page":1,"pageSize":100,"totalRecords":1,"records":[{"id":7,"title":"Accidentally Unmonitored"}]}`
+	detail := map[int]string{findingID: `{"id": 7, "title": "Accidentally Unmonitored", "monitored": false, "hasFile": true, "qualityProfileId": 1, "tags": []}`}
+	finding := unmonitoredBelowCutoffMovie(findingID, "Accidentally Unmonitored")
+
+	t.Run("nothing was sampled, so every write is withheld", func(t *testing.T) {
+		fake := newRadarrFake(t, "", detail)
+		fake.reverseWantedJSON = reverseWanted
+
+		logger, buf := newDecisionTestLogger(slog.LevelInfo)
+		runRadarrDecisionEngine(context.Background(), logger, fake.instance(), []movieListElement{finding}, map[int]bool{},
+			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+
+		out := buf.String()
+		if !strings.Contains(out, `crossCheck="passed (nothing sampled`) {
+			t.Fatalf("this test is only meaningful if the cross-check really sampled nothing:\n%s", out)
+		}
+		if writes := fake.writes(); len(writes) != 0 {
+			t.Errorf("a cycle that verified nothing must write nothing: %+v", writes)
+		}
+		if n := fake.countRequests("/api/v3/movie/7"); n != 0 {
+			t.Errorf("a blocked pass must not even make its pre-write fetch, got %d", n)
+		}
+		if !strings.Contains(out, "reverse-scan writes withheld for this instance") || !strings.Contains(out, "sampled nothing") {
+			t.Errorf("the block must name the nothing-sampled pass as its reason:\n%s", out)
+		}
+		c := summaryCounters(t, out)
+		if c["reverseFindings"] != 1 || c["reverseWithheld"] != 1 || c["remonitored"] != 0 {
+			t.Errorf("want reverseFindings=1 reverseWithheld=1 remonitored=0, got %v:\n%s", c, out)
+		}
+		assertReverseIdentity(t, out)
+	})
+
+	t.Run("a real forward sample was verified, so the gate opens", func(t *testing.T) {
+		fake := newRadarrFake(t, "", detail)
+		fake.reverseWantedJSON = reverseWanted
+
+		logger, buf := newDecisionTestLogger(slog.LevelInfo)
+		movies := []movieListElement{crossCheckWitnessMovie(5, "Ordinary Monitored"), finding}
+		runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{5: true},
+			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+
+		out := buf.String()
+		if !strings.Contains(out, `crossCheck="passed (1 verified`) {
+			t.Fatalf("this test is only meaningful if the cross-check really verified something:\n%s", out)
+		}
+		puts := fake.puts()
+		if len(puts) != 1 || puts[0].path != "/api/v3/movie/7" {
+			t.Fatalf("want exactly the finding's PUT, got %+v", puts)
+		}
+		c := summaryCounters(t, out)
+		if c["reverseFindings"] != 1 || c["remonitored"] != 1 || c["reverseWithheld"] != 0 {
+			t.Errorf("want reverseFindings=1 remonitored=1 reverseWithheld=0, got %v:\n%s", c, out)
+		}
+		assertReverseIdentity(t, out)
+	})
+}
+
 // TestRun_ReverseScan_WriteMode_ItemThatNowMeetsCriteria_IsRefused is the
 // fresh-GET re-verification, mirrored for the reverse direction. The decision
 // was correct when it was made; by the time the write pass reaches it the
@@ -786,10 +972,13 @@ func TestRunRadarrDecisionEngine_ReverseScan_CrossCheckNotPassed_WithholdsEveryW
 func TestRun_ReverseScan_WriteMode_ItemThatNowMeetsCriteria_IsRefused(t *testing.T) {
 	// A CF-score finding: absent from the unmonitored wanted set (its quality
 	// cutoff is met) but scoring below the profile's cutoffFormatScore of 100.
-	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{{
-		id: 7, title: "Upgraded Meanwhile", monitored: false, hasFile: true, qualityProfileID: 1,
-		tags: []int{}, movieFileID: 7, cfScore: 10, qualityCutoffNotMet: false, inWantedSet: false,
-	}})
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		crossCheckWitnessStatefulMovie(5, "Ordinary Monitored"),
+		{
+			id: 7, title: "Upgraded Meanwhile", monitored: false, hasFile: true, qualityProfileID: 1,
+			tags: []int{}, movieFileID: 7, cfScore: 10, qualityCutoffNotMet: false, inWantedSet: false,
+		},
+	})
 	// The world changes between the scan and the write pass: the write path's
 	// own fresh pre-write fetch is the moment this movie stops being a finding.
 	fake.onRequest = func(method, path string) {
@@ -825,7 +1014,10 @@ func TestRun_ReverseScan_WriteMode_ItemThatNowMeetsCriteria_IsRefused(t *testing
 // between the scan and the write pass. Nothing needs doing, and the refusal is
 // counted rather than vanishing into an unexplained gap in the summary.
 func TestRun_ReverseScan_WriteMode_AlreadyMonitoredAtWrite_IsRefused(t *testing.T) {
-	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{reverseFindingStatefulMovie(7, "Someone Beat Us To It")})
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		crossCheckWitnessStatefulMovie(5, "Ordinary Monitored"),
+		reverseFindingStatefulMovie(7, "Someone Beat Us To It"),
+	})
 	fake.onRequest = func(method, path string) {
 		if method == http.MethodGet && path == "/api/v3/movie/7" {
 			fake.setMonitored(7, true)
@@ -852,14 +1044,46 @@ func TestRun_ReverseScan_WriteMode_AlreadyMonitoredAtWrite_IsRefused(t *testing.
 // discipline the two forward passes are held to: every finding must end in
 // exactly one counted outcome, so a future path that silently drops a promised
 // write cannot hide.
+//
+// Every caller runs with the write switch ON, so it also enforces that switch's
+// half of the frozen report vocabulary (binding controller resolution 7) in
+// BOTH states a flag-on cycle can end in — the pass ran, or the pass was skipped
+// — because "always present including as 0" is what stops an absent number from
+// reading as "none happened".
 func assertReverseIdentity(t *testing.T, out string) {
 	t.Helper()
 	for _, msg := range []string{"radarr decision summary", "sonarr decision summary"} {
 		if !strings.Contains(out, msg) {
 			continue
 		}
+		line := summaryLineFor(t, out, msg)
 		c := summaryCountersFor(t, out, msg)
-		if _, present := c["reverseFindings"]; !present {
+		_, ran := c["reverseFindings"]
+		skipped := strings.Contains(line, "reverseScan=skipped")
+		if !ran && !skipped {
+			// This cycle ran no reverse pass at all (a webhook or --only-id
+			// scope): the whole vocabulary is deliberately absent and there is
+			// no identity to check.
+			continue
+		}
+		for _, always := range []string{"remonitored", "remonitorsRefused", "reverseWithheld"} {
+			if _, present := c[always]; !present {
+				t.Errorf("with the write switch on the summary must always carry %s=, including as 0:\n%s", always, line)
+			}
+		}
+		if skipped {
+			// A skipped pass has no finding count to balance — that is the
+			// point of the state — but the three counters it does print are
+			// facts, and every path that sets skipped returns before the write
+			// half is reached, so each of them must read 0.
+			if ran {
+				t.Errorf("a skipped reverse pass must print no finding count, which cannot be trusted:\n%s", line)
+			}
+			for _, zero := range []string{"remonitored", "remonitorsRefused", "reverseWithheld"} {
+				if c[zero] != 0 {
+					t.Errorf("a skipped reverse pass never reached the write half, so %s must be 0, got %d:\n%s", zero, c[zero], line)
+				}
+			}
 			continue
 		}
 		accounted := c["remonitored"] + c["remonitorsRefused"] + c["reverseWithheld"] +
@@ -867,11 +1091,64 @@ func assertReverseIdentity(t *testing.T, out string) {
 		if accounted != c["reverseFindings"] {
 			t.Errorf("%s accounts for %d of %d findings; every finding must end in exactly one counted outcome:\n%s", msg, accounted, c["reverseFindings"], out)
 		}
-		for _, always := range []string{"remonitored=", "remonitorsRefused=", "reverseWithheld="} {
-			if !strings.Contains(out, always) {
-				t.Errorf("with the write switch on the summary must always carry %s, including as 0:\n%s", always, out)
-			}
+	}
+}
+
+// TestRunRadarrDecisionEngine_ReverseScan_SkippedWithTheFlagOn_StillCarriesTheWriteCounters
+// pins both halves of binding controller resolution 7's frozen vocabulary on
+// the one cycle where they are hardest to keep: a reverse pass that ran but
+// could not be trusted.
+//
+// "remonitored, remonitorsRefused and reverseWithheld are always present incl. 0
+// when the flag is on; ABSENT entirely when the flag is off — the off state must
+// be visually distinguishable" has to hold here too, and it is here that it
+// matters most: something went wrong, nothing was re-monitored, and a human is
+// reading this line to find out which mode the daemon is even in. A skipped
+// flag-ON cycle that printed the same bytes as a skipped flag-OFF cycle would
+// answer that question wrongly.
+func TestRunRadarrDecisionEngine_ReverseScan_SkippedWithTheFlagOn_StillCarriesTheWriteCounters(t *testing.T) {
+	cycleWith := func(t *testing.T, remonitor bool) string {
+		t.Helper()
+		fake := newRadarrFake(t, "", nil)
+		// Claims 50 records and returns none: the completeness contract skips
+		// the reverse pass for this instance.
+		fake.reverseWantedJSON = `{"page":1,"pageSize":100,"totalRecords":50,"records":[]}`
+
+		logger, buf := newDecisionTestLogger(slog.LevelInfo)
+		movies := []movieListElement{unmonitoredBelowCutoffMovie(7, "Never Evaluated")}
+		// Write mode, so nothing but the flag itself distinguishes the two runs.
+		runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude",
+			fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: remonitor})
+		return buf.String()
+	}
+
+	onOut, offOut := cycleWith(t, true), cycleWith(t, false)
+	on := summaryLineFor(t, onOut, "radarr decision summary")
+	off := summaryLineFor(t, offOut, "radarr decision summary")
+	// The accounting rules for the skipped state itself: three counters, all 0,
+	// and no finding count to balance them against.
+	assertReverseIdentity(t, onOut)
+
+	for _, line := range []string{on, off} {
+		if !strings.Contains(line, "reverseScan=skipped") {
+			t.Fatalf("this test proves nothing unless the pass really was skipped:\n%s", line)
 		}
+		if strings.Contains(line, "reverseFindings=") {
+			t.Errorf("a skipped pass must never print a finding count:\n%s", line)
+		}
+	}
+	for _, want := range []string{"remonitored=0", "remonitorsRefused=0", "reverseWithheld=0"} {
+		if !strings.Contains(on, want) {
+			t.Errorf("with the flag on the summary must carry %s even on a skipped pass:\n%s", want, on)
+		}
+	}
+	for _, token := range []string{"remonitored=", "remonitorsRefused=", "reverseWithheld="} {
+		if strings.Contains(off, token) {
+			t.Errorf("with the flag off the summary must carry no write counter at all, but it carries %s:\n%s", token, off)
+		}
+	}
+	if stripTimeAttr(on) == stripTimeAttr(off) {
+		t.Errorf("a flag-on skipped cycle and a flag-off one must not be byte-identical:\n%s", on)
 	}
 }
 
@@ -884,17 +1161,43 @@ func assertReverseIdentity(t *testing.T, out string) {
 // finding may ever be written.
 func reverseFindingSonarrFake(t *testing.T, seriesMonitored bool) *statefulSonarrFake {
 	t.Helper()
+	series, episodes, files := crossCheckWitnessSonarrFixtures()
 	return newStatefulSonarrFake(t,
-		[]*statefulSonarrSeries{
-			{id: 1, title: "Accidentally Unmonitored", monitored: seriesMonitored, profileID: 1, tags: []int{},
-				seasons: []statefulSonarrSeason{{number: 2, monitored: false, episodeFileCount: 1, totalEpisodeCount: 1}}},
+		append(series,
+			&statefulSonarrSeries{id: 1, title: "Accidentally Unmonitored", monitored: seriesMonitored, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 2, monitored: false, episodeFileCount: 1, totalEpisodeCount: 1}}}),
+		append(episodes,
+			&statefulSonarrEpisode{id: 200, seriesID: 1, seasonNumber: 2, episodeNumber: 1, monitored: false, hasFile: true,
+				airDateUtc: pastAirDate, episodeFileID: 600, inWantedSet: true}),
+		append(files, &statefulSonarrEpisodeFile{id: 600, seasonNumber: 2, customFormatScore: 200, qualityCutoffNotMet: true}),
+	)
+}
+
+// crossCheckWitnessSonarrFixtures is crossCheckWitnessStatefulMovie's Sonarr
+// twin: an ORDINARY monitored series with one monitored season that is complete,
+// fully aired, in the forward wanted set, and whose episode file agrees that its
+// cutoff is not met.
+//
+// The forward pass skips that season at rule 4, so it is never written; what it
+// contributes is the one thing every reverse write test needs and none of them
+// had — a forward decision for the cross-check to sample, compare and VERIFY.
+// Without it the cross-check has an empty pool, reports "passed (nothing
+// sampled)", and the reverse write gate refuses to open on a health signal that
+// does not exist.
+//
+// It is a separate SERIES rather than an extra season of the series under test
+// because one of the tests retires that series (series-level monitored false),
+// which would take the witness out of the forward pass with it.
+func crossCheckWitnessSonarrFixtures() ([]*statefulSonarrSeries, []*statefulSonarrEpisode, []*statefulSonarrEpisodeFile) {
+	return []*statefulSonarrSeries{
+			{id: 9, title: "Ordinary Monitored Show", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 1, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1}}},
 		},
 		[]*statefulSonarrEpisode{
-			{id: 200, seriesID: 1, seasonNumber: 2, episodeNumber: 1, monitored: false, hasFile: true,
-				airDateUtc: pastAirDate, episodeFileID: 600, inWantedSet: true},
+			{id: 900, seriesID: 9, seasonNumber: 1, episodeNumber: 1, monitored: true, hasFile: true,
+				airDateUtc: pastAirDate, episodeFileID: 9000, inWantedSet: true},
 		},
-		[]*statefulSonarrEpisodeFile{{id: 600, seasonNumber: 2, customFormatScore: 200, qualityCutoffNotMet: true}},
-	)
+		[]*statefulSonarrEpisodeFile{{id: 9000, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: true}}
 }
 
 // TestRun_ReverseScan_Sonarr_RemonitorFlagOff_ComposesNoWriteAtAll is the
@@ -911,6 +1214,9 @@ func TestRun_ReverseScan_Sonarr_RemonitorFlagOff_ComposesNoWriteAtAll(t *testing
 	out := stdout.String()
 	if !strings.Contains(out, `msg="reverse-scan finding"`) {
 		t.Fatalf("this test proves nothing unless the finding really was made:\n%s", out)
+	}
+	if !strings.Contains(out, `crossCheck="passed (1 verified`) {
+		t.Fatalf("nor unless the write gate would have opened, leaving the flag as the only explanation:\n%s", out)
 	}
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Errorf("report-only must compose no write of any method: got %+v", writes)
@@ -941,6 +1247,11 @@ func TestRun_ReverseScan_Sonarr_WriteMode_RemonitorsTheSeasonEpisodesFirst(t *te
 	}
 
 	out := stdout.String()
+	// As on the Radarr twin: the gate opened because the cross-check verified a
+	// real forward sample, which is a precondition of every assertion below.
+	if !strings.Contains(out, `crossCheck="passed (1 verified`) {
+		t.Fatalf("the cycle must have verified something for its reverse writes to be authorized:\n%s", out)
+	}
 	writes := fake.writes()
 	if len(writes) != 2 {
 		t.Fatalf("want exactly 2 writes (episodes then season), got %d: %+v", len(writes), writes)
@@ -996,6 +1307,54 @@ func TestRun_ReverseScan_Sonarr_UnmonitoredSeries_IsReportedButNeverWritten(t *t
 	}
 	if !strings.Contains(out, "its series is not monitored") {
 		t.Errorf("the withheld finding must say why, or a human cannot tell it from a gate block:\n%s", out)
+	}
+	c := summaryCountersFor(t, out, "sonarr decision summary")
+	if c["reverseFindings"] != 1 || c["reverseWithheld"] != 1 || c["remonitored"] != 0 {
+		t.Errorf("want reverseFindings=1 reverseWithheld=1 remonitored=0, got %v:\n%s", c, out)
+	}
+	assertReverseIdentity(t, out)
+}
+
+// TestRunSonarrDecisionEngine_ReverseScan_CrossCheckFailed_WithholdsEverySeasonWrite
+// is binding controller resolution 6 on the SONARR engine, whose gate block is a
+// second, independent copy of the check (remonitorSeasons has its own) that no
+// test exercised: every Sonarr reverse test ran under a passing cross-check, so
+// deleting that block would have written two PUTs per season on data the cycle
+// had declared unsound, with reverseWithheld=0 and no warning, and the whole
+// suite would still have passed.
+//
+// The failure is built the way a real one arrives: season 1 is monitored,
+// complete, fully aired and ABSENT from the forward wanted set, while its own
+// episodeFile.qualityCutoffNotMet says the cutoff is not met — the two signals
+// Sonarr computes separately, disagreeing.
+func TestRunSonarrDecisionEngine_ReverseScan_CrossCheckFailed_WithholdsEverySeasonWrite(t *testing.T) {
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "," + episodeJSON(200, 2, 1, pastAirDate, 600) + "]"
+	// File 500 scores below the profile's cutoff of 100, so season 1 is an
+	// ordinary skip rather than a would-unmonitor decision: this test is about
+	// the REVERSE gate, and a forward write candidate would only muddy it.
+	filesJSON := "[" + episodeFileJSON(500, 1, 10, true) + "," + episodeFileJSON(600, 2, 200, true) + "]"
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	fake.reverseWantedJSON = `{"page":1,"pageSize":100,"totalRecords":1,"records":[{"id":200,"seriesId":1,"seasonNumber":2}]}`
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	series := []seriesElement{testSeries(1, "Contradictory Show", true, 1, []int{},
+		testSeason(1, true, 1, 1), testSeason(2, false, 1, 1))}
+
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{},
+		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+
+	out := buf.String()
+	if !strings.Contains(out, "crossCheck=FAILED") {
+		t.Fatalf("this test is only meaningful if the cross-check really failed:\n%s", out)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("a failed cross-check must block every reverse write, in both of the season path's two calls: %+v", writes)
+	}
+	if n := fake.countRequests("/api/v3/series/1"); n != 0 {
+		t.Errorf("a blocked pass must not even make its pre-write fetch, got %d", n)
+	}
+	if !strings.Contains(out, "reverse-scan writes withheld for this instance") {
+		t.Errorf("a blocked reverse pass must say so: 'nothing was written' and 'nothing needed writing' are different facts:\n%s", out)
 	}
 	c := summaryCountersFor(t, out, "sonarr decision summary")
 	if c["reverseFindings"] != 1 || c["reverseWithheld"] != 1 || c["remonitored"] != 0 {
@@ -1071,6 +1430,16 @@ func TestDaemon_StartupScanAndReconciliationSweep_BothRunTheReverseScan(t *testi
 	if !strings.Contains(startup, `msg="reverse-scan finding"`) || !strings.Contains(startup, "reverseFindings=1") {
 		t.Fatalf("the startup scan must run the reverse scan and report it in full:\n%s", startup)
 	}
+	// FLAKE FIX: the loop computes its first sweep deadline from the clock as it
+	// enters, asynchronously, AFTER the startup scan returns. Advancing the fake
+	// clock before that happens moves time forward past a timer that does not
+	// exist yet, and the sweep then never fires — reproducible under load (this
+	// test failed 3 runs in 15 on a busy machine, on this branch's own HEAD).
+	// Waiting for the loop to announce its schedule is the synchronization point
+	// every other sweep test in this suite already uses.
+	eventually(t, "the reconciliation schedule to be announced", func() bool {
+		return strings.Contains(h.out.String(), "reconciliation sweep scheduled")
+	})
 
 	mark := h.mark()
 	h.clock.Advance(time.Hour)
@@ -1341,8 +1710,12 @@ func TestRunRadarrDecisionEngine_EveryReverseFindingIsAccountedForInTheSummary(t
 			}
 
 			logger, buf := newDecisionTestLogger(slog.LevelInfo)
-			movies := []movieListElement{unmonitoredBelowCutoffMovie(findingID, "Accounted Movie")}
-			runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude",
+			// The witness is what opens the write gate: a cycle whose
+			// cross-check sampled nothing withholds every reverse write, and
+			// then every case below would end in the same counter and prove
+			// nothing about the others.
+			movies := []movieListElement{crossCheckWitnessMovie(5, "Ordinary Monitored"), unmonitoredBelowCutoffMovie(findingID, "Accounted Movie")}
+			runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{5: true}, "cutoffarr-exclude",
 				fullLibraryScope(slog.LevelInfo), tc.dryRun, reverseOptions{enabled: true, remonitor: true})
 
 			out := buf.String()
@@ -1478,16 +1851,15 @@ func TestRun_ReverseScan_Sonarr_WriteMode_SeasonFlagOnly_NeedsNoEpisodeWrite(t *
 	// A CF-score finding: the episode is MONITORED (so it is absent from the
 	// unmonitored wanted set and its quality cutoff counts as met) while the
 	// SEASON is not, and its file scores below the profile's cutoff of 100.
+	witnessSeries, witnessEpisodes, witnessFiles := crossCheckWitnessSonarrFixtures()
 	fake := newStatefulSonarrFake(t,
-		[]*statefulSonarrSeries{
-			{id: 1, title: "Season Flag Only", monitored: true, profileID: 1, tags: []int{},
-				seasons: []statefulSonarrSeason{{number: 2, monitored: false, episodeFileCount: 1, totalEpisodeCount: 1}}},
-		},
-		[]*statefulSonarrEpisode{
-			{id: 200, seriesID: 1, seasonNumber: 2, episodeNumber: 1, monitored: true, hasFile: true,
-				airDateUtc: pastAirDate, episodeFileID: 600, inWantedSet: false},
-		},
-		[]*statefulSonarrEpisodeFile{{id: 600, seasonNumber: 2, customFormatScore: 10, qualityCutoffNotMet: false}},
+		append(witnessSeries,
+			&statefulSonarrSeries{id: 1, title: "Season Flag Only", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 2, monitored: false, episodeFileCount: 1, totalEpisodeCount: 1}}}),
+		append(witnessEpisodes,
+			&statefulSonarrEpisode{id: 200, seriesID: 1, seasonNumber: 2, episodeNumber: 1, monitored: true, hasFile: true,
+				airDateUtc: pastAirDate, episodeFileID: 600, inWantedSet: false}),
+		append(witnessFiles, &statefulSonarrEpisodeFile{id: 600, seasonNumber: 2, customFormatScore: 10, qualityCutoffNotMet: false}),
 	)
 
 	var stdout, stderr bytes.Buffer

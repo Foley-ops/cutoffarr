@@ -161,25 +161,43 @@ type reverseCounts struct {
 //   - the pass did not run (a webhook or --only-id cycle): NOTHING is printed.
 //     A reverseFindings=0 on a cycle that never looked would be a false
 //     all-clear, and those cycles are the majority in a busy daemon.
-//   - the pass ran but could not be trusted: reverseScan=skipped, and no count
-//     — not even the write counters, with the switch on. "Always present
-//     including as 0" exists so an absent number cannot be read as "none
-//     happened"; here the line says in one token that NOTHING happened, which
-//     is the same guarantee stated more strongly, and a row of zeroes beside it
-//     would invite the reading that a pass ran and found nothing.
+//   - the pass ran but could not be trusted: reverseScan=skipped and NO finding
+//     count — a number this cycle is in no position to state — but, with the
+//     switch on, still the three frozen write counters, all of them 0.
 //   - the pass ran: reverseFindings=N, plus — only when the write switch is on
 //     — the five write counters, always present including as 0.
 //
 // The write counters being ABSENT with the switch off is itself the point
 // (binding controller resolution 7): report-only and write-enabled cycles must
 // not look alike, and the presence of the word remonitored on the line is the
-// cheapest possible way for a human to tell which one they are reading.
+// cheapest possible way for a human to tell which one they are reading. That is
+// why the skipped state prints them too — REVIEW FIX (Phase 10 round 2). This
+// used to return reverseScan=skipped alone, reasoning that one token saying
+// "nothing happened" was the stronger statement; but it made a flag-ON skipped
+// cycle byte-identical to a flag-OFF one, and it did so on precisely the cycle a
+// human is most likely to be reading (something went wrong and nothing was
+// re-monitored), where "is this daemon even allowed to write?" is the first
+// question they have. The zeroes are honest: every path that sets skipped —
+// runRadarr's incomplete wanted set and its shutdown boundary, runSonarr's twins
+// — returns before remonitorMovies / remonitorSeasons is ever reached, so all
+// three counters are provably 0 there. They are printed from the fields rather
+// than as literal zeroes so a future path that skipped AFTER writing could not
+// silently under-report itself.
+//
+// The two mode-dependent counters (reverseWriteErrors and its dry-run twin,
+// reverseEchoUnverified) stay out of the skipped line: they are diagnostics of a
+// write half that provably did not run, and they are not part of the vocabulary
+// resolution 7 froze.
 func (c reverseCounts) summaryAttrs(opts reverseOptions, dryRun bool) []any {
 	if !opts.enabled {
 		return nil
 	}
 	if c.skipped {
-		return []any{"reverseScan", "skipped"}
+		attrs := []any{"reverseScan", "skipped"}
+		if opts.remonitor {
+			attrs = append(attrs, "remonitored", c.remonitored, "remonitorsRefused", c.refused, "reverseWithheld", c.withheld)
+		}
+		return attrs
 	}
 	attrs := []any{"reverseFindings", c.findings}
 	if !opts.remonitor {
@@ -491,19 +509,47 @@ func verifyMovieStillAReverseFinding(ctx context.Context, logger *slog.Logger, c
 // it uses the forward verdict for is therefore narrower than what the forward
 // gate uses it for, and the difference is worth stating. The forward gate asks
 // "was anything verified about the decisions I am about to act on" — a question
-// about evidence for specific writes. This gate asks only "did this instance's
-// data agree with itself this cycle": a data-layer health signal. An explicit
-// PASS is the only answer that admits a write; FAILED, inconclusive, and any
-// status a future change might add all block the pass, with the withheld
-// accounting saying so.
+// about evidence for specific writes, answered by the would-unmonitor pool's own
+// counts. This gate asks "did this instance's data agree with itself this
+// cycle", which is a question about the sample as a whole, so it reads the
+// aggregate counts: a reverse write acts on no forward decision, and the
+// would-unmonitor pool is routinely empty on exactly the cycles this pass has
+// work to do.
+//
+// FAILED, inconclusive, and any status a future change might add all block the
+// pass, with the withheld accounting saying so.
+//
+// REVIEW FIX (Phase 10 round 2): a bare `status == passed` used to open the
+// gate, which re-introduced verbatim the rule this project already rejected once
+// for the forward direction (writeGateBlockReason, hardened in the phase-4
+// round-2 review: "far weaker than it reads"). "passed" is awarded whenever
+// nothing DISAGREED, which includes two states where nothing was checked:
+//
+//   - Nothing sampled at all. Both cross-checks fall through to `default:
+//     passed` when their sample pool is empty — no would-unmonitor decision and
+//     no sample-eligible skip existed — so verified and unverifiable are both 0
+//     and not one comparison was made. renderCrossCheckSummary carves this case
+//     out with its own wording precisely so it "can never be mistaken for 'a
+//     sample was taken and it checked out clean'"; a gate that treats it as one
+//     is the same mistake in executable form. It is not a corner case in this
+//     direction: a library whose only unmonitored items are the findings
+//     produces exactly this, so it was the ONLY way the reverse gate had ever
+//     opened in the test suite.
+//   - A sample that verified almost nothing. One verified item out of twenty
+//     still passes, and one movie is not evidence that an instance's data agrees
+//     with itself. The forward gate blocks this shape; so does this one, on the
+//     aggregate counts that match its own question.
 //
 // There is no recovery-equivalent here, and none is needed: a half-done
 // re-monitor converges by itself, because a season or movie that is still
-// unmonitored is still a finding next cycle.
+// unmonitored is still a finding next cycle. That is also why blocking costs so
+// little: a withheld reverse write is retried, in full, by the next cycle whose
+// data does check out.
 func reverseWriteGateBlockReason(cc crossCheckResult) string {
 	switch cc.status {
 	case crossCheckStatusPassed:
-		return ""
+		// The evidence conditions below apply only to this status; every other
+		// answer is already a block.
 	case crossCheckStatusFailed:
 		return "the cross-check found a disagreement, so this instance's data cannot be trusted in either direction"
 	case crossCheckStatusInconclusive:
@@ -511,6 +557,13 @@ func reverseWriteGateBlockReason(cc crossCheckResult) string {
 	default:
 		return "the cross-check status is unrecognized, which blocks every write"
 	}
+	if cc.verified == 0 && cc.unverifiable == 0 {
+		return "the cross-check sampled nothing this cycle, so no health signal exists to authorize a write"
+	}
+	if cc.unverifiable > cc.verified {
+		return "most of what the cross-check sampled could not be verified, so this instance's data is only partly established as sound"
+	}
+	return ""
 }
 
 // record folds one attempted re-monitor into the counters, by the same five

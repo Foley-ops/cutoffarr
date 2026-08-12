@@ -254,9 +254,11 @@ forward pass, and found again by the next reverse one.)
 
 Two things it will never do:
 
-- Re-monitor anything while the cycle's cross-check did not explicitly pass.
-  If an instance's data disagreed with itself, nothing derived from it is
-  written in either direction.
+- Re-monitor anything unless the cycle's cross-check explicitly passed *and*
+  actually verified something. If an instance's data disagreed with itself,
+  nothing derived from it is written in either direction — and a cycle that
+  compared nothing (no monitored item was eligible for the sample) has no
+  health signal to offer, so it authorizes nothing either.
 - Re-monitor a season whose **series** is unmonitored. Unmonitoring a whole
   series is a human retiring a show; such seasons are reported (with
   `seriesMonitored=false`) and left alone. cutoffarr never writes a
@@ -264,7 +266,10 @@ Two things it will never do:
 
 The summary line tells you which mode you are in: with the switch off it
 carries `reverseFindings=N` and nothing else; with it on, `remonitored`,
-`remonitorsRefused` and `reverseWithheld` are always present, including as 0.
+`remonitorsRefused` and `reverseWithheld` are always present, including as 0
+— and including on a cycle whose reverse pass could not be trusted, which
+reads `reverseScan=skipped` in place of the finding count (a number that
+cycle is in no position to state) with those three counters still beside it.
 
 ## Known limitations
 

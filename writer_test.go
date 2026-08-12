@@ -2296,6 +2296,26 @@ func reverseFindingStatefulMovie(id int, title string) *statefulRadarrMovie {
 	}
 }
 
+// crossCheckWitnessStatefulMovie builds an ORDINARY monitored movie that is
+// still below its quality cutoff: in the forward wanted set, with its own
+// movieFile.qualityCutoffNotMet agreeing. Its forward decision is a plain skip,
+// so it is never written in either direction — what it contributes is EVIDENCE.
+// It is the item the cycle's cross-check samples, compares and verifies, which
+// is what the reverse write gate now requires before it will open
+// (reverseWriteGateBlockReason): a cycle that compared nothing may not write.
+//
+// It exists because a fake staged only with unmonitored movies gives the
+// forward cross-check nothing to sample at all, and "passed (nothing sampled)"
+// is not a health signal — a distinction the reverse write tests could not make
+// while that was the only state they ran in.
+func crossCheckWitnessStatefulMovie(id int, title string) *statefulRadarrMovie {
+	return &statefulRadarrMovie{
+		id: id, title: title, monitored: true, hasFile: true,
+		qualityProfileID: 1, tags: []int{}, movieFileID: id, cfScore: 200,
+		qualityCutoffNotMet: true, inWantedSet: true,
+	}
+}
+
 // statefulRadarrProfilesJSON is decisionEngineProfilesJSON plus the "cutoff"
 // field a real Radarr /api/v3/qualityprofile always returns (every other
 // profile fixture in this suite carries it; the shared decision-engine one
