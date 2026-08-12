@@ -2072,6 +2072,16 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	var allDecisions []seasonDecision
 	var reported []seasonDecision
 	totalSeriesMonitored := 0
+	// seriesEvaluated counts, LIBRARY-WIDE, how many series the loop below
+	// actually got through — every series that reached evaluateSeries, whether
+	// or not the scope reports it. It exists for the shutdown line and only for
+	// it: that line answers "how far did this cycle get before it was cut
+	// short", which is a fact about the library, since the evidence pool the
+	// cross-check samples is built from every series regardless of scope.
+	// totalSeriesMonitored cannot answer it — it is narrowed by the scope, so a
+	// webhook cycle interrupted after evaluating hundreds of series would report
+	// 0 or 1. This is the counterpart of the Radarr engine's len(decisions).
+	seriesEvaluated := 0
 	seasonsEvaluated := 0
 	wouldUnmonitorCount := 0
 	alreadyUnmonitoredCount := 0
@@ -2083,7 +2093,7 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		// cross-checked or written.
 		if ctx.Err() != nil {
 			logger.Info("shutdown requested: abandoning this instance's cycle mid-evaluation; a partial evaluation is never cross-checked or written",
-				"instance", inst.Name, "type", inst.Type, "seriesEvaluated", totalSeriesMonitored, "libraryTotal", len(series))
+				"instance", inst.Name, "type", inst.Type, "seriesEvaluated", seriesEvaluated, "libraryTotal", len(series))
 			return
 		}
 
@@ -2113,6 +2123,7 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		}
 		eval := evaluateSeries(ctx, logger, client, inst, s, profiles, exclusionTagID, tagActive, wantedSeasons)
 		allDecisions = append(allDecisions, eval.decisions...)
+		seriesEvaluated++
 
 		// --only-id scoping happens here and nowhere else: every series is
 		// still evaluated above (the cross-check needs the full candidate

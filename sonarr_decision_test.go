@@ -2392,3 +2392,128 @@ func TestBuildSeasonCrossCheckEpisodes_AllEpisodesNameable_ReportsComplete(t *te
 		t.Errorf("complete = false, want true: no episode was dropped\n%s", buf.String())
 	}
 }
+
+// --- shutdown mid-evaluation (the Sonarr half) ------------------------------
+//
+// Until these two existed, the Sonarr engine's mid-evaluation shutdown check
+// had NO test at all: deleting the whole `if ctx.Err() != nil { ... return }`
+// block left the suite green. The Radarr twin
+// (TestRunRadarrDecisionEngine_ShutdownMidEvaluation_AbandonsTheCycleWithoutWriting,
+// decision_test.go) was pinned; nothing cancelled a context while a SONARR
+// evaluation was in flight — TestDaemon_ShutdownDuringAnEvaluation cancels
+// while the loop is idle, TestDaemon_SecondSignal blocks a Radarr read, and
+// TestRunSonarrWritePass_ShutdownDuringAnInFlightSeason enters the WRITE pass
+// with an already-cancelled context and never reaches the series loop.
+//
+// It is the half that matters more in production. A Sonarr sweep is the long
+// one — one /episode fetch per series — so a SIGTERM lands inside one far more
+// often than inside a Radarr cycle. Without the check, the remaining series'
+// fetches fail with "context canceled", their seasons enter the cross-check
+// pool as unverifiable, the verdict degrades to inconclusive — which the
+// recovery path is ADMITTED under, with writes detached via
+// context.WithoutCancel — and the cycle prints a summary describing a fraction
+// of the library as if it were the library.
+
+// twoSeriesShutdownSonarrFake is a two-series library in which BOTH series
+// carry one fully eligible season, so a cycle that runs to completion really
+// would write. One series is not enough to test a boundary that is checked
+// BETWEEN items.
+func twoSeriesShutdownSonarrFake(t *testing.T) *statefulSonarrFake {
+	t.Helper()
+	return newStatefulSonarrFake(t,
+		[]*statefulSonarrSeries{
+			{id: 1, title: "First Show", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 1, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1}}},
+			{id: 2, title: "Second Show", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 1, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1}}},
+		},
+		[]*statefulSonarrEpisode{
+			{id: 100, seriesID: 1, seasonNumber: 1, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 500},
+			{id: 200, seriesID: 2, seasonNumber: 1, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 600},
+		},
+		[]*statefulSonarrEpisodeFile{
+			{id: 500, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
+			{id: 600, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
+		},
+	)
+}
+
+func twoSeriesShutdownLibrary() []seriesElement {
+	return []seriesElement{
+		testSeries(1, "First Show", true, 1, []int{}, testSeason(1, true, 1, 1)),
+		testSeries(2, "Second Show", true, 1, []int{}, testSeason(1, true, 1, 1)),
+	}
+}
+
+// TestRunSonarrDecisionEngine_ShutdownMidEvaluation_AbandonsTheCycleWithoutWriting
+// mirrors the Radarr twin exactly: cancellation is delivered partway through the
+// FIRST series' evaluation, at its /episode fetch, and the assertions are the
+// three things a partial evaluation must never produce — a write, a summary, or
+// silence.
+func TestRunSonarrDecisionEngine_ShutdownMidEvaluation_AbandonsTheCycleWithoutWriting(t *testing.T) {
+	fake := twoSeriesShutdownSonarrFake(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var once sync.Once
+	fake.onRequest = func(method, path string) {
+		if method == http.MethodGet && path == "/api/v3/episode" {
+			once.Do(cancel) // partway through the FIRST series' evaluation
+		}
+	}
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	runSonarrDecisionEngine(ctx, logger, fake.instance(), twoSeriesShutdownLibrary(),
+		map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
+
+	out := buf.String()
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("a partial evaluation must never reach the write pass, got %+v", writes)
+	}
+	if strings.Contains(out, "sonarr decision summary") {
+		t.Errorf("no summary may be printed for a cycle that saw part of the library:\n%s", out)
+	}
+	if !strings.Contains(out, "abandoning this instance's cycle mid-evaluation") {
+		t.Errorf("the abandonment must be stated, or the silence reads as a clean no-op cycle:\n%s", out)
+	}
+	if !strings.Contains(out, "libraryTotal=2") {
+		t.Errorf("the abandonment line must say how much library it was measured against:\n%s", out)
+	}
+}
+
+// TestRunSonarrDecisionEngine_ShutdownMidEvaluation_CountsSeriesEvaluatedNotSeriesInScope
+// pins the one number on that line, in the cycle where it is most misleading.
+//
+// seriesEvaluated used to be totalSeriesMonitored, which is narrowed by the
+// SCOPE — so a webhook cycle interrupted after evaluating hundreds of series
+// reported seriesEvaluated=0 libraryTotal=N, indistinguishable from a shutdown
+// that arrived before any work was done. The evidence pool is built from EVERY
+// series (the cross-check needs the whole library, which is why the loop
+// evaluates series the scope excludes), so how far the loop got is a fact about
+// the library, not about the scope, and that is what the Radarr twin's
+// len(decisions) reports.
+func TestRunSonarrDecisionEngine_ShutdownMidEvaluation_CountsSeriesEvaluatedNotSeriesInScope(t *testing.T) {
+	fake := twoSeriesShutdownSonarrFake(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var once sync.Once
+	fake.onRequest = func(method, path string) {
+		if method == http.MethodGet && path == "/api/v3/episode" {
+			once.Do(cancel)
+		}
+	}
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	// A webhook cycle naming series 2 only. Series 1 is evaluated anyway — the
+	// cross-check pool is library-wide — and it is the series the shutdown
+	// interrupts, so a count narrowed by the scope reads 0.
+	runSonarrDecisionEngine(ctx, logger, fake.instance(), twoSeriesShutdownLibrary(),
+		map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", webhookScope([]int{2}, nil), false)
+
+	out := buf.String()
+	if !strings.Contains(out, "abandoning this instance's cycle mid-evaluation") {
+		t.Fatalf("the abandonment must be stated:\n%s", out)
+	}
+	if !strings.Contains(out, "seriesEvaluated=1") {
+		t.Errorf("seriesEvaluated must count the series the loop actually got through (1 of 2), not the ones the scope names — a cycle that evaluated the whole library before a shutdown must not report 0:\n%s", out)
+	}
+}
