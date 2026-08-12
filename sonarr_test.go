@@ -1137,3 +1137,68 @@ instances:
 		t.Errorf("expected season 3's would-unmonitor line:\n%s", out)
 	}
 }
+
+// TestRun_SonarrInstance_AiringSeason_ReportLineCarriesMandatedReasonString_NeverWouldUnmonitor
+// is the IMPORTANT review fix: every prior airing-guard test (evaluateSeries'
+// TestEvaluateSeries_AiringSeason_NeverWouldUnmonitor_EvenWhenCompleteAndCutoffMet
+// and its siblings) compared d.reason against the ReasonSeasonNotFullyAired
+// CONSTANT, never the brief-mandated LITERAL string "unaired or undated
+// episodes" — so editing the constant's value, or having the report line
+// emit the airing skip under a different reason/msg, would keep the whole
+// suite green while breaking the one greppable output the brief's accept
+// criterion actually asks a human to spot-check ("no currently-airing season
+// appears as would-unmonitor"). Every prior airing test also stopped at
+// evaluateSeries' return value; none drove a future-dated episode through
+// runSonarrDecisionEngine/run() far enough to see the REPORT LINE itself.
+// This test closes both gaps at once: driven end to end through run()
+// against statefulSonarrFake (which models airDateUtc), asserting the
+// isolated report line (via reportLineWithMsg, sonarr_decision_test.go)
+// contains the literal reason string, and that no would-unmonitor line ever
+// appears for this season.
+func TestRun_SonarrInstance_AiringSeason_ReportLineCarriesMandatedReasonString_NeverWouldUnmonitor(t *testing.T) {
+	fake := newStatefulSonarrFake(t,
+		[]*statefulSonarrSeries{
+			{id: 1, title: "Airing Show", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 1, monitored: true, episodeFileCount: 2, totalEpisodeCount: 2}}},
+		},
+		[]*statefulSonarrEpisode{
+			// Otherwise-passing: complete on disk (2/2), CF score comfortably
+			// above threshold, not in the wanted set. Only episode 101's
+			// future airDateUtc should stop this season from would-unmonitor.
+			{id: 100, seriesID: 1, seasonNumber: 1, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 500, inWantedSet: false},
+			{id: 101, seriesID: 1, seasonNumber: 1, episodeNumber: 2, monitored: true, hasFile: true, airDateUtc: futureAirDate, episodeFileID: 501, inWantedSet: false},
+		},
+		[]*statefulSonarrEpisodeFile{
+			{id: 500, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
+			{id: 501, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
+		},
+	)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := `
+instances:
+  - name: sonarr-main
+    type: sonarr
+    url: ` + fake.srv.URL + `
+    api_key: key1
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+
+	skipLine := reportLineWithMsg(t, out, "skip")
+	if !strings.Contains(skipLine, `reason="unaired or undated episodes"`) {
+		t.Errorf("airing skip report line = %q, want the LITERAL brief-mandated reason string %q — not merely whatever ReasonSeasonNotFullyAired happens to equal today", skipLine, "unaired or undated episodes")
+	}
+	if strings.Contains(out, "msg=would-unmonitor") {
+		t.Errorf("a currently-airing season must NEVER appear as would-unmonitor, per the phase's accept criterion:\n%s", out)
+	}
+}
