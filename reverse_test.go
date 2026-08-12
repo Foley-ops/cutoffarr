@@ -1383,3 +1383,77 @@ func TestRunRadarrDecisionEngine_ReverseGateBlocked_WithheldAccountsForThePass(t
 	}
 	assertReverseIdentity(t, out)
 }
+
+// TestRunRadarrDecisionEngine_ReverseScan_ShutdownMidEvaluation_ReportsNoFindingCount
+// is the shutdown boundary applied to the new pass. A cycle cut short has an
+// incomplete picture, and the reverse scan's output is a COUNT of things that
+// are wrong — reporting a partial one as though it were the whole library is
+// exactly the false all-clear the skipped state exists to prevent.
+func TestRunRadarrDecisionEngine_ReverseScan_ShutdownMidEvaluation_ReportsNoFindingCount(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		// Evaluated first, and the only movie whose evaluation makes a request
+		// of its own (rule 6's /moviefile, reached because its quality cutoff IS
+		// met): the hook below turns that request into the shutdown.
+		{id: 1, title: "Evaluated First", monitored: false, hasFile: true, qualityProfileID: 1,
+			tags: []int{}, movieFileID: 1, cfScore: 10, qualityCutoffNotMet: false, inWantedSet: false},
+		reverseFindingStatefulMovie(2, "Never Reached"),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fake.onRequest = func(method, path string) {
+		if path == "/api/v3/moviefile" {
+			cancel()
+		}
+	}
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("Evaluated First"), Monitored: boolPtr(false), HasFile: boolPtr(true),
+			QualityProfileID: intPtr(1), Tags: &noTags,
+			MovieFile: &movieFileElement{ID: intPtr(1), QualityCutoffNotMet: boolPtr(false)}},
+		unmonitoredBelowCutoffMovie(2, "Never Reached"),
+	}
+
+	runRadarrDecisionEngine(ctx, logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude",
+		fullLibraryScope(slog.LevelInfo), true, reverseScanOn())
+
+	out := buf.String()
+	if !strings.Contains(out, "abandoning this instance's reverse scan mid-evaluation") {
+		t.Errorf("an interrupted reverse scan must say so:\n%s", out)
+	}
+	if !strings.Contains(out, "reverseScan=skipped") {
+		t.Errorf("an interrupted reverse scan must not report a finding count:\n%s", out)
+	}
+	if strings.Contains(out, "reverseFindings=") {
+		t.Errorf("a partial reverse scan must never print a count that reads as the whole library:\n%s", out)
+	}
+}
+
+// TestRunRadarrDecisionEngine_ReverseFindings_NeverEnterTheForwardCrossCheck
+// pins the separation the two passes depend on. The cross-check samples the
+// forward decisions and nothing else; a reverse finding that leaked into its
+// pools would be sampled as though it were a would-unmonitor decision, and — via
+// writeGateBlockReason, which reads exactly those counts — could authorize or
+// block FORWARD writes on the strength of an item the forward pass never
+// considered.
+func TestRunRadarrDecisionEngine_ReverseFindings_NeverEnterTheForwardCrossCheck(t *testing.T) {
+	fake := newRadarrFake(t, "", nil)
+	fake.reverseWantedJSON = `{"page":1,"pageSize":100,"totalRecords":2,"records":[{"id":7,"title":"A"},{"id":8,"title":"B"}]}`
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	movies := []movieListElement{unmonitoredBelowCutoffMovie(7, "A"), unmonitoredBelowCutoffMovie(8, "B")}
+
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude",
+		fullLibraryScope(slog.LevelInfo), true, reverseScanOn())
+
+	out := buf.String()
+	if !strings.Contains(out, "reverseFindings=2") {
+		t.Fatalf("this test proves nothing unless both findings were made:\n%s", out)
+	}
+	if strings.Contains(out, "msg=cross-check ") {
+		t.Errorf("no reverse finding may be sampled by the forward cross-check:\n%s", out)
+	}
+	if !strings.Contains(out, `crossCheck="passed (nothing sampled`) {
+		t.Errorf("the forward cross-check had nothing to sample this cycle and must say so:\n%s", out)
+	}
+}

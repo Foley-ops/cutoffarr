@@ -18,6 +18,7 @@ enforced and checked.
 - [Quick start](#quick-start)
 - [Configuration reference](#configuration-reference)
 - [Safety and dry-run](#safety-and-dry-run)
+- [The reverse scan](#the-reverse-scan)
 - [Known limitations](#known-limitations)
 - [Webhook setup](#webhook-setup)
 - [FAQ](#faq)
@@ -120,6 +121,7 @@ blank.
 | `webhook_debounce` | `45s` | How long to wait after the *last* event for a given movie/series before evaluating it — so a season-pack import (many episode-import events) becomes one evaluation, not one per episode. `0` evaluates immediately, with no wait. |
 | `log_level` | `info` | One of `debug`, `info`, `warn`, `error`. Logging is always to stdout only, via `log/slog`'s text handler — never to a file. |
 | `exclusion_tag` | `cutoffarr-exclude` | The tag label that opts an item out of everything cutoffarr does, in every mode, including dry-run reporting. Must not be empty or all-whitespace (omit the key entirely to use the default; an explicit empty string is a fatal config error, not a silent "exclude nothing"). |
+| `reverse_scan_remonitor` | **`false`** | Whether the reverse scan may WRITE. The reverse scan itself always runs on full cycles and reports what it finds; this flag alone decides whether it re-monitors it. With `false` no write of any kind is composed by that pass — not gated, not attempted. With `true`, re-monitoring obeys `dry_run` and the exclusion tag exactly like the forward path. See [The reverse scan](#the-reverse-scan). |
 | `instances` | *(required, may be empty)* | A list of `*arr` instances to reconcile against. An empty list is valid (cutoffarr just warns and does nothing) but almost certainly not what you want. |
 | `instances[].name` | — | A unique, human-readable name used in every log line and as the webhook path segment (`/webhook/{instance-name}`). |
 | `instances[].type` | — | `radarr` or `sonarr`. |
@@ -195,6 +197,75 @@ deliberately small and independently checked, not just documented:
   worst-case, 90 for headroom. **Don't lower `stop_grace_period` below that
   without understanding why it's there.**
 
+## The reverse scan
+
+cutoffarr's main job is to stop monitoring things that are finished. The
+reverse scan asks the opposite question, on every full cycle (the startup
+scan, each reconciliation sweep, and `--once`): **what is unmonitored that
+should not be?**
+
+It runs the *same* decision function over the unmonitored half of your
+library — Radarr movies that have a file, Sonarr seasons that are complete on
+disk and fully aired — against Radarr/Sonarr's own
+`/wanted/cutoff?monitored=false`. Anything that is unmonitored while still
+failing the criteria is reported:
+
+```
+level=INFO msg="reverse-scan finding" id=707 title="Some Film" reason="quality cutoff not met" profile=HD-1080p instance=radarr-main
+level=INFO msg="radarr decision summary" ... reverseFindings=1 ...
+```
+
+In practice a finding is almost always an accidental unmonitor — a stray
+click in the UI, an import that flipped something, a list sync — and nothing
+else in the stack would ever tell you about it.
+
+What is **not** a finding, deliberately:
+
+- An unmonitored item that *meets* the criteria. That is cutoffarr's own
+  output, and every item it has ever unmonitored looks like that.
+- An unmonitored movie with **no file**: leaving a film unmonitored and
+  undownloaded is a deliberate choice, not a mistake. (Counted at
+  `log_level: debug` so the numbers still add up.)
+- Anything carrying the `exclusion_tag`. The tag means *leave this alone*,
+  which includes not being told about it.
+- Anything cutoffarr could not read with confidence. "We could not check
+  this" is never reported as "this is below cutoff".
+
+Findings repeat every cycle, because they stay true until you act on them.
+They are printed in full on the startup scan and on `--once`, and demoted to
+`debug` on the daemon's repeating sweeps — where the summary's
+`reverseFindings=N` is what stays visible.
+
+### Letting it fix them
+
+`reverse_scan_remonitor: true` lets the reverse scan re-monitor what it
+finds. It is **off by default**, and off means off: the pass composes no
+write at all, rather than composing one and gating it.
+
+With it on, re-monitoring goes through the *same* three write call sites the
+rest of the project uses, with every one of the same guards — `dry_run`
+checked immediately before each HTTP write, the exclusion tag re-checked
+against a fresh fetch, the object's identity confirmed, the server's own echo
+required before anything counts as done — plus one more that only this
+direction needs: the decision is **re-run against fresh data**, and the write
+is refused if the item no longer fails the criteria. (Without that, an item
+upgraded since the scan would be re-monitored, unmonitored again by the next
+forward pass, and found again by the next reverse one.)
+
+Two things it will never do:
+
+- Re-monitor anything while the cycle's cross-check did not explicitly pass.
+  If an instance's data disagreed with itself, nothing derived from it is
+  written in either direction.
+- Re-monitor a season whose **series** is unmonitored. Unmonitoring a whole
+  series is a human retiring a show; such seasons are reported (with
+  `seriesMonitored=false`) and left alone. cutoffarr never writes a
+  series-level monitored flag in either direction.
+
+The summary line tells you which mode you are in: with the switch off it
+carries `reverseFindings=N` and nothing else; with it on, `remonitored`,
+`remonitorsRefused` and `reverseWithheld` are always present, including as 0.
+
 ## Known limitations
 
 Honest gaps found during live testing, carried forward rather than hidden:
@@ -215,6 +286,14 @@ Honest gaps found during live testing, carried forward rather than hidden:
   hasn't, by that profile's own definition. This is not a bug to report; it
   means the profile needs to be tuned to a real, reachable "good enough"
   score before cutoffarr has anything to do for it.
+- **The reverse scan costs a second pass over the unmonitored half.** It
+  re-uses the real decision rules rather than a cheap approximation of them,
+  which means one `/moviefile` call per unmonitored movie whose *quality*
+  cutoff is already met (the ones below it are decided from the paged wanted
+  set alone), and — for a Sonarr series that has both monitored and
+  unmonitored seasons — one extra `/episode` read. On a large library with
+  many unmonitored items this is the most expensive part of a full cycle. It
+  runs only on full cycles, never per webhook.
 - **macOS + Docker Desktop can block LAN access entirely.** If you develop
   or test on macOS, Docker Desktop's containers can be silently prevented
   from reaching other devices on your LAN (including a `*arr` on another
