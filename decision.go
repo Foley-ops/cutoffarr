@@ -2064,15 +2064,15 @@ func sonarrCrossCheckSampleKey(seriesID, season int) int {
 //
 // Two per-episode shapes are excluded from comparison rather than flagged as
 // disagreements (IMPORTANT REVIEW FIX, both confirmed live facts): (a) an
-// UNMONITORED episode whose file says the quality cutoff is not met —
-// Sonarr's /wanted/cutoff pool is filtered to monitored episodes, so such an
-// episode's absence from the wanted set is explained by its monitoring state
-// rather than by its quality, and comparing the two would manufacture a
-// disagreement the wanted-set semantics never claimed to make (an unmonitored
-// episode whose cutoff IS met carries no such ambiguity and is compared
-// normally — see where this is applied for why that narrowing matters to
-// convergence); and (b) the mirror-image shape inWantedSet=true with
-// qualityCutoffNotMet=false —
+// UNMONITORED episode, whatever its file says — Sonarr's /wanted/cutoff pool
+// is filtered to monitored episodes, so such an episode's absence from the
+// wanted set is explained by its monitoring state rather than by its quality,
+// and comparing the two either manufactures a disagreement the wanted-set
+// semantics never claimed to make or produces an agreement that could not
+// have failed (Phase 7 narrowed this shape to the first half and the review
+// round reversed the narrowing: an agreement that cannot fail is not evidence,
+// and the write gate reads this count); and (b) the mirror-image shape
+// inWantedSet=true with qualityCutoffNotMet=false —
 // /wanted/cutoff also lists episodes below the profile's custom-format
 // cutoff even when the QUALITY cutoff is met (confirmed live: anime
 // profile max ~3890, sample episodefile score 2120), which
@@ -2148,11 +2148,24 @@ func runSonarrCrossCheck(ctx context.Context, logger *slog.Logger, client *APICl
 		// the CF-only ambiguous shape (b) the binding live-probe ruling
 		// says to "classify as unverifiable, never a disagreement" — as
 		// opposed to shape (a)'s unmonitored-episode exclusion, which is
-		// simply out of the comparable population and contributes to
-		// neither count.
+		// simply out of the comparable population and belongs to neither
+		// the verified nor the unverifiable count.
+		//
+		// seasonAlreadyUnmonitoredEpisodes is shape (a)'s own bucket
+		// (REVIEW FIX, Phase 7 round 2). Phase 7 had narrowed shape (a) to
+		// unmonitored episodes whose file ALSO said qualityCutoffNotMet, so
+		// an unmonitored episode with qualityCutoffNotMet==false fell
+		// through to the final comparison — where inWantedSet is false by
+		// construction (Sonarr filters /wanted/cutoff to monitored
+		// episodes), making it `false != false`: an agreement that could
+		// never have been a disagreement, credited to seasonVerified and
+		// from there to writeVerified, which is what the write gate reads to
+		// authorize writes for the WHOLE instance. Shape (a) is whole again
+		// and these episodes are counted here, visibly, and nowhere else.
 		seasonVerified := 0
 		seasonFinalDisagreed := 0
 		seasonUnverifiableEpisodes := 0
+		seasonAlreadyUnmonitoredEpisodes := 0
 		for _, ep := range crossCheckEpisodes {
 			inWantedSet := wantedEpisodeIDs[ep.episodeID]
 
@@ -2219,6 +2232,29 @@ func runSonarrCrossCheck(ctx context.Context, logger *slog.Logger, client *APICl
 			}
 			logger.Debug("cross-check", attrs...)
 
+			// Shape (a), whole (REVIEW FIX, Phase 7 round 2): an unmonitored
+			// episode is out of the comparable population entirely. Sonarr's
+			// /wanted/cutoff is filtered to MONITORED episodes, so such an
+			// episode's absence from the wanted set is a fact about its
+			// monitoring state and says nothing whatsoever about its quality
+			// — whichever way its file's qualityCutoffNotMet reads. Comparing
+			// the two either manufactures a disagreement the wanted-set
+			// semantics never claimed to make (qualityCutoffNotMet==true) or
+			// produces an agreement that could not have failed
+			// (qualityCutoffNotMet==false). Neither is evidence, so neither
+			// is counted as any.
+			//
+			// This exclusion is what makes a would-unmonitor season whose
+			// episodes are ALL unmonitored land as unverifiable — the state a
+			// partially completed write leaves behind. Its retry is
+			// authorized by the write pass's explicitly named recovery
+			// allowance (seasonWriteRecoverySignature), not by weakening what
+			// "verified" means here.
+			if !*ep.monitored {
+				seasonAlreadyUnmonitoredEpisodes++
+				continue
+			}
+
 			if ep.qualityCutoffNotMet == nil {
 				// Data-quality issue distinct from an actual disagreement,
 				// same as Radarr's cross-check: silently treating "absent"
@@ -2231,31 +2267,6 @@ func runSonarrCrossCheck(ctx context.Context, logger *slog.Logger, client *APICl
 				// the function doc comment, shape (b), and the binding
 				// live-probe ruling ("classify as unverifiable, never a
 				// disagreement"). Not a disagreement.
-				seasonUnverifiableEpisodes++
-				continue
-			}
-			if !*ep.monitored && *ep.qualityCutoffNotMet {
-				// Shape (a), narrowed to the ambiguity it actually describes
-				// (REVIEW FIX, Phase 7): an unmonitored episode cannot appear
-				// in the wanted set whatever its file says, so when the file
-				// says the quality cutoff is NOT met, "absent from the wanted
-				// set" is explained by the episode being unmonitored rather
-				// than by its quality, and comparing the two would manufacture
-				// a disagreement the wanted-set semantics never claimed to
-				// make. With qualityCutoffNotMet false there is no ambiguity
-				// at all — the episode is not wanted and its file agrees it
-				// need not be — so that case falls through to the comparison
-				// below as the genuine agreement it is.
-				//
-				// The narrowing is load-bearing, not tidying. Excluding EVERY
-				// unmonitored episode left one state permanently unverifiable:
-				// a monitored season whose episodes are all unmonitored, which
-				// is exactly what a partially completed write leaves behind
-				// (the episode call landed, the season PUT failed). That season
-				// is a would-unmonitor candidate on every later cycle, and with
-				// nothing left to compare it could never earn the write gate's
-				// would-unmonitor evidence — so the partial state would persist
-				// forever instead of converging on the next cycle.
 				seasonUnverifiableEpisodes++
 				continue
 			}
@@ -2284,7 +2295,8 @@ func runSonarrCrossCheck(ctx context.Context, logger *slog.Logger, client *APICl
 		}
 		logger.Info("cross-check season",
 			"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season, "wouldUnmonitor", d.wouldUnmonitor,
-			"verdict", verdict, "compared", seasonVerified, "agreed", seasonVerified-seasonFinalDisagreed, "unverifiable", seasonUnverifiableEpisodes)
+			"verdict", verdict, "compared", seasonVerified, "agreed", seasonVerified-seasonFinalDisagreed, "unverifiable", seasonUnverifiableEpisodes,
+			"alreadyUnmonitoredEpisodes", seasonAlreadyUnmonitoredEpisodes)
 
 		if seasonVerified > 0 {
 			result.verified++

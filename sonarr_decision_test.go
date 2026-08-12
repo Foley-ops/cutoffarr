@@ -1991,24 +1991,25 @@ func TestEvaluateSeries_SeasonMonitoredAbsent_WarnNamesTheSeries(t *testing.T) {
 	}
 }
 
-// TestRunSonarrCrossCheck_UnmonitoredEpisodeAboveCutoff_StillVerifies narrows
-// shape (a) to the ambiguity it was actually introduced for.
+// TestRunSonarrCrossCheck_UnmonitoredEpisodeAboveCutoff_IsNotEvidence is the
+// review-round reversal of a Phase 7 narrowing of shape (a), and the reason
+// this file's shape (a) is whole again.
 //
-// Excluding EVERY unmonitored episode from the comparison made one state
-// permanently unverifiable: a season whose episodes are all unmonitored while
-// the season itself is still monitored — precisely what a partially completed
-// write leaves behind (the episode call landed, the season PUT failed). That
-// season is a would-unmonitor candidate on every subsequent cycle, and with no
-// episode left to compare it can never earn the write gate's would-unmonitor
-// evidence, so the partial state would persist forever.
+// Phase 7 narrowed shape (a) to "exclude only unmonitored episodes whose file
+// says qualityCutoffNotMet == true", letting an unmonitored episode with
+// qualityCutoffNotMet == false fall through to the final comparison. That
+// comparison cannot fail: an unmonitored episode is filtered out of Sonarr's
+// /wanted/cutoff by construction, so inWantedSet is false, and the comparison
+// is `false != false` — an agreement that could never have been a
+// disagreement. It still incremented writeVerified, which is exactly what the
+// write gate reads to authorize writes for the WHOLE instance.
 //
-// The ambiguity shape (a) exists to suppress is specifically qualityCutoffNotMet
-// == true: "not in the wanted set" is then explained by the episode being
-// unmonitored rather than by its quality, so the comparison proves nothing.
-// With qualityCutoffNotMet == false there is no ambiguity at all — the episode
-// is not in the wanted set and its file says it does not need to be — so it is
-// a genuine agreement and counts as one.
-func TestRunSonarrCrossCheck_UnmonitoredEpisodeAboveCutoff_StillVerifies(t *testing.T) {
+// A sample that verified nothing must never look like a sample that verified
+// everything: this shape is counted in its own bucket, never as evidence.
+// (Post-partial-write convergence is preserved by the write pass's explicitly
+// named recovery allowance instead — see
+// TestRunSonarrWritePass_GateBlocked_RecoverySeasonIsStillWritten.)
+func TestRunSonarrCrossCheck_UnmonitoredEpisodeAboveCutoff_IsNotEvidence(t *testing.T) {
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	inst := Instance{Name: "sonarr-main", Type: "sonarr"}
 
@@ -2019,14 +2020,22 @@ func TestRunSonarrCrossCheck_UnmonitoredEpisodeAboveCutoff_StillVerifies(t *test
 	}
 	cc := runSonarrCrossCheck(context.Background(), logger, nil, inst, decisions, map[int]bool{})
 
-	if cc.status != crossCheckStatusPassed {
-		t.Fatalf("status = %q, want %q:\n%s", cc.status, crossCheckStatusPassed, buf.String())
+	if cc.writeVerified != 0 {
+		t.Errorf("writeVerified = %d, want 0: a comparison that is structurally incapable of disagreeing is not evidence, and the write gate reads this number:\n%s", cc.writeVerified, buf.String())
 	}
-	if cc.verified != 1 || cc.writeVerified != 1 {
-		t.Errorf("verified/writeVerified = %d/%d, want 1/1 — the write gate reads writeVerified, and a season stuck in this state must still be able to earn it", cc.verified, cc.writeVerified)
+	if cc.verified != 0 || cc.unverifiable != 1 {
+		t.Errorf("verified/unverifiable = %d/%d, want 0/1", cc.verified, cc.unverifiable)
+	}
+	if cc.status != crossCheckStatusInconclusive {
+		t.Errorf("status = %q, want %q (nothing was verified):\n%s", cc.status, crossCheckStatusInconclusive, buf.String())
 	}
 	if strings.Contains(buf.String(), "level=ERROR") {
 		t.Errorf("no disagreement may be manufactured here:\n%s", buf.String())
+	}
+	// The own bucket: a human reading the season line must be able to see WHY
+	// nothing was comparable, not merely that nothing was.
+	if !strings.Contains(buf.String(), "alreadyUnmonitoredEpisodes=1") {
+		t.Errorf("the season aggregate must count the excluded unmonitored episodes in their own bucket:\n%s", buf.String())
 	}
 }
 
