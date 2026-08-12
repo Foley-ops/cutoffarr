@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // EVERY instance URL in this file is 127.0.0.1 or an httptest server, and that
@@ -540,6 +542,30 @@ instances:
 	for _, want := range []string{"--only-id", "42", "--instance", "radarr-main", "sonarr-main"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("the refusal must name %q so the human can act on it:\n%s", want, msg)
+		}
+	}
+}
+
+// TestPrintRedactedConfig_NamesTheReverseScanWriteSwitch pins the Phase 10 flag
+// into the mandatory startup printout.
+//
+// That printout is this project's answer to "what is this process actually
+// going to do", printed unconditionally at every start regardless of log_level.
+// reverse_scan_remonitor belongs on it for the same reason dry_run does: it is
+// a switch that decides whether writes happen at all, in a direction nothing
+// else in this program writes. A human reading a log after an unexpected
+// re-monitor must be able to see, on the first line, whether the switch was on.
+func TestPrintRedactedConfig_NamesTheReverseScanWriteSwitch(t *testing.T) {
+	for _, on := range []bool{false, true} {
+		var buf bytes.Buffer
+		printRedactedConfig(&buf, Config{
+			DryRun: true, PollInterval: time.Hour, WebhookPort: 9898,
+			WebhookDebounce: 45 * time.Second, LogLevel: "info", ExclusionTag: "cutoffarr-exclude",
+			ReverseScanRemonitor: on,
+		})
+		want := fmt.Sprintf("reverse_scan_remonitor=%t", on)
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("the startup printout must carry %q:\n%s", want, buf.String())
 		}
 	}
 }

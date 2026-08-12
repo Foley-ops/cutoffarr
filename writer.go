@@ -19,11 +19,43 @@ import (
 // is checkable by grepping for it.
 const monitoredKey = "monitored"
 
-// unmonitoredValue is the raw JSON literal written into monitoredKey. It is
-// a json.RawMessage rather than a Go bool marshaled at write time so the
-// payload surgery below never re-encodes anything: the fetched object's
-// bytes are reused verbatim and exactly one value is substituted.
-var unmonitoredValue = json.RawMessage("false")
+// unmonitoredValue and monitoredValue are the raw JSON literals written into
+// monitoredKey — false by the forward (unmonitor) direction, true by the
+// reverse (remonitor) one, and nothing else, ever. They are json.RawMessage
+// rather than Go bools marshaled at write time so the payload surgery below
+// never re-encodes anything: the fetched object's bytes are reused verbatim and
+// exactly one value is substituted.
+var (
+	unmonitoredValue = json.RawMessage("false")
+	monitoredValue   = json.RawMessage("true")
+)
+
+// monitoredWriteValue is the literal a direction writes, and
+// monitoredWriteTarget the same thing as a Go bool for the places that compare
+// against a decoded value (an episode's current state, an echo's answer). The
+// two directions are structural opposites and there is no third, so these two
+// functions are the whole of the difference between them.
+func monitoredWriteValue(rev *reverseWriteContext) json.RawMessage {
+	if rev != nil {
+		return monitoredValue
+	}
+	return unmonitoredValue
+}
+
+func monitoredWriteTarget(rev *reverseWriteContext) bool { return rev != nil }
+
+// monitoredWriteVerb is the same fact as a word, for the messages a human reads.
+// Every shared write-path sentence that names what is being done has to come
+// through here or through an explicit per-direction branch: those sentences were
+// all written when only one direction existed, and a wrong one is not cosmetic —
+// the reverse pass surfaces this exact string in its ERROR line, where "the
+// write that failed was an unmonitor" is the opposite of what happened.
+func monitoredWriteVerb(rev *reverseWriteContext) string {
+	if rev != nil {
+		return "re-monitoring"
+	}
+	return "unmonitoring"
+}
 
 // moviePath returns the /api/v3/movie/{id} path used for both halves of the
 // write path (the fresh GET and the PUT), so the two can never drift apart.
@@ -125,7 +157,34 @@ func moviePath(movieID int) string {
 // Errors are returned, never retried (§2.6: "Never retry writes
 // automatically within a cycle"); the caller logs them and moves to the
 // next item.
+// The reverse direction (Phase 10) reuses every step above verbatim and adds
+// exactly one of its own, between steps 5 and 6: the fresh payload must still
+// FAIL the criteria. That check is evaluateMovie — the decision function
+// itself — re-run against the object this write path just fetched, so "still a
+// finding" cannot drift from "is a finding". Steps 3, 4 and 5 are direction-
+// aware only in what they refuse: the reverse direction refuses a movie that is
+// already MONITORED (the same race, from the other side).
+//
+// unmonitorMovie and remonitorMovie are the two entry points, and they exist as
+// named wrappers rather than a bool parameter so that a call site says which
+// direction it means in the one word a reader will actually read.
 func unmonitorMovie(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, movieID, exclusionTagID int, tagActive bool, dryRun bool) (written bool, err error) {
+	return writeMovieMonitored(ctx, logger, client, inst, movieID, exclusionTagID, tagActive, dryRun, nil)
+}
+
+// remonitorMovie is the reverse direction's entry point: the same write, the
+// same guards, the opposite value, plus the fresh re-evaluation rev carries the
+// inputs for. It is only ever reached with reverse_scan_remonitor set (see
+// reverse.go), and it obeys dryRun and the exclusion tag exactly as the forward
+// path does.
+func remonitorMovie(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, movieID, exclusionTagID int, tagActive bool, dryRun bool, rev reverseWriteContext) (written bool, err error) {
+	return writeMovieMonitored(ctx, logger, client, inst, movieID, exclusionTagID, tagActive, dryRun, &rev)
+}
+
+// writeMovieMonitored is the single implementation behind both. rev == nil is
+// the forward direction; non-nil is the reverse one and carries what the
+// reverse re-verification needs.
+func writeMovieMonitored(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, movieID, exclusionTagID int, tagActive bool, dryRun bool, rev *reverseWriteContext) (written bool, err error) {
 	// PHASE 8, the shutdown boundary (binding controller note 4): once a write
 	// operation has STARTED, it runs to its own end. context.WithoutCancel
 	// detaches every request below from the daemon's shutdown cancellation, so
@@ -195,7 +254,22 @@ func unmonitorMovie(ctx context.Context, logger *slog.Logger, client *APIClient,
 	if err != nil {
 		return false, err
 	}
-	if !monitored {
+	if rev != nil {
+		// The reverse direction's own step 5: the movie must still be
+		// unmonitored, and it must still FAIL the criteria as of this fresh
+		// payload. Both are races the forward path has mirrors of, and the
+		// second one is the important one — re-monitoring a movie that has been
+		// upgraded since the scan would undo this project's own correct work,
+		// and the next forward cycle would unmonitor it again, forever.
+		if monitored {
+			logger.Info("already monitored, skipping write",
+				"instance", inst.Name, "type", inst.Type, "id", movieID, "title", title)
+			return false, fmt.Errorf("movie %d: %w", movieID, errAlreadyMonitoredAtWrite)
+		}
+		if err := verifyMovieStillAReverseFinding(ctx, logger, client, inst, body, movieID, exclusionTagID, tagActive, *rev, attrs); err != nil {
+			return false, err
+		}
+	} else if !monitored {
 		logger.Info("already unmonitored, skipping write",
 			"instance", inst.Name, "type", inst.Type, "id", movieID, "title", title)
 		// REVIEW FIX (Phase 5 round 4): this used to be (false, nil), the same
@@ -212,7 +286,7 @@ func unmonitorMovie(ctx context.Context, logger *slog.Logger, client *APIClient,
 
 	// The single mutation. Every other key in payload still holds the exact
 	// bytes Radarr sent.
-	payload[monitoredKey] = unmonitoredValue
+	payload[monitoredKey] = monitoredWriteValue(rev)
 
 	encoded, err := encodePayload(payload)
 	if err != nil {
@@ -250,7 +324,7 @@ func unmonitorMovie(ctx context.Context, logger *slog.Logger, client *APIClient,
 		// (2xx) and we simply cannot see what it said about it.
 		return false, fmt.Errorf("movie %d: the write returned %d but its body could not be read, so the change is unconfirmed (%w): %v", movieID, resp.StatusCode, errWriteUnverified, err)
 	}
-	if err := verifyWriteEcho(echo, movieID, resp.StatusCode); err != nil {
+	if err := verifyWriteEcho(echo, movieID, resp.StatusCode, rev != nil); err != nil {
 		return false, err
 	}
 
@@ -336,6 +410,44 @@ var errTagsUnverifiable = errors.New("the tags in the pre-write fetch could not 
 // branch writes at the moment it refuses.
 var errAlreadyUnmonitoredAtWrite = errors.New("already unmonitored as of the pre-write fetch")
 
+// errAlreadyMonitoredAtWrite is errAlreadyUnmonitoredAtWrite's mirror for the
+// reverse direction: the fresh pre-write fetch shows the movie (or season) is
+// ALREADY monitored, so there is nothing to re-monitor. Something else — a
+// human in the *arr's UI, another tool — got there between the scan and the
+// write pass.
+//
+// It is a separate sentinel rather than a shared "already in the target state"
+// one because the two say opposite things about the world and a human reading a
+// refusal needs to know which happened; and it is a refusal rather than a
+// silent no-op for the reason every other refusal here is one — a promised
+// write that ends nowhere countable is a gap in the summary.
+var errAlreadyMonitoredAtWrite = errors.New("already monitored as of the pre-write fetch")
+
+// errNoLongerAReverseFinding marks the reverse direction's own pre-write
+// re-verification refusing: the finding this write rests on could not be
+// re-established from the fresh data, so re-monitoring would be acting on
+// something nothing currently says is true.
+//
+// Its text names the re-establishment rather than the outcome (REVIEW FIX, Phase
+// 10 round 5) because it covers two different endings, and only one of them is
+// "it now meets the criteria": the fresh evaluation can also come back with
+// untrusted input — an unknown profile, unreadable tags, a score that could not
+// be fetched — where nothing about the item was established at all. Both refuse,
+// both are counted the same, and each wrapping error says which happened; a
+// sentinel that asserted the first would put a claim nobody observed into the
+// error chain of the second. The log lines make the same distinction (see
+// verifyMovieStillAReverseFinding).
+//
+// This is the reverse mirror of the forward path's airing and completeness
+// re-checks, and it exists for a sharper reason than tidiness. The reverse and
+// forward passes act on opposite conclusions about the same item: if the
+// reverse pass re-monitored something that now meets the criteria, the very
+// next forward cycle would unmonitor it again, and the two would flap that item
+// against each other forever. The re-check is the decision function itself
+// (evaluateMovie / evaluateSeries) re-run on fresh data, so "still a finding"
+// can never drift from "is a finding".
+var errNoLongerAReverseFinding = errors.New("the finding could not be re-established from the pre-write fetch")
+
 // errMonitoredUnverifiable marks the pre-write fetch's own "monitored" field
 // being unreadable: the key absent (this Radarr version may not have the field
 // at all, and setting it would ADD a key rather than change one), present but
@@ -365,9 +477,12 @@ func isWriteRefusal(err error) bool {
 		errors.Is(err, errTagsUnverifiable) ||
 		errors.Is(err, errMonitoredUnverifiable) ||
 		errors.Is(err, errAlreadyUnmonitoredAtWrite) ||
+		errors.Is(err, errAlreadyMonitoredAtWrite) ||
+		errors.Is(err, errNoLongerAReverseFinding) ||
 		errors.Is(err, errSeasonUnverifiableAtWrite) ||
 		errors.Is(err, errSeasonAiringAtWrite) ||
-		errors.Is(err, errNotRecoveryAtWrite)
+		errors.Is(err, errNotRecoveryAtWrite) ||
+		errors.Is(err, errSeasonNotCleanlyUnmonitored)
 }
 
 // preWriteExclusionTagCheck re-checks the exclusion tag against a FRESH
@@ -507,7 +622,12 @@ func readMonitoredFlag(logger *slog.Logger, payload map[string]json.RawMessage, 
 // The six "cannot tell" cases wrap errWriteUnverified; the one "told us it
 // did not happen" case does not. See errWriteUnverified for why that line is
 // drawn where it is.
-func verifyWriteEcho(echo []byte, movieID, status int) error {
+//
+// want (Phase 10) is the value the write asked for: false on the forward path,
+// true on the reverse one. Everything below is symmetric in it — "the server
+// says the movie is still monitored" and "the server says it is still
+// unmonitored" are the same confirmed failure read from opposite directions.
+func verifyWriteEcho(echo []byte, movieID, status int, want bool) error {
 	var confirmed map[string]json.RawMessage
 	if err := json.Unmarshal(echo, &confirmed); err != nil {
 		return fmt.Errorf("movie %d: the write returned %d but the response is not a JSON object, so %q is unconfirmed (%w): %s", movieID, status, monitoredKey, errWriteUnverified, bodySnippet(echo))
@@ -534,9 +654,13 @@ func verifyWriteEcho(echo []byte, movieID, status int) error {
 	if stillMonitoredPtr == nil {
 		return fmt.Errorf("movie %d: the write returned %d but %q came back as JSON null, which does not confirm the change (%w): %s", movieID, status, monitoredKey, errWriteUnverified, bodySnippet(echo))
 	}
-	stillMonitored := *stillMonitoredPtr
-	if stillMonitored {
-		return fmt.Errorf("movie %d: the write returned %d but the returned object still has %q: true; the movie was NOT unmonitored: %s", movieID, status, monitoredKey, bodySnippet(echo))
+	if *stillMonitoredPtr != want {
+		verb := "unmonitored"
+		if want {
+			verb = "re-monitored"
+		}
+		return fmt.Errorf("movie %d: the write returned %d but the returned object still has %q: %t; the movie was NOT %s: %s",
+			movieID, status, monitoredKey, *stillMonitoredPtr, verb, bodySnippet(echo))
 	}
 	return nil
 }

@@ -970,7 +970,7 @@ func TestVerifyWriteEcho_SeparatesUnverifiableFromContradicted(t *testing.T) {
 	}
 	for _, tc := range unverifiable {
 		t.Run(tc.name, func(t *testing.T) {
-			err := verifyWriteEcho([]byte(tc.echo), 7, http.StatusOK)
+			err := verifyWriteEcho([]byte(tc.echo), 7, http.StatusOK, false)
 			if err == nil {
 				t.Fatal("verifyWriteEcho returned nil: an unconfirmed write must never pass")
 			}
@@ -980,12 +980,27 @@ func TestVerifyWriteEcho_SeparatesUnverifiableFromContradicted(t *testing.T) {
 		})
 	}
 
-	err := verifyWriteEcho([]byte(`{"id": 7, "monitored": true}`), 7, http.StatusOK)
+	err := verifyWriteEcho([]byte(`{"id": 7, "monitored": true}`), 7, http.StatusOK, false)
 	if err == nil {
 		t.Fatal("verifyWriteEcho returned nil for an echo that still says monitored:true")
 	}
 	if errors.Is(err, errWriteUnverified) {
 		t.Errorf("an echo that says the movie is STILL MONITORED is a failed write, not an unverifiable one: %q", err)
+	}
+
+	// The reverse direction is the same rule read the other way (Phase 10): an
+	// echo that still says monitored:false after a re-monitor is the server
+	// telling us the write did not happen, and an echo that says true confirms
+	// it. Sharing one function is what keeps the two from drifting.
+	if err := verifyWriteEcho([]byte(`{"id": 7, "monitored": true}`), 7, http.StatusOK, true); err != nil {
+		t.Errorf("a reverse write echoed back as monitored:true is CONFIRMED, got %v", err)
+	}
+	reverseContradicted := verifyWriteEcho([]byte(`{"id": 7, "monitored": false}`), 7, http.StatusOK, true)
+	if reverseContradicted == nil {
+		t.Fatal("verifyWriteEcho returned nil for a reverse write echoed back as still unmonitored")
+	}
+	if errors.Is(reverseContradicted, errWriteUnverified) {
+		t.Errorf("an echo that says the movie is STILL UNMONITORED is a failed reverse write, not an unverifiable one: %q", reverseContradicted)
 	}
 }
 
@@ -1034,13 +1049,20 @@ type radarrFake struct {
 
 	// Fixtures. Set directly by a test after construction and before the
 	// run under test starts; the handlers read them under the same mutex.
-	moviesJSON   string
-	wantedJSON   string
-	tagsJSON     string
-	profilesJSON string
-	cfScore      int
-	detail       map[int]string // GET /api/v3/movie/{id} bodies, by id
-	putStatus    map[int]int    // PUT /api/v3/movie/{id} status, by id (default 200)
+	moviesJSON string
+	// wantedJSON is the FORWARD /wanted/cutoff body (no monitored parameter);
+	// reverseWantedJSON is what the same endpoint answers with when the reverse
+	// scan narrows it to monitored=false. They are separate fixtures because the
+	// live endpoint really does answer differently (3 records against 131), and a
+	// fake that served one body for both would let a reverse pass that consulted
+	// the WRONG set pass every test in this suite.
+	wantedJSON        string
+	reverseWantedJSON string
+	tagsJSON          string
+	profilesJSON      string
+	cfScore           int
+	detail            map[int]string // GET /api/v3/movie/{id} bodies, by id
+	putStatus         map[int]int    // PUT /api/v3/movie/{id} status, by id (default 200)
 
 	// putEcho overrides what a successful PUT answers with, by id. Unset
 	// means "behave like Radarr": echo the object that was sent. Set to ""
@@ -1059,14 +1081,15 @@ type radarrFake struct {
 func newRadarrFake(t *testing.T, moviesJSON string, detail map[int]string) *radarrFake {
 	t.Helper()
 	f := &radarrFake{
-		moviesJSON:   moviesJSON,
-		wantedJSON:   emptyWantedCutoffJSON,
-		tagsJSON:     decisionEngineNoTagsJSON,
-		profilesJSON: decisionEngineProfilesJSON,
-		cfScore:      200,
-		detail:       detail,
-		putStatus:    map[int]int{},
-		putEcho:      map[int]string{},
+		moviesJSON:        moviesJSON,
+		wantedJSON:        emptyWantedCutoffJSON,
+		reverseWantedJSON: emptyWantedCutoffJSON,
+		tagsJSON:          decisionEngineNoTagsJSON,
+		profilesJSON:      decisionEngineProfilesJSON,
+		cfScore:           200,
+		detail:            detail,
+		putStatus:         map[int]int{},
+		putEcho:           map[int]string{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v3/system/status", f.handle(func(w http.ResponseWriter, r *http.Request) {
@@ -1079,7 +1102,7 @@ func newRadarrFake(t *testing.T, moviesJSON string, detail map[int]string) *rada
 		w.Write([]byte(f.tagsJSON))
 	}))
 	mux.HandleFunc("/api/v3/wanted/cutoff", f.handle(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(f.wantedJSON))
+		w.Write([]byte(f.wantedFor(r.URL.Query().Get("monitored"))))
 	}))
 	mux.HandleFunc("/api/v3/moviefile", f.handle(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `[{"id": 1, "customFormatScore": %d}]`, f.cfScore)
@@ -1182,6 +1205,35 @@ func (f *radarrFake) puts() []recordedRequest {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return filterRequests(f.requests, http.MethodPut)
+}
+
+// wantedFor answers with the body for the requested wanted set. Only the
+// explicit monitored=false the reverse scan sends selects the unmonitored one;
+// everything else (no parameter, monitored=true) gets the forward body, which
+// is the live behavior the controller probed — default and monitored=true are
+// identical.
+func (f *radarrFake) wantedFor(monitored string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if monitored == "false" {
+		return f.reverseWantedJSON
+	}
+	return f.wantedJSON
+}
+
+// countRequests reports how many requests this fake received for a path,
+// whatever their method or query — the shape "this endpoint was never called"
+// assertions need.
+func (f *radarrFake) countRequests(path string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, r := range f.requests {
+		if r.path == path {
+			n++
+		}
+	}
+	return n
 }
 
 func (f *radarrFake) instance() Instance {
@@ -2230,6 +2282,40 @@ func wouldUnmonitorStatefulMovie(id int, title string) *statefulRadarrMovie {
 	}
 }
 
+// reverseFindingStatefulMovie builds a statefulRadarrMovie shaped to be a
+// Phase 10 reverse-scan finding: UNMONITORED, with a file, and still below its
+// quality cutoff (in the wanted set, with its own qualityCutoffNotMet agreeing).
+// It is the mirror of wouldUnmonitorStatefulMovie above — same profile, same
+// tags, same shape — with monitored flipped and the cutoff state inverted,
+// which is exactly what an accidental unmonitor looks like.
+func reverseFindingStatefulMovie(id int, title string) *statefulRadarrMovie {
+	return &statefulRadarrMovie{
+		id: id, title: title, monitored: false, hasFile: true,
+		qualityProfileID: 1, tags: []int{}, movieFileID: id, cfScore: 200,
+		qualityCutoffNotMet: true, inWantedSet: true,
+	}
+}
+
+// crossCheckWitnessStatefulMovie builds an ORDINARY monitored movie that is
+// still below its quality cutoff: in the forward wanted set, with its own
+// movieFile.qualityCutoffNotMet agreeing. Its forward decision is a plain skip,
+// so it is never written in either direction — what it contributes is EVIDENCE.
+// It is the item the cycle's cross-check samples, compares and verifies, which
+// is what the reverse write gate now requires before it will open
+// (reverseWriteGateBlockReason): a cycle that compared nothing may not write.
+//
+// It exists because a fake staged only with unmonitored movies gives the
+// forward cross-check nothing to sample at all, and "passed (nothing sampled)"
+// is not a health signal — a distinction the reverse write tests could not make
+// while that was the only state they ran in.
+func crossCheckWitnessStatefulMovie(id int, title string) *statefulRadarrMovie {
+	return &statefulRadarrMovie{
+		id: id, title: title, monitored: true, hasFile: true,
+		qualityProfileID: 1, tags: []int{}, movieFileID: id, cfScore: 200,
+		qualityCutoffNotMet: true, inWantedSet: true,
+	}
+}
+
 // statefulRadarrProfilesJSON is decisionEngineProfilesJSON plus the "cutoff"
 // field a real Radarr /api/v3/qualityprofile always returns (every other
 // profile fixture in this suite carries it; the shared decision-engine one
@@ -2288,7 +2374,7 @@ func newStatefulRadarrFake(t *testing.T, movies []*statefulRadarrMovie) *statefu
 		w.Write([]byte(f.tagsJSON))
 	}))
 	mux.HandleFunc("/api/v3/wanted/cutoff", f.handle(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(f.wantedJSON()))
+		w.Write([]byte(f.wantedJSON(r.URL.Query().Get("monitored"))))
 	}))
 	mux.HandleFunc("/api/v3/moviefile", f.handle(func(w http.ResponseWriter, r *http.Request) {
 		id, _ := strconv.Atoi(r.URL.Query().Get("movieId"))
@@ -2374,19 +2460,34 @@ func (f *statefulRadarrFake) moviefileJSON(id int) string {
 	return fmt.Sprintf(`[{"id": %d, "customFormatScore": %d}]`, m.movieFileID, m.cfScore)
 }
 
-// wantedJSON renders the whole /api/v3/wanted/cutoff envelope on a single
-// page: every configured movie here has inWantedSet=false (a deliberate
-// choice — see wouldUnmonitorStatefulMovie), and fetchWantedCutoff stops
-// paging as soon as one page accounts for the full totalRecords, so a
-// single response is a faithful, complete fake regardless of query params.
-func (f *statefulRadarrFake) wantedJSON() string {
+// wantedJSON renders the whole /api/v3/wanted/cutoff envelope on a single page.
+// fetchWantedCutoff stops paging as soon as one page accounts for the full
+// totalRecords, so a single response is a faithful, complete fake.
+//
+// It is DERIVED from live per-movie state, in both directions (Phase 10, the
+// same rule statefulSonarrFake's wanted set has always followed): inWantedSet
+// means "below its cutoff", and the monitored parameter selects which half of
+// the library that is asked about. monitored=false — the only value this
+// project ever sends — answers with the UNMONITORED below-cutoff movies, and
+// everything else with the monitored ones, which is exactly what the live
+// endpoint does (3 records against 131, with default and monitored=true
+// identical).
+//
+// Deriving it matters more than it looks: a fake that answered one body for
+// both would let a reverse pass that mistakenly consulted the FORWARD set pass
+// every test here, and would hide the write direction's own convergence
+// property — a re-monitored movie really does move from one set to the other.
+func (f *statefulRadarrFake) wantedJSON(monitored string) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	wantUnmonitored := monitored == "false"
 	var recs []string
 	for _, id := range f.order {
-		if m := f.movies[id]; m.inWantedSet {
-			recs = append(recs, fmt.Sprintf(`{"id":%d,"title":%q}`, m.id, m.title))
+		m := f.movies[id]
+		if !m.inWantedSet || m.monitored == wantUnmonitored {
+			continue
 		}
+		recs = append(recs, fmt.Sprintf(`{"id":%d,"title":%q}`, m.id, m.title))
 	}
 	return fmt.Sprintf(`{"page":1,"pageSize":100,"totalRecords":%d,"records":[%s]}`, len(recs), strings.Join(recs, ","))
 }
@@ -2454,6 +2555,51 @@ func (f *statefulRadarrFake) puts() []recordedRequest {
 
 func (f *statefulRadarrFake) instance() Instance {
 	return Instance{Name: "radarr-main", Type: "radarr", URL: f.srv.URL, APIKey: "key"}
+}
+
+// movie exposes one movie's live state to a test. Every read and write of the
+// backing map happens under the fake's mutex; returning the pointer is safe
+// only because these tests read it after the run under test has finished.
+func (f *statefulRadarrFake) movie(id int) *statefulRadarrMovie {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.movies[id]
+}
+
+// countRequests reports how many requests this fake received for a path,
+// whatever their method or query.
+func (f *statefulRadarrFake) countRequests(path string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, r := range f.requests {
+		if r.path == path {
+			n++
+		}
+	}
+	return n
+}
+
+// setMonitored flips a movie's monitored flag while the fake is serving,
+// modelling the scan-to-write race the write path's fresh pre-write fetch
+// exists to catch: something else changed the item between the two.
+func (f *statefulRadarrFake) setMonitored(id int, monitored bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if m, found := f.movies[id]; found {
+		m.monitored = monitored
+	}
+}
+
+// setCFScore changes a movie file's custom format score while the fake is
+// serving, modelling the other world-change a write pass can lose a race to: an
+// upgrade landed, and the file now scores above its profile's cutoff.
+func (f *statefulRadarrFake) setCFScore(id, score int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if m, found := f.movies[id]; found {
+		m.cfScore = score
+	}
 }
 
 // setWanted moves a movie in or out of the fake's /wanted/cutoff set while it

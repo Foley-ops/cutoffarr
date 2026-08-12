@@ -181,11 +181,23 @@ func run(args []string, stdout, stderr io.Writer, daemonOpts ...daemonOptions) i
 		if onlyIDSet {
 			scope = onlyIDScope(*onlyID)
 		}
+		// A full --once pass runs the reverse scan over the whole library. A
+		// SCOPED one runs it only when it may write, and then only over the item
+		// --only-id names: that is the acceptance instrument (binding controller
+		// ruling R7), the one way to try a re-monitor against a real library
+		// deliberately, one item at a time, with a human watching. Report-only
+		// scoped runs stay forward-only — see scopedReverseOptions for both
+		// halves of the reasoning.
+		reverse := fullScanReverseOptions(*cfg)
+		if onlyIDSet {
+			reverse = scopedReverseOptions(*cfg)
+		}
 		runScanCycle(context.Background(), logger, *cfg, scanCycle{
 			instanceName: *instanceName,
 			samples:      parseSamples(*samplesFlag),
 			scope:        scope,
 			dryRun:       cfg.DryRun,
+			reverse:      reverse,
 		})
 	} else {
 		// --only-id and --instance stay --once-only. Daemon mode DOES run
@@ -296,13 +308,14 @@ func slogLevel(level string) slog.Level {
 func printRedactedConfig(w io.Writer, cfg Config) {
 	redacted := cfg.Redacted()
 
-	fmt.Fprintf(w, "configuration loaded: dry_run=%t poll_interval=%s webhook_port=%d webhook_debounce=%s log_level=%s exclusion_tag=%s instance_count=%d\n",
+	fmt.Fprintf(w, "configuration loaded: dry_run=%t poll_interval=%s webhook_port=%d webhook_debounce=%s log_level=%s exclusion_tag=%s reverse_scan_remonitor=%t instance_count=%d\n",
 		redacted.DryRun,
 		redacted.PollInterval,
 		redacted.WebhookPort,
 		redacted.WebhookDebounce,
 		redacted.LogLevel,
 		redacted.ExclusionTag,
+		redacted.ReverseScanRemonitor,
 		len(redacted.Instances),
 	)
 

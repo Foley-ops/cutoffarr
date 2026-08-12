@@ -249,12 +249,23 @@ const (
 // of wording where the brief left it unspecified, following the same
 // concise, lowercase, no-trailing-punctuation style as the Radarr reasons
 // above.
+//
+// ReasonSeasonMonitorMismatch (Phase 10 round 3) is the newest of them, and the
+// only one produced in the REVERSE direction alone: the season's own monitored
+// flag says false while episodes inside it say true. It is a season-only concept
+// for the same reason the others are — a movie's monitored flag has nothing
+// below it to disagree with — and it is reported rather than skipped over
+// because nothing else in this program can see that state: the forward pass
+// excludes the season at rule 1, so its monitored episodes are upgraded by
+// Sonarr forever with no cutoff enforcement of any kind. See evaluateSeries'
+// rule 7 for why it is decided there and nowhere else.
 const (
 	ReasonSeasonIncomplete              = "season incomplete on disk"
 	ReasonSeasonNotFullyAired           = "unaired or undated episodes"
 	ReasonSeasonEpisodeDataInconsistent = "episode data inconsistent with statistics"
 	ReasonSeasonFileCountMismatch       = "episode file count mismatch"
 	ReasonSeasonEpisodesUnavailable     = "could not fetch episode data"
+	ReasonSeasonMonitorMismatch         = "unmonitored season with monitored episodes"
 )
 
 // movieDecision is the outcome of evaluating one monitored movie against
@@ -451,7 +462,15 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 // checkInstanceConnectivity and inspectRadarrLibrary, the binding
 // error-handling rule (§2.6) is "skip that instance for the cycle and log a
 // warning" with no further work for a caller to gate on.
-func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, movies []movieListElement, wantedIDs map[int]bool, exclusionTagLabel string, scope evalScope, dryRun bool) {
+//
+// reverse (Phase 10) is the fourth pass, and it runs AFTER the write pass
+// rather than beside the evaluation, deliberately: it is a second, independent
+// question about the same library ("what is unmonitored that should not be"),
+// its findings must never enter the forward cross-check's candidate pools, and
+// — when its own write switch is on — the cross-check verdict it answers to is
+// the one this cycle already produced. It is silent and free on any cycle that
+// did not ask for it.
+func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, movies []movieListElement, wantedIDs map[int]bool, exclusionTagLabel string, scope evalScope, dryRun bool, reverse reverseOptions) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	// The per-cycle-repetition logger (see demoteInfoTo): the profile fetch,
@@ -660,6 +679,15 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 
 	unmonitoredCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount := runWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun)
 
+	var rev reverseCounts
+	if reverse.enabled {
+		rev = reversePass{
+			logger: logger, cycleLogger: cycleLogger, client: client, inst: inst,
+			profiles: profiles, exclusionTagID: exclusionTagID, tagActive: tagActive,
+			cc: cc, scope: scope, itemLevel: scope.itemLevel, dryRun: dryRun, opts: reverse,
+		}.runRadarr(ctx, movies)
+	}
+
 	attrs := []any{"instance", inst.Name, "type", inst.Type}
 	attrs = append(attrs, scope.summaryAttrs()...)
 	attrs = append(attrs, "totalMonitored", totalMonitored, "wouldUnmonitor", wouldUnmonitorCount, "unmonitored", unmonitoredCount, "alreadyUnmonitored", alreadyUnmonitoredCount)
@@ -712,6 +740,11 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// writeEchoUnverified always is in write mode: an absent number must never
 	// be readable as "none happened".
 	attrs = append(attrs, "writesRefused", writesRefusedCount, "withheldWrites", withheldWriteCount)
+
+	// The reverse scan's own accounting, and nothing at all when this cycle ran
+	// no reverse pass — see reverseCounts.summaryAttrs for why the three states
+	// (did not run / could not be trusted / ran) must not look alike.
+	attrs = append(attrs, rev.summaryAttrs(reverse, dryRun)...)
 
 	attrs = append(attrs, "skipReasons", formatSkipCounts(skipCounts), "crossCheck", crossCheckSummary)
 	logger.Info("radarr decision summary", attrs...)
@@ -1537,21 +1570,55 @@ func buildSeasonCrossCheckEpisodes(logger *slog.Logger, inst Instance, seriesID,
 	return out, complete
 }
 
+// seasonHasMonitoredEpisode reports whether any episode of this season's
+// evidence set explicitly says it is monitored. It is the reverse direction's
+// mirror of recoveryCandidate (sonarr_writer.go), asking the same question from
+// the other side, and it reads the same already-built set — no extra fetch, no
+// second join, no second copy of the episode/file matching rules.
+//
+// The asymmetry with recoveryCandidate is deliberate and is the safe direction
+// in each case. Recovery asks "is EVERY episode already unmonitored?", which an
+// incomplete set can never answer positively, so it demands
+// crossCheckEpisodesComplete. This asks "is ANY episode monitored?", which one
+// positive observation settles regardless of what else was dropped; and when
+// nothing observed says true, an incomplete set simply produces no mismatch,
+// which is the conservative answer (no finding invented from data that was never
+// read). An episode lost on the way in has already been warned about where it
+// was dropped (buildSeasonCrossCheckEpisodes).
+//
+// A nil monitored is untrusted input, not a state, and is never evidence of
+// anything — the same rule every other pointer decode in this engine follows.
+func seasonHasMonitoredEpisode(d seasonDecision) bool {
+	for _, ep := range d.crossCheckEpisodes {
+		if ep.monitored != nil && *ep.monitored {
+			return true
+		}
+	}
+	return false
+}
+
 // seriesEvaluation is evaluateSeries's full result for one series: the
 // season decisions to report (would-unmonitor/skip lines), plus the
 // season-level accounting runSonarrDecisionEngine's summary line needs.
 type seriesEvaluation struct {
 	decisions []seasonDecision
-	// alreadyUnmonitored counts seasons with monitored explicitly false
-	// (present, not absent) — the season-granularity analogue of Radarr's
-	// alreadyUnmonitoredCount, scoped to a single series here so the caller
-	// can sum it across the whole library.
-	alreadyUnmonitored int
+	// offDirection counts seasons this pass excluded because their monitored
+	// flag is not the state the pass is about: going FORWARD those are the
+	// explicitly-unmonitored seasons (the season-granularity analogue of
+	// Radarr's alreadyUnmonitoredCount, which is what the forward caller
+	// reports it as), and coming back they are the monitored ones. Scoped to a
+	// single series here so the caller can sum it across the whole library.
+	//
+	// It is named for what it structurally IS rather than for what the forward
+	// pass calls it (Phase 10): a field named alreadyUnmonitored that holds the
+	// MONITORED seasons on a reverse pass would be a lie in the type system,
+	// and the reverse caller ignores both of these fields entirely.
+	offDirection int
 
-	// unmonitoredSeasons are those same seasons, handed back for the CALLER to
+	// offDirectionSeasons are those same seasons, handed back for the CALLER to
 	// log one line each — but only when reporting them individually is what the
-	// noise budget calls for. It is empty for a series with zero monitored
-	// seasons, where the binding rule is a single bulk debug line instead.
+	// noise budget calls for. It is empty for a series with no evaluable season
+	// at all, where the binding rule is a single bulk debug line instead.
 	//
 	// The list exists so the fan-out can be scoped, which is the whole point:
 	// evaluateSeries has no idea whether this series is in the report's scope
@@ -1559,7 +1626,7 @@ type seriesEvaluation struct {
 	// one line per unmonitored season of EVERY series in the library regardless
 	// — the one place the Sonarr engine's logging diverged from its own,
 	// correctly-scoped counters.
-	unmonitoredSeasons []seriesSeasonElement
+	offDirectionSeasons []seriesSeasonElement
 }
 
 // episodeAiringStatus reports whether an episode's airDateUtc is in the past
@@ -1603,15 +1670,26 @@ func episodeAiringStatus(e episodeElement, now time.Time) (aired bool, untrusted
 	return t.Before(now), false
 }
 
-// evaluateSeries applies the Sonarr season decision rule to every monitored
-// season of one series, in the binding evaluation order described above.
-// Rule 1's SERIES-level half (series.monitored == true) is the caller's
-// responsibility, exactly as rule 1 (movie.monitored == true) is
-// evaluateMovie's caller's responsibility in the Radarr engine — a series
-// that is not monitored produces no seasonDecision at all, for any of its
-// seasons. Rule 1's SEASON-level half (season.monitored == true) IS handled
-// here, since it is intrinsically about this series' own season list.
-func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, s seriesElement, profiles map[int]qualityProfile, exclusionTagID int, tagActive bool, wantedSeasons map[seasonKey]bool) seriesEvaluation {
+// evaluateSeries applies the Sonarr season decision rule to every season of
+// one series whose monitored flag matches dir, in the binding evaluation order
+// described above. Rule 1's SERIES-level half is the caller's responsibility,
+// exactly as rule 1 (movie.monitored) is evaluateMovie's caller's
+// responsibility in the Radarr engine — a series the caller declines produces
+// no seasonDecision at all, for any of its seasons. Rule 1's SEASON-level half
+// IS handled here, since it is intrinsically about this series' own season
+// list.
+//
+// dir (Phase 10) is rule 1's season-half EXPECTATION and the only thing about
+// this function the reverse scan changes: forward it evaluates the monitored
+// seasons, in reverse the unmonitored ones. Every other rule — completeness,
+// the airing guard, the wanted-set lookup, tags, the profile, the custom-format
+// threshold — runs identically and produces the identical reason constants,
+// because "does this item meet the criteria" is one question with one
+// implementation, and which side of it a caller cares about is the caller's
+// business. The reverse caller supplies the UNMONITORED wanted set for rule 4,
+// which is the second and last of the two parameters that turn this function
+// around.
+func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, s seriesElement, profiles map[int]qualityProfile, exclusionTagID int, tagActive bool, wantedSeasons map[seasonKey]bool, dir scanDirection) seriesEvaluation {
 	seriesID := *s.ID // caller guarantees non-nil
 	seriesTitle := titleOrAbsent(s.Title)
 
@@ -1625,14 +1703,15 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 		seasons = *s.Seasons
 	}
 
-	// Rule 1 (season half): partition this series' seasons into monitored,
-	// explicitly-unmonitored, and excluded-as-untrusted (monitored absent,
-	// or seasonNumber absent — without a season number a decision can be
-	// evaluated but never safely reported or looked up in wantedSeasons, the
-	// same defensive posture Radarr's fetchWantedCutoff takes toward a
-	// record missing its id).
-	var monitoredSeasons []seriesSeasonElement
-	var explicitlyUnmonitored []seriesSeasonElement
+	// Rule 1 (season half): partition this series' seasons into the ones this
+	// direction evaluates, the ones it excludes because their monitored flag is
+	// the other state, and excluded-as-untrusted (monitored absent, or
+	// seasonNumber absent — without a season number a decision can be evaluated
+	// but never safely reported or looked up in wantedSeasons, the same
+	// defensive posture Radarr's fetchWantedCutoff takes toward a record
+	// missing its id).
+	var evaluableSeasons []seriesSeasonElement
+	var offDirection []seriesSeasonElement
 	seenSeasonNumbers := make(map[int]bool)
 	for _, season := range seasons {
 		// REVIEW FIX (Phase 6 branch review): warnIfFieldAbsent's generic
@@ -1647,8 +1726,14 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 				"season", derefOrAbsent(season.SeasonNumber))
 			continue
 		}
-		if !*season.Monitored {
-			explicitlyUnmonitored = append(explicitlyUnmonitored, season)
+		// The direction switch, and the only place rule 1's season half is
+		// decided. A season whose monitored flag is not the state this pass is
+		// about is not "already unmonitored" in any absolute sense — it is
+		// simply the other pass's business — so it is set aside under a
+		// direction-neutral name and reported (or not) by the caller that knows
+		// which pass this is.
+		if *season.Monitored != dir.wantsMonitored() {
+			offDirection = append(offDirection, season)
 			continue
 		}
 		if season.SeasonNumber == nil {
@@ -1672,7 +1757,7 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 			continue
 		}
 		seenSeasonNumbers[*season.SeasonNumber] = true
-		monitoredSeasons = append(monitoredSeasons, season)
+		evaluableSeasons = append(evaluableSeasons, season)
 	}
 
 	// "Series with zero monitored seasons: single debug line, no per-season
@@ -1680,11 +1765,19 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 	// series entirely composed of unmonitored seasons (a fully completed,
 	// deliberately-unmonitored classic show, most commonly) would otherwise
 	// produce one debug line per season, every single cycle, forever.
-	if len(monitoredSeasons) == 0 {
+	if len(evaluableSeasons) == 0 {
 		switch {
-		case len(explicitlyUnmonitored) > 0:
+		case dir == directionReverse:
+			// A series with no UNMONITORED season is the ordinary, healthy state
+			// of most of a library, so the reverse direction says this at debug
+			// and never warns (Phase 10). Warning here would put one line per
+			// series into every cycle forever — and would be warning about the
+			// absence of a problem.
+			logger.Debug("series has no unmonitored seasons to reverse-scan",
+				"instance", inst.Name, "type", inst.Type, "seriesId", seriesID, "series", seriesTitle, "seasons", len(offDirection))
+		case len(offDirection) > 0:
 			logger.Debug("series has no monitored seasons",
-				"instance", inst.Name, "type", inst.Type, "seriesId", seriesID, "series", seriesTitle, "seasons", len(explicitlyUnmonitored))
+				"instance", inst.Name, "type", inst.Type, "seriesId", seriesID, "series", seriesTitle, "seasons", len(offDirection))
 		default:
 			// REVIEW FIX (PROBE C): neither monitored nor explicitly-
 			// unmonitored seasons at all — an empty (or entirely absent,
@@ -1698,10 +1791,10 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 			logger.Warn("monitored series produced no season decisions: no seasons, or none had a usable monitored/seasonNumber field",
 				"instance", inst.Name, "type", inst.Type, "seriesId", seriesID, "series", seriesTitle)
 		}
-		// unmonitoredSeasons is deliberately left EMPTY on this path: the
-		// binding noise-budget rule for a series with zero monitored seasons is
-		// one bulk debug line (just logged above), never one line per season.
-		return seriesEvaluation{alreadyUnmonitored: len(explicitlyUnmonitored)}
+		// offDirectionSeasons is deliberately left EMPTY on this path: the
+		// binding noise-budget rule for a series with no evaluable season is one
+		// bulk debug line (just logged above), never one line per season.
+		return seriesEvaluation{offDirection: len(offDirection)}
 	}
 
 	// The complementary case — at least one season IS monitored, so the
@@ -1754,14 +1847,14 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 		if profileFound {
 			threshold = profile.CutoffFormatScore
 		}
-		decisions := make([]seasonDecision, 0, len(monitoredSeasons))
-		for _, season := range monitoredSeasons {
+		decisions := make([]seasonDecision, 0, len(evaluableSeasons))
+		for _, season := range evaluableSeasons {
 			decisions = append(decisions, seasonDecision{
 				seriesID: seriesID, series: seriesTitle, season: *season.SeasonNumber,
 				reason: seriesLevelReason, profileName: profileName, cfThreshold: threshold,
 			})
 		}
-		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored), unmonitoredSeasons: explicitlyUnmonitored}
+		return seriesEvaluation{decisions: decisions, offDirection: len(offDirection), offDirectionSeasons: offDirection}
 	}
 
 	// The series survived every series-level check: exactly one
@@ -1769,17 +1862,17 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 	// series, per the binding evaluation-order resolution.
 	episodes, ok := fetchEpisodes(ctx, logger, client, inst, seriesID)
 	if !ok {
-		decisions := make([]seasonDecision, 0, len(monitoredSeasons))
-		for _, season := range monitoredSeasons {
+		decisions := make([]seasonDecision, 0, len(evaluableSeasons))
+		for _, season := range evaluableSeasons {
 			decisions = append(decisions, seasonDecision{
 				seriesID: seriesID, series: seriesTitle, season: *season.SeasonNumber,
 				reason: ReasonSeasonEpisodesUnavailable, profileName: profileName, cfThreshold: profile.CutoffFormatScore,
 			})
 		}
-		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored), unmonitoredSeasons: explicitlyUnmonitored}
+		return seriesEvaluation{decisions: decisions, offDirection: len(offDirection), offDirectionSeasons: offDirection}
 	}
 
-	episodesBySeason := make(map[int][]episodeElement, len(monitoredSeasons))
+	episodesBySeason := make(map[int][]episodeElement, len(evaluableSeasons))
 	for _, e := range episodes {
 		if e.SeasonNumber == nil {
 			logger.Warn("episode missing seasonNumber field; excluded from every season's evaluation",
@@ -1796,7 +1889,7 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 	seasonEpisodesFor := make(map[int][]episodeElement)
 	statsFileCountFor := make(map[int]int)
 
-	for _, season := range monitoredSeasons {
+	for _, season := range evaluableSeasons {
 		sn := *season.SeasonNumber
 		d := seasonDecision{seriesID: seriesID, series: seriesTitle, season: sn, profileName: profileName, cfThreshold: profile.CutoffFormatScore}
 
@@ -1937,7 +2030,7 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 	}
 
 	if len(candidateSeasons) == 0 {
-		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored), unmonitoredSeasons: explicitlyUnmonitored}
+		return seriesEvaluation{decisions: decisions, offDirection: len(offDirection), offDirectionSeasons: offDirection}
 	}
 
 	// The most expensive fetch, made at most once per series, and only for
@@ -1968,7 +2061,7 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 			// read side.
 			decisions[candidateIndex[sn]].completeOnDisk = false
 		}
-		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored), unmonitoredSeasons: explicitlyUnmonitored}
+		return seriesEvaluation{decisions: decisions, offDirection: len(offDirection), offDirectionSeasons: offDirection}
 	}
 
 	filesBySeason := make(map[int][]episodeFileElement)
@@ -2045,13 +2138,47 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 			decisions[idx].reason = ReasonCouldNotFetchCFScore
 		case belowThreshold:
 			decisions[idx].reason = ReasonCFCutoffNotMet
+		case dir == directionReverse && seasonHasMonitoredEpisode(decisions[idx]):
+			// REVIEW FIX (Phase 10 round 3), and the one place the reverse
+			// direction reaches a verdict the forward one cannot. This season is
+			// UNMONITORED and meets every criterion, which normally means
+			// cutoffarr's own work is done and there is nothing to say — but an
+			// episode inside it is still monitored, and that combination is a
+			// state nothing in this program can otherwise see or act on: the
+			// forward pass excludes the whole season at rule 1 (its flag is
+			// false), so Sonarr goes on searching and upgrading those episodes
+			// with no cutoff enforcement, forever, and the previous code reported
+			// ReasonCutoffMet — a silent all-clear.
+			//
+			// It is also precisely what a half-done reverse write leaves behind:
+			// writeSeasonMonitored sends PUT /episode/monitor first and the season
+			// PUT second, so a failure between them lands the episodes and not the
+			// flag. Without this branch that state is not merely unrepaired but
+			// UNSEEN — the episodes that landed have LEFT the monitored=false
+			// wanted set, so rule 4 no longer fires for that season and nothing
+			// else would ever look at it again.
+			//
+			// The same state is exactly what a human leaves by monitoring ONE
+			// episode of a finished unmonitored season, and the API does not say
+			// which happened — which is why this verdict is a report and NOTHING
+			// else: the write side refuses every season that already has monitored
+			// episodes inside it (errSeasonNotCleanlyUnmonitored, binding
+			// controller ruling R2). Both shapes are worth telling a human about;
+			// neither is this program's to resolve by guessing.
+			//
+			// Decided here rather than earlier because everything above it is a
+			// better answer: a season that is incomplete, still airing, in the
+			// wanted set, below its CF threshold or untrusted already has a reason
+			// that is either reported (and therefore retried) or warned about, and
+			// re-labelling those would lose the reason a human needs.
+			decisions[idx].reason = ReasonSeasonMonitorMismatch
 		default:
 			decisions[idx].wouldUnmonitor = true
 			decisions[idx].reason = ReasonCutoffMet
 		}
 	}
 
-	return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored), unmonitoredSeasons: explicitlyUnmonitored}
+	return seriesEvaluation{decisions: decisions, offDirection: len(offDirection), offDirectionSeasons: offDirection}
 }
 
 // runSonarrDecisionEngine is the entry point for a single sonarr instance.
@@ -2091,7 +2218,12 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 // runRadarrDecisionEngine, it never returns anything: the binding
 // error-handling rule (§2.6) is "skip that instance for the cycle and log a
 // warning", with no further work for a caller to gate on.
-func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, series []seriesElement, wantedEpisodeIDs map[int]bool, wantedSeasons map[seasonKey]bool, exclusionTagLabel string, scope evalScope, dryRun bool) {
+//
+// reverse (Phase 10) is the fourth pass, run after the write pass for the same
+// reasons the Radarr engine runs it there: it is a separate question about the
+// same library, its findings must never enter the forward cross-check's pools,
+// and its own write gate reads the verdict this cycle already produced.
+func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, series []seriesElement, wantedEpisodeIDs map[int]bool, wantedSeasons map[seasonKey]bool, exclusionTagLabel string, scope evalScope, dryRun bool, reverse reverseOptions) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	// See the Radarr twin: the once-per-cycle informational reads log through
@@ -2195,7 +2327,7 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 				"instance", inst.Name, "type", inst.Type, "title", titleOrAbsent(s.Title))
 			continue
 		}
-		eval := evaluateSeries(ctx, logger, client, inst, s, profiles, exclusionTagID, tagActive, wantedSeasons)
+		eval := evaluateSeries(ctx, logger, client, inst, s, profiles, exclusionTagID, tagActive, wantedSeasons, directionForward)
 		allDecisions = append(allDecisions, eval.decisions...)
 		seriesEvaluated++
 
@@ -2213,7 +2345,7 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		// path returns the count with an EMPTY season list (its noise budget is
 		// one bulk line, not one per season), which leaves nothing to filter by
 		// in the one case where filtering would matter most.
-		alreadyUnmonitoredCount += eval.alreadyUnmonitored
+		alreadyUnmonitoredCount += eval.offDirection
 
 		// The SEASON narrowing, and the only place it is applied. Every season
 		// above was still evaluated (the cross-check needs the full pools);
@@ -2255,7 +2387,7 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		// the scope check — rather than inside evaluateSeries, which cannot
 		// know the scope. Same placement, and same reason, as the Radarr
 		// engine's own alreadyUnmonitored debug line.
-		for _, season := range eval.unmonitoredSeasons {
+		for _, season := range eval.offDirectionSeasons {
 			logger.Debug("season already unmonitored",
 				"instance", inst.Name, "type", inst.Type, "seriesId", *s.ID, "series", titleOrAbsent(s.Title),
 				"season", derefOrAbsent(season.SeasonNumber))
@@ -2291,6 +2423,15 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
 
 	unmonitoredCount, recoveredWriteCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount := runSonarrWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun)
+
+	var rev reverseCounts
+	if reverse.enabled {
+		rev = reversePass{
+			logger: logger, cycleLogger: cycleLogger, client: client, inst: inst,
+			profiles: profiles, exclusionTagID: exclusionTagID, tagActive: tagActive,
+			cc: cc, scope: scope, itemLevel: scope.itemLevel, dryRun: dryRun, opts: reverse,
+		}.runSonarr(ctx, series)
+	}
 
 	attrs := []any{"instance", inst.Name, "type", inst.Type}
 	attrs = append(attrs, scope.summaryAttrs()...)
@@ -2332,6 +2473,9 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// pinned by
 	// TestRunSonarrDecisionEngine_EveryWouldUnmonitorSeasonIsAccountedForInTheSummary.
 	attrs = append(attrs, "writesRefused", writesRefusedCount, "withheldWrites", withheldWriteCount)
+
+	// The reverse scan's own accounting — see reverseCounts.summaryAttrs.
+	attrs = append(attrs, rev.summaryAttrs(reverse, dryRun)...)
 
 	attrs = append(attrs, "skipReasons", formatSkipCounts(skipCounts), "crossCheck", crossCheckSummary)
 	logger.Info("sonarr decision summary", attrs...)

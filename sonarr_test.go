@@ -434,7 +434,7 @@ func TestFetchSonarrWantedCutoff_HappyPath_BuildsEpisodeIDsAndSeasonLookup(t *te
 	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	episodeIDs, seasons, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst)
+	episodeIDs, seasons, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst, nil)
 	if !ok {
 		t.Fatalf("fetchSonarrWantedCutoff returned ok=false, want true:\n%s", buf.String())
 	}
@@ -469,7 +469,7 @@ func TestFetchSonarrWantedCutoff_RecordMissingSeriesId_SkipsInstance(t *testing.
 	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	_, _, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst)
+	_, _, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst, nil)
 	if ok {
 		t.Fatal("fetchSonarrWantedCutoff returned ok=true, want false: a record missing seriesId makes the whole result untrustworthy")
 	}
@@ -489,7 +489,7 @@ func TestFetchSonarrWantedCutoff_RecordMissingSeasonNumber_SkipsInstance(t *test
 	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	_, _, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst)
+	_, _, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst, nil)
 	if ok {
 		t.Fatal("fetchSonarrWantedCutoff returned ok=true, want false: a record missing seasonNumber makes the whole result untrustworthy")
 	}
@@ -509,7 +509,7 @@ func TestFetchSonarrWantedCutoff_RecordMissingId_SkipsInstance(t *testing.T) {
 	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	_, _, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst)
+	_, _, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst, nil)
 	if ok {
 		t.Fatal("fetchSonarrWantedCutoff returned ok=true, want false: a record missing id makes the whole result untrustworthy")
 	}
@@ -548,7 +548,7 @@ func TestFetchSonarrWantedCutoff_PagingUsesSharedMachinery(t *testing.T) {
 	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
-	episodeIDs, seasons, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst)
+	episodeIDs, seasons, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst, nil)
 	if !ok {
 		t.Fatalf("fetchSonarrWantedCutoff returned ok=false, want true:\n%s", buf.String())
 	}
@@ -940,7 +940,7 @@ func newStatefulSonarrFake(t *testing.T, series []*statefulSonarrSeries, episode
 		w.Write([]byte(f.episodeFilesJSON(seriesID)))
 	}))
 	mux.HandleFunc("/api/v3/wanted/cutoff", f.handle(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(f.wantedCutoffJSON()))
+		w.Write([]byte(f.wantedCutoffJSON(r.URL.Query().Get("monitored"))))
 	}))
 	// Catch-all: same rationale as radarrFake's (writer_test.go) — a request
 	// to any path this fake does not stub (a future Sonarr write verb, an
@@ -1026,7 +1026,14 @@ func (f *statefulSonarrFake) serveSeriesDetail(w http.ResponseWriter, r *http.Re
 		}
 		w.Write([]byte(body))
 	case http.MethodPut:
-		if status, overridden := f.seriesPutStatus[id]; overridden && status >= 400 {
+		// Read under the fake's own lock (REVIEW FIX, Phase 10 round 3): a test
+		// that changes this override BETWEEN two runs against the same fake — the
+		// half-done-write convergence test does exactly that — would otherwise
+		// race the serving goroutines that read it.
+		f.mu.Lock()
+		status, overridden := f.seriesPutStatus[id]
+		f.mu.Unlock()
+		if overridden && status >= 400 {
 			w.WriteHeader(status)
 			w.Write([]byte(`{"message":"write rejected by fake"}`))
 			return
@@ -1194,18 +1201,54 @@ func (f *statefulSonarrFake) episodeFilesJSON(seriesID int) string {
 // set — instead of the set being a hand-set constant that no write can ever
 // affect. Iteration follows episodeOrder for the same determinism reason
 // episodesJSON does.
-func (f *statefulSonarrFake) wantedCutoffJSON() string {
+// The monitored parameter (Phase 10) selects WHICH half of the library is asked
+// about, exactly as the live endpoint does: monitored=false — the only value
+// this project ever sends — answers with the UNMONITORED below-cutoff episodes
+// (1213 of them on the live instance, against 2405 for the default), and
+// anything else with the monitored ones. Deriving both from the same per-episode
+// state is what makes a write visible in both directions on the next read.
+func (f *statefulSonarrFake) wantedCutoffJSON(monitored string) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	wantUnmonitored := monitored == "false"
 	var recs []string
 	for _, id := range f.episodeOrder {
 		e := f.episodes[id]
-		if e.inWantedSet && e.monitored {
-			recs = append(recs, fmt.Sprintf(`{"id":%d,"seriesId":%d,"seasonNumber":%d,"episodeNumber":%d,"title":"Ep","airDateUtc":"2015-01-01T00:00:00Z","monitored":true,"hasFile":%t}`,
-				e.id, e.seriesID, e.seasonNumber, e.episodeNumber, e.hasFile))
+		if e.inWantedSet && e.monitored != wantUnmonitored {
+			recs = append(recs, fmt.Sprintf(`{"id":%d,"seriesId":%d,"seasonNumber":%d,"episodeNumber":%d,"title":"Ep","airDateUtc":"2015-01-01T00:00:00Z","monitored":%t,"hasFile":%t}`,
+				e.id, e.seriesID, e.seasonNumber, e.episodeNumber, e.monitored, e.hasFile))
 		}
 	}
 	return fmt.Sprintf(`{"page":1,"pageSize":100,"totalRecords":%d,"records":[%s]}`, len(recs), strings.Join(recs, ","))
+}
+
+// setSeriesPutStatus overrides (status >= 400) or clears (status 0) what
+// PUT /api/v3/series/{id} answers with, while the fake is serving. It models a
+// server that rejects one cycle's write and accepts the next one's, which is how
+// a half-completed season write — episodes landed, season flag not — is staged
+// without any hand-built state.
+func (f *statefulSonarrFake) setSeriesPutStatus(id, status int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if status == 0 {
+		delete(f.seriesPutStatus, id)
+		return
+	}
+	f.seriesPutStatus[id] = status
+}
+
+// countRequests reports how many requests this fake received for a path,
+// whatever their method or query.
+func (f *statefulSonarrFake) countRequests(path string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, r := range f.requests {
+		if r.path == path {
+			n++
+		}
+	}
+	return n
 }
 
 // setEpisodeWanted moves an episode in or out of the fake's /wanted/cutoff set
@@ -1778,5 +1821,43 @@ func TestFetchSeriesLibrary_TagsKeyPresentTwiceInDifferentCases_TreatedAsUnverif
 	}
 	if !strings.Contains(buf.String(), "level=WARN") {
 		t.Errorf("expected a warning:\n%s", buf.String())
+	}
+}
+
+// TestFetchSonarrWantedCutoff_UnmonitoredFilter_SendsMonitoredFalseAndBuildsBothLookups
+// is the Sonarr half of the reverse scan's quality-cutoff signal. The record
+// shape is unchanged — id, seriesId, seasonNumber, verified live against the
+// monitored=false set itself (1213 records, every one monitored=false) — so the
+// reverse scan reuses this fetch whole rather than growing a second decoder for
+// the same records.
+func TestFetchSonarrWantedCutoff_UnmonitoredFilter_SendsMonitoredFalseAndBuildsBothLookups(t *testing.T) {
+	var gotQueries []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/wanted/cutoff", func(w http.ResponseWriter, r *http.Request) {
+		gotQueries = append(gotQueries, r.URL.RawQuery)
+		w.Write([]byte(`{"page":1,"pageSize":100,"totalRecords":2,"records":[
+			{"id": 57093, "seriesId": 416, "seasonNumber": 2},
+			{"id": 17131, "seriesId": 226, "seasonNumber": 5}
+		]}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	episodeIDs, seasons, ok := fetchSonarrWantedCutoff(context.Background(), logger, client, inst, unmonitoredWantedFilter())
+	if !ok {
+		t.Fatalf("fetchSonarrWantedCutoff returned ok=false, want true:\n%s", buf.String())
+	}
+	if !episodeIDs[57093] || !episodeIDs[17131] || len(episodeIDs) != 2 {
+		t.Errorf("episode id set = %v, want exactly the two records' ids", episodeIDs)
+	}
+	if !seasons[seasonKey{seriesID: 416, seasonNumber: 2}] || !seasons[seasonKey{seriesID: 226, seasonNumber: 5}] {
+		t.Errorf("season lookup = %v, want both (seriesId, seasonNumber) pairs", seasons)
+	}
+	if len(gotQueries) != 1 || !strings.Contains(gotQueries[0], "monitored=false") {
+		t.Errorf("query = %v, want the monitored=false filter", gotQueries)
 	}
 }

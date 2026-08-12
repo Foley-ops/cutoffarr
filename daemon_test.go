@@ -896,10 +896,14 @@ func TestDaemon_SecondCycleWithNothingChanged_LogsSummariesOnlyAtInfo(t *testing
 //     waiting — which is what
 //     TestDaemon_IdleCycleWithAnInconclusiveCrossCheck_StaysWithinTheNoiseBudget
 //     exists to construct.
+//   - the per-instance decision summary of EITHER engine: Phase 10's reverse
+//     scan is reported through the same line, so a radarr instance's summary is
+//     now as much a part of an idle cycle as a sonarr's.
 var idleCycleAllowedInfo = []string{
 	"reconciliation sweep beginning",
 	"reconciliation sweep complete",
 	"sonarr decision summary",
+	"radarr decision summary",
 	"exclusion tag not defined in this instance",
 	"writes withheld for this instance",
 }
@@ -922,7 +926,7 @@ func assertIdleCycleInfoIsWithinTheBudget(t *testing.T, cycle string) (sawSummar
 		if matched == "" {
 			t.Errorf("an idle reconciliation cycle printed an INFO line that is not on the noise budget's allowlist:\n%s\n(whole cycle:\n%s)", line, cycle)
 		}
-		if matched == "sonarr decision summary" {
+		if strings.HasSuffix(matched, "decision summary") {
 			sawSummary = true
 		}
 	}

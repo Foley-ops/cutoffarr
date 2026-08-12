@@ -1212,3 +1212,121 @@ func TestInspectRadarrLibrary_TagsKeyPresentTwiceInDifferentCases_TreatedAsUnver
 		t.Errorf("expected a warning naming the unverifiable tags:\n%s", buf.String())
 	}
 }
+
+// --- the reverse scan's wanted set (Phase 10) ------------------------------
+//
+// The reverse scan's quality-cutoff signal is the SAME /wanted/cutoff endpoint
+// the forward scan reads, narrowed to unmonitored records with an explicit
+// monitored=false parameter (verified against both live instances before this
+// code was written: Radarr returns only monitored=false records, 3 of them
+// against 131 for the default, and default/monitored=true are identical).
+// Reusing the paging machinery means it inherits the completeness contract
+// unchanged, which matters more here than on the forward side: a partial
+// unmonitored set manufactures FALSE FINDINGS, and — with the remonitor flag
+// on — wrong writes.
+
+func TestFetchWantedCutoff_UnmonitoredFilter_SendsMonitoredFalseOnEveryPage(t *testing.T) {
+	var gotQueries []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/wanted/cutoff", func(w http.ResponseWriter, r *http.Request) {
+		gotQueries = append(gotQueries, r.URL.RawQuery)
+		page := r.URL.Query().Get("page")
+		var records []string
+		start := 1
+		if page == "2" {
+			start = 101
+		}
+		count := 100
+		if page == "2" {
+			count = 50
+		}
+		for i := start; i < start+count; i++ {
+			records = append(records, fmt.Sprintf(`{"id": %d, "title": "Record %d"}`, i, i))
+		}
+		fmt.Fprintf(w, `{"page": %s, "pageSize": 100, "totalRecords": 150, "records": [%s]}`, page, strings.Join(records, ","))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newRadarrTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	ids, ok := fetchWantedCutoff(context.Background(), logger, client, inst, unmonitoredWantedFilter())
+	if !ok {
+		t.Fatalf("fetchWantedCutoff returned ok=false, want true:\n%s", buf.String())
+	}
+	if len(ids) != 150 || !ids[1] || !ids[150] {
+		t.Errorf("got %d ids, want the full 150-record set", len(ids))
+	}
+	if len(gotQueries) != 2 {
+		t.Fatalf("expected 2 page requests, got %d: %v", len(gotQueries), gotQueries)
+	}
+	for i, q := range gotQueries {
+		if !strings.Contains(q, "monitored=false") {
+			t.Errorf("page %d query = %q, want it to carry monitored=false: the filter must be sent on EVERY page, not only the first", i+1, q)
+		}
+		if !strings.Contains(q, "pageSize=100") || !strings.Contains(q, fmt.Sprintf("page=%d", i+1)) {
+			t.Errorf("page %d query = %q lost the paging parameters", i+1, q)
+		}
+	}
+	if !strings.Contains(buf.String(), `wantedFilter="monitored=false"`) {
+		t.Errorf("the wanted/cutoff line must say WHICH set it counted, or the forward and reverse fetches are two indistinguishable lines:\n%s", buf.String())
+	}
+}
+
+// TestFetchWantedCutoff_ForwardFetch_SendsNoMonitoredFilter pins the other half:
+// the forward fetch's request is unchanged by this phase. The live probe showed
+// default and monitored=true return identical sets, so the forward path keeps
+// sending neither — adding a parameter it never sent would be a behavior change
+// smuggled in beside a new feature.
+func TestFetchWantedCutoff_ForwardFetch_SendsNoMonitoredFilter(t *testing.T) {
+	var gotQueries []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/wanted/cutoff", func(w http.ResponseWriter, r *http.Request) {
+		gotQueries = append(gotQueries, r.URL.RawQuery)
+		w.Write([]byte(emptyWantedCutoffJSON))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, _ := newRadarrTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	if _, ok := fetchWantedCutoff(context.Background(), logger, client, inst, nil); !ok {
+		t.Fatal("fetchWantedCutoff returned ok=false on an empty but well-formed set")
+	}
+	if len(gotQueries) != 1 {
+		t.Fatalf("expected 1 page request, got %v", gotQueries)
+	}
+	if strings.Contains(gotQueries[0], "monitored") {
+		t.Errorf("the forward fetch must send no monitored filter at all, got %q", gotQueries[0])
+	}
+}
+
+// TestFetchWantedCutoff_UnmonitoredFilter_PartialSetIsRefused pins that the
+// filtered fetch inherits the completeness contract rather than getting a
+// weaker one. The dangerous direction is reversed here — a missing record means
+// a movie the reverse scan will NOT report, and a set short of what
+// totalRecords claimed cannot say which — so a partial answer is refused
+// exactly as the forward one is.
+func TestFetchWantedCutoff_UnmonitoredFilter_PartialSetIsRefused(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/wanted/cutoff", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"page": 1, "pageSize": 100, "totalRecords": 50, "records": []}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newRadarrTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-partial", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	if _, ok := fetchWantedCutoff(context.Background(), logger, client, inst, unmonitoredWantedFilter()); ok {
+		t.Fatal("fetchWantedCutoff returned ok=true on a partial set; the completeness contract must apply to the filtered fetch too")
+	}
+	if !strings.Contains(buf.String(), "level=WARN") || !strings.Contains(buf.String(), "radarr-partial") {
+		t.Errorf("expected a warning naming the instance:\n%s", buf.String())
+	}
+}

@@ -352,11 +352,11 @@ type seasonKey struct {
 // derived data can never be reconstructed as complete, and
 // fetchWantedCutoffPages's handleRecord-returns-false contract makes that
 // instance-fatal (warn + skip, ok=false) rather than silently partial.
-func fetchSonarrWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance) (wantedEpisodeIDs map[int]bool, wantedSeasons map[seasonKey]bool, ok bool) {
+func fetchSonarrWantedCutoff(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, filter url.Values) (wantedEpisodeIDs map[int]bool, wantedSeasons map[seasonKey]bool, ok bool) {
 	wantedEpisodeIDs = make(map[int]bool)
 	wantedSeasons = make(map[seasonKey]bool)
 
-	fetched, totalRecords, ok := fetchWantedCutoffPages(ctx, logger, client, inst, func(page int, raw json.RawMessage) bool {
+	fetched, totalRecords, ok := fetchWantedCutoffPages(ctx, logger, client, inst, filter, func(page int, raw json.RawMessage) bool {
 		var r sonarrWantedRecord
 		if err := json.Unmarshal(raw, &r); err != nil {
 			logger.Warn("skipping instance: wanted/cutoff record is not valid JSON",
@@ -378,7 +378,8 @@ func fetchSonarrWantedCutoff(ctx context.Context, logger *slog.Logger, client *A
 	}
 
 	logger.Info("wanted/cutoff",
-		"instance", inst.Name, "type", inst.Type, "totalRecords", totalRecords, "fetched", fetched)
+		"instance", inst.Name, "type", inst.Type, "wantedFilter", wantedFilterLabel(filter),
+		"totalRecords", totalRecords, "fetched", fetched)
 
 	return wantedEpisodeIDs, wantedSeasons, true
 }
@@ -398,7 +399,7 @@ func inspectSonarrLibrary(ctx context.Context, logger *slog.Logger, inst Instanc
 		return nil, nil, nil, false
 	}
 
-	wantedEpisodeIDs, wantedSeasons, ok := fetchSonarrWantedCutoff(ctx, logger, client, inst)
+	wantedEpisodeIDs, wantedSeasons, ok := fetchSonarrWantedCutoff(ctx, logger, client, inst, nil)
 	if !ok {
 		return nil, nil, nil, false
 	}

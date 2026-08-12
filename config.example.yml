@@ -28,6 +28,30 @@ webhook_debounce: 45s    # wait after the LAST event for a movie/series before
 log_level: info          # debug | info | warn | error
 exclusion_tag: cutoffarr-exclude
 
+reverse_scan_remonitor: false
+                         # The reverse scan runs on every full cycle (startup
+                         # scan, reconciliation sweep, --once) and REPORTS items
+                         # that are unmonitored while still failing the criteria
+                         # — usually an accidental unmonitor. Reporting is
+                         # unconditional; this flag is only about writing.
+                         # false (the default) means the reverse scan composes
+                         # no write of any kind, ever. true lets it re-monitor
+                         # what it finds, obeying dry_run and the exclusion tag
+                         # exactly like the forward path. Sonarr seasons under
+                         # an UNMONITORED series are always report-only: a
+                         # series-level unmonitor is a deliberate retirement.
+                         # With it on, --once --only-id N runs BOTH directions
+                         # against that one item and nothing else, which is how
+                         # to try a re-monitor deliberately before letting a
+                         # full cycle make them. With it off, scoped runs stay
+                         # forward-only.
+                         # A Sonarr season that already has MONITORED episodes
+                         # inside it is report-only too: re-monitoring is for
+                         # the clean case (the flag off and every episode under
+                         # it off), and a mixed state is indistinguishable from
+                         # one a human made by hand, so it is reported every
+                         # cycle and never written either way.
+
 instances:
   - name: radarr-main    # unique, used in logs
     type: radarr         # radarr | sonarr
