@@ -123,7 +123,7 @@ blank.
 | `webhook_debounce` | `45s` | How long to wait after the *last* event for a given movie/series before evaluating it — so a season-pack import (many episode-import events) becomes one evaluation, not one per episode. `0` evaluates immediately, with no wait. |
 | `log_level` | `info` | One of `debug`, `info`, `warn`, `error`. Logging is always to stdout only, via `log/slog`'s text handler — never to a file. |
 | `exclusion_tag` | `cutoffarr-exclude` | The tag label that opts an item out of everything cutoffarr does, in every mode, including dry-run reporting. Must not be empty or all-whitespace (omit the key entirely to use the default; an explicit empty string is a fatal config error, not a silent "exclude nothing"). |
-| `reverse_scan_remonitor` | **`false`** | Whether the reverse scan may WRITE. The reverse scan itself always runs on full cycles and reports what it finds; this flag alone decides whether it re-monitors it. With `false` no write of any kind is composed by that pass — not gated, not attempted. With `true`, re-monitoring obeys `dry_run` and the exclusion tag exactly like the forward path. See [The reverse scan](#the-reverse-scan). |
+| `reverse_scan_remonitor` | **`false`** | Whether the reverse scan may WRITE. The reverse scan itself always runs on full cycles and reports what it finds; this flag alone decides whether it re-monitors it. With `false` no write of any kind is composed by that pass — not gated, not attempted. With `true`, re-monitoring obeys `dry_run` and the exclusion tag exactly like the forward path, and `--once --only-id N` becomes a scoped both-directions run against that single item ([Trying it on one item first](#trying-it-on-one-item-first)). See [The reverse scan](#the-reverse-scan). |
 | `instances` | *(required, may be empty)* | A list of `*arr` instances to reconcile against. An empty list is valid (cutoffarr just warns and does nothing) but almost certainly not what you want. |
 | `instances[].name` | — | A unique, human-readable name used in every log line and as the webhook path segment (`/webhook/{instance-name}`). |
 | `instances[].type` | — | `radarr` or `sonarr`. |
@@ -302,6 +302,34 @@ Three things it will never do:
   writing just the flag would guess that the half-done write was cutoffarr's.
   The season is reported every cycle instead, and the refusal is logged and
   counted as `remonitorsRefused`.
+
+### Trying it on one item first
+
+Switching a write flag on and letting a whole-library pass make the first
+re-monitors, unattended, is not a way to try a feature. So the scoped one-shot
+run doubles as the instrument for it:
+
+```sh
+cutoffarr --once --only-id 707 --instance radarr-main
+```
+
+With `reverse_scan_remonitor: true`, that runs **both** directions against
+exactly that one id — the ordinary forward evaluation of it, and a reverse pass
+that evaluates *only* it. Nothing else in the library is evaluated, reported,
+or written, in either direction. If the item turns out not to be a finding on
+fresh data (you named something that is unmonitored and finished, say), the
+pass reports `reverseFindings=0` and writes nothing: naming an item asks a
+question, it does not issue an instruction. Every gate applies unchanged — the
+cross-check must have passed *and* verified something, the exclusion tag is
+re-checked, the decision is re-run against a fresh fetch, and `dry_run: true`
+still withholds the write immediately before the PUT.
+
+`--instance` is required when more than one instance could hold that id, since
+each `*arr` numbers its own library from 1.
+
+With the switch **off**, a scoped run stays forward-only, exactly as before:
+there is nothing the reverse pass could do about the item, and a second pass
+over the unmonitored half of your library is not what `--only-id` means.
 
 The summary line tells you which mode you are in: with the switch off it
 carries `reverseFindings=N` and nothing else; with it on, `remonitored`,

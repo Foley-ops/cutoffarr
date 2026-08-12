@@ -145,13 +145,13 @@ func isUntrustedInputReason(reason string) bool {
 //
 // The two are separate because they answer to different things. enabled is
 // SCHEDULING — the reverse scan belongs to full-library cycles (the startup
-// scan, the reconciliation sweep, a --once run) and never to a webhook or an
-// --only-id run, which are surgical and forward-looking by construction.
-// remonitor is CONFIGURATION — cfg.ReverseScanRemonitor, default false, the
-// only thing that lets the reverse scan write anything ever.
+// scan, the reconciliation sweep, a --once run), plus the one scoped cycle
+// described below, and never to a webhook, which fires unattended on every
+// import. remonitor is CONFIGURATION — cfg.ReverseScanRemonitor, default false,
+// the only thing that lets the reverse scan write anything ever.
 //
-// The zero value is "do not run", which is what every scoped cycle wants and
-// what a caller that forgot about this phase gets.
+// The zero value is "do not run", which is what a webhook cycle wants and what a
+// caller that forgot about this phase gets.
 type reverseOptions struct {
 	enabled   bool
 	remonitor bool
@@ -166,6 +166,30 @@ type reverseOptions struct {
 // rather than something they have to spell.
 func fullScanReverseOptions(cfg Config) reverseOptions {
 	return reverseOptions{enabled: true, remonitor: cfg.ReverseScanRemonitor}
+}
+
+// scopedReverseOptions is what a SCOPED one-shot run (--once --only-id N, with
+// --instance where the id is ambiguous) asks for: the reverse pass runs only
+// when it may WRITE, and then only over the item the flag names.
+//
+// It is the acceptance instrument for the reverse direction (binding controller
+// ruling R7, amending the brief's resolution 8), and it exists because there was
+// no other honest way to try this feature once. v1's forward writes have never
+// run against a live library and are not authorized to, so the alternative to
+// this was switching the daemon on and letting a whole-library pass make the
+// first re-monitors this project has ever made, unattended. A human names one
+// item, watches one write, and checks it in the UI.
+//
+// With the switch OFF a scoped run stays forward-only, exactly as before. There
+// is nothing the reverse pass could DO about the named item in that
+// configuration, and a whole extra pass over the unmonitored half of the library
+// to report items nobody asked about is not what --only-id means.
+//
+// What the scope narrows is stated at reversePass.scope: the pass evaluates the
+// named item and no other, in either direction, and every gate, refusal, echo
+// and dry-run rule applies to it unchanged.
+func scopedReverseOptions(cfg Config) reverseOptions {
+	return reverseOptions{enabled: cfg.ReverseScanRemonitor, remonitor: cfg.ReverseScanRemonitor}
 }
 
 // reverseCounts is one instance's reverse-scan accounting for one cycle.
@@ -294,6 +318,26 @@ type reversePass struct {
 	// about any individual finding.
 	cc crossCheckResult
 
+	// scope is the cycle's own evalScope, and it narrows this pass exactly as it
+	// narrows the forward one: the items it names are the only ones evaluated,
+	// reported or written (binding controller ruling R7). An INACTIVE scope — a
+	// full-library cycle — contains everything, so the common path pays nothing
+	// and reads as though this field were not here.
+	//
+	// It is applied at the POPULATION, before the decision function is called,
+	// rather than at the write: a scoped run must not report findings about
+	// items nobody asked about either, and an evaluation that never happens
+	// cannot be acted on by a later change to this file. That is the whole of
+	// the "exactly one item, either direction, nothing else ever" guarantee the
+	// acceptance instrument rests on, and it is pinned as such
+	// (TestRun_OnlyID_WithRemonitorFlag_RunsBothDirectionsOnThatItemAlone).
+	//
+	// Unlike the forward pass, nothing here needs the whole library for
+	// evidence: the reverse direction runs no cross-check of its own (it reads
+	// the forward one's verdict, which the forward pass computed over
+	// everything), so narrowing what it evaluates costs it no soundness.
+	scope evalScope
+
 	itemLevel slog.Level
 	dryRun    bool
 	opts      reverseOptions
@@ -361,9 +405,18 @@ func (p reversePass) runRadarr(ctx context.Context, movies []movieListElement) r
 		if m.ID == nil {
 			// The forward loop never reaches its own missing-id guard for an
 			// unmonitored movie (rule 1 excludes it first), so this is the only
-			// place an unmonitored movie with no id is ever noticed.
+			// place an unmonitored movie with no id is ever noticed. It is
+			// warned about before the scope check below because it is a
+			// statement about the library's data, not about this item's
+			// eligibility — and a movie with no id can never be the one a scope
+			// names, since matching an id required a non-nil one.
 			p.logger.Warn("reverse scan: skipping movie: missing id field",
 				"instance", p.inst.Name, "type", p.inst.Type, "title", titleOrAbsent(m.Title))
+			continue
+		}
+		// The scope (see the field): on a scoped run this is the whole of what
+		// keeps the pass to the one item it was given.
+		if !p.scope.contains(*m.ID) {
 			continue
 		}
 
@@ -472,10 +525,25 @@ func (p reversePass) runSonarr(ctx context.Context, series []seriesElement) reve
 			continue
 		}
 
+		// The scope (see the field): the one thing that keeps a scoped run to
+		// the series it was given, checked before the evaluation so an
+		// out-of-scope series is not even read.
+		if !p.scope.contains(*s.ID) {
+			continue
+		}
+
 		eval := evaluateSeries(ctx, p.logger, p.client, p.inst, s, p.profiles, p.exclusionTagID, p.tagActive, wantedSeasons, directionReverse)
 		seriesEvaluated++
 		for _, d := range eval.decisions {
 			if !isReverseFinding(d.reason) {
+				continue
+			}
+			// The scope's SECOND level, which only a webhook cycle ever sets and
+			// which no webhook cycle reaches (they run no reverse pass at all).
+			// It is applied anyway because the season is the decision unit here,
+			// and a narrowing that exists must mean the same thing in both
+			// directions or it means nothing.
+			if !p.scope.containsSeason(d.seriesID, d.season) {
 				continue
 			}
 			c.findings++

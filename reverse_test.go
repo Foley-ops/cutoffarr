@@ -1873,15 +1873,23 @@ func TestDaemon_WebhookCycle_RunsNoReversePass(t *testing.T) {
 	assertNoReversePass(t, cycle)
 }
 
-// TestRun_OnlyID_RunsNoReversePass is the same rule for the scoped one-shot run.
-func TestRun_OnlyID_RunsNoReversePass(t *testing.T) {
+// TestRun_OnlyID_FlagOff_RunsNoReversePass is the same rule for the scoped
+// one-shot run, in the configuration that is the product: report-only.
+//
+// A scoped run is about the one item a human named. With re-monitoring switched
+// off there is nothing the reverse pass could do about that item, so running a
+// second pass over the unmonitored half of the library would answer a question
+// nobody asked at the cost of a full extra scan. (With the switch ON it becomes
+// the acceptance instrument — see
+// TestRun_OnlyID_WithRemonitorFlag_RunsBothDirectionsOnThatItemAlone.)
+func TestRun_OnlyID_FlagOff_RunsNoReversePass(t *testing.T) {
 	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
 		wouldUnmonitorStatefulMovie(1, "Named"),
 		reverseFindingStatefulMovie(7, "Accidentally Unmonitored"),
 	})
 
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"--config", writeReverseTestConfig(t, fake.srv.URL, true, true), "--once", "--only-id", "1"}, &stdout, &stderr)
+	code := run([]string{"--config", writeReverseTestConfig(t, fake.srv.URL, true, false), "--once", "--only-id", "1"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("exit code = %d; stderr=%s", code, stderr.String())
 	}
@@ -1894,6 +1902,216 @@ func TestRun_OnlyID_RunsNoReversePass(t *testing.T) {
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Errorf("a dry-run must write nothing at all: %+v", writes)
 	}
+}
+
+// --- the scoped acceptance instrument (controller ruling R7) ----------------
+//
+// v1's forward writes have never run against a live library, and are not
+// authorized to. That leaves the reverse direction's first real write with
+// nothing to learn from, and "switch the daemon on and watch" is not an
+// acceptance procedure for a program whose whole claim is that it writes one
+// field to items it is certain about.
+//
+// So `--once --only-id N --instance X` WITH reverse_scan_remonitor:true becomes
+// the instrument: it runs BOTH directions, each scoped to that one id — the
+// forward evaluation of that item exactly as before, and a reverse pass that
+// evaluates that item and nothing else, skipping it unless it is a current
+// finding on fresh data. Every gate, refusal and echo rule applies unchanged;
+// the only thing narrowed is which items exist as far as the pass is concerned.
+//
+// The scoping guarantee is therefore held to the same standard as this
+// project's zero-write pins: exactly one item, either direction, nothing else
+// ever. Without the flag, scoped runs stay forward-only (above).
+
+// TestRun_OnlyID_WithRemonitorFlag_RunsBothDirectionsOnThatItemAlone is the
+// instrument itself, staged as the acceptance run would be: a library holding
+// the named item, a second identical reverse finding, a forward would-unmonitor
+// candidate, and the cross-check witness that makes the gate's verdict real.
+// Exactly one write leaves the process, to exactly the named movie.
+func TestRun_OnlyID_WithRemonitorFlag_RunsBothDirectionsOnThatItemAlone(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		crossCheckWitnessStatefulMovie(5, "Ordinary Monitored"),
+		// The forward direction's own candidate: monitored and finished, so a
+		// full write-mode cycle would unmonitor it. Nothing may touch it here.
+		wouldUnmonitorStatefulMovie(1, "Would Be Unmonitored"),
+		reverseFindingStatefulMovie(7, "The Named Item"),
+		reverseFindingStatefulMovie(8, "The Other Accidental Unmonitor"),
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeReverseTestConfig(t, fake.srv.URL, false, true), "--once", "--only-id", "7"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d; stderr=%s", code, stderr.String())
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "onlyId=7") {
+		t.Fatalf("this test proves nothing unless the run really was scoped:\n%s", out)
+	}
+	// The gate's evidence comes from the FORWARD pass, which is library-wide
+	// even on a scoped run (the cross-check validates the data, not the target),
+	// so both monitored movies are sampled and verified here.
+	if !strings.Contains(out, `crossCheck="passed (2 verified`) {
+		t.Fatalf("nor unless the write gate really opened on a verified sample:\n%s", out)
+	}
+
+	puts := fake.puts()
+	if len(puts) != 1 || puts[0].path != "/api/v3/movie/7" {
+		t.Fatalf("a scoped run may write exactly the item it names, in either direction, got %+v", puts)
+	}
+	if !fake.movie(7).monitored {
+		t.Error("the named movie must be re-monitored")
+	}
+	if fake.movie(8).monitored {
+		t.Error("movie 8 must be left exactly as it was found: unmonitored")
+	}
+	if !fake.movie(1).monitored {
+		t.Error("the forward candidate must be left monitored: a scoped run writes nothing it did not name")
+	}
+	// Not merely unwritten: never even looked at by the write path, and never
+	// reported. A finding line for another item on a scoped run would send a
+	// human to act on something this run was not asked about.
+	for _, id := range []int{1, 8} {
+		if n := fake.countRequests("/api/v3/movie/" + strconv.Itoa(id)); n != 0 {
+			t.Errorf("movie %d got %d pre-write fetch(es); a scoped run must not enter any write path but the named one", id, n)
+		}
+	}
+	if strings.Contains(out, "The Other Accidental Unmonitor") {
+		t.Errorf("a scoped reverse pass must report only the item it was given:\n%s", out)
+	}
+	if n := strings.Count(out, `msg="reverse-scan finding"`); n != 1 {
+		t.Errorf("want exactly one reverse-scan finding, got %d:\n%s", n, out)
+	}
+	c := summaryCounters(t, out)
+	if c["reverseFindings"] != 1 || c["remonitored"] != 1 {
+		t.Errorf("want reverseFindings=1 remonitored=1, got %v:\n%s", c, out)
+	}
+	if c["unmonitored"] != 0 || c["wouldUnmonitor"] != 0 {
+		t.Errorf("the forward half of a scoped run must be about the named item only, got %v:\n%s", c, out)
+	}
+	assertReverseIdentity(t, out)
+}
+
+// TestRun_OnlyID_WithRemonitorFlag_ItemThatIsNotAFinding_WritesNothing is the
+// other half of the instrument: it is a QUESTION, not an instruction. Naming an
+// item that is unmonitored and meets the criteria — cutoffarr's own ordinary
+// output — must produce a reverse pass that ran, found nothing, and wrote
+// nothing, rather than a re-monitor on the strength of having been asked.
+func TestRun_OnlyID_WithRemonitorFlag_ItemThatIsNotAFinding_WritesNothing(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		crossCheckWitnessStatefulMovie(5, "Ordinary Monitored"),
+		// Unmonitored, with a file, and meeting every criterion: exactly what
+		// this program leaves behind, and never a finding.
+		{id: 7, title: "Finished And Unmonitored", monitored: false, hasFile: true,
+			qualityProfileID: 1, tags: []int{}, movieFileID: 7, cfScore: 200,
+			qualityCutoffNotMet: false, inWantedSet: false},
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeReverseTestConfig(t, fake.srv.URL, false, true), "--once", "--only-id", "7"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d; stderr=%s", code, stderr.String())
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "reverseFindings=0") {
+		t.Fatalf("the pass must have run and reported nothing:\n%s", out)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("naming an item is not an instruction to write it: %+v", writes)
+	}
+	if fake.movie(7).monitored {
+		t.Error("the named movie must be left unmonitored")
+	}
+	assertReverseIdentity(t, out)
+}
+
+// TestRun_OnlyID_WithRemonitorFlag_Sonarr_WritesOnlyTheNamedSeries is the
+// instrument on the other *arr, where the scope names a SERIES and the reverse
+// pass has a second level of narrowing under it. Two series, each with an
+// unmonitored qualifying season; one of them is named.
+func TestRun_OnlyID_WithRemonitorFlag_Sonarr_WritesOnlyTheNamedSeries(t *testing.T) {
+	witnessSeries, witnessEpisodes, witnessFiles := crossCheckWitnessSonarrFixtures()
+	fake := newStatefulSonarrFake(t,
+		append(witnessSeries,
+			&statefulSonarrSeries{id: 1, title: "The Named Show", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 2, monitored: false, episodeFileCount: 1, totalEpisodeCount: 1}}},
+			&statefulSonarrSeries{id: 2, title: "The Other Show", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 3, monitored: false, episodeFileCount: 1, totalEpisodeCount: 1}}}),
+		append(witnessEpisodes,
+			&statefulSonarrEpisode{id: 200, seriesID: 1, seasonNumber: 2, episodeNumber: 1, monitored: false, hasFile: true,
+				airDateUtc: pastAirDate, episodeFileID: 600, inWantedSet: true},
+			&statefulSonarrEpisode{id: 300, seriesID: 2, seasonNumber: 3, episodeNumber: 1, monitored: false, hasFile: true,
+				airDateUtc: pastAirDate, episodeFileID: 700, inWantedSet: true}),
+		append(witnessFiles,
+			&statefulSonarrEpisodeFile{id: 600, seasonNumber: 2, customFormatScore: 200, qualityCutoffNotMet: true},
+			&statefulSonarrEpisodeFile{id: 700, seasonNumber: 3, customFormatScore: 200, qualityCutoffNotMet: true}),
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeReverseSonarrTestConfig(t, fake.srv.URL, false, true), "--once", "--only-id", "1"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d; stderr=%s", code, stderr.String())
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "onlyId=1") || !strings.Contains(out, `crossCheck="passed (1 verified`) {
+		t.Fatalf("this test needs a scoped run whose gate really opened:\n%s", out)
+	}
+	for _, w := range fake.writes() {
+		if w.path != "/api/v3/series/1" && w.path != "/api/v3/episode/monitor" {
+			t.Errorf("a scoped run wrote to %s %s", w.method, w.path)
+		}
+	}
+	if !fake.seasonMonitored(1, 2) {
+		t.Errorf("the named series' season must be re-monitored:\n%s", out)
+	}
+	if fake.seasonMonitored(2, 3) {
+		t.Error("the other series must be untouched")
+	}
+	if n := fake.countRequests("/api/v3/series/2"); n != 0 {
+		t.Errorf("the other series' write path was entered %d time(s)", n)
+	}
+	if strings.Contains(out, "The Other Show") {
+		t.Errorf("a scoped reverse pass must report only the series it was given:\n%s", out)
+	}
+	c := summaryCountersFor(t, out, "sonarr decision summary")
+	if c["reverseFindings"] != 1 || c["remonitored"] != 1 {
+		t.Errorf("want reverseFindings=1 remonitored=1, got %v:\n%s", c, out)
+	}
+	assertReverseIdentity(t, out)
+}
+
+// TestDaemon_WebhookCycle_WithRemonitorFlag_StillRunsNoReversePass keeps the
+// instrument from widening into the cycle it must never reach. A webhook cycle
+// is scoped too, and R7 gives scoped runs a reverse pass when the write switch
+// is on — but only the --once ones a human is watching. A webhook fires
+// unattended on every import, and a reverse pass there would be both a
+// per-import full scan and a write nobody asked for at that moment.
+func TestDaemon_WebhookCycle_WithRemonitorFlag_StillRunsNoReversePass(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		wouldUnmonitorStatefulMovie(1, "Imported"),
+		reverseFindingStatefulMovie(7, "Accidentally Unmonitored"),
+	})
+	h := startDaemon(t, writeReverseDaemonConfig(t, fake.srv.URL, true, "0", "debug"))
+	h.waitReady()
+	if !strings.Contains(h.out.String(), "remonitored=") {
+		t.Fatalf("this test proves nothing unless the startup scan really did run a reverse pass with the switch on:\n%s", h.out.String())
+	}
+
+	mark := h.mark()
+	h.post("radarr-main", downloadMoviePayload)
+	eventually(t, "the event to be queued", func() bool {
+		return strings.Contains(h.out.String(), "webhook queued")
+	})
+	h.clock.Advance(45 * time.Second)
+	h.awaitLogCount("webhook debounce expired; evaluating", 1)
+	eventually(t, "the webhook cycle to finish", func() bool {
+		return strings.Contains(h.since(mark), "radarr decision summary")
+	})
+	h.stop()
+
+	assertNoReversePass(t, h.since(mark))
 }
 
 // TestDaemon_IdleCycleWithReverseFindings_StaysWithinTheNoiseBudget is the
@@ -2714,4 +2932,44 @@ func TestRunSonarrDecisionEngine_ReverseScan_SeasonMonitoredBeforeTheWrite_IsRef
 		t.Errorf("want reverseFindings=1 remonitorsRefused=1 remonitored=0, got %v:\n%s", c, out)
 	}
 	assertReverseIdentity(t, out)
+}
+
+// TestRunSonarrDecisionEngine_ReverseScan_SeasonNarrowedScope_ReportsOnlyThatSeason
+// pins the scope's SECOND level in the reverse direction. An evalScope can name
+// seasons under a series id, and the reverse pass applies that narrowing exactly
+// as the forward one does.
+//
+// No cycle this daemon builds today combines the two — season narrowing comes
+// only from webhook events, and webhook cycles run no reverse pass — so this is
+// deliberately constructed at the engine boundary rather than through run(). The
+// alternative was leaving the narrowing unapplied on the reverse side, which
+// would mean a scope that says "season 2 of series 1" quietly meaning "every
+// season of series 1" the first time the two are combined. A narrowing that
+// exists must mean the same thing in both directions.
+func TestRunSonarrDecisionEngine_ReverseScan_SeasonNarrowedScope_ReportsOnlyThatSeason(t *testing.T) {
+	episodesJSON := "[" + episodeJSONWithMonitored(200, 2, 1, pastAirDate, 600, false) + "," +
+		episodeJSONWithMonitored(300, 3, 1, pastAirDate, 700, false) + "]"
+	filesJSON := "[" + episodeFileJSON(600, 2, 200, true) + "," + episodeFileJSON(700, 3, 200, true) + "]"
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	fake.reverseWantedJSON = `{"page":1,"pageSize":100,"totalRecords":2,"records":[` +
+		`{"id":200,"seriesId":1,"seasonNumber":2},{"id":300,"seriesId":1,"seasonNumber":3}]}`
+
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+	series := []seriesElement{
+		testSeries(1, "Two Unmonitored Seasons", true, 1, []int{}, testSeason(2, false, 1, 1), testSeason(3, false, 1, 1)),
+	}
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{},
+		"cutoffarr-exclude", webhookScope([]int{1}, map[int][]int{1: {2}}), true, reverseScanOn())
+
+	out := buf.String()
+	line := reverseFindingLine(t, out)
+	if !strings.Contains(line, "season=2") {
+		t.Errorf("the reported finding must be the season the scope names:\n%s", line)
+	}
+	if strings.Contains(out, "season=3") {
+		t.Errorf("a season the scope excludes must not be reported at all:\n%s", out)
+	}
+	if !strings.Contains(out, "reverseFindings=1") {
+		t.Errorf("and the count must agree with what was reported:\n%s", out)
+	}
 }

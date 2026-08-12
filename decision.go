@@ -684,7 +684,7 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		rev = reversePass{
 			logger: logger, cycleLogger: cycleLogger, client: client, inst: inst,
 			profiles: profiles, exclusionTagID: exclusionTagID, tagActive: tagActive,
-			cc: cc, itemLevel: scope.itemLevel, dryRun: dryRun, opts: reverse,
+			cc: cc, scope: scope, itemLevel: scope.itemLevel, dryRun: dryRun, opts: reverse,
 		}.runRadarr(ctx, movies)
 	}
 
@@ -2429,7 +2429,7 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		rev = reversePass{
 			logger: logger, cycleLogger: cycleLogger, client: client, inst: inst,
 			profiles: profiles, exclusionTagID: exclusionTagID, tagActive: tagActive,
-			cc: cc, itemLevel: scope.itemLevel, dryRun: dryRun, opts: reverse,
+			cc: cc, scope: scope, itemLevel: scope.itemLevel, dryRun: dryRun, opts: reverse,
 		}.runSonarr(ctx, series)
 	}
 

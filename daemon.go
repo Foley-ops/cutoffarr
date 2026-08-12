@@ -60,11 +60,15 @@ type scanCycle struct {
 	// It is a per-cycle field rather than a config lookup inside the engines
 	// because it is a SCHEDULING decision: the reverse scan belongs to
 	// full-library cycles — the startup scan, the reconciliation sweep, a
-	// --once run — and never to a webhook or an --only-id run. Those are
-	// surgical, forward-looking cycles about one item somebody just imported or
-	// named, and running a whole-library reverse scan inside them would be both
-	// a surprise and a cost the debounce was sized to prevent. The zero value
-	// is "no reverse pass", so a cycle has to ask.
+	// --once run — and never to a WEBHOOK cycle, which fires unattended on every
+	// import, where a whole-library second pass would be both a surprise and a
+	// cost the debounce was sized to prevent. Every cycle this file builds is
+	// one of those two, so nothing here ever asks for the third case: a scoped
+	// --once --only-id run, which gets a reverse pass narrowed to the one item
+	// it names when (and only when) the write switch is on (scopedReverseOptions
+	// — the acceptance instrument, built in main.go and unreachable from daemon
+	// mode, where those flags are refused). The zero value is "no reverse pass",
+	// so a cycle has to ask.
 	reverse reverseOptions
 }
 
