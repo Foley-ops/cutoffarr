@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -506,4 +510,519 @@ func TestRunSonarrDecisionEngine_ReverseScanDisabled_MakesNoUnmonitoredWantedFet
 	if strings.Contains(buf.String(), "reverse") {
 		t.Errorf("a cycle that ran no reverse pass must say nothing about one:\n%s", buf.String())
 	}
+}
+
+// --- the remonitor write path (Phase 10) ------------------------------------
+//
+// Everything below is about the flag. Report-only is the default and the
+// headline pin is that a write-mode config with a qualifying finding composes
+// no write at all with the flag off — not "sends no PUT", but never enters the
+// write path in the first place, which is checkable because the write path's
+// own fresh pre-write GET would show up in the fake's request log.
+
+// writeReverseTestConfig writes a radarr config with dry_run and
+// reverse_scan_remonitor set explicitly.
+func writeReverseTestConfig(t *testing.T, url string, dryRun, remonitor bool) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yml")
+	content := fmt.Sprintf(`
+dry_run: %t
+reverse_scan_remonitor: %t
+instances:
+  - name: radarr-main
+    type: radarr
+    url: %s
+    api_key: key1
+`, dryRun, remonitor, url)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+	return path
+}
+
+// writeReverseSonarrTestConfig is its Sonarr twin.
+func writeReverseSonarrTestConfig(t *testing.T, url string, dryRun, remonitor bool) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yml")
+	content := fmt.Sprintf(`
+dry_run: %t
+reverse_scan_remonitor: %t
+instances:
+  - name: sonarr-main
+    type: sonarr
+    url: %s
+    api_key: key1
+`, dryRun, remonitor, url)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+	return path
+}
+
+// TestRun_ReverseScan_RemonitorFlagOff_ComposesNoWriteAtAll is THE pin of this
+// phase, and it is deliberately the historically strongest shape this project
+// has: a run in WRITE MODE (dry_run: false — no dry-run gate anywhere in the
+// picture) against a movie that really is a qualifying finding, with the flag
+// left at its default. Zero requests of any method other than GET, and zero
+// pre-write fetches: the write path is never entered, so there is nothing to
+// gate.
+func TestRun_ReverseScan_RemonitorFlagOff_ComposesNoWriteAtAll(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{reverseFindingStatefulMovie(7, "Accidentally Unmonitored")})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeReverseTestConfig(t, fake.srv.URL, false, false), "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, `msg="reverse-scan finding"`) {
+		t.Fatalf("this test proves nothing unless the finding really was made:\n%s", out)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("report-only must compose no write of any method: got %+v", writes)
+	}
+	if n := fake.countRequests("/api/v3/movie/7"); n != 0 {
+		t.Errorf("the write path's own pre-write GET was issued %d time(s); with the flag off the write path must never be entered at all", n)
+	}
+	if m := fake.movie(7); m.monitored {
+		t.Errorf("movie 7 is monitored: report-only must change nothing")
+	}
+	// The off state must be visually distinguishable from the on state.
+	if strings.Contains(out, "remonitored=") || strings.Contains(out, "reverseWithheld=") {
+		t.Errorf("with the flag off the summary must carry no write counters at all:\n%s", out)
+	}
+	if !strings.Contains(out, "reverseFindings=1") {
+		t.Errorf("the finding is still counted with the flag off:\n%s", out)
+	}
+}
+
+// TestRun_ReverseScan_RemonitorFlagOn_DryRun_RehearsesAndWritesNothing is §2.1
+// in the new direction: the whole write path runs — fresh GET, identity check,
+// tag re-check, the fresh re-evaluation — and stops at the gate immediately
+// before the PUT, which is what makes a dry-run a rehearsal rather than a
+// different code path.
+func TestRun_ReverseScan_RemonitorFlagOn_DryRun_RehearsesAndWritesNothing(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{reverseFindingStatefulMovie(7, "Accidentally Unmonitored")})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeReverseTestConfig(t, fake.srv.URL, true, true), "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	out := stdout.String()
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("dry-run must write nothing: got %+v", writes)
+	}
+	if n := fake.countRequests("/api/v3/movie/7"); n == 0 {
+		t.Errorf("the dry-run must still REHEARSE the write path, including its fresh pre-write fetch:\n%s", out)
+	}
+	c := summaryCounters(t, out)
+	if c["reverseFindings"] != 1 || c["reverseWithheld"] != 1 || c["remonitored"] != 0 {
+		t.Errorf("want reverseFindings=1 reverseWithheld=1 remonitored=0, got %v:\n%s", c, out)
+	}
+	assertReverseIdentity(t, out)
+}
+
+// TestRun_ReverseScan_RemonitorFlagOn_WriteMode_RemonitorsExactlyTheFinding is
+// the plan's own acceptance criterion, machine-verified: with the flag on and
+// dry_run false, the one qualifying movie is re-monitored — the PUT really
+// carries monitored:true, the server's echo confirms it, and the fake's state
+// changes.
+func TestRun_ReverseScan_RemonitorFlagOn_WriteMode_RemonitorsExactlyTheFinding(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		reverseFindingStatefulMovie(7, "Accidentally Unmonitored"),
+		// A correctly unmonitored movie, which must be left alone.
+		{id: 8, title: "Correctly Unmonitored", monitored: false, hasFile: true, qualityProfileID: 1,
+			tags: []int{}, movieFileID: 8, cfScore: 200, qualityCutoffNotMet: false, inWantedSet: false},
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeReverseTestConfig(t, fake.srv.URL, false, true), "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	out := stdout.String()
+	puts := fake.puts()
+	if len(puts) != 1 {
+		t.Fatalf("want exactly 1 PUT (the one finding), got %d: %+v", len(puts), puts)
+	}
+	if puts[0].path != "/api/v3/movie/7" {
+		t.Errorf("PUT path = %s, want /api/v3/movie/7", puts[0].path)
+	}
+	if !strings.Contains(string(puts[0].body), `"monitored":true`) {
+		t.Errorf("the reverse write must set monitored true:\n%s", puts[0].body)
+	}
+	if !fake.movie(7).monitored {
+		t.Errorf("movie 7 must be monitored after a confirmed remonitor write")
+	}
+	if fake.movie(8).monitored {
+		t.Errorf("movie 8 meets the criteria and must not be touched")
+	}
+	if !strings.Contains(out, "msg=remonitor") {
+		t.Errorf("a confirmed re-monitor must log msg=remonitor:\n%s", out)
+	}
+	c := summaryCounters(t, out)
+	if c["reverseFindings"] != 1 || c["remonitored"] != 1 || c["reverseWithheld"] != 0 {
+		t.Errorf("want reverseFindings=1 remonitored=1 reverseWithheld=0, got %v:\n%s", c, out)
+	}
+	assertReverseIdentity(t, out)
+}
+
+// TestRun_ReverseScan_WriteMode_SecondRunIsANoOp is the property that makes the
+// write direction safe to leave switched on: once a finding has been
+// re-monitored it is no longer a finding (it is monitored), and the FORWARD
+// pass must not immediately unmonitor it again. A pair of passes that disagreed
+// would flap the same movie on every cycle forever.
+func TestRun_ReverseScan_WriteMode_SecondRunIsANoOp(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{reverseFindingStatefulMovie(7, "Accidentally Unmonitored")})
+	cfg := writeReverseTestConfig(t, fake.srv.URL, false, true)
+
+	var run1, stderr bytes.Buffer
+	if code := run([]string{"--config", cfg, "--once"}, &run1, &stderr); code != 0 {
+		t.Fatalf("run 1 exit code = %d; stderr=%s", code, stderr.String())
+	}
+	if len(fake.puts()) != 1 {
+		t.Fatalf("run 1 must re-monitor the finding: %+v", fake.puts())
+	}
+
+	before := len(fake.puts())
+	var run2 bytes.Buffer
+	if code := run([]string{"--config", cfg, "--once"}, &run2, &stderr); code != 0 {
+		t.Fatalf("run 2 exit code = %d; stderr=%s", code, stderr.String())
+	}
+	if len(fake.puts()) != before {
+		t.Errorf("run 2 wrote again (%d -> %d PUTs); the two directions must not flap the same movie", before, len(fake.puts()))
+	}
+	out := run2.String()
+	c := summaryCounters(t, out)
+	if c["reverseFindings"] != 0 {
+		t.Errorf("run 2 must find nothing: reverseFindings = %d:\n%s", c["reverseFindings"], out)
+	}
+	if c["unmonitored"] != 0 || c["wouldUnmonitor"] != 0 {
+		t.Errorf("run 2's forward pass must not unmonitor what run 1 re-monitored: %v\n%s", c, out)
+	}
+}
+
+// TestRun_ReverseScan_WriteMode_ExcludedMovieIsNeitherReportedNorWritten pins
+// §2.5 end to end, in write mode, with the flag on: the strongest form of the
+// exclusion tag's promise.
+func TestRun_ReverseScan_WriteMode_ExcludedMovieIsNeitherReportedNorWritten(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{reverseFindingStatefulMovie(7, "Excluded Finding")})
+	fake.movie(7).tags = []int{42}
+	fake.tagsJSON = `[{"id": 42, "label": "cutoffarr-exclude"}]`
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--config", writeReverseTestConfig(t, fake.srv.URL, false, true), "--once"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code; stderr=%s", stderr.String())
+	}
+
+	out := stdout.String()
+	if strings.Contains(out, "reverse-scan finding") {
+		t.Errorf("an excluded movie must never be reported:\n%s", out)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("an excluded movie must never be written: %+v", writes)
+	}
+	if c := summaryCounters(t, out); c["reverseFindings"] != 0 {
+		t.Errorf("reverseFindings = %d, want 0:\n%s", c["reverseFindings"], out)
+	}
+}
+
+// TestRunRadarrDecisionEngine_ReverseScan_CrossCheckNotPassed_WithholdsEveryWrite
+// pins binding controller resolution 6. The reverse pass has no cross-check of
+// its own — it has no second signal to compare against — so what authorizes its
+// writes is the FORWARD cross-check's verdict, read as a data-layer health
+// signal: if this instance's data disagreed with itself this cycle, nothing
+// derived from it may be written in either direction.
+func TestRunRadarrDecisionEngine_ReverseScan_CrossCheckNotPassed_WithholdsEveryWrite(t *testing.T) {
+	fake := newRadarrFake(t, "", nil)
+	fake.reverseWantedJSON = `{"page":1,"pageSize":100,"totalRecords":1,"records":[{"id":7,"title":"Finding"}]}`
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	movies := []movieListElement{
+		// A monitored movie whose own qualityCutoffNotMet contradicts its
+		// absence from the forward wanted set: the cross-check FAILS.
+		{ID: intPtr(1), Title: strPtr("Contradictory"), Monitored: boolPtr(true), HasFile: boolPtr(true),
+			QualityProfileID: intPtr(1), Tags: &noTags,
+			MovieFile: &movieFileElement{ID: intPtr(1), QualityCutoffNotMet: boolPtr(true)}},
+		unmonitoredBelowCutoffMovie(7, "Finding"),
+	}
+
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude",
+		fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+
+	out := buf.String()
+	if !strings.Contains(out, "crossCheck=FAILED") {
+		t.Fatalf("this test is only meaningful if the cross-check really failed:\n%s", out)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("a failed cross-check must block every reverse write: %+v", writes)
+	}
+	c := summaryCounters(t, out)
+	if c["reverseFindings"] != 1 || c["reverseWithheld"] != 1 || c["remonitored"] != 0 {
+		t.Errorf("want reverseFindings=1 reverseWithheld=1 remonitored=0, got %v:\n%s", c, out)
+	}
+	if !strings.Contains(out, "reverse-scan writes withheld for this instance") {
+		t.Errorf("a blocked reverse pass must say so: 'nothing was written' and 'nothing needed writing' are different facts:\n%s", out)
+	}
+	assertReverseIdentity(t, out)
+}
+
+// TestRun_ReverseScan_WriteMode_ItemThatNowMeetsCriteria_IsRefused is the
+// fresh-GET re-verification, mirrored for the reverse direction. The decision
+// was correct when it was made; by the time the write pass reaches it the
+// movie's file has been upgraded and now scores above the profile's cutoff, so
+// re-monitoring it would undo cutoffarr's own correct work — and the next
+// forward pass would unmonitor it again, forever.
+//
+// The re-verification is evaluateMovie itself, re-run against the write path's
+// own fresh fetches, which is why it sees the new score at all: rule 6 goes
+// back to /moviefile rather than trusting anything the scan remembered.
+func TestRun_ReverseScan_WriteMode_ItemThatNowMeetsCriteria_IsRefused(t *testing.T) {
+	// A CF-score finding: absent from the unmonitored wanted set (its quality
+	// cutoff is met) but scoring below the profile's cutoffFormatScore of 100.
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{{
+		id: 7, title: "Upgraded Meanwhile", monitored: false, hasFile: true, qualityProfileID: 1,
+		tags: []int{}, movieFileID: 7, cfScore: 10, qualityCutoffNotMet: false, inWantedSet: false,
+	}})
+	// The world changes between the scan and the write pass: the write path's
+	// own fresh pre-write fetch is the moment this movie stops being a finding.
+	fake.onRequest = func(method, path string) {
+		if method == http.MethodGet && path == "/api/v3/movie/7" {
+			fake.setCFScore(7, 200)
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--config", writeReverseTestConfig(t, fake.srv.URL, false, true), "--once"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code; stderr=%s", stderr.String())
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, `msg="reverse-scan finding"`) {
+		t.Fatalf("this test proves nothing unless the finding was made first:\n%s", out)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("a movie that now meets the criteria must not be re-monitored: %+v", writes)
+	}
+	c := summaryCounters(t, out)
+	if c["reverseFindings"] != 1 || c["remonitorsRefused"] != 1 || c["remonitored"] != 0 {
+		t.Errorf("want reverseFindings=1 remonitorsRefused=1 remonitored=0, got %v:\n%s", c, out)
+	}
+	if !strings.Contains(out, "no longer fails the criteria") {
+		t.Errorf("the refusal must say why:\n%s", out)
+	}
+	assertReverseIdentity(t, out)
+}
+
+// TestRun_ReverseScan_WriteMode_AlreadyMonitoredAtWrite_IsRefused is the
+// scan-to-write race: something (a human, another tool) re-monitored the movie
+// between the scan and the write pass. Nothing needs doing, and the refusal is
+// counted rather than vanishing into an unexplained gap in the summary.
+func TestRun_ReverseScan_WriteMode_AlreadyMonitoredAtWrite_IsRefused(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{reverseFindingStatefulMovie(7, "Someone Beat Us To It")})
+	fake.onRequest = func(method, path string) {
+		if method == http.MethodGet && path == "/api/v3/movie/7" {
+			fake.setMonitored(7, true)
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--config", writeReverseTestConfig(t, fake.srv.URL, false, true), "--once"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code; stderr=%s", stderr.String())
+	}
+
+	out := stdout.String()
+	if puts := fake.puts(); len(puts) != 0 {
+		t.Errorf("an already-monitored movie needs no write: %+v", puts)
+	}
+	c := summaryCounters(t, out)
+	if c["remonitorsRefused"] != 1 {
+		t.Errorf("remonitorsRefused = %d, want 1:\n%s", c["remonitorsRefused"], out)
+	}
+	assertReverseIdentity(t, out)
+}
+
+// assertReverseIdentity is the reverse pass's accounting identity, the same
+// discipline the two forward passes are held to: every finding must end in
+// exactly one counted outcome, so a future path that silently drops a promised
+// write cannot hide.
+func assertReverseIdentity(t *testing.T, out string) {
+	t.Helper()
+	for _, msg := range []string{"radarr decision summary", "sonarr decision summary"} {
+		if !strings.Contains(out, msg) {
+			continue
+		}
+		c := summaryCountersFor(t, out, msg)
+		if _, present := c["reverseFindings"]; !present {
+			continue
+		}
+		accounted := c["remonitored"] + c["remonitorsRefused"] + c["reverseWithheld"] +
+			c["reverseWriteErrors"] + c["reverseRehearsalErrors"] + c["reverseEchoUnverified"]
+		if accounted != c["reverseFindings"] {
+			t.Errorf("%s accounts for %d of %d findings; every finding must end in exactly one counted outcome:\n%s", msg, accounted, c["reverseFindings"], out)
+		}
+		for _, always := range []string{"remonitored=", "remonitorsRefused=", "reverseWithheld="} {
+			if !strings.Contains(out, always) {
+				t.Errorf("with the write switch on the summary must always carry %s, including as 0:\n%s", always, out)
+			}
+		}
+	}
+}
+
+// --- the remonitor write path: Sonarr ---------------------------------------
+
+// reverseFindingSonarrFake is one series with one UNMONITORED season that is
+// complete on disk, fully aired, and still below its quality cutoff — the
+// Sonarr shape of an accidental unmonitor. seriesMonitored says whether the
+// SERIES itself is monitored, which is the fact that decides whether the
+// finding may ever be written.
+func reverseFindingSonarrFake(t *testing.T, seriesMonitored bool) *statefulSonarrFake {
+	t.Helper()
+	return newStatefulSonarrFake(t,
+		[]*statefulSonarrSeries{
+			{id: 1, title: "Accidentally Unmonitored", monitored: seriesMonitored, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 2, monitored: false, episodeFileCount: 1, totalEpisodeCount: 1}}},
+		},
+		[]*statefulSonarrEpisode{
+			{id: 200, seriesID: 1, seasonNumber: 2, episodeNumber: 1, monitored: false, hasFile: true,
+				airDateUtc: pastAirDate, episodeFileID: 600, inWantedSet: true},
+		},
+		[]*statefulSonarrEpisodeFile{{id: 600, seasonNumber: 2, customFormatScore: 200, qualityCutoffNotMet: true}},
+	)
+}
+
+// TestRun_ReverseScan_Sonarr_RemonitorFlagOff_ComposesNoWriteAtAll is the
+// headline pin's Sonarr half: write mode, a real finding, flag off, nothing
+// written and the write path never entered.
+func TestRun_ReverseScan_Sonarr_RemonitorFlagOff_ComposesNoWriteAtAll(t *testing.T) {
+	fake := reverseFindingSonarrFake(t, true)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--config", writeReverseSonarrTestConfig(t, fake.srv.URL, false, false), "--once"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code; stderr=%s", stderr.String())
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, `msg="reverse-scan finding"`) {
+		t.Fatalf("this test proves nothing unless the finding really was made:\n%s", out)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("report-only must compose no write of any method: got %+v", writes)
+	}
+	if n := fake.countRequests("/api/v3/series/1"); n != 0 {
+		t.Errorf("the write path's own pre-write GET was issued %d time(s); with the flag off it must never be entered", n)
+	}
+	if strings.Contains(out, "remonitored=") {
+		t.Errorf("with the flag off the summary must carry no write counters:\n%s", out)
+	}
+}
+
+// TestRun_ReverseScan_Sonarr_WriteMode_RemonitorsTheSeasonEpisodesFirst is the
+// Sonarr acceptance shape. Both writes go out, in the binding order — episodes
+// first, then the season — and both carry monitored:true.
+//
+// The order matters in this direction for its own reason: the season flag is
+// what makes a season visible to the reverse pass, so writing it LAST means a
+// half-completed re-monitor leaves the season unmonitored and therefore still a
+// finding next cycle. That is the whole of why the reverse direction needs no
+// recovery path.
+func TestRun_ReverseScan_Sonarr_WriteMode_RemonitorsTheSeasonEpisodesFirst(t *testing.T) {
+	fake := reverseFindingSonarrFake(t, true)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--config", writeReverseSonarrTestConfig(t, fake.srv.URL, false, true), "--once"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code; stderr=%s", stderr.String())
+	}
+
+	out := stdout.String()
+	writes := fake.writes()
+	if len(writes) != 2 {
+		t.Fatalf("want exactly 2 writes (episodes then season), got %d: %+v", len(writes), writes)
+	}
+	if writes[0].path != "/api/v3/episode/monitor" || writes[1].path != "/api/v3/series/1" {
+		t.Fatalf("write order = %s then %s, want /api/v3/episode/monitor then /api/v3/series/1", writes[0].path, writes[1].path)
+	}
+	if !strings.Contains(string(writes[0].body), `"monitored":true`) || !strings.Contains(string(writes[0].body), `"episodeIds":[200]`) {
+		t.Errorf("the episode write must name the season's unmonitored episodes and set them monitored:\n%s", writes[0].body)
+	}
+	if !fake.episodeMonitored(200) {
+		t.Error("episode 200 must be monitored after the write")
+	}
+	if !fake.seasonMonitored(1, 2) {
+		t.Error("season 2 must be monitored after the write")
+	}
+	if !fake.seriesMonitored(1) {
+		t.Error("the series-level flag must be untouched and still monitored")
+	}
+	if !strings.Contains(out, "msg=remonitor") {
+		t.Errorf("a confirmed re-monitor must log msg=remonitor:\n%s", out)
+	}
+	c := summaryCountersFor(t, out, "sonarr decision summary")
+	if c["reverseFindings"] != 1 || c["remonitored"] != 1 {
+		t.Errorf("want reverseFindings=1 remonitored=1, got %v:\n%s", c, out)
+	}
+	assertReverseIdentity(t, out)
+}
+
+// TestRun_ReverseScan_Sonarr_UnmonitoredSeries_IsReportedButNeverWritten pins
+// binding controller resolution 3's write half. A series-level unmonitor is a
+// human deliberately retiring a show; re-monitoring its seasons would be this
+// program arguing with that decision, so the finding is reported (with its
+// seriesMonitored=false attr and a reason) and withheld — even in write mode,
+// even with the flag on, even with a passing cross-check.
+func TestRun_ReverseScan_Sonarr_UnmonitoredSeries_IsReportedButNeverWritten(t *testing.T) {
+	fake := reverseFindingSonarrFake(t, false)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--config", writeReverseSonarrTestConfig(t, fake.srv.URL, false, true), "--once"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code; stderr=%s", stderr.String())
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "seriesMonitored=false") {
+		t.Fatalf("the finding must be reported with its series state:\n%s", out)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("a season under an unmonitored series must never be written: %+v", writes)
+	}
+	if n := fake.countRequests("/api/v3/series/1"); n != 0 {
+		t.Errorf("it must not even be fetched for a write: %d pre-write GET(s)", n)
+	}
+	if !strings.Contains(out, "its series is not monitored") {
+		t.Errorf("the withheld finding must say why, or a human cannot tell it from a gate block:\n%s", out)
+	}
+	c := summaryCountersFor(t, out, "sonarr decision summary")
+	if c["reverseFindings"] != 1 || c["reverseWithheld"] != 1 || c["remonitored"] != 0 {
+		t.Errorf("want reverseFindings=1 reverseWithheld=1 remonitored=0, got %v:\n%s", c, out)
+	}
+	assertReverseIdentity(t, out)
+}
+
+// TestRun_ReverseScan_Sonarr_DryRun_RehearsesAndWritesNothing is §2.1 for the
+// season path's TWO write calls: both gates hold, and the rehearsal still runs
+// every read and every check in front of them.
+func TestRun_ReverseScan_Sonarr_DryRun_RehearsesAndWritesNothing(t *testing.T) {
+	fake := reverseFindingSonarrFake(t, true)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--config", writeReverseSonarrTestConfig(t, fake.srv.URL, true, true), "--once"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code; stderr=%s", stderr.String())
+	}
+
+	out := stdout.String()
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("dry-run must write nothing: %+v", writes)
+	}
+	if n := fake.countRequests("/api/v3/series/1"); n == 0 {
+		t.Errorf("the dry-run must still rehearse the write path, including its fresh pre-write fetch:\n%s", out)
+	}
+	c := summaryCountersFor(t, out, "sonarr decision summary")
+	if c["reverseFindings"] != 1 || c["reverseWithheld"] != 1 || c["remonitored"] != 0 {
+		t.Errorf("want reverseFindings=1 reverseWithheld=1 remonitored=0, got %v:\n%s", c, out)
+	}
+	assertReverseIdentity(t, out)
 }

@@ -940,7 +940,7 @@ func newStatefulSonarrFake(t *testing.T, series []*statefulSonarrSeries, episode
 		w.Write([]byte(f.episodeFilesJSON(seriesID)))
 	}))
 	mux.HandleFunc("/api/v3/wanted/cutoff", f.handle(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(f.wantedCutoffJSON()))
+		w.Write([]byte(f.wantedCutoffJSON(r.URL.Query().Get("monitored"))))
 	}))
 	// Catch-all: same rationale as radarrFake's (writer_test.go) — a request
 	// to any path this fake does not stub (a future Sonarr write verb, an
@@ -1194,18 +1194,39 @@ func (f *statefulSonarrFake) episodeFilesJSON(seriesID int) string {
 // set — instead of the set being a hand-set constant that no write can ever
 // affect. Iteration follows episodeOrder for the same determinism reason
 // episodesJSON does.
-func (f *statefulSonarrFake) wantedCutoffJSON() string {
+// The monitored parameter (Phase 10) selects WHICH half of the library is asked
+// about, exactly as the live endpoint does: monitored=false — the only value
+// this project ever sends — answers with the UNMONITORED below-cutoff episodes
+// (1213 of them on the live instance, against 2405 for the default), and
+// anything else with the monitored ones. Deriving both from the same per-episode
+// state is what makes a write visible in both directions on the next read.
+func (f *statefulSonarrFake) wantedCutoffJSON(monitored string) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	wantUnmonitored := monitored == "false"
 	var recs []string
 	for _, id := range f.episodeOrder {
 		e := f.episodes[id]
-		if e.inWantedSet && e.monitored {
-			recs = append(recs, fmt.Sprintf(`{"id":%d,"seriesId":%d,"seasonNumber":%d,"episodeNumber":%d,"title":"Ep","airDateUtc":"2015-01-01T00:00:00Z","monitored":true,"hasFile":%t}`,
-				e.id, e.seriesID, e.seasonNumber, e.episodeNumber, e.hasFile))
+		if e.inWantedSet && e.monitored != wantUnmonitored {
+			recs = append(recs, fmt.Sprintf(`{"id":%d,"seriesId":%d,"seasonNumber":%d,"episodeNumber":%d,"title":"Ep","airDateUtc":"2015-01-01T00:00:00Z","monitored":%t,"hasFile":%t}`,
+				e.id, e.seriesID, e.seasonNumber, e.episodeNumber, e.monitored, e.hasFile))
 		}
 	}
 	return fmt.Sprintf(`{"page":1,"pageSize":100,"totalRecords":%d,"records":[%s]}`, len(recs), strings.Join(recs, ","))
+}
+
+// countRequests reports how many requests this fake received for a path,
+// whatever their method or query.
+func (f *statefulSonarrFake) countRequests(path string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, r := range f.requests {
+		if r.path == path {
+			n++
+		}
+	}
+	return n
 }
 
 // setEpisodeWanted moves an episode in or out of the fake's /wanted/cutoff set

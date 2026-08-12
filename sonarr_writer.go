@@ -236,7 +236,40 @@ var errNotRecoveryAtWrite = errors.New("the season the recovery pass admitted st
 //
 // Errors are returned, never retried (§2.6); the caller logs them and moves
 // to the next season.
+// The reverse direction (Phase 10) reuses every step above verbatim, with three
+// differences and no fourth:
+//
+//   - it writes true instead of false, into the same one value;
+//   - its races are the mirror ones (the season is already MONITORED), and it
+//     adds the same "still fails the criteria on fresh data" re-verification the
+//     movie path does, run through evaluateSeries itself;
+//   - it names the season's UNMONITORED episodes in the episode call, for the
+//     same reason the forward path names the monitored ones: an episode already
+//     in the target state needs no write, and leaving it out makes a retry after
+//     a partial failure smaller rather than duplicated.
+//
+// Everything else — the series-monitored guard, the fresh airing and
+// completeness re-checks, the episodes-first order, both dry-run gates, the
+// echo-before-the-season-PUT rule — is the same code doing the same thing. The
+// series-monitored guard in particular is not merely reused but load-bearing in
+// the new direction: binding controller resolution 3 says a season under an
+// UNMONITORED series may never be re-monitored, because a series-level unmonitor
+// is a human retiring a show, and this is the second place that is enforced.
 func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, seriesID, seasonNumber, exclusionTagID int, tagActive bool, dryRun bool, requireRecovery bool) (written bool, recovery bool, err error) {
+	return writeSeasonMonitored(ctx, logger, client, inst, seriesID, seasonNumber, exclusionTagID, tagActive, dryRun, requireRecovery, nil)
+}
+
+// remonitorSeason is the reverse direction's entry point. It has no recovery
+// path and takes no requireRecovery: a half-done re-monitor converges by itself,
+// because a season that is still unmonitored is still a finding next cycle.
+func remonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, seriesID, seasonNumber, exclusionTagID int, tagActive bool, dryRun bool, rev reverseWriteContext) (written bool, err error) {
+	written, _, err = writeSeasonMonitored(ctx, logger, client, inst, seriesID, seasonNumber, exclusionTagID, tagActive, dryRun, false, &rev)
+	return written, err
+}
+
+// writeSeasonMonitored is the single implementation behind both. rev == nil is
+// the forward direction; non-nil is the reverse one.
+func writeSeasonMonitored(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, seriesID, seasonNumber, exclusionTagID int, tagActive bool, dryRun bool, requireRecovery bool, rev *reverseWriteContext) (written bool, recovery bool, err error) {
 	// PHASE 8, the shutdown boundary (binding controller note 4). This is the
 	// function that boundary exists for: a season is TWO writes, and a
 	// cancellation landing between them leaves episodes unmonitored inside a
@@ -298,9 +331,15 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 	if err != nil {
 		return false, false, err
 	}
-	if !seasonMonitored {
+	if rev == nil && !seasonMonitored {
 		logger.Info("season already unmonitored as of the pre-write fetch, skipping write", attrs...)
 		return false, false, fmt.Errorf("%s: %w", subject, errAlreadyUnmonitoredAtWrite)
+	}
+	if rev != nil && seasonMonitored {
+		// The reverse direction's mirror race: something else re-monitored this
+		// season between the scan and the write pass, so there is nothing to do.
+		logger.Info("season already monitored as of the pre-write fetch, skipping write", attrs...)
+		return false, false, fmt.Errorf("%s: %w", subject, errAlreadyMonitoredAtWrite)
 	}
 
 	// Step 6: fresh episode data, then the airing guard re-run over it. A
@@ -318,6 +357,17 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 	}
 	if err := verifySeasonStillWritable(logger, targetSeason, seasonEpisodes, subject, attrs); err != nil {
 		return false, false, err
+	}
+
+	// The reverse direction's own re-verification, after the guards above (which
+	// are cheap and shared) and before anything is assembled: the season must
+	// still FAIL the criteria as of fresh data, or re-monitoring it would undo
+	// this project's own correct work and the next forward cycle would unmonitor
+	// it again.
+	if rev != nil {
+		if err := verifySeasonStillAReverseFinding(ctx, logger, client, inst, body, seriesID, seasonNumber, exclusionTagID, tagActive, *rev, subject, attrs); err != nil {
+			return false, false, err
+		}
 	}
 
 	// The episode ids to unmonitor: ONLY episodes this fresh read says are
@@ -345,7 +395,10 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 				append(append([]any(nil), attrs...), "episodeId", *e.ID)...)
 			return false, false, fmt.Errorf("%s: %w: episode %d has no readable monitored field in the pre-write fetch", subject, errSeasonUnverifiableAtWrite, *e.ID)
 		}
-		if !*e.Monitored {
+		if *e.Monitored == monitoredWriteTarget(rev) {
+			// Already in the target state: no write needed for this episode,
+			// and leaving it out is what makes a retry after a partial failure
+			// smaller rather than a duplicate.
 			continue
 		}
 		episodeIDs = append(episodeIDs, *e.ID)
@@ -363,7 +416,12 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 	// shape whose season PUT cannot strand anything: there is nothing left to
 	// strand, and Sonarr cannot grab an unmonitored episode whatever the season
 	// flag says.
-	recovery = len(episodeIDs) == 0
+	//
+	// The reverse direction has no recovery concept at all (binding controller
+	// resolution 6): a half-done re-monitor leaves the season unmonitored, which
+	// means it is still a finding next cycle and is simply retried. So the
+	// verdict is only ever true going forward, and the reverse caller ignores it.
+	recovery = rev == nil && len(episodeIDs) == 0
 
 	// The recovery pass's precondition. It admitted this season on
 	// decision-time evidence (recoveryCandidate); the fresh data is the
@@ -383,7 +441,7 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 	// half-written for a reason that had nothing to do with the server. It
 	// also makes the dry-run rehearsal complete — the payload is really built,
 	// really checked, and only then withheld.
-	encoded, err := assembleSeasonWrite(payload, seasonElems, targetIdx, targetSeason, subject)
+	encoded, err := assembleSeasonWrite(payload, seasonElems, targetIdx, targetSeason, subject, rev)
 	if err != nil {
 		return false, recovery, err
 	}
@@ -410,7 +468,7 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 			// left open. Aborting strands nothing: the season stays monitored,
 			// the next cycle re-reads /episode, and the retry is smaller by
 			// whatever really landed.
-			if err := putEpisodeMonitor(ctx, logger, client, inst, seriesID, episodeIDs, subject, attrs); err != nil {
+			if err := putEpisodeMonitor(ctx, logger, client, inst, seriesID, episodeIDs, subject, attrs, rev); err != nil {
 				logger.Warn("episode monitor write could not be confirmed; the season write is withheld and the season is left monitored so the next cycle can retry it",
 					append(append([]any(nil), attrs...), "episodeIds", len(episodeIDs), "error", err)...)
 				return false, recovery, err
@@ -446,7 +504,7 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 	if err != nil {
 		return false, recovery, fmt.Errorf("%s: the write returned %d but its body could not be read, so the change is unconfirmed (%w): %v", subject, resp.StatusCode, errWriteUnverified, err)
 	}
-	if err := verifySeasonWriteEcho(echo, seriesID, seasonNumber, resp.StatusCode, subject); err != nil {
+	if err := verifySeasonWriteEcho(echo, seriesID, seasonNumber, resp.StatusCode, subject, monitoredWriteTarget(rev)); err != nil {
 		return false, recovery, err
 	}
 
@@ -663,10 +721,10 @@ func verifySeasonStillWritable(logger *slog.Logger, targetSeason map[string]json
 // program itself refuses to violate, so a future edit that reached for the
 // series-level flag would fail here instead of silently unmonitoring a whole
 // show.
-func assembleSeasonWrite(payload map[string]json.RawMessage, seasonElems []json.RawMessage, targetIdx int, targetSeason map[string]json.RawMessage, subject string) ([]byte, error) {
+func assembleSeasonWrite(payload map[string]json.RawMessage, seasonElems []json.RawMessage, targetIdx int, targetSeason map[string]json.RawMessage, subject string, rev *reverseWriteContext) ([]byte, error) {
 	originalMonitored, hadMonitored := payload[monitoredKey]
 
-	targetSeason[monitoredKey] = unmonitoredValue
+	targetSeason[monitoredKey] = monitoredWriteValue(rev)
 	encodedSeason, err := encodePayload(targetSeason)
 	if err != nil {
 		return nil, fmt.Errorf("%s: re-encoding the target season for write: %w", subject, err)
@@ -724,8 +782,8 @@ func assembleSeasonWrite(payload map[string]json.RawMessage, seasonElems []json.
 // run is most likely to hit (Sonarr's real /episode/monitor echo shape is
 // unconfirmed by any live write) and it is the one a human has to be able to
 // diagnose from the log alone.
-func putEpisodeMonitor(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, seriesID int, episodeIDs []int, subject string, attrs []any) error {
-	body, err := json.Marshal(episodeMonitorRequest{EpisodeIDs: episodeIDs, Monitored: false})
+func putEpisodeMonitor(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, seriesID int, episodeIDs []int, subject string, attrs []any, rev *reverseWriteContext) error {
+	body, err := json.Marshal(episodeMonitorRequest{EpisodeIDs: episodeIDs, Monitored: monitoredWriteTarget(rev)})
 	if err != nil {
 		return fmt.Errorf("%s: encoding the episode monitor request: %w", subject, err)
 	}
@@ -739,9 +797,9 @@ func putEpisodeMonitor(ctx context.Context, logger *slog.Logger, client *APIClie
 	echo, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 	if err != nil {
 		unconfirmed := fmt.Errorf("%s: the episode monitor write returned %d but its body could not be read (%w): %v", subject, resp.StatusCode, errEpisodeMonitorUnconfirmed, err)
-		return confirmEpisodeMonitorByReRead(ctx, logger, client, inst, seriesID, episodeIDs, subject, attrs, unconfirmed)
+		return confirmEpisodeMonitorByReRead(ctx, logger, client, inst, seriesID, episodeIDs, subject, attrs, unconfirmed, rev)
 	}
-	if err := verifyEpisodeMonitorEcho(echo, episodeIDs); err != nil {
+	if err := verifyEpisodeMonitorEcho(echo, episodeIDs, monitoredWriteTarget(rev)); err != nil {
 		if errors.Is(err, errEpisodeMonitorContradicted) {
 			// NOT re-read, deliberately. The server did not fail to answer the
 			// question — it answered it, with "that episode is still
@@ -752,7 +810,7 @@ func putEpisodeMonitor(ctx context.Context, logger *slog.Logger, client *APIClie
 			return fmt.Errorf("%s: the episode monitor write returned %d but %w", subject, resp.StatusCode, err)
 		}
 		unconfirmed := fmt.Errorf("%s: the episode monitor write returned %d but %v (%w)", subject, resp.StatusCode, err, errEpisodeMonitorUnconfirmed)
-		return confirmEpisodeMonitorByReRead(ctx, logger, client, inst, seriesID, episodeIDs, subject, attrs, unconfirmed)
+		return confirmEpisodeMonitorByReRead(ctx, logger, client, inst, seriesID, episodeIDs, subject, attrs, unconfirmed, rev)
 	}
 	return nil
 }
@@ -777,7 +835,7 @@ func putEpisodeMonitor(ctx context.Context, logger *slog.Logger, client *APIClie
 //
 // Only reached on a NON-contradicted failure. See putEpisodeMonitor for why a
 // contradicted echo is never re-read.
-func confirmEpisodeMonitorByReRead(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, seriesID int, episodeIDs []int, subject string, attrs []any, unconfirmed error) error {
+func confirmEpisodeMonitorByReRead(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, seriesID int, episodeIDs []int, subject string, attrs []any, unconfirmed error, rev *reverseWriteContext) error {
 	logger.Info("the episode monitor response could not confirm the write; re-reading the season's episodes to settle whether it landed",
 		append(append([]any(nil), attrs...), "episodeIds", len(episodeIDs), "error", unconfirmed)...)
 
@@ -804,12 +862,12 @@ func confirmEpisodeMonitorByReRead(ctx context.Context, logger *slog.Logger, cli
 			return fmt.Errorf("%s: the re-read's episode %d does not state that it belongs to this series, so the episode write remains unconfirmed: %w", subject, id, unconfirmed)
 		case e.Monitored == nil:
 			return fmt.Errorf("%s: the re-read does not say whether episode %d is monitored, so the episode write remains unconfirmed: %w", subject, id, unconfirmed)
-		case *e.Monitored:
-			return fmt.Errorf("%s: the re-read says episode %d is still monitored, so the episode write did not land: %w", subject, id, unconfirmed)
+		case *e.Monitored != monitoredWriteTarget(rev):
+			return fmt.Errorf("%s: the re-read says episode %d is still monitored=%t, so the episode write did not land: %w", subject, id, *e.Monitored, unconfirmed)
 		}
 	}
 
-	logger.Warn("the episode monitor response could not be recognized, but a read-only re-read confirms every episode this write named is now unmonitored; treating the episode write as confirmed",
+	logger.Warn("the episode monitor response could not be recognized, but a read-only re-read confirms every episode this write named is now in the state it asked for; treating the episode write as confirmed",
 		append(append([]any(nil), attrs...), "episodeIds", len(episodeIDs), "echoError", unconfirmed)...)
 	return nil
 }
@@ -827,7 +885,12 @@ func confirmEpisodeMonitorByReRead(ctx context.Context, logger *slog.Logger, cli
 //
 // Every branch names the episode it is about and quotes a bounded snippet of
 // the body, so an unrecognized live shape is diagnosable from the error alone.
-func verifyEpisodeMonitorEcho(echo []byte, episodeIDs []int) error {
+//
+// want (Phase 10) is the state the write asked for: false going forward, true
+// coming back. The contradiction rule is symmetric in it — an echo naming a
+// requested episode in the state the write was trying to leave is the server
+// saying the write did not happen, whichever direction that is.
+func verifyEpisodeMonitorEcho(echo []byte, episodeIDs []int, want bool) error {
 	var confirmed []map[string]json.RawMessage
 	if err := json.Unmarshal(echo, &confirmed); err != nil {
 		return fmt.Errorf("the episode monitor response is not a JSON array of objects: %s", bodySnippet(echo))
@@ -868,7 +931,7 @@ func verifyEpisodeMonitorEcho(echo []byte, episodeIDs []int) error {
 		if monitored == nil {
 			return fmt.Errorf("the episode monitor response does not say whether episode %d is monitored: %s", id, bodySnippet(echo))
 		}
-		if *monitored {
+		if *monitored != want {
 			return fmt.Errorf("%w: episode %d: %s", errEpisodeMonitorContradicted, id, bodySnippet(echo))
 		}
 	}
@@ -887,7 +950,10 @@ func verifyEpisodeMonitorEcho(echo []byte, episodeIDs []int) error {
 // happen" case — an echo whose target season still says monitored: true — does
 // not, for the same reason the movie path draws that line: it is a confirmed
 // failure, not a failure to confirm.
-func verifySeasonWriteEcho(echo []byte, seriesID, seasonNumber, status int, subject string) error {
+//
+// want (Phase 10) is the value the write asked for, and the "told us it did not
+// happen" case is symmetric in it.
+func verifySeasonWriteEcho(echo []byte, seriesID, seasonNumber, status int, subject string, want bool) error {
 	var confirmed map[string]json.RawMessage
 	if err := json.Unmarshal(echo, &confirmed); err != nil {
 		return fmt.Errorf("%s: the write returned %d but the response is not a JSON object, so the change is unconfirmed (%w): %s", subject, status, errWriteUnverified, bodySnippet(echo))
@@ -932,8 +998,13 @@ func verifySeasonWriteEcho(echo []byte, seriesID, seasonNumber, status int, subj
 	if elems[matchIdx].Monitored == nil {
 		return fmt.Errorf("%s: the write returned %d but the returned season's %q is absent or JSON null, which does not confirm the change (%w): %s", subject, status, monitoredKey, errWriteUnverified, bodySnippet(echo))
 	}
-	if *elems[matchIdx].Monitored {
-		return fmt.Errorf("%s: the write returned %d but the returned object still has the season %q: true; the season was NOT unmonitored: %s", subject, status, monitoredKey, bodySnippet(echo))
+	if *elems[matchIdx].Monitored != want {
+		verb := "unmonitored"
+		if want {
+			verb = "re-monitored"
+		}
+		return fmt.Errorf("%s: the write returned %d but the returned object still has the season %q: %t; the season was NOT %s: %s",
+			subject, status, monitoredKey, *elems[matchIdx].Monitored, verb, bodySnippet(echo))
 	}
 	return nil
 }

@@ -3045,7 +3045,7 @@ func TestAssembleSeasonWrite_RefusesToEmitAChangedSeriesLevelMonitored(t *testin
 
 	// payload is handed in as its own "target season": the mutation therefore
 	// lands on the series-level monitored flag.
-	encoded, err := assembleSeasonWrite(payload, seasons, 0, payload, "series 3 season 1")
+	encoded, err := assembleSeasonWrite(payload, seasons, 0, payload, "series 3 season 1", nil)
 	if err == nil {
 		t.Fatalf("assembleSeasonWrite produced a payload that changes the series-level monitored flag:\n%s", encoded)
 	}

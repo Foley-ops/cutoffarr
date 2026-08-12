@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 )
 
@@ -254,6 +257,7 @@ func (p reversePass) runRadarr(ctx context.Context, movies []movieListElement) r
 		return c
 	}
 
+	var findings []movieDecision
 	for _, m := range movies {
 		// The same shutdown boundary the forward evaluation draws, and the same
 		// ending: a partial reverse scan is not a reverse scan, so nothing it
@@ -289,6 +293,7 @@ func (p reversePass) runRadarr(ctx context.Context, movies []movieListElement) r
 			continue
 		}
 		c.findings++
+		findings = append(findings, d)
 		p.logger.Log(ctx, p.itemLevel, "reverse-scan finding",
 			"id", d.id, "title", d.title, "reason", d.reason, "profile", d.profileName, "instance", p.inst.Name)
 	}
@@ -298,6 +303,13 @@ func (p reversePass) runRadarr(ctx context.Context, movies []movieListElement) r
 			"instance", p.inst.Name, "type", p.inst.Type, "reverseNoFile", c.noFile)
 	}
 
+	// THE REPORT-ONLY DEFAULT, structurally. With the flag off there is no
+	// write pass to gate, no fresh pre-write fetch, no payload assembled and no
+	// dry-run branch to get wrong — the reverse scan simply ends here, and the
+	// only evidence it ran at all is what it reported.
+	if p.opts.remonitor {
+		p.remonitorMovies(ctx, findings, reverseWriteContext{profiles: p.profiles, wantedIDs: wantedIDs}, &c)
+	}
 	return c
 }
 
@@ -310,6 +322,22 @@ func (p reversePass) runRadarr(ctx context.Context, movies []movieListElement) r
 // rather than something they have to spell.
 func fullScanReverseOptions(cfg Config) reverseOptions {
 	return reverseOptions{enabled: true, remonitor: cfg.ReverseScanRemonitor}
+}
+
+// reverseSeasonFinding pairs a reported season with the one fact about it the
+// write side needs and the decision itself does not carry: whether its SERIES
+// is monitored.
+//
+// That fact decides everything about what may happen next (binding controller
+// resolution 3). A season under a monitored series may be re-monitored; a
+// season under an UNMONITORED series may only ever be reported, because a
+// series-level unmonitor is a human deliberately retiring a show and
+// re-monitoring its seasons would be this program arguing with that decision.
+// Series-level monitored is never written in either direction, which has been a
+// structural rule of the Sonarr write path since Phase 7.
+type reverseSeasonFinding struct {
+	decision        seasonDecision
+	seriesMonitored bool
 }
 
 // runSonarr is the Sonarr reverse scan: every UNMONITORED season, of a
@@ -338,6 +366,7 @@ func (p reversePass) runSonarr(ctx context.Context, series []seriesElement) reve
 		return c
 	}
 
+	var findings []reverseSeasonFinding
 	for _, s := range series {
 		if ctx.Err() != nil {
 			p.logger.Info("shutdown requested: abandoning this instance's reverse scan mid-evaluation; a partial reverse scan is never reported as a finding count",
@@ -370,11 +399,295 @@ func (p reversePass) runSonarr(ctx context.Context, series []seriesElement) reve
 				continue
 			}
 			c.findings++
+			findings = append(findings, reverseSeasonFinding{decision: d, seriesMonitored: *s.Monitored})
 			p.logger.Log(ctx, p.itemLevel, "reverse-scan finding",
 				"instance", p.inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season,
 				"reason", d.reason, "profile", d.profileName, "seriesMonitored", *s.Monitored)
 		}
 	}
 
+	// The report-only default, structurally: with the flag off there is no write
+	// pass to gate — see the Radarr twin.
+	if p.opts.remonitor {
+		p.remonitorSeasons(ctx, findings, reverseWriteContext{profiles: p.profiles, wantedSeasons: wantedSeasons}, &c)
+	}
 	return c
+}
+
+// --- the write direction ----------------------------------------------------
+
+// reverseWriteContext is everything the reverse direction's pre-write
+// re-verification needs to re-run the decision function against FRESH data:
+// this instance's quality profiles, and the unmonitored wanted set this cycle
+// already paged.
+//
+// The wanted set is the one input that is not re-fetched per item, and that is
+// deliberate: it is minutes old at most (the same cycle fetched it), re-paging
+// it per candidate would turn one fetch into one-per-write, and the forward
+// write path makes exactly the same trade with its own wanted set. Everything
+// else the re-evaluation reads — the movie or series object, its file scores —
+// comes from the write path's own fresh GETs.
+type reverseWriteContext struct {
+	profiles      map[int]qualityProfile
+	wantedIDs     map[int]bool       // Radarr: the unmonitored wanted set
+	wantedSeasons map[seasonKey]bool // Sonarr: the same set, keyed by season
+}
+
+// verifyMovieStillAReverseFinding re-runs evaluateMovie against the body of the
+// write path's own fresh pre-write GET, and refuses the write unless the movie
+// STILL fails the criteria.
+//
+// It re-runs the decision function rather than re-checking a remembered reason
+// for the same reason the reverse scan reuses that function in the first place:
+// "still a finding" and "is a finding" must be the same question, asked of the
+// same code. A movie upgraded between the scan and this moment now meets the
+// criteria, and re-monitoring it would undo this project's own correct work —
+// after which the next forward cycle would unmonitor it again, and the two
+// directions would flap it against each other forever.
+//
+// The decode is a plain one. A corrupted "tags" array cannot change the outcome
+// here: when the exclusion tag is active, preWriteExclusionTagCheck has already
+// run against these exact bytes and refused every untrusted tags shape there is
+// (absent, JSON null, non-array, a null element, ambiguous casing), and when it
+// is not active, rule 4 is vacuous whatever tags say.
+//
+// WHAT THIS CAN AND CANNOT SEE, stated because the boundary is a real one. Rules
+// 2, 3, 4 and 6 read the fresh object and — for the custom-format score — a
+// fresh /moviefile, so a file removed, a profile changed, upgrades switched off,
+// a tag added or a score raised since the scan are all caught here. Rule 5 reads
+// the unmonitored wanted set this cycle already paged (reverseWriteContext),
+// which is minutes old at most but is not re-fetched per item, so a movie whose
+// QUALITY cutoff was met in that window still reads as a finding. The
+// consequence is bounded and self-correcting — the movie is re-monitored once,
+// meets the criteria, and the next forward cycle unmonitors it again — and the
+// alternative is re-paging an entire wanted set per write candidate, a cost the
+// forward path does not pay for its own equally-fresh set either.
+func verifyMovieStillAReverseFinding(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, body []byte, movieID, exclusionTagID int, tagActive bool, rev reverseWriteContext, attrs []any) error {
+	var fresh movieListElement
+	if err := json.Unmarshal(body, &fresh); err != nil {
+		logger.Warn("the pre-write fetch could not be read as a movie, so whether it still fails the criteria cannot be determined; refusing to re-monitor",
+			append(append([]any(nil), attrs...), "error", err)...)
+		return fmt.Errorf("movie %d: %w: the pre-write fetch could not be decoded: %v", movieID, errNoLongerAReverseFinding, err)
+	}
+	if fresh.ID == nil || *fresh.ID != movieID {
+		// verifyMovieIdentity has already established this against the same
+		// bytes; reaching here would mean the two decodes disagree about the
+		// object, which is not something to write through.
+		logger.Warn("the pre-write fetch does not identify the movie being re-monitored; refusing to write", attrs...)
+		return fmt.Errorf("movie %d: %w: the pre-write fetch identifies a different movie", movieID, errNoLongerAReverseFinding)
+	}
+
+	d := evaluateMovie(ctx, logger, client, inst, fresh, rev.profiles, exclusionTagID, tagActive, rev.wantedIDs)
+	if !isReverseFinding(d.reason) {
+		logger.Info("the movie no longer fails the criteria as of the pre-write fetch, skipping the re-monitor",
+			append(append([]any(nil), attrs...), "reason", d.reason)...)
+		return fmt.Errorf("movie %d: %w: it now evaluates as %q", movieID, errNoLongerAReverseFinding, d.reason)
+	}
+	return nil
+}
+
+// reverseWriteGateBlockReason decides whether this cycle's forward cross-check
+// authorizes the reverse pass's writes, returning "" to open the gate or the
+// reason it stays shut (binding controller resolution 6).
+//
+// The reverse pass has no cross-check of its own: a cross-check compares two
+// independently computed signals, and the reverse direction has only one. What
+// it uses the forward verdict for is therefore narrower than what the forward
+// gate uses it for, and the difference is worth stating. The forward gate asks
+// "was anything verified about the decisions I am about to act on" — a question
+// about evidence for specific writes. This gate asks only "did this instance's
+// data agree with itself this cycle": a data-layer health signal. An explicit
+// PASS is the only answer that admits a write; FAILED, inconclusive, and any
+// status a future change might add all block the pass, with the withheld
+// accounting saying so.
+//
+// There is no recovery-equivalent here, and none is needed: a half-done
+// re-monitor converges by itself, because a season or movie that is still
+// unmonitored is still a finding next cycle.
+func reverseWriteGateBlockReason(cc crossCheckResult) string {
+	switch cc.status {
+	case crossCheckStatusPassed:
+		return ""
+	case crossCheckStatusFailed:
+		return "the cross-check found a disagreement, so this instance's data cannot be trusted in either direction"
+	case crossCheckStatusInconclusive:
+		return "the cross-check verified nothing this cycle, so nothing establishes that this instance's data is sound"
+	default:
+		return "the cross-check status is unrecognized, which blocks every write"
+	}
+}
+
+// record folds one attempted re-monitor into the counters, by the same five
+// outcomes the forward passes use and in the same order of precedence. Sharing
+// one classifier between the movie and season paths is what keeps the two from
+// counting the same ending differently.
+//
+// attrs names the item; the caller owns that vocabulary, since a movie line and
+// a season line identify their subject differently.
+func (c *reverseCounts) record(logger *slog.Logger, attrs []any, written bool, err error, dryRun bool) {
+	withAttrs := func(extra ...any) []any {
+		return append(append([]any(nil), attrs...), extra...)
+	}
+	switch {
+	case isWriteRefusal(err):
+		// Every refusal logged its own specific reason at the moment it
+		// refused — the exclusion tag reappeared, the item is already
+		// monitored, it no longer fails the criteria, a field could not be read
+		// — so nothing more is logged here and no cause is lost by sharing a
+		// counter. No HTTP write was sent, so none of them is a failed write.
+		c.refused++
+	case errors.Is(err, errWriteUnverified):
+		c.echoUnverified++
+		logger.Warn("remonitor write accepted but the response was unverifiable; treat it as applied and let the next cycle reconcile it",
+			withAttrs("error", err)...)
+	case err != nil:
+		c.writeErrors++
+		msg := "remonitor write failed; skipping this item for the cycle"
+		if dryRun {
+			msg = "remonitor write rehearsal failed; no write was attempted (dry-run), and this item is skipped for the cycle"
+		}
+		logger.Error(msg, withAttrs("error", err)...)
+	case !written:
+		// Dry-run: the write was withheld at the §2.1 gate immediately before
+		// the PUT, and has already been logged at debug. The ONLY remaining
+		// (false, nil) case, exactly as on the forward paths.
+		c.withheld++
+	default:
+		c.remonitored++
+		logger.Info("remonitor", attrs...)
+	}
+}
+
+// remonitorMovies is the reverse pass's write half for Radarr. It runs only
+// with reverse_scan_remonitor set: with the flag off, the caller never reaches
+// this function, so the reverse scan composes no write call at all rather than
+// composing one and gating it.
+func (p reversePass) remonitorMovies(ctx context.Context, findings []movieDecision, rev reverseWriteContext, c *reverseCounts) {
+	if reason := reverseWriteGateBlockReason(p.cc); reason != "" {
+		c.withheld += len(findings)
+		if len(findings) > 0 {
+			// One line per instance per cycle, not per item: "nothing was
+			// written" and "nothing needed writing" must never look the same,
+			// and a blocked pass that left reverseFindings=N against a line of
+			// zeroes is exactly the unexplained gap the identity forbids.
+			attrs := []any{"instance", p.inst.Name, "type", p.inst.Type, "crossCheck", p.cc.status}
+			attrs = append(attrs, p.cc.logAttrs()...)
+			attrs = append(attrs, "reverseWithheld", len(findings), "dryRun", p.dryRun)
+			p.logger.Warn("reverse-scan writes withheld for this instance: "+reason, attrs...)
+		}
+		return
+	}
+
+	shutdownNoted := false
+	for _, d := range findings {
+		// The shutdown boundary, between items and nowhere else — the write
+		// itself detaches from this cancellation so an item already under way
+		// finishes.
+		if ctx.Err() != nil {
+			c.withheld++
+			if !shutdownNoted {
+				shutdownNoted = true
+				p.logger.Info("shutdown requested: the remaining reverse-scan writes for this instance are withheld and the next cycle will revisit them",
+					"instance", p.inst.Name, "type", p.inst.Type, "dryRun", p.dryRun)
+			}
+			continue
+		}
+
+		written, err := remonitorMovie(ctx, p.logger, p.client, p.inst, d.id, p.exclusionTagID, p.tagActive, p.dryRun, rev)
+		c.record(p.logger, []any{"id", d.id, "title", d.title, "reason", d.reason, "profile", d.profileName, "instance", p.inst.Name}, written, err, p.dryRun)
+	}
+}
+
+// verifySeasonStillAReverseFinding is the season path's half of the same
+// re-verification: evaluateSeries — the decision function itself, in its reverse
+// direction — re-run against the write path's own fresh series payload, with the
+// write refused unless the target season STILL fails the criteria.
+//
+// It costs a second /episode fetch and one /episodefile fetch for this series,
+// because evaluateSeries owns its own reads and reusing it whole is the point.
+// That is a per-candidate cost on a pass whose candidates are, by construction,
+// the rare accidental unmonitors.
+//
+// The same freshness boundary as the movie path applies (see
+// verifyMovieStillAReverseFinding): everything but rule 4's wanted set is read
+// again here.
+func verifySeasonStillAReverseFinding(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, body []byte, seriesID, seasonNumber, exclusionTagID int, tagActive bool, rev reverseWriteContext, subject string, attrs []any) error {
+	var fresh seriesElement
+	if err := json.Unmarshal(body, &fresh); err != nil {
+		logger.Warn("the pre-write fetch could not be read as a series, so whether the season still fails the criteria cannot be determined; refusing to re-monitor",
+			append(append([]any(nil), attrs...), "error", err)...)
+		return fmt.Errorf("%s: %w: the pre-write fetch could not be decoded: %v", subject, errNoLongerAReverseFinding, err)
+	}
+	if fresh.ID == nil || *fresh.ID != seriesID {
+		logger.Warn("the pre-write fetch does not identify the series being re-monitored; refusing to write", attrs...)
+		return fmt.Errorf("%s: %w: the pre-write fetch identifies a different series", subject, errNoLongerAReverseFinding)
+	}
+
+	eval := evaluateSeries(ctx, logger, client, inst, fresh, rev.profiles, exclusionTagID, tagActive, rev.wantedSeasons, directionReverse)
+	for _, d := range eval.decisions {
+		if d.season != seasonNumber {
+			continue
+		}
+		if isReverseFinding(d.reason) {
+			return nil
+		}
+		logger.Info("the season no longer fails the criteria as of the pre-write fetch, skipping the re-monitor",
+			append(append([]any(nil), attrs...), "reason", d.reason)...)
+		return fmt.Errorf("%s: %w: it now evaluates as %q", subject, errNoLongerAReverseFinding, d.reason)
+	}
+	// No decision at all for the target season: it is no longer an unmonitored
+	// season of this series, or it is no longer readable. Either way the finding
+	// this write rests on cannot be re-established, and §2.6 says never guess.
+	logger.Warn("the pre-write fetch produced no reverse decision for this season, so the finding could not be re-established; refusing to write", attrs...)
+	return fmt.Errorf("%s: %w: the pre-write fetch produced no decision for this season", subject, errNoLongerAReverseFinding)
+}
+
+// remonitorSeasons is the reverse pass's write half for Sonarr. Like its Radarr
+// twin it is reached only with reverse_scan_remonitor set, so report-only
+// composes no write call at all.
+func (p reversePass) remonitorSeasons(ctx context.Context, findings []reverseSeasonFinding, rev reverseWriteContext, c *reverseCounts) {
+	if reason := reverseWriteGateBlockReason(p.cc); reason != "" {
+		c.withheld += len(findings)
+		if len(findings) > 0 {
+			attrs := []any{"instance", p.inst.Name, "type", p.inst.Type, "crossCheck", p.cc.status}
+			attrs = append(attrs, p.cc.logAttrs()...)
+			attrs = append(attrs, "reverseWithheld", len(findings), "dryRun", p.dryRun)
+			p.logger.Warn("reverse-scan writes withheld for this instance: "+reason, attrs...)
+		}
+		return
+	}
+
+	shutdownNoted := false
+	for _, f := range findings {
+		d := f.decision
+		attrs := []any{"instance", p.inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season,
+			"reason", d.reason, "profile", d.profileName}
+
+		// Binding controller resolution 3: a season under an UNMONITORED series
+		// is report-only, always. Re-monitoring it would fight a human's
+		// deliberate retirement of the show, and this is where that is decided
+		// — before any fetch, so nothing is even asked about a series this pass
+		// has no business writing to. The write path enforces it a second time
+		// from the other side (its series-monitored guard), which is where a
+		// series retired between the scan and the write is caught.
+		if !f.seriesMonitored {
+			c.withheld++
+			p.logger.Log(ctx, p.itemLevel, "reverse-scan finding withheld: its series is not monitored, so re-monitoring this season would fight a deliberate retirement of the whole show; reporting it is all this cycle will do",
+				append(append([]any(nil), attrs...), "seriesMonitored", false)...)
+			continue
+		}
+
+		if ctx.Err() != nil {
+			c.withheld++
+			if !shutdownNoted {
+				shutdownNoted = true
+				p.logger.Info("shutdown requested: the remaining reverse-scan writes for this instance are withheld and the next cycle will revisit them",
+					"instance", p.inst.Name, "type", p.inst.Type, "dryRun", p.dryRun)
+			}
+			continue
+		}
+
+		written, err := remonitorSeason(ctx, p.logger, p.client, p.inst, d.seriesID, d.season, p.exclusionTagID, p.tagActive, p.dryRun, rev)
+		c.record(p.logger, attrs, written, err, p.dryRun)
+	}
 }
