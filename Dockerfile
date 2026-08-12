@@ -11,6 +11,18 @@
 # Pinned to the repo's own Go version (go.mod says 1.23.6). Bump both together.
 FROM golang:1.23.6-alpine AS build
 
+# TARGETARCH is one of buildx's automatic per-platform build args (alongside
+# TARGETOS, TARGETPLATFORM, ...): when release.yml runs
+# `docker buildx build --platform linux/amd64,linux/arm64 .`, buildx invokes
+# this Dockerfile once per platform and sets TARGETARCH to "amd64" or "arm64"
+# for that invocation — but only if a stage actually ARGs it in. Without this
+# line the go build below had no GOARCH at all, so it silently built whatever
+# arch the Go toolchain's own host defaulted to (this base image's arch)
+# regardless of which platform buildx thought it was producing: the arm64
+# manifest entry would carry an amd64 binary that fails immediately on real
+# arm64 hardware.
+ARG TARGETARCH
+
 WORKDIR /src
 
 # Dependency layer first, so a source-only change does not re-download modules.
@@ -40,7 +52,11 @@ COPY . .
 #
 # The tests are run in CI, not here: a build stage that runs them makes every
 # image build slower and every test failure look like a Docker problem.
-RUN CGO_ENABLED=0 GOOS=linux go build \
+# GOARCH=$TARGETARCH is what makes this stage actually cross-compile: with it
+# unset, `go build` targets the builder's own host arch no matter which
+# platform buildx requested. GOOS stays hardcoded to linux — this image never
+# targets anything else, and TARGETOS would only add a second unused build arg.
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build \
         -trimpath \
         -ldflags "-s -w" \
         -o /out/cutoffarr .

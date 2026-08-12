@@ -46,6 +46,41 @@ func TestDockerfile_BuildsWithTheModulesOwnGoVersion(t *testing.T) {
 	}
 }
 
+// TestDockerfile_CrossBuildsForTARGETARCH pins Phase 9's release-workflow
+// requirement: the build stage must be buildable for linux/amd64 AND
+// linux/arm64 from a single `docker buildx build --platform
+// linux/amd64,linux/arm64 .` invocation. Before this phase the build stage
+// hardcoded GOOS=linux with no GOARCH at all, so every cross-arch build
+// silently produced an amd64 binary (Go defaults GOARCH to the host
+// toolchain's arch when unset) regardless of which platform buildx thought it
+// was building — the image would report as arm64 in the manifest and fail
+// immediately on any actual arm64 host. buildx auto-populates a TARGETARCH
+// build arg per platform, but only a Dockerfile that ARGs it in and threads it
+// into GOARCH ever sees it.
+func TestDockerfile_CrossBuildsForTARGETARCH(t *testing.T) {
+	dockerfile := readRepoFile(t, "Dockerfile")
+
+	for _, want := range []string{
+		"ARG TARGETARCH",
+		"GOARCH=$TARGETARCH",
+	} {
+		if !strings.Contains(dockerfile, want) {
+			t.Errorf("Dockerfile must contain %q so buildx's per-platform build arg reaches `go build`:\n%s", want, dockerfile)
+		}
+	}
+
+	// ARG TARGETARCH must be declared in the BUILD stage (before the RUN that
+	// consumes it), not merely present anywhere in the file — a bare mention
+	// in a comment or the final stage would satisfy the substring check above
+	// without actually wiring anything.
+	argIdx := strings.Index(dockerfile, "ARG TARGETARCH")
+	buildIdx := strings.Index(dockerfile, "AS build")
+	useIdx := strings.Index(dockerfile, "GOARCH=$TARGETARCH")
+	if argIdx == -1 || buildIdx == -1 || useIdx == -1 || !(buildIdx < argIdx && argIdx < useIdx) {
+		t.Errorf("ARG TARGETARCH must be declared inside the build stage, before the go build line that consumes it:\n%s", dockerfile)
+	}
+}
+
 // TestDockerfile_FinalStageIsDistrolessNonRootAndStaticallyLinked pins the
 // three properties that make the image what the plan asked for: nothing in it
 // but the binary, never running as root, and no libc dependency (which is what
