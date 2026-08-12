@@ -2672,3 +2672,46 @@ func TestReverseFindingReasons_UntrustedInputIsClassifiedExhaustively(t *testing
 			named, declared)
 	}
 }
+
+// TestRunSonarrDecisionEngine_ReverseScan_SeasonMonitoredBeforeTheWrite_IsRefused
+// is the reverse direction's scan-to-write race on the SONARR path: something
+// else — a human in the UI, another tool, a list sync — re-monitored the season
+// between the scan that found it and the write pass that would have.
+//
+// The Radarr twin has been pinned since this branch opened
+// (TestRun_ReverseScan_WriteMode_AlreadyMonitoredAtWrite_IsRefused); this guard
+// had nothing but the happy path passing THROUGH it, so deleting it left the
+// suite green. It stayed green because a later guard catches the same world in a
+// different way — the pre-write re-verification finds no unmonitored season and
+// refuses for want of a decision — which is why this test asserts WHICH guard
+// spoke. A refusal is not the property; refusing for the reason that is actually
+// true is.
+func TestRunSonarrDecisionEngine_ReverseScan_SeasonMonitoredBeforeTheWrite_IsRefused(t *testing.T) {
+	fake, series, wantedEpisodes, wantedSeasons := reverseSeasonWriteEngineFake(t)
+	// The pre-write fetch, and the only thing that differs from the scan: the
+	// season is monitored again.
+	fake.seriesDetail[1] = sonarrWriteEngineSeriesDetail(1, "Reverse Write Candidate", 2, 1, true)
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodes, wantedSeasons,
+		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+
+	out := buf.String()
+	if !strings.Contains(out, `crossCheck="passed (1 verified`) {
+		t.Fatalf("this test proves nothing unless the write gate really opened:\n%s", out)
+	}
+	if n := fake.countRequests("/api/v3/series/1"); n == 0 {
+		t.Fatalf("the write path was never entered, so it says nothing about this guard:\n%s", out)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("there is nothing to re-monitor, so nothing may be written: %+v", writes)
+	}
+	if !strings.Contains(out, "season already monitored as of the pre-write fetch") {
+		t.Errorf("the refusal must be the race's own, naming what the fresh fetch found:\n%s", out)
+	}
+	c := summaryCountersFor(t, out, "sonarr decision summary")
+	if c["reverseFindings"] != 1 || c["remonitorsRefused"] != 1 || c["remonitored"] != 0 {
+		t.Errorf("want reverseFindings=1 remonitorsRefused=1 remonitored=0, got %v:\n%s", c, out)
+	}
+	assertReverseIdentity(t, out)
+}
