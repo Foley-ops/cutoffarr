@@ -10,6 +10,12 @@ import (
 	"strings"
 )
 
+// defaultConfigPath is where the container image expects the config to be
+// mounted, and therefore the flag's default. Named rather than spelled twice so
+// the Dockerfile's CMD and this default cannot drift apart (container_test.go
+// asserts they agree).
+const defaultConfigPath = "/config/config.yml"
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
@@ -27,7 +33,7 @@ func main() {
 func run(args []string, stdout, stderr io.Writer, daemonOpts ...daemonOptions) int {
 	fs := flag.NewFlagSet("cutoffarr", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	configPath := fs.String("config", "/config/config.yml", "path to the cutoffarr YAML config file")
+	configPath := fs.String("config", defaultConfigPath, "path to the cutoffarr YAML config file")
 	once := fs.Bool("once", false, "run a single pass and exit; without it, cutoffarr runs as a daemon (startup scan, webhook listener, reconciliation sweep every poll_interval)")
 	forceDryRun := fs.Bool("dry-run", false, "force dry-run mode on; cannot be used to disable dry-run set by config")
 	samplesFlag := fs.String("samples", "", "comma-separated movie titles to dump full detail for during Radarr library inspection (--once only)")
