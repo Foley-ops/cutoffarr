@@ -258,12 +258,19 @@ func TestComposeExample_StopGracePeriodOutlastsASeasonWrite(t *testing.T) {
 			grace, seasonWriteCalls, apiClientTimeout, webhookShutdownGrace, want)
 	}
 
-	// webui is deliberately omitted (plan: "webui omitted for now") — cutoffarr
-	// has no web UI, and the label would point Unraid's button at a 405. The
-	// check is against the UNCOMMENTED file, because saying so in a comment is
-	// how the omission stays deliberate rather than looking like an oversight.
-	if strings.Contains(uncommented(compose), "net.unraid.docker.webui") {
-		t.Errorf("net.unraid.docker.webui must stay omitted: there is no web UI to point it at:\n%s", compose)
+	// Phase 12 (v2c): cutoffarr now serves a small read-only dashboard (GET /,
+	// GET /api/stats, POST /api/scan) on the SAME port the webhook endpoint
+	// already binds, so net.unraid.docker.webui is no longer a 405 trap and
+	// must be present, pointing Unraid's WebUI button at that port with
+	// Unraid's own [IP]/[PORT:n] placeholder syntax. Checked against the
+	// UNCOMMENTED file and against defaultWebhookPort (config.go) rather
+	// than the literal 9898, so this and the webhook port config agree by
+	// construction — the same discipline
+	// TestTemplate_AgreesWithComposeExample_WebhookPort already holds the
+	// Unraid CA template to.
+	wantWebUI := `net.unraid.docker.webui: "http://[IP]:[PORT:` + strconv.Itoa(defaultWebhookPort) + `]/"`
+	if !strings.Contains(uncommented(compose), wantWebUI) {
+		t.Errorf("docker-compose.example.yml must set %s:\n%s", wantWebUI, compose)
 	}
 
 	// The external network needs a warning, because the single most likely

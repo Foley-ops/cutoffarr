@@ -72,11 +72,14 @@ services:
       # - /mnt/user/data/media/TV_Shows:/data/media/TV_Shows:ro
 
     ports:
-      # The webhook endpoint: POST /webhook/{instance-name}. It must be
-      # reachable from the *arrs — on the shared network below, they can reach
-      # it as http://cutoffarr:9898/webhook/radarr-main without this published
-      # port at all, which is the better setup. Publishing it is only for
-      # configuring or testing the hook from outside the Docker network.
+      # The webhook endpoint (POST /webhook/{instance-name}) and, since v2c
+      # (Phase 12), the read-only dashboard (GET /, GET /api/stats, POST
+      # /api/scan) on the same port. The *arrs only ever need the webhook
+      # endpoint, and only ever need it on the shared network below — they can
+      # reach it as http://cutoffarr:9898/webhook/radarr-main without this
+      # published port at all, which is the better setup. Publishing it is for
+      # configuring/testing the hook from outside the Docker network, and for
+      # reaching the dashboard from a browser on your LAN.
       - "9898:9898"
 
     networks:
@@ -94,9 +97,14 @@ services:
       # surface, change the Dockerfile's final stage to an alpine base and this
       # label becomes true.
       net.unraid.docker.shell: "sh"
-      # net.unraid.docker.webui is deliberately omitted: cutoffarr has no web
-      # UI, and a label pointing Unraid's "WebUI" button at the webhook endpoint
-      # would take a curious human to a 405.
+      # v2c (Phase 12) added a small, read-only, unauthenticated dashboard —
+      # GET / (an HTML page), GET /api/stats (JSON), POST /api/scan (queues
+      # one full sweep) — on this SAME port, alongside the webhook endpoint;
+      # unlike the webhook-only endpoint this used to point at, a browser GET
+      # here gets a real page. No auth: this is a LAN homelab tool (see the
+      # README's "The web dashboard" section) — do not publish this port
+      # beyond your LAN.
+      net.unraid.docker.webui: "http://[IP]:[PORT:9898]/"
 
 networks:
   # EXTERNAL, and the name has to be the one your *arrs are actually on.
