@@ -126,6 +126,19 @@ func moviePath(movieID int) string {
 // automatically within a cycle"); the caller logs them and moves to the
 // next item.
 func unmonitorMovie(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, movieID, exclusionTagID int, tagActive bool, dryRun bool) (written bool, err error) {
+	// PHASE 8, the shutdown boundary (binding controller note 4): once a write
+	// operation has STARTED, it runs to its own end. context.WithoutCancel
+	// detaches every request below from the daemon's shutdown cancellation, so
+	// a SIGTERM landing between the pre-write GET and the PUT cannot turn a
+	// clean write into a "context canceled" write error — or, on the Sonarr
+	// twin, into a half-written season. The shutdown is instead checked
+	// BETWEEN items, by the write pass, before this function is entered at all:
+	// an item either completes or never starts.
+	//
+	// Nothing is unbounded here: every request still carries the client's
+	// 15-second timeout (client.go), and the write pass withholds every
+	// REMAINING item, so a shutdown is delayed by at most one item's writes.
+	ctx = context.WithoutCancel(ctx)
 	path := moviePath(movieID)
 
 	body, err := fetchBody(ctx, client, path, nil)
@@ -375,8 +388,21 @@ func isWriteRefusal(err error) bool {
 // summary. noun names the thing for the human-facing log line ("movie",
 // "series"); subject prefixes the error ("movie 7", "series 3 season 1").
 func preWriteExclusionTagCheck(logger *slog.Logger, payload map[string]json.RawMessage, noun, subject string, exclusionTagID int, attrs []any) error {
-	rawTags, tagsPresent := payload["tags"]
-	if !tagsPresent {
+	// rawMapField (shared.go), not payload["tags"]: the lookup has to match
+	// the decode it is re-checking. encoding/json matches JSON keys to struct
+	// fields case-INsensitively, so the read path was made case-insensitive
+	// with an ambiguity refusal in Phase 6/7 — while this, the check §2.5 says
+	// always wins, was still an exact map index (DEFERRED DEBT from the Phase 7
+	// branch review, cleared in Phase 8). See rawMapField's doc comment for the
+	// two shapes that mismatch produced; the ambiguous one let a payload
+	// carrying the exclusion tag under the other spelling pass this check.
+	rawTags, tagMatches := rawMapField(payload, "tags")
+	if tagMatches > 1 {
+		logger.Warn(noun+" carries more than one differently-cased tags key in the pre-write fetch; either could be the authoritative field, so the exclusion tag cannot be verified, refusing to write",
+			append(append([]any(nil), attrs...), "tagsKeyMatches", tagMatches)...)
+		return fmt.Errorf("%s: %w: %d differently-cased %q keys in the pre-write fetch, so the field's provenance is ambiguous", subject, errTagsUnverifiable, tagMatches, "tags")
+	}
+	if tagMatches == 0 {
 		logger.Warn(noun+" tags absent from the pre-write fetch; cannot verify the exclusion tag is not present, refusing to write", attrs...)
 		return fmt.Errorf("%s: %w: %q key absent from the pre-write fetch", subject, errTagsUnverifiable, "tags")
 	}

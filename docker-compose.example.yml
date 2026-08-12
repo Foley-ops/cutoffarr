@@ -1,0 +1,91 @@
+# Example docker-compose for cutoffarr. Copy to docker-compose.yml and edit.
+#
+# NOTHING IN THIS FILE IS A REAL CREDENTIAL, and none ever should be: the API
+# keys come from a .env file beside it (see below), which is gitignored. The
+# config file itself references them as ${RADARR_MAIN_API_KEY} etc., which
+# cutoffarr expands at startup and refuses to run without.
+
+services:
+  cutoffarr:
+    image: cutoffarr:latest
+    # Or build it in place:
+    # build: .
+    container_name: cutoffarr
+    restart: unless-stopped
+
+    # DO NOT LOWER THIS, and understand it before you raise the *arrs' timeouts.
+    #
+    # cutoffarr stops between ITEMS, never inside one. A Sonarr season is
+    # written as a pair of calls — the episodes first, then the season flag —
+    # and the pair is deliberately detached from shutdown so it completes or
+    # never starts: the state in between (episodes unmonitored, season still
+    # monitored) is the one thing this program goes out of its way never to
+    # leave behind. On SIGTERM it finishes the item in flight and exits.
+    #
+    # Docker's DEFAULT stop timeout is 10 seconds, after which it SIGKILLs —
+    # which would break that guarantee from the outside, in exactly the slow-*arr
+    # case the guarantee exists for. One season write is at most five sequential
+    # API calls, each bounded by cutoffarr's own 15s per-call timeout, plus a 5s
+    # drain of the webhook listener: 80s worst case, 90 for headroom. In the
+    # ordinary case the process is gone in well under a second — this is a
+    # ceiling, not a delay.
+    stop_grace_period: 90s
+
+    # Unraid's usual nobody:users. The container's own default is distroless's
+    # nonroot (65532:65532); this override exists so the mounted /config is
+    # readable with the permissions Unraid shares elsewhere in the stack.
+    # cutoffarr only ever READS from disk, so read access is all it needs.
+    user: "99:100"
+
+    environment:
+      - TZ=America/New_York
+      # Referenced from .env — never written here. cutoffarr expands ${VAR} in
+      # the config file and treats a referenced-but-unset variable as fatal, so
+      # a missing key fails at startup rather than at the first API call.
+      - RADARR_MAIN_API_KEY=${RADARR_MAIN_API_KEY}
+      - SONARR_MAIN_API_KEY=${SONARR_MAIN_API_KEY}
+
+    volumes:
+      # The config directory, read-only: cutoffarr never writes to disk, so
+      # mounting it :ro removes a way for a bug to matter.
+      - /mnt/user/appdata/cutoffarr:/config:ro
+
+    ports:
+      # The webhook endpoint: POST /webhook/{instance-name}. It must be
+      # reachable from the *arrs — on the shared network below, they can reach
+      # it as http://cutoffarr:9898/webhook/radarr-main without this published
+      # port at all, which is the better setup. Publishing it is only for
+      # configuring or testing the hook from outside the Docker network.
+      - "9898:9898"
+
+    networks:
+      - media-net
+
+    labels:
+      # Point this at whatever icon you want Unraid's dashboard to show; the
+      # URL below is a placeholder for one committed alongside the source.
+      net.unraid.docker.icon: "https://raw.githubusercontent.com/Foley-ops/cutoffarr/main/icon.png"
+      # Present because the plan calls for it, with a caveat worth knowing
+      # before you click it: the image is distroless and contains NO shell, so
+      # Unraid's console button will fail whatever this says. Diagnose with
+      # `docker logs cutoffarr` instead — everything this program has to say is
+      # on stdout. If you would rather have a console than the smaller attack
+      # surface, change the Dockerfile's final stage to an alpine base and this
+      # label becomes true.
+      net.unraid.docker.shell: "sh"
+      # net.unraid.docker.webui is deliberately omitted: cutoffarr has no web
+      # UI, and a label pointing Unraid's "WebUI" button at the webhook endpoint
+      # would take a curious human to a 405.
+
+networks:
+  # EXTERNAL, and the name has to be the one your *arrs are actually on.
+  # `external: true` means compose will NOT create it — it must already exist,
+  # which is what stops cutoffarr from ending up alone on a fresh network that
+  # happens to share a name.
+  #
+  # Check with `docker network ls`. A network compose created for another stack
+  # is named "<project>_default" (e.g. "arrs_default"), NOT the bare name in
+  # that stack's file. If cutoffarr cannot resolve http://radarr:7878, this line
+  # is the first thing to check.
+  media-net:
+    external: true

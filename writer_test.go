@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -1822,28 +1823,53 @@ func TestRun_WriteMode_SonarrInstance_TouchesOnlyItsAllowlistedPaths(t *testing.
 //     Sonarr season PUT — each in a write-path file, each immediately behind
 //     its own dry-run gate.
 //   - A write could also be smuggled through the bodyless client.Do, so no
-//     non-GET HTTP method constant may appear in ANY non-test file outside
-//     those two write-path files. (client.go names no method at all; it takes
-//     whichever its callers pass.)
+//     non-GET HTTP method may be NAMED in ANY non-test file outside those two
+//     write-path files — neither as an http.Method* constant nor as a bare
+//     quoted literal, since client.Do takes a plain string. (client.go names no
+//     method at all; it takes whichever its callers pass.)
+//
+// Phase 8 hardened it in two ways the Phase 7 branch review asked for, both
+// because Phase 8 is the phase that adds files (daemon.go, webhook.go) and
+// could plausibly add a subpackage:
+//
+//   - The walk is RECURSIVE (filepath.WalkDir), so a future subpackage cannot
+//     escape either invariant simply by not being in the root directory.
+//   - Quoted verb literals are banned alongside the constants. `client.Do(ctx,
+//     "PUT", path, body)` compiles, writes, and named no constant at all.
+//
+// The literal ban is deliberately for the EXACT quoted verb (`"PUT"`), not for
+// the four letters anywhere in a string. The distinction is the difference
+// between a CLIENT method argument — the only thing this audit is about — and a
+// net/http ServeMux route pattern like "POST /webhook/{instance}", which names
+// a method the SERVER accepts on an endpoint this project exposes. A route
+// pattern cannot issue a request; declaring it out of scope by construction is
+// more honest than a substring rule that would have to be suppressed at the one
+// place it fires.
 func TestTree_HasExactlyThreeWriteVerbCallSites(t *testing.T) {
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("reading the package directory: %v", err)
-	}
-
 	wantCallSites := map[string]int{"writer.go": 1, "sonarr_writer.go": 2}
 	writePathFiles := map[string]bool{"writer.go": true, "sonarr_writer.go": true}
 	gotCallSites := map[string]int{}
 	total := 0
 
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-		src, err := os.ReadFile(name)
+	err := filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			t.Fatalf("reading %s: %v", name, err)
+			return err
+		}
+		if d.IsDir() {
+			// Nothing under a dot-directory is this project's source; .git in
+			// particular holds blobs that would be scanned as text.
+			if path != "." && strings.HasPrefix(d.Name(), ".") {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		name := filepath.ToSlash(path)
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			return nil
+		}
+		src, err := os.ReadFile(path)
+		if err != nil {
+			return err
 		}
 		body := string(src)
 
@@ -1858,13 +1884,20 @@ func TestTree_HasExactlyThreeWriteVerbCallSites(t *testing.T) {
 			total += n
 		}
 		if writePathFiles[name] {
-			continue
+			return nil
 		}
-		for _, verb := range []string{"http.MethodPut", "http.MethodPost", "http.MethodDelete", "http.MethodPatch"} {
-			if strings.Contains(body, verb) {
-				t.Errorf("%s names %s: outside the write-path files, this project issues reads only", name, verb)
+		for _, verb := range []string{"Put", "Post", "Delete", "Patch"} {
+			if strings.Contains(body, "http.Method"+verb) {
+				t.Errorf("%s names http.Method%s: outside the write-path files, this project issues reads only", name, verb)
+			}
+			if literal := `"` + strings.ToUpper(verb) + `"`; strings.Contains(body, literal) {
+				t.Errorf("%s contains the literal %s: a write verb passed as a bare string is still a write verb", name, literal)
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking the tree: %v", err)
 	}
 
 	if total != 3 {
@@ -2219,6 +2252,12 @@ type statefulRadarrFake struct {
 
 	profilesJSON string
 	tagsJSON     string
+
+	// onRequest mirrors statefulSonarrFake's hook (sonarr_test.go): called
+	// with every request's method and path before the fake answers it, so a
+	// Phase 8 shutdown test can deliver a cancellation at an exact instant
+	// inside a write pass.
+	onRequest func(method, path string)
 }
 
 // newStatefulRadarrFake starts a fake Radarr backed by movies. Order is
@@ -2276,7 +2315,11 @@ func (f *statefulRadarrFake) handle(next http.HandlerFunc) http.HandlerFunc {
 		body, _ := io.ReadAll(r.Body)
 		f.mu.Lock()
 		f.requests = append(f.requests, recordedRequest{method: r.Method, path: r.URL.Path, body: body, contentType: r.Header.Get("Content-Type")})
+		hook := f.onRequest
 		f.mu.Unlock()
+		if hook != nil {
+			hook(r.Method, r.URL.Path)
+		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		next(w, r)
 	}
@@ -2411,6 +2454,21 @@ func (f *statefulRadarrFake) puts() []recordedRequest {
 
 func (f *statefulRadarrFake) instance() Instance {
 	return Instance{Name: "radarr-main", Type: "radarr", URL: f.srv.URL, APIKey: "key"}
+}
+
+// setWanted moves a movie in or out of the fake's /wanted/cutoff set while it
+// is serving, under the same lock every other accessor takes. It models the one
+// world-change a Download webhook actually announces: a file landed, and this
+// movie is no longer below its cutoff. Without it, a daemon test could only
+// observe a write the STARTUP scan would already have made, which proves
+// nothing about the webhook path.
+func (f *statefulRadarrFake) setWanted(id int, wanted bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if m, found := f.movies[id]; found {
+		m.inWantedSet = wanted
+		m.qualityCutoffNotMet = wanted
+	}
 }
 
 // writeNoOpTestConfig writes a config with the given dry_run and log_level,
@@ -2611,4 +2669,55 @@ func stripTimeAttr(line string) string {
 		fields = fields[1:]
 	}
 	return strings.Join(fields, " ")
+}
+
+// --- preWriteExclusionTagCheck: the key lookup must match the decode ---------
+//
+// DEFERRED DEBT from the Phase 7 branch review, cleared here. The read path
+// was made case-insensitive with an ambiguity refusal (shared.go's
+// rawObjectField) precisely because encoding/json matches JSON keys to struct
+// fields case-insensitively — but the PRE-WRITE re-check still looked
+// payload["tags"] up exactly. The two tests below are the two shapes that
+// mismatch produces, and only the second is dangerous.
+
+// TestPreWriteExclusionTagCheck_DifferentlyCasedTagsKey_IsStillRead: a payload
+// spelling the key "Tags" used to be refused as "tags absent from the pre-write
+// fetch" — safe, but a permanent, unexplainable refusal of every write on an
+// instance whose API happens to case the key differently. It must be READ.
+func TestPreWriteExclusionTagCheck_DifferentlyCasedTagsKey_IsStillRead(t *testing.T) {
+	payload := map[string]json.RawMessage{
+		"id":   json.RawMessage(`7`),
+		"Tags": json.RawMessage(`[1, 2]`),
+	}
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+
+	if err := preWriteExclusionTagCheck(logger, payload, "movie", "movie 7", 9, nil); err != nil {
+		t.Fatalf("preWriteExclusionTagCheck returned %v, want nil: the exclusion tag is genuinely absent from this payload's tags\nlog:\n%s", err, buf.String())
+	}
+}
+
+// TestPreWriteExclusionTagCheck_TagsKeyPresentTwiceInDifferentCases_RefusesTheWrite
+// is the dangerous half, and the reason this is not a cosmetic fix. With both
+// "tags" and "Tags" present, an exact lookup validated the clean array while
+// the corrupted/excluding one was equally able to be the authoritative field —
+// so a payload carrying the exclusion tag under the other spelling passed the
+// one check §2.5 says always wins. Ambiguous provenance is untrusted input.
+func TestPreWriteExclusionTagCheck_TagsKeyPresentTwiceInDifferentCases_RefusesTheWrite(t *testing.T) {
+	payload := map[string]json.RawMessage{
+		"id":   json.RawMessage(`7`),
+		"tags": json.RawMessage(`[]`),
+		"Tags": json.RawMessage(`[9]`), // 9 is the exclusion tag id below
+	}
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+
+	err := preWriteExclusionTagCheck(logger, payload, "movie", "movie 7", 9, nil)
+	if err == nil {
+		t.Fatalf("preWriteExclusionTagCheck returned nil: one of the two tags arrays carries the exclusion tag, so this write must be refused\nlog:\n%s", buf.String())
+	}
+	if !errors.Is(err, errTagsUnverifiable) {
+		t.Errorf("error = %v, want it to wrap errTagsUnverifiable (nothing was written, so this is a refusal, not a failure)", err)
+	}
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("expected a WARN naming the refusal:\n%s", buf.String())
+	}
 }

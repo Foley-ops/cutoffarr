@@ -866,6 +866,14 @@ type statefulSonarrFake struct {
 	// apply the write and echo the updated resource.
 	seriesPutStatus      map[int]int
 	episodeMonitorStatus int
+
+	// onRequest, when set, is called with every request's method and path
+	// BEFORE the fake answers it, from the serving goroutine and outside the
+	// fake's own lock. It exists for the Phase 8 shutdown tests, which have to
+	// deliver a cancellation at an exact point inside a multi-season write pass
+	// — between two items, or between a season's two write calls — and no other
+	// mechanism can name those instants.
+	onRequest func(method, path string)
 }
 
 // newStatefulSonarrFake starts a fake Sonarr backed by series/episodes/
@@ -952,7 +960,11 @@ func (f *statefulSonarrFake) handle(next http.HandlerFunc) http.HandlerFunc {
 		body, _ := io.ReadAll(r.Body)
 		f.mu.Lock()
 		f.requests = append(f.requests, recordedRequest{method: r.Method, path: r.URL.Path, body: body, contentType: r.Header.Get("Content-Type")})
+		hook := f.onRequest
 		f.mu.Unlock()
+		if hook != nil {
+			hook(r.Method, r.URL.Path)
+		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		next(w, r)
 	}
@@ -1136,8 +1148,14 @@ func (f *statefulSonarrFake) episodesJSON(seriesID int) string {
 		if e.airDateUtc != "" {
 			airDateJSON = strconv.Quote(e.airDateUtc)
 		}
-		elems = append(elems, fmt.Sprintf(`{"id":%d,"seasonNumber":%d,"episodeNumber":%d,"monitored":%t,"hasFile":%t,"airDateUtc":%s,"episodeFileId":%d}`,
-			e.id, e.seasonNumber, e.episodeNumber, e.monitored, e.hasFile, airDateJSON, e.episodeFileID))
+		// seriesId is emitted because a real Sonarr always emits it, and since
+		// Phase 8 the WRITE path requires it: an episode of the target season
+		// that does not state its provenance cannot be named in PUT
+		// /episode/monitor (see episodesOfSeason). A fake that omitted it made
+		// every write-mode end-to-end test pass through a code path no real
+		// instance would take.
+		elems = append(elems, fmt.Sprintf(`{"id":%d,"seriesId":%d,"seasonNumber":%d,"episodeNumber":%d,"monitored":%t,"hasFile":%t,"airDateUtc":%s,"episodeFileId":%d}`,
+			e.id, e.seriesID, e.seasonNumber, e.episodeNumber, e.monitored, e.hasFile, airDateJSON, e.episodeFileID))
 	}
 	return "[" + strings.Join(elems, ",") + "]"
 }
@@ -1188,6 +1206,25 @@ func (f *statefulSonarrFake) wantedCutoffJSON() string {
 		}
 	}
 	return fmt.Sprintf(`{"page":1,"pageSize":100,"totalRecords":%d,"records":[%s]}`, len(recs), strings.Join(recs, ","))
+}
+
+// setEpisodeWanted moves an episode in or out of the fake's /wanted/cutoff set
+// (and its episode file's qualityCutoffNotMet, which the cross-check compares
+// against it) while the fake is serving. It models what a Download webhook
+// actually announces — a file landed and this episode is no longer below its
+// cutoff — so a daemon test can observe a write the STARTUP scan would not
+// already have made. Mirrors statefulRadarrFake.setWanted.
+func (f *statefulSonarrFake) setEpisodeWanted(episodeID int, wanted bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	e, found := f.episodes[episodeID]
+	if !found {
+		return
+	}
+	e.inWantedSet = wanted
+	if file, ok := f.files[e.episodeFileID]; ok {
+		file.qualityCutoffNotMet = wanted
+	}
 }
 
 // all returns a copy of every request the fake received, under the mutex the

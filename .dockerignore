@@ -1,0 +1,53 @@
+# .dockerignore — what must never enter the Docker build context.
+#
+# WHY THIS FILE IS A SECURITY CONTROL AND NOT HOUSEKEEPING. The Dockerfile's
+# final image is clean by construction: it is distroless and only the compiled
+# binary is copied forward. The BUILD STAGE is not. `COPY . .` copies whatever
+# the build context holds, and a working tree of this project holds the
+# operator's live config.yml — one api_key per *arr — plus a .env, the whole
+# .git history, and agent scratch.
+#
+# A build-stage layer is not private. It survives in the BuildKit cache on
+# whatever host ran the build, and it is directly readable with
+# `docker build --target build`, `docker buildx ... -o type=local`, or
+# `docker history` on the cached stage. Since this project is built on the
+# machine it is deployed to, an unfiltered context means `docker build` copies
+# the developer's *arr credentials onto the server as a side effect — the exact
+# thing that never appears in any log, any commit, or any image manifest, and
+# so is never noticed.
+#
+# The list below is the .gitignore list, and container_test.go asserts that it
+# STAYS the .gitignore list: anything git is told to refuse must be refused
+# here too, or the next secret file added to this repo is protected from the
+# remote and handed straight to Docker.
+
+# Private planning docs
+cutoffarr-implementation-plan.md
+
+# Local config / secrets. config.yml is the live one: it carries a real api_key
+# for every configured instance. The image reads its config from the mounted
+# /config volume at RUN time; nothing about the build needs it.
+config.yml
+config.yaml
+*.env
+.env*
+
+# Build artifacts. /cutoffarr is a host-built binary — the wrong GOOS/GOARCH for
+# the image, ~9 MB, and rebuilt inside the build stage anyway.
+/cutoffarr
+*.exe
+dist/
+bin/
+
+# Agent scratch
+.superpowers/
+
+# OS / editor noise
+.DS_Store
+.vscode/
+.idea/
+
+# Git's own directory, which .gitignore has no reason to name and this file
+# does: every key ever committed by mistake and later removed is still in here.
+# The build needs no version information (-trimpath, and no ldflags read git).
+.git

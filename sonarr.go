@@ -167,7 +167,7 @@ func fetchSeriesLibrary(ctx context.Context, logger *slog.Logger, client *APICli
 // episodeElement decodes the subset of one /api/v3/episode?seriesId=X array
 // element the season decision engine needs. AirDateUtc is decoded as
 // *string, not *time.Time: a malformed date string then fails only THIS
-// episode's airing-guard determination (episodeHasAired in decision.go
+// episode's airing-guard determination (episodeAiringStatus in decision.go
 // treats a parse failure the same as "absent" — fail safe, per the binding
 // airing-guard rule), rather than an invalid date anywhere in a large
 // episode list aborting the entire decode the way a *time.Time field's

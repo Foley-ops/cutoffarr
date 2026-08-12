@@ -1179,3 +1179,36 @@ func TestInspectRadarrLibrary_TagsKeyDifferentlyCased_NullElementStillCaught(t *
 		t.Errorf("a corrupted tags array must be normalized to nil regardless of how the JSON key is cased, got %v", *movies[0].Tags)
 	}
 }
+
+// TestInspectRadarrLibrary_TagsKeyPresentTwiceInDifferentCases_TreatedAsUnverifiable
+// is the Radarr twin of the Sonarr fixture in sonarr_test.go, and the reason it
+// had to exist: radarr.go's found==false branch (the one that normalizes Tags
+// back to nil) had no fixture that could reach it at all, so the branch was
+// asserted by reading rather than by running. encoding/json decodes an object
+// key by key, so with BOTH "tags" and "Tags" present the LAST one wins for the
+// struct field while rawObjectField reports found=false — the field's
+// provenance is ambiguous, which on the exclusion tag's own input is untrusted
+// input.
+func TestInspectRadarrLibrary_TagsKeyPresentTwiceInDifferentCases_TreatedAsUnverifiable(t *testing.T) {
+	moviesJSON := `[{"id": 1, "title": "Two Tags Keys Movie", "monitored": true, "hasFile": true, "qualityProfileId": 1, "tags": [1, 2], "Tags": [3, null]}]`
+	var gotRequests []string
+	srv := radarrTestServer(t, http.StatusOK, moviesJSON, staticWantedCutoffHandler(http.StatusOK, emptyWantedCutoffJSON), &gotRequests)
+	defer srv.Close()
+
+	logger, buf := newRadarrTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+
+	movies, _, ok := inspectRadarrLibrary(context.Background(), logger, inst, nil)
+	if !ok {
+		t.Fatalf("inspectRadarrLibrary returned ok=false, want true:\n%s", buf.String())
+	}
+	if len(movies) != 1 {
+		t.Fatalf("expected 1 movie, got %d", len(movies))
+	}
+	if movies[0].Tags != nil {
+		t.Errorf("two keys could each have populated tags; ambiguous provenance must be treated as unverifiable, got %v", *movies[0].Tags)
+	}
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("expected a warning naming the unverifiable tags:\n%s", buf.String())
+	}
+}

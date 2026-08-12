@@ -133,6 +133,30 @@ func rawObjectField(raw json.RawMessage, key string) (json.RawMessage, bool) {
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return nil, false
 	}
+	found, matches := rawMapField(obj, key)
+	return found, matches == 1
+}
+
+// rawMapField is rawObjectField's lookup rule over an ALREADY-decoded object,
+// returning the matched value and — unlike rawObjectField's bool — how many
+// keys matched, so a caller that wants to say something different about
+// "absent" (0) and "ambiguous" (more than one) can.
+//
+// It exists because the pre-write exclusion-tag re-check (writer.go) works from
+// a map[string]json.RawMessage it must keep intact for §2.4's byte-preserving
+// PUT, not from raw bytes it can re-scan, and it was the one tag lookup in the
+// project still done with an exact, case-SENSITIVE map index (DEFERRED DEBT
+// from the Phase 7 branch review, cleared in Phase 8). That mismatch had both
+// of the failure modes the read path's own fix was made for: a payload spelling
+// the key "Tags" was refused as "tags absent" forever, and — the dangerous one
+// — a payload carrying BOTH spellings had its exclusion tag checked against
+// whichever array happened to be spelled exactly, while the other one was
+// equally able to be the field the *arr considers authoritative.
+//
+// Note that a decoded map really can hold both spellings at once: "tags" and
+// "Tags" are distinct map keys even though encoding/json would have matched
+// either one to the same struct field.
+func rawMapField(obj map[string]json.RawMessage, key string) (json.RawMessage, int) {
 	var found json.RawMessage
 	matches := 0
 	for k, v := range obj {
@@ -141,8 +165,5 @@ func rawObjectField(raw json.RawMessage, key string) (json.RawMessage, bool) {
 			matches++
 		}
 	}
-	if matches != 1 {
-		return nil, false
-	}
-	return found, true
+	return found, matches
 }

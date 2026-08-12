@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -986,7 +987,7 @@ func TestRunRadarrDecisionEngine_UnmonitoredMovies_ExcludedFromReportEntirely(t 
 	movies := []movieListElement{
 		{ID: intPtr(1), Title: strPtr("Unmonitored Movie"), Monitored: boolPtr(false), HasFile: boolPtr(true), QualityProfileID: intPtr(1)},
 	}
-	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if strings.Contains(out, "Unmonitored Movie") {
@@ -1023,7 +1024,7 @@ func TestRunRadarrDecisionEngine_UnmonitoredMovies_DebugLineNotInfo(t *testing.T
 
 	t.Run("invisible at info", func(t *testing.T) {
 		logger, buf := newDecisionTestLogger(slog.LevelInfo)
-		runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+		runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 		out := buf.String()
 		if strings.Contains(out, `msg="already unmonitored"`) {
 			t.Errorf("the already-unmonitored line must stay invisible at info level:\n%s", out)
@@ -1032,7 +1033,7 @@ func TestRunRadarrDecisionEngine_UnmonitoredMovies_DebugLineNotInfo(t *testing.T
 
 	t.Run("visible at debug with id, title, instance", func(t *testing.T) {
 		logger, buf := newDecisionTestLogger(slog.LevelDebug)
-		runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+		runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 		out := buf.String()
 		if !strings.Contains(out, `msg="already unmonitored"`) {
 			t.Errorf("expected msg=\"already unmonitored\" at debug level:\n%s", out)
@@ -1058,7 +1059,7 @@ func TestRunRadarrDecisionEngine_LogsWouldUnmonitorAndSkipLinesWithMandatedAttrs
 			MovieFile: &movieFileElement{ID: intPtr(1)}},
 		{ID: intPtr(2), Title: strPtr("No File Movie"), Monitored: boolPtr(true), HasFile: boolPtr(false), QualityProfileID: intPtr(1)},
 	}
-	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if !strings.Contains(out, `msg=would-unmonitor`) {
@@ -1100,7 +1101,7 @@ func TestRunRadarrDecisionEngine_MoviefileFetchedOnlyForMoviesPassingRulesOneThr
 			MovieFile: &movieFileElement{ID: intPtr(1)}},
 	}
 	wantedIDs := map[int]bool{4: true}
-	runRadarrDecisionEngine(context.Background(), logger, inst, movies, wantedIDs, "cutoffarr-exclude", 0, true)
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, wantedIDs, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	if len(gotMoviefileRequests) != 1 {
 		t.Errorf("expected exactly 1 /moviefile request, got %d: %v", len(gotMoviefileRequests), gotMoviefileRequests)
@@ -1125,7 +1126,7 @@ func TestRunRadarrDecisionEngine_ProfileFetchFailure_NoReportLinesAtAll(t *testi
 	movies := []movieListElement{
 		{ID: intPtr(1), Title: strPtr("Some Movie"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1)},
 	}
-	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if strings.Contains(out, "msg=would-unmonitor") || strings.Contains(out, "msg=skip") {
@@ -1156,7 +1157,7 @@ func TestRunRadarrDecisionEngine_TagFetchFailure_NoReportLinesAtAll(t *testing.T
 	movies := []movieListElement{
 		{ID: intPtr(1), Title: strPtr("Some Movie"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1)},
 	}
-	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if strings.Contains(out, "msg=would-unmonitor") || strings.Contains(out, "msg=skip") {
@@ -1179,7 +1180,7 @@ func TestRunRadarrDecisionEngine_SummaryCountsCorrect(t *testing.T) {
 		{ID: intPtr(4), Title: strPtr("Would Unmonitor"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
 			MovieFile: &movieFileElement{ID: intPtr(1)}},
 	}
-	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if !strings.Contains(out, "totalMonitored=3") {
@@ -1233,7 +1234,7 @@ func TestRunRadarrDecisionEngine_PerMovieMoviefileFailure_DoesNotStopOtherMovies
 		{ID: intPtr(3), Title: strPtr("Succeeds Movie"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
 			MovieFile: &movieFileElement{ID: intPtr(1)}},
 	}
-	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if !strings.Contains(out, `title="Fails Movie"`) || !strings.Contains(out, `reason="could not fetch custom format score"`) {
@@ -1266,7 +1267,7 @@ func TestRunRadarrDecisionEngine_MovieMissingID_WarnsAndExcludedFromReport(t *te
 	movies := []movieListElement{
 		{Title: strPtr("No Id Movie"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1)},
 	}
-	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if strings.Contains(out, "msg=would-unmonitor") || strings.Contains(out, "msg=skip") {
@@ -1301,7 +1302,7 @@ func TestRunRadarrDecisionEngine_MonitoredFieldAbsent_WarnsButStillExcluded(t *t
 	movies := []movieListElement{
 		{ID: intPtr(1), Title: strPtr("No Monitored Field Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1)}, // Monitored left nil
 	}
-	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if strings.Contains(out, "msg=would-unmonitor") || strings.Contains(out, "msg=skip") {
@@ -1353,7 +1354,7 @@ func TestRunRadarrDecisionEngine_MonitoredFieldAbsent_NoAlreadyUnmonitoredDebugL
 	movies := []movieListElement{
 		{ID: intPtr(1), Title: strPtr("No Monitored Field Movie"), HasFile: boolPtr(true), QualityProfileID: intPtr(1)}, // Monitored left nil
 	}
-	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if strings.Contains(out, `msg="already unmonitored"`) {
@@ -1380,7 +1381,7 @@ func TestRunRadarrDecisionEngine_MonitoredFalse_PresentValue_NoWarn(t *testing.T
 	movies := []movieListElement{
 		{ID: intPtr(1), Title: strPtr("Explicitly Unmonitored Movie"), Monitored: boolPtr(false), HasFile: boolPtr(true), QualityProfileID: intPtr(1)},
 	}
-	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if strings.Contains(out, "level=WARN") {
@@ -1718,7 +1719,7 @@ func TestRunRadarrDecisionEngine_CrossCheckPassed_SummaryStatesPassedWithCount(t
 		{ID: intPtr(1), Title: strPtr("Would Unmonitor Movie"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
 			MovieFile: &movieFileElement{ID: intPtr(1), QualityCutoffNotMet: boolPtr(false)}},
 	}
-	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if strings.Contains(out, "level=ERROR") {
@@ -1750,7 +1751,7 @@ func TestRunRadarrDecisionEngine_CrossCheckAllUnverifiable_SummaryStatesInconclu
 		{ID: intPtr(1), Title: strPtr("Would Unmonitor Movie"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
 			MovieFile: &movieFileElement{ID: intPtr(1)}},
 	}
-	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if strings.Contains(out, "level=ERROR") {
@@ -1781,7 +1782,7 @@ func TestRunRadarrDecisionEngine_CrossCheckDisagreement_SummaryStatesFailed(t *t
 		{ID: intPtr(1), Title: strPtr("Disagreeing Movie"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1),
 			MovieFile: &movieFileElement{ID: intPtr(1), QualityCutoffNotMet: boolPtr(true)}},
 	}
-	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+	runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if !strings.Contains(out, "level=ERROR") {
@@ -1854,7 +1855,7 @@ func TestRunRadarrDecisionEngine_DryRun_WouldUnmonitorItemsProduceZeroWrites(t *
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	movies := []movieListElement{wouldUnmonitorMovie(1, "Would Unmonitor Movie")}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("dry-run made %d write request(s), want ZERO: %+v", len(writes), writes)
@@ -1911,7 +1912,7 @@ func TestRunRadarrDecisionEngine_WriteMode_UnmonitorsOnlyWouldUnmonitorItems(t *
 		skippedMovie(2, "No File Movie"),
 	}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
 
 	puts := fake.puts()
 	if len(puts) != 1 {
@@ -1951,7 +1952,7 @@ func TestRunRadarrDecisionEngine_CrossCheckFailed_WritePassBlocked(t *testing.T)
 		MovieFile: &movieFileElement{ID: intPtr(1), QualityCutoffNotMet: boolPtr(true)},
 	}}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("a FAILED cross-check must block every write, got %d: %+v", len(writes), writes)
@@ -1993,7 +1994,7 @@ func TestRunRadarrDecisionEngine_CrossCheckInconclusive_WritePassBlocked(t *test
 		MovieFile: &movieFileElement{ID: intPtr(1)},
 	}}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("an inconclusive cross-check must block every write, got %d: %+v", len(writes), writes)
@@ -2137,7 +2138,7 @@ func TestRunRadarrDecisionEngine_WriteFailure_CountedAndRunContinues(t *testing.
 		wouldUnmonitorMovie(2, "Accepted Movie"),
 	}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
 
 	puts := fake.puts()
 	if len(puts) != 2 {
@@ -2177,7 +2178,7 @@ func TestRunRadarrDecisionEngine_WriteAcceptedButUnverifiable_IsNotAWriteFailure
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	movies := []movieListElement{wouldUnmonitorMovie(1, "Silently Accepted Movie")}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
 
 	// §2.6: reported once, never retried, even though the outcome is unknown.
 	if puts := fake.puts(); len(puts) != 1 {
@@ -2228,7 +2229,7 @@ func TestRunRadarrDecisionEngine_EchoSaysStillMonitored_IsAWriteFailure(t *testi
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	movies := []movieListElement{wouldUnmonitorMovie(1, "Stubborn Movie")}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
 
 	out := buf.String()
 	if !strings.Contains(out, "level=ERROR") || !strings.Contains(out, "unmonitor write failed") {
@@ -2275,7 +2276,7 @@ func TestRunRadarrDecisionEngine_AlreadyUnmonitoredAtWriteTime_NoPut(t *testing.
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	movies := []movieListElement{wouldUnmonitorMovie(1, "Raced Movie")}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("expected zero write requests of any method for an already-unmonitored movie, got %+v", writes)
@@ -2313,7 +2314,7 @@ func TestRunRadarrDecisionEngine_ExclusionTagAddedBetweenScanAndWrite_RefusesThe
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	movies := []movieListElement{wouldUnmonitorMovie(1, "Tagged Since Scan")}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("expected zero write requests of any method: the fresh fetch shows the exclusion tag, which always wins, got %+v", writes)
@@ -2362,7 +2363,7 @@ func TestRunRadarrDecisionEngine_DryRun_ExclusionTagAddedBetweenScanAndWrite_Ref
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	movies := []movieListElement{wouldUnmonitorMovie(1, "Tagged Since Scan")}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("expected zero write requests of any method even in dry-run: the fresh fetch shows the exclusion tag, which always wins, got %+v", writes)
@@ -2404,7 +2405,7 @@ func TestRunRadarrDecisionEngine_AllPreWriteTagChecksRefused_SummaryAccountsForE
 		wouldUnmonitorMovie(2, "No Tags Key B"),
 	}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
 
 	if puts := fake.puts(); len(puts) != 0 {
 		t.Fatalf("expected zero PUTs: every fresh fetch's tags could not be verified, got %+v", puts)
@@ -2575,7 +2576,7 @@ func TestRunRadarrDecisionEngine_EveryWouldUnmonitorDecisionIsAccountedForInTheS
 
 			logger, buf := newDecisionTestLogger(slog.LevelInfo)
 			movies := []movieListElement{wouldUnmonitorMovie(1, "Accounted Movie")}
-			runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, tc.dryRun)
+			runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), tc.dryRun)
 
 			out := buf.String()
 			c := summaryCounters(t, out)
@@ -2622,7 +2623,7 @@ func TestRunRadarrDecisionEngine_GateBlocked_WithheldWritesAccountsForThePass(t 
 			QualityProfileID: intPtr(1), Tags: &noTags, MovieFile: &movieFileElement{ID: intPtr(1), QualityCutoffNotMet: boolPtr(true)}},
 	}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("a blocked pass must write nothing, got %+v", writes)
@@ -2661,7 +2662,7 @@ func TestRunRadarrDecisionEngine_DryRun_PreWriteFetchFailure_IsARehearsalFailure
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	movies := []movieListElement{wouldUnmonitorMovie(1, "Vanished Movie")}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("a dry-run must make zero write requests even when the pre-write fetch fails, got %+v", writes)
@@ -2693,7 +2694,7 @@ func TestRunRadarrDecisionEngine_WriteMode_HasNoRehearsalCounter(t *testing.T) {
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	movies := []movieListElement{wouldUnmonitorMovie(1, "Vanished Movie")}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
 
 	out := buf.String()
 	if !strings.Contains(out, "writeErrors=1") {
@@ -2719,7 +2720,7 @@ func TestRunRadarrDecisionEngine_ReportLinesCarryMovieId(t *testing.T) {
 		skippedMovie(2, "No File Movie"),
 	}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 0, true)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	for _, line := range strings.Split(out, "\n") {
@@ -2757,7 +2758,7 @@ func TestRunRadarrDecisionEngine_OnlyID_ReportsAndWritesOnlyTheTarget(t *testing
 		wouldUnmonitorMovie(3, "Another Movie"),
 	}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 2, false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", onlyIDScope(2), false)
 
 	puts := fake.puts()
 	if len(puts) != 1 {
@@ -2799,7 +2800,7 @@ func TestRunRadarrDecisionEngine_OnlyID_CrossCheckStillRunsOnFullCandidatePools(
 		wouldUnmonitorMovie(3, "Another Movie"),
 	}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 2, true)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", onlyIDScope(2), true)
 
 	out := buf.String()
 	if !strings.Contains(out, `crossCheck="passed (3 verified, 0 unverifiable)"`) {
@@ -2830,7 +2831,7 @@ func TestRunRadarrDecisionEngine_OnlyID_AlreadyUnmonitoredScopedToTarget(t *test
 		{ID: intPtr(2), Title: strPtr("Target Already Unmonitored"), Monitored: boolPtr(false), HasFile: boolPtr(true), QualityProfileID: intPtr(1)},
 	}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 2, true)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", onlyIDScope(2), true)
 
 	out := buf.String()
 	if strings.Contains(out, "Other Already Unmonitored") {
@@ -2859,7 +2860,7 @@ func TestRunRadarrDecisionEngine_OnlyID_CrossCheckDisagreementElsewhereBlocksThe
 		wouldUnmonitorMovie(2, "Target Movie"),
 	}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 2, false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", onlyIDScope(2), false)
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("a disagreement elsewhere in the library must still withhold the --only-id write, got %+v", writes)
@@ -2878,7 +2879,7 @@ func TestRunRadarrDecisionEngine_OnlyID_UnknownId_WarnsAndMakesNoDecisions(t *te
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 	movies := []movieListElement{wouldUnmonitorMovie(1, "Only Movie")}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 4242, false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", onlyIDScope(4242), false)
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("an unknown --only-id must write nothing, got %+v", writes)
@@ -2904,7 +2905,7 @@ func TestRunRadarrDecisionEngine_OnlyID_TargetIsSkipped_NoWriteButSkipLineLogged
 		skippedMovie(2, "Target No File"),
 	}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 2, false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", onlyIDScope(2), false)
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("a skipped target must never be written, got %+v", writes)
@@ -2931,7 +2932,7 @@ func TestRunRadarrDecisionEngine_OnlyID_TargetNotMonitored_ExplainsTheNoOp(t *te
 			QualityProfileID: intPtr(1), Tags: &noTags},
 	}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 2, false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", onlyIDScope(2), false)
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("an unmonitored target must never be written, got %+v", writes)
@@ -2953,7 +2954,7 @@ func TestRunRadarrDecisionEngine_OnlyID_SummaryNamesTheScope(t *testing.T) {
 		wouldUnmonitorMovie(2, "Target Movie"),
 	}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 2, true)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", onlyIDScope(2), true)
 
 	out := buf.String()
 	if !strings.Contains(out, "onlyId=2") {
@@ -2981,7 +2982,7 @@ func TestRunRadarrDecisionEngine_CrossCheckBlockedWithNothingToWrite_SaysSoPlain
 		MovieFile: &movieFileElement{ID: intPtr(1)},
 	}}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{1: true}, "cutoffarr-exclude", 0, false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{1: true}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
 
 	out := buf.String()
 	if !strings.Contains(out, "withheldWrites=0") {
@@ -3007,7 +3008,7 @@ func TestRunRadarrDecisionEngine_CrossCheckBlockedWithNothingToWrite_IsInfoNotWa
 		MovieFile: &movieFileElement{ID: intPtr(1)},
 	}}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{1: true}, "cutoffarr-exclude", 0, false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{1: true}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
 
 	out := buf.String()
 	var withheldLine string
@@ -3042,7 +3043,7 @@ func TestRunRadarrDecisionEngine_OnlyID_TargetNotMonitored_MessageNamesTheActual
 			QualityProfileID: intPtr(1), Tags: &noTags},
 	}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", 2, false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", onlyIDScope(2), false)
 
 	out := buf.String()
 	if !strings.Contains(out, "not monitored") {
@@ -3096,7 +3097,7 @@ func TestRunRadarrDecisionEngine_CrossCheckVerifiedNoWouldUnmonitorItem_WritePas
 			QualityProfileID: intPtr(1), Tags: &noTags, MovieFile: &movieFileElement{ID: intPtr(1), QualityCutoffNotMet: boolPtr(true)}},
 	}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{2: true}, "cutoffarr-exclude", 0, false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{2: true}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("a cross-check that verified only a skip item must authorize no write, got %d: %+v", len(writes), writes)
@@ -3347,5 +3348,195 @@ func TestRunWritePass_NothingToWrite_UnverifiedPoolIsNotAnAlarm(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "level=WARN") {
 		t.Errorf("nothing to write is not a reason to warn:\n%s", buf.String())
+	}
+}
+
+// --- Phase 8: the scope is a SET, and it carries the report level ----------
+
+// TestRunRadarrDecisionEngine_WebhookScope_CoalescedIDs_ReportsAndWritesEachOfThem
+// is the mandated coalescing optimization at the engine level (binding
+// controller note 2): when several debounce keys for the SAME instance expire
+// together, ONE evaluation runs whose write scope is the union of their ids —
+// not one full instance scan per event, and not a widening to the whole
+// library either.
+func TestRunRadarrDecisionEngine_WebhookScope_CoalescedIDs_ReportsAndWritesEachOfThem(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{
+		1: monitoredMovieDetail(1, "First Import"),
+		2: monitoredMovieDetail(2, "Untouched Movie"),
+		3: monitoredMovieDetail(3, "Second Import"),
+	})
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+	movies := []movieListElement{
+		wouldUnmonitorMovie(1, "First Import"),
+		wouldUnmonitorMovie(2, "Untouched Movie"),
+		wouldUnmonitorMovie(3, "Second Import"),
+	}
+
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", webhookScope([]int{3, 1}, nil), false)
+
+	out := buf.String()
+	if !strings.Contains(out, `scopeIds=1,3`) {
+		t.Errorf("the summary must name the coalesced write scope:\n%s", out)
+	}
+	if !strings.Contains(out, "totalMonitored=2") || !strings.Contains(out, "unmonitored=2") {
+		t.Errorf("expected exactly the two named movies to be reported and written:\n%s", out)
+	}
+	var wrote []string
+	for _, w := range fake.puts() {
+		wrote = append(wrote, w.path)
+	}
+	for _, want := range []string{"/api/v3/movie/1", "/api/v3/movie/3"} {
+		if !containsString(wrote, want) {
+			t.Errorf("expected a PUT to %s, got %v", want, wrote)
+		}
+	}
+	if containsString(wrote, "/api/v3/movie/2") {
+		t.Errorf("movie 2 was never named by any webhook event and must not be written: %v", wrote)
+	}
+}
+
+// TestRunRadarrDecisionEngine_WebhookScope_DemotesPerItemLinesButNotTheSummary
+// is the daemon's idle-cycle noise budget (binding controller note 6) at the
+// level it is enforced. The daemon repeats this cycle forever; per-item report
+// lines are the point of a --once run and pure repetition on the hundredth
+// sweep, so they drop to DEBUG while summaries, warnings and WRITE lines stay
+// where a human can see them.
+func TestRunRadarrDecisionEngine_WebhookScope_DemotesPerItemLinesButNotTheSummary(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{1: monitoredMovieDetail(1, "Imported Movie")})
+	logger, buf := newDecisionTestLogger(slog.LevelInfo) // INFO: the demoted lines must vanish entirely
+	movies := []movieListElement{
+		wouldUnmonitorMovie(1, "Imported Movie"),
+		skippedMovie(2, "Skipped Movie"),
+	}
+
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", webhookScope([]int{1}, nil), false)
+
+	out := buf.String()
+	if strings.Contains(out, "msg=would-unmonitor") || strings.Contains(out, "msg=skip") {
+		t.Errorf("per-item report lines must be demoted below INFO on a webhook cycle:\n%s", out)
+	}
+	if !strings.Contains(out, "msg=unmonitor ") {
+		t.Errorf("an actual WRITE is never demoted — it is the one thing a daemon cycle must always announce:\n%s", out)
+	}
+	if !strings.Contains(out, "radarr decision summary") {
+		t.Errorf("the summary is never demoted:\n%s", out)
+	}
+}
+
+// TestRunRadarrDecisionEngine_ScopedIDMissing_NamesItButStillProcessesTheRest:
+// one webhook event can name a movie that has since been deleted from the
+// library while another names a real one. Refusing the whole cycle would let a
+// stale event suppress real work; saying nothing would hide the stale event.
+func TestRunRadarrDecisionEngine_ScopedIDMissing_NamesItButStillProcessesTheRest(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{1: monitoredMovieDetail(1, "Present Movie")})
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+	movies := []movieListElement{wouldUnmonitorMovie(1, "Present Movie")}
+
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", webhookScope([]int{1, 4242}, nil), false)
+
+	out := buf.String()
+	if !strings.Contains(out, "movieId=4242") {
+		t.Errorf("the id that names nothing must be reported:\n%s", out)
+	}
+	if !strings.Contains(out, "unmonitored=1") {
+		t.Errorf("the id that names something real must still be acted on:\n%s", out)
+	}
+}
+
+// containsString is a local helper: the suite has no generic slice-contains
+// and containsIntID (shared.go) is deliberately int-only.
+func containsString(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRunRadarrDecisionEngine_ShutdownMidEvaluation_AbandonsTheCycleWithoutWriting
+// is the other half of the Phase 8 shutdown boundary. The write pass withholds
+// and accounts for what it did not do; an interrupted EVALUATION cannot do even
+// that, because its picture of the library is a fraction of one — so the cycle
+// is abandoned before the cross-check ever samples that truncated pool, and no
+// summary is printed that would describe part of a library as if it were the
+// whole thing.
+func TestRunRadarrDecisionEngine_ShutdownMidEvaluation_AbandonsTheCycleWithoutWriting(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		wouldUnmonitorStatefulMovie(1, "First"),
+		wouldUnmonitorStatefulMovie(2, "Second"),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var once sync.Once
+	fake.onRequest = func(method, path string) {
+		if method == http.MethodGet && path == "/api/v3/moviefile" {
+			once.Do(cancel) // partway through the FIRST movie's evaluation
+		}
+	}
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	movies := []movieListElement{
+		wouldUnmonitorMovie(1, "First"),
+		wouldUnmonitorMovie(2, "Second"),
+	}
+
+	runRadarrDecisionEngine(ctx, logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
+
+	out := buf.String()
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("a partial evaluation must never reach the write pass, got %+v", writes)
+	}
+	if strings.Contains(out, "radarr decision summary") {
+		t.Errorf("no summary may be printed for a cycle that saw part of the library:\n%s", out)
+	}
+	if !strings.Contains(out, "abandoning this instance's cycle mid-evaluation") {
+		t.Errorf("the abandonment must be stated, or the silence reads as a clean no-op cycle:\n%s", out)
+	}
+}
+
+// TestRunRadarrDecisionEngine_AlreadyUnmonitoredMovieWithoutAnID_IsStillCounted
+// is a self-review regression pin from the Phase 8 scope refactor. The
+// already-unmonitored branch used to read `onlyID == 0 || (m.ID != nil && *m.ID
+// == onlyID)`, and became `m.ID != nil && scope.contains(*m.ID)` — which is the
+// same thing for a scoped run and NOT the same thing for an unscoped one: a
+// movie with monitored:false and no id silently stopped being counted at all.
+//
+// It is a corner (real Radarr always sends id) but it is exactly the corner
+// this project refuses to let vanish: the summary's alreadyUnmonitored is one
+// of the numbers a human reads to decide a no-op cycle really was a no-op.
+func TestRunRadarrDecisionEngine_AlreadyUnmonitoredMovieWithoutAnID_IsStillCounted(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{})
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+	movies := []movieListElement{
+		{Title: strPtr("No Id, Not Monitored"), Monitored: boolPtr(false), HasFile: boolPtr(true), QualityProfileID: intPtr(1), Tags: &noTags},
+	}
+
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
+
+	out := buf.String()
+	if !strings.Contains(out, "alreadyUnmonitored=1") {
+		t.Errorf("an unscoped run counts every already-unmonitored movie, id or no id:\n%s", out)
+	}
+	if !strings.Contains(out, `msg="already unmonitored"`) || !strings.Contains(out, "id=absent") {
+		t.Errorf("and says so at debug, naming what it could not name:\n%s", out)
+	}
+}
+
+// TestRunRadarrDecisionEngine_ScopedRun_AlreadyUnmonitoredMovieWithoutAnID_IsNotCounted
+// is the other side: a movie whose id was never observed cannot be shown to be
+// the one the scope names, so a scoped run must not count it. Together the two
+// tests pin the exact expression, which is what makes it safe to simplify later.
+func TestRunRadarrDecisionEngine_ScopedRun_AlreadyUnmonitoredMovieWithoutAnID_IsNotCounted(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{2: monitoredMovieDetail(2, "Target")})
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+	movies := []movieListElement{
+		{Title: strPtr("No Id, Not Monitored"), Monitored: boolPtr(false), HasFile: boolPtr(true), QualityProfileID: intPtr(1), Tags: &noTags},
+		wouldUnmonitorMovie(2, "Target"),
+	}
+
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", onlyIDScope(2), true)
+
+	if out := buf.String(); !strings.Contains(out, "alreadyUnmonitored=0") {
+		t.Errorf("a scoped run counts only the named movie; an unidentifiable one is not it:\n%s", out)
 	}
 }

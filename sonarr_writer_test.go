@@ -53,6 +53,15 @@ type sonarrWriterFake struct {
 	// its response body could not be READ" branch, which no echo fixture can
 	// produce.
 	episodeMonitorTruncated bool
+
+	// episodesAfterMonitorWrite, when set, is what GET /api/v3/episode answers
+	// with once a PUT /api/v3/episode/monitor has been received. It is what
+	// makes the Phase 8 read-only disambiguation testable: the whole point of
+	// that path is that the WRITE really landed while its ECHO was
+	// unrecognizable, so the fake has to be able to say two different things
+	// about the same episodes before and after the call.
+	episodesAfterMonitorWrite *string
+	monitorWriteSeen          bool
 }
 
 // sonarrWriterSeriesJSON is a series object shaped like a real Sonarr
@@ -140,7 +149,13 @@ func newSonarrWriterFake(t *testing.T, seriesJSON, episodesJSON string) *sonarrW
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v3/episode/monitor", f.handle(f.serveEpisodeMonitor))
 	mux.HandleFunc("/api/v3/episode", f.handle(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(f.episodesJSON))
+		f.mu.Lock()
+		body := f.episodesJSON
+		if f.monitorWriteSeen && f.episodesAfterMonitorWrite != nil {
+			body = *f.episodesAfterMonitorWrite
+		}
+		f.mu.Unlock()
+		w.Write([]byte(body))
 	}))
 	mux.HandleFunc("/api/v3/series/", f.handle(f.serveSeriesDetail))
 	mux.HandleFunc("/", f.handle(func(w http.ResponseWriter, r *http.Request) {
@@ -193,6 +208,9 @@ func (f *sonarrWriterFake) serveEpisodeMonitor(w http.ResponseWriter, r *http.Re
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	f.mu.Lock()
+	f.monitorWriteSeen = true
+	f.mu.Unlock()
 	if f.episodeMonitorStatus >= 400 {
 		w.WriteHeader(f.episodeMonitorStatus)
 		w.Write([]byte(`{"message":"episode monitor write rejected by fake"}`))
@@ -521,8 +539,16 @@ func TestUnmonitorSeason_NoMonitoredEpisodesLeft_SkipsTheEpisodeCallOnly(t *test
 	if len(writes) != 1 || writes[0].path != "/api/v3/series/3" {
 		t.Fatalf("expected exactly one write (the series PUT), got %+v", writes)
 	}
-	if !strings.Contains(buf.String(), "level=DEBUG") {
-		t.Errorf("the skipped episode call must be visible at debug:\n%s", buf.String())
+	// "level=DEBUG" alone was the whole assertion here, which every debug line
+	// this call emits satisfies — the message that actually explains the
+	// skipped call went unasserted, so deleting or rewording it left the suite
+	// green (DEFERRED TEST DEBT from the Phase 7 branch review).
+	out := buf.String()
+	if !strings.Contains(out, `msg="no monitored episodes remain`) {
+		t.Errorf("the skipped episode call must say WHY it was skipped:\n%s", out)
+	}
+	if !strings.Contains(out, "recovery=true") {
+		t.Errorf("a season with nothing but its flag left to write is a recovery, and the debug line must say so:\n%s", out)
 	}
 }
 
@@ -1905,7 +1931,7 @@ func TestRunSonarrDecisionEngine_WriteMode_ConfirmedWriteCountsAsUnmonitored(t *
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	series := []seriesElement{testSeries(1, "Writable Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, false)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
 
 	out := buf.String()
 	c := sonarrSummaryCounters(t, out)
@@ -1939,7 +1965,7 @@ func TestRunSonarrDecisionEngine_DryRun_RehearsesAndWithholds(t *testing.T) {
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	series := []seriesElement{testSeries(1, "Rehearsed Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if writes := fake.writes(); len(writes) != 0 {
@@ -2094,7 +2120,7 @@ func TestRunSonarrDecisionEngine_EveryWouldUnmonitorSeasonIsAccountedForInTheSum
 
 			logger, buf := newDecisionTestLogger(slog.LevelInfo)
 			series := []seriesElement{testSeries(1, "Accounted Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
-			runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, tc.dryRun)
+			runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), tc.dryRun)
 
 			out := buf.String()
 			c := sonarrSummaryCounters(t, out)
@@ -2151,7 +2177,7 @@ func TestRunSonarrDecisionEngine_TwoPendingSeasons_OneRefuses_IdentityStillHolds
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	series := []seriesElement{testSeries(1, "Two Season Show", true, 1, []int{}, testSeason(1, true, 1, 1), testSeason(2, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, false)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
 
 	out := buf.String()
 	c := sonarrSummaryCounters(t, out)
@@ -2209,7 +2235,7 @@ func TestRunSonarrDecisionEngine_GateBlocked_WithheldWritesAccountsForThePass(t 
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	series := []seriesElement{testSeries(1, "Blocked Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, false)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
 
 	out := buf.String()
 	if !strings.Contains(out, "crossCheck=FAILED") {
@@ -2258,7 +2284,7 @@ func TestRunSonarrDecisionEngine_OnlyID_ScopesReportAndWritesToOneSeries(t *test
 		testSeries(1, "Other Show", true, 1, []int{}, testSeason(1, true, 1, 1), testSeason(9, false, 1, 1)),
 		testSeries(2, "Named Show", true, 1, []int{}, testSeason(1, true, 1, 1), testSeason(2, true, 1, 1), testSeason(9, false, 1, 1)),
 	}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 2, false)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", onlyIDScope(2), false)
 
 	out := buf.String()
 	for _, w := range fake.writes() {
@@ -2308,6 +2334,111 @@ func TestRunSonarrDecisionEngine_OnlyID_ScopesReportAndWritesToOneSeries(t *test
 	}
 }
 
+// TestRunSonarrDecisionEngine_WebhookSeasonScope_ReportsAndWritesOnlyThatSeason
+// is the engine's half of the plan's granularity: "a webhook event evaluates
+// only that movie (Radarr) or that series' AFFECTED SEASON (Sonarr)".
+//
+// Series 2 has two seasons that are BOTH eligible right now. A webhook naming
+// season 2 must produce exactly one decision, one report line, and one write —
+// not because season 1 is ineligible (it is not; the next reconciliation sweep
+// will write it) but because a season 2 import is not the event that authorizes
+// a season 1 write.
+//
+// The counters are asserted alongside the writes on purpose: wouldUnmonitor and
+// seasonsEvaluated feed the accounting identity, and a narrowing that moved the
+// writes without moving the numbers would produce a summary that does not add
+// up.
+func TestRunSonarrDecisionEngine_WebhookSeasonScope_ReportsAndWritesOnlyThatSeason(t *testing.T) {
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "," + episodeJSON(200, 2, 1, pastAirDate, 600) + "]"
+	filesJSON := "[" + episodeFileJSON(500, 1, 200, false) + "," + episodeFileJSON(600, 2, 200, false) + "]"
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	fake.seriesDetail[2] = `{"id":2,"title":"Named Show","monitored":true,"qualityProfileId":1,"tags":[],"seasons":[` +
+		`{"seasonNumber":1,"monitored":true,"statistics":{"episodeFileCount":1,"totalEpisodeCount":1}},` +
+		`{"seasonNumber":2,"monitored":true,"statistics":{"episodeFileCount":1,"totalEpisodeCount":1}}]}`
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+
+	series := []seriesElement{
+		testSeries(2, "Named Show", true, 1, []int{}, testSeason(1, true, 1, 1), testSeason(2, true, 1, 1)),
+	}
+	scope := webhookScope([]int{2}, map[int][]int{2: {2}})
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", scope, false)
+
+	out := buf.String()
+	seriesPuts := 0
+	for _, w := range fake.writes() {
+		if w.path == "/api/v3/series/2" {
+			seriesPuts++
+		}
+	}
+	if seriesPuts != 1 {
+		t.Errorf("series PUTs = %d, want 1 — a webhook naming season 2 writes season 2, not every eligible season of the show: %+v", seriesPuts, fake.writes())
+	}
+	c := sonarrSummaryCounters(t, out)
+	if c["wouldUnmonitor"] != 1 || c["unmonitored"] != 1 {
+		t.Errorf("wouldUnmonitor/unmonitored = %d/%d, want 1/1:\n%s", c["wouldUnmonitor"], c["unmonitored"], out)
+	}
+	if c["seasonsEvaluated"] != 1 {
+		t.Errorf("seasonsEvaluated = %d, want 1 — the report covers the season in scope, and the counters must move with it:\n%s", c["seasonsEvaluated"], out)
+	}
+	if !strings.Contains(out, "scopeSeasons=2:2") {
+		t.Errorf("the summary must say which seasons the cycle could write:\n%s", out)
+	}
+	// The report names season 2 and never season 1.
+	for _, line := range strings.Split(out, "\n") {
+		isReport := strings.Contains(line, "msg=would-unmonitor") || strings.Contains(line, "msg=skip") || strings.Contains(line, "msg=unmonitor ")
+		if isReport && strings.Contains(line, "season=1 ") {
+			t.Errorf("a season the event did not name must not be reported: %q", line)
+		}
+	}
+	if !strings.Contains(out, "msg=would-unmonitor") || !strings.Contains(out, "season=2") {
+		t.Errorf("the named season must still be reported in full:\n%s", out)
+	}
+	// The evidence half is unchanged: the cross-check still samples the whole
+	// library, season 1 included, because it validates the data the decision
+	// rests on rather than the target.
+	if !strings.Contains(out, `msg="cross-check season"`) {
+		t.Errorf("a season-scoped write must not shrink the evidence the cross-check works from:\n%s", out)
+	}
+}
+
+// TestRunSonarrDecisionEngine_WebhookSeasonScope_SeasonWithNoDecision_SaysSoRatherThanNothing
+// closes the one new way the season narrowing lets a scoped cycle produce
+// nothing: the named season has no decision this cycle — most often because an
+// earlier cycle already unmonitored it, sometimes because the payload named a
+// season this series does not have.
+//
+// The summary alone would show seasonsEvaluated=0 and leave a human to guess
+// which. It is logged at the scope's own item level (DEBUG for a webhook, per
+// the idle-cycle noise budget) because the common cause is the ordinary steady
+// state: every re-import into an already-unmonitored season reaches this.
+func TestRunSonarrDecisionEngine_WebhookSeasonScope_SeasonWithNoDecision_SaysSoRatherThanNothing(t *testing.T) {
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "]"
+	filesJSON := "[" + episodeFileJSON(500, 1, 200, false) + "]"
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+
+	series := []seriesElement{testSeries(2, "Named Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
+	// The event named season 9; this series has only season 1.
+	scope := webhookScope([]int{2}, map[int][]int{2: {9}})
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", scope, false)
+
+	out := buf.String()
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("a season with no decision must produce no write: %+v", writes)
+	}
+	line := logLineContaining(t, out, "named seasons produced no decision")
+	for _, want := range []string{"seriesId=2", "scopeSeasons=9", "level=DEBUG"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("the line must carry %q so the cycle is explicable from it alone:\n%s", want, line)
+		}
+	}
+	c := sonarrSummaryCounters(t, out)
+	if c["seasonsEvaluated"] != 0 || c["wouldUnmonitor"] != 0 {
+		t.Errorf("seasonsEvaluated/wouldUnmonitor = %d/%d, want 0/0 — this test only proves something while the report really is empty:\n%s",
+			c["seasonsEvaluated"], c["wouldUnmonitor"], out)
+	}
+}
+
 // TestRunSonarrDecisionEngine_OnlyID_UnmonitoredSeries_SaysSoRatherThanNothing
 // pins the one line standing between a scoped run on an unmonitored series and
 // total silence about the series a human explicitly named.
@@ -2328,7 +2459,7 @@ func TestRunSonarrDecisionEngine_OnlyID_UnmonitoredSeries_SaysSoRatherThanNothin
 		testSeries(1, "Monitored Show", true, 1, []int{}, testSeason(1, true, 1, 1)),
 		testSeries(2, "Unmonitored Show", false, 1, []int{}, testSeason(1, true, 1, 1)),
 	}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 2, false)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", onlyIDScope(2), false)
 
 	out := buf.String()
 	line := logLineContaining(t, out, "--only-id series produced no decision")
@@ -2358,7 +2489,7 @@ func TestRunSonarrDecisionEngine_OnlyID_UnknownSeries_WarnsAndWritesNothing(t *t
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	series := []seriesElement{testSeries(1, "Only Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 99, false)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", onlyIDScope(99), false)
 
 	out := buf.String()
 	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "onlyId=99") {
@@ -2505,6 +2636,50 @@ func twoWritableSeasonsSonarrFake(t *testing.T) *statefulSonarrFake {
 			{id: 600, seasonNumber: 2, customFormatScore: 200, qualityCutoffNotMet: false},
 			{id: 601, seasonNumber: 2, customFormatScore: 200, qualityCutoffNotMet: false},
 			{id: 700, seasonNumber: 3, customFormatScore: 200, qualityCutoffNotMet: false},
+		},
+	)
+}
+
+// threeWritableSeasonsSonarrFake is the fixture the (seriesID, seasonNumber)
+// write-scope pins need, and the reason it is not twoWritableSeasonsSonarrFake
+// is that two seasons cannot tell a SET of seasons from a RANGE of them.
+//
+// One series with THREE fully eligible seasons (1, 2 and 3) plus a fourth that
+// is still airing. Season 3 carries two episodes, one of them episode 5, so a
+// webhook can name S03E05 the way a real import does. What the third eligible
+// season buys is the two questions a two-season fixture cannot ask:
+//
+//   - a payload naming season 3 must leave BOTH earlier seasons monitored, not
+//     merely "the other one" — an off-by-one in the season filter that wrote
+//     everything up to the named season would pass a two-season test;
+//   - a burst naming seasons 1 and 3 must write exactly those two and leave the
+//     season BETWEEN them alone, which is what makes the accumulated scope a set
+//     rather than a span.
+func threeWritableSeasonsSonarrFake(t *testing.T) *statefulSonarrFake {
+	t.Helper()
+	return newStatefulSonarrFake(t,
+		[]*statefulSonarrSeries{
+			{id: 1, title: "Write Three", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{
+					{number: 1, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1},
+					{number: 2, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1},
+					{number: 3, monitored: true, episodeFileCount: 2, totalEpisodeCount: 2},
+					{number: 4, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1},
+				}},
+		},
+		[]*statefulSonarrEpisode{
+			{id: 100, seriesID: 1, seasonNumber: 1, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 500},
+			{id: 200, seriesID: 1, seasonNumber: 2, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 600},
+			{id: 300, seriesID: 1, seasonNumber: 3, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 700},
+			{id: 305, seriesID: 1, seasonNumber: 3, episodeNumber: 5, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 705},
+			{id: 400, seriesID: 1, seasonNumber: 4, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: futureAirDate, episodeFileID: 800},
+		},
+		[]*statefulSonarrEpisodeFile{
+			{id: 500, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
+			{id: 600, seasonNumber: 2, customFormatScore: 200, qualityCutoffNotMet: false},
+			{id: 700, seasonNumber: 3, customFormatScore: 200, qualityCutoffNotMet: false},
+			{id: 705, seasonNumber: 3, customFormatScore: 200, qualityCutoffNotMet: false},
+			{id: 800, seasonNumber: 4, customFormatScore: 200, qualityCutoffNotMet: false},
 		},
 	)
 }
@@ -3012,5 +3187,369 @@ func TestUnmonitorSeason_SeasonNoLongerCompleteOnDisk_Refuses(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "level=WARN") {
 		t.Errorf("expected a warning:\n%s", buf.String())
+	}
+}
+
+// --- write-time provenance: an episode must PROVE it is this series' --------
+//
+// DEFERRED DEBT from the Phase 7 branch review, cleared here. belongsToSeries
+// (sonarr.go) deliberately treats an ABSENT seriesId as belonging — "the key is
+// missing" is not evidence of a routing mistake, and at decision time the
+// count guards are the backstop for a wholesale wrong-series response. At WRITE
+// time that tolerance has a consequence the read path does not: an
+// unprovenanced record's id gets named in PUT /api/v3/episode/monitor, which is
+// a write against an episode nothing established belongs to this series at all.
+// Nothing else in this write path accepts an unreadable load-bearing field, and
+// this one is load-bearing in the most literal sense — it decides which rows
+// the write names.
+
+// TestUnmonitorSeason_EpisodeOfTheSeasonHasNoSeriesId_RefusesToWrite pins the
+// refusal. The episode is otherwise perfect (aired, monitored, in the target
+// season); only its provenance is missing.
+func TestUnmonitorSeason_EpisodeOfTheSeasonHasNoSeriesId_RefusesToWrite(t *testing.T) {
+	episodes := `[
+		{"id": 100, "seriesId": 3, "seasonNumber": 1, "episodeNumber": 1, "monitored": true, "hasFile": true, "airDateUtc": "2015-01-01T00:00:00Z", "episodeFileId": 500},
+		{"id": 101, "seasonNumber": 1, "episodeNumber": 2, "monitored": true, "hasFile": true, "airDateUtc": "2015-01-02T00:00:00Z", "episodeFileId": 501}
+	]`
+	fake := newSonarrWriterFake(t, sonarrWriterSeriesJSON, episodes)
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	if written {
+		t.Error("written = true, want false: an episode with no seriesId cannot be named in a write")
+	}
+	if !errors.Is(err, errSeasonUnverifiableAtWrite) {
+		t.Fatalf("error = %v, want it to wrap errSeasonUnverifiableAtWrite", err)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("expected ZERO write requests, got %+v", writes)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "episodeId=101") {
+		t.Errorf("the refusal must name the unprovenanced episode:\n%s", out)
+	}
+}
+
+// TestUnmonitorSeason_EpisodeOfAnotherSeasonHasNoSeriesId_StillWrites keeps the
+// refusal from becoming a whole-series veto: provenance is required of the
+// episodes this write actually NAMES, and an unprovenanced record in some other
+// season is the read path's problem, not this write's.
+func TestUnmonitorSeason_EpisodeOfAnotherSeasonHasNoSeriesId_StillWrites(t *testing.T) {
+	episodes := `[
+		{"id": 100, "seriesId": 3, "seasonNumber": 1, "episodeNumber": 1, "monitored": true, "hasFile": true, "airDateUtc": "2015-01-01T00:00:00Z", "episodeFileId": 500},
+		{"id": 101, "seriesId": 3, "seasonNumber": 1, "episodeNumber": 2, "monitored": true, "hasFile": true, "airDateUtc": "2015-01-02T00:00:00Z", "episodeFileId": 501},
+		{"id": 200, "seasonNumber": 2, "episodeNumber": 1, "monitored": true, "hasFile": true, "airDateUtc": "2016-01-01T00:00:00Z", "episodeFileId": 600}
+	]`
+	fake := newSonarrWriterFake(t, sonarrWriterSeriesJSON, episodes)
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	if err != nil {
+		t.Fatalf("unmonitorSeason returned error = %v, want nil\n%s", err, buf.String())
+	}
+	if !written {
+		t.Errorf("written = false, want true: season 1's own episodes are all provenanced\n%s", buf.String())
+	}
+}
+
+// --- recoveryCandidate: the shut-gate filter's own narrowing conditions -----
+//
+// DEFERRED TEST DEBT from the Phase 7 branch review, cleared here. recoveryCandidate
+// is the cost filter in front of the one write path in this project that can run
+// without cross-check authorization, and each of its narrowing conditions could
+// be deleted with the whole suite still green (they are backstopped at write
+// time by unmonitorSeason's own fresh-data verdict, but a filter whose
+// conditions are untested is a filter nobody will notice loosening).
+
+func TestRecoveryCandidate_EmptyEpisodeSet_IsNotACandidate(t *testing.T) {
+	if recoveryCandidate(seasonDecision{seriesID: 1, season: 1, crossCheckEpisodesComplete: true}) {
+		t.Error("a season with NO episode evidence at all must not be admitted: a condition nothing can satisfy must not be satisfied by nothing")
+	}
+}
+
+func TestRecoveryCandidate_EpisodeWithUnreadableMonitored_IsNotACandidate(t *testing.T) {
+	d := seasonDecision{seriesID: 1, season: 1, crossCheckEpisodesComplete: true, crossCheckEpisodes: []seasonCrossCheckEpisode{
+		{episodeID: 100, monitored: boolPtr(false)},
+		{episodeID: 101, monitored: nil}, // absent or JSON null
+	}}
+	if recoveryCandidate(d) {
+		t.Error("untrusted input is never evidence: an episode whose monitored value was never observed cannot prove the season is fully unmonitored")
+	}
+}
+
+// TestRecoveryCandidate_IncompleteEpisodeSet_IsNotACandidate is the new
+// condition this phase adds, and the reason buildSeasonCrossCheckEpisodes now
+// reports completeness at all: recoveryCandidate asks whether EVERY episode of
+// the season is already unmonitored, and a set that silently lost an episode
+// (one with no id) cannot answer that question — the missing one is exactly the
+// episode that would still be monitored.
+func TestRecoveryCandidate_IncompleteEpisodeSet_IsNotACandidate(t *testing.T) {
+	d := seasonDecision{seriesID: 1, season: 1, crossCheckEpisodesComplete: false, crossCheckEpisodes: []seasonCrossCheckEpisode{
+		{episodeID: 100, monitored: boolPtr(false)},
+	}}
+	if recoveryCandidate(d) {
+		t.Error("an incomplete episode set cannot establish that every episode of the season is unmonitored")
+	}
+}
+
+func TestRecoveryCandidate_CompleteAndFullyUnmonitored_IsACandidate(t *testing.T) {
+	d := seasonDecision{seriesID: 1, season: 1, crossCheckEpisodesComplete: true, crossCheckEpisodes: []seasonCrossCheckEpisode{
+		{episodeID: 100, monitored: boolPtr(false)},
+		{episodeID: 101, monitored: boolPtr(false)},
+	}}
+	if !recoveryCandidate(d) {
+		t.Error("a complete, fully-unmonitored episode set is exactly the shape the recovery path exists for")
+	}
+}
+
+// --- the read-only disambiguation of an unrecognized episode-monitor echo ---
+//
+// DEFERRED DEBT from the Phase 7 branch review, and the item that review said
+// must be cleared BEFORE the first live write: Sonarr's real
+// PUT /api/v3/episode/monitor echo shape is unconfirmed by any live write of
+// ours, and an unrecognized shape was permanently fatal to EVERY season write
+// on the instance — every cycle, forever, with the season correctly left
+// monitored and nothing ever converging.
+//
+// The fix is evidence, not tolerance: on a NON-contradicted failure to confirm
+// (the echo could not be understood — as opposed to the server explicitly
+// saying an episode is still monitored), re-GET /api/v3/episode?seriesId=X and
+// let the fresh read settle it. This adds no write verb and no new endpoint:
+// it is the same read the write path already makes.
+
+// TestUnmonitorSeason_UnrecognizedEpisodeEcho_ReReadConfirmsAndTheWriteProceeds
+// is the case the debt was about: the write LANDED, only its echo was
+// unintelligible.
+func TestUnmonitorSeason_UnrecognizedEpisodeEcho_ReReadConfirmsAndTheWriteProceeds(t *testing.T) {
+	fake := newSonarrWriterFake(t, sonarrWriterSeriesJSON, sonarrWriterEpisodesJSON)
+	echo := `{"status":"ok"}` // a shape this project has never seen
+	fake.episodeMonitorEcho = &echo
+	after := `[
+		{"id": 100, "seriesId": 3, "seasonNumber": 1, "episodeNumber": 1, "monitored": false, "hasFile": true, "airDateUtc": "2015-01-01T00:00:00Z", "episodeFileId": 500},
+		{"id": 101, "seriesId": 3, "seasonNumber": 1, "episodeNumber": 2, "monitored": false, "hasFile": true, "airDateUtc": "2015-01-02T00:00:00Z", "episodeFileId": 501},
+		{"id": 200, "seriesId": 3, "seasonNumber": 2, "episodeNumber": 1, "monitored": true, "hasFile": true, "airDateUtc": "2016-01-01T00:00:00Z", "episodeFileId": 600}
+	]`
+	fake.episodesAfterMonitorWrite = &after
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	if err != nil {
+		t.Fatalf("unmonitorSeason returned error = %v, want nil (a read-only re-read confirms the episode write landed)\n%s", err, buf.String())
+	}
+	if !written {
+		t.Errorf("written = false, want true\n%s", buf.String())
+	}
+	var sawSeasonPUT bool
+	for _, w := range fake.writes() {
+		if w.method == http.MethodPut && w.path == "/api/v3/series/3" {
+			sawSeasonPUT = true
+		}
+	}
+	if !sawSeasonPUT {
+		t.Errorf("expected the season PUT to follow the re-read confirmation, got %+v", fake.writes())
+	}
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("proceeding on a re-read rather than on the echo must be stated in the log:\n%s", buf.String())
+	}
+}
+
+// TestUnmonitorSeason_UnrecognizedEpisodeEcho_ReReadStillMonitored_KeepsTheAbort
+// is the half that must NOT loosen: if the fresh read says an episode this
+// write named is still monitored, the write did not land, and the season PUT
+// stays withheld so the season remains monitored for the next cycle.
+func TestUnmonitorSeason_UnrecognizedEpisodeEcho_ReReadStillMonitored_KeepsTheAbort(t *testing.T) {
+	fake := newSonarrWriterFake(t, sonarrWriterSeriesJSON, sonarrWriterEpisodesJSON)
+	echo := `{"status":"ok"}`
+	fake.episodeMonitorEcho = &echo
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	if written {
+		t.Error("written = true, want false: nothing confirmed the episode write")
+	}
+	if !errors.Is(err, errEpisodeMonitorUnconfirmed) {
+		t.Fatalf("error = %v, want it to wrap errEpisodeMonitorUnconfirmed", err)
+	}
+	for _, w := range fake.writes() {
+		if w.path == "/api/v3/series/3" {
+			t.Errorf("the season PUT must not follow an unconfirmed episode write: %+v", fake.writes())
+		}
+	}
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("expected the abort to be warned about:\n%s", buf.String())
+	}
+}
+
+// TestUnmonitorSeason_ContradictedEpisodeEcho_DoesNotReRead keeps the
+// disambiguation narrow. A server that explicitly says "episode 100 is still
+// monitored" has ANSWERED the question; re-reading would be looking for a
+// second opinion on a confirmed failure, and a race that flipped the episode
+// between the two reads would turn the server's own "no" into a "yes".
+func TestUnmonitorSeason_ContradictedEpisodeEcho_DoesNotReRead(t *testing.T) {
+	fake := newSonarrWriterFake(t, sonarrWriterSeriesJSON, sonarrWriterEpisodesJSON)
+	echo := `[{"id":100,"seriesId":3,"monitored":true},{"id":101,"seriesId":3,"monitored":false}]`
+	fake.episodeMonitorEcho = &echo
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+
+	episodeGETsBefore := 0
+	written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+	if written {
+		t.Error("written = true, want false")
+	}
+	if !errors.Is(err, errEpisodeMonitorContradicted) {
+		t.Fatalf("error = %v, want it to wrap errEpisodeMonitorContradicted", err)
+	}
+	// Exactly one GET /api/v3/episode: the pre-write read. A second one would
+	// be the disambiguation running on a question the server already answered.
+	got := episodeGETsBefore
+	for _, r := range fake.all() {
+		if r.method == http.MethodGet && r.path == "/api/v3/episode" {
+			got++
+		}
+	}
+	if got != 1 {
+		t.Errorf("GET /api/v3/episode happened %d time(s), want exactly 1 (the pre-write read; a contradicted echo is never re-read):\n%s", got, buf.String())
+	}
+}
+
+// TestRunSonarrDecisionEngine_OnlyID_AlreadyUnmonitoredDebugIsScopedToo clears
+// the last of the Phase 7 branch review's DEFERRED DEBT: the "season already
+// unmonitored" debug fan-out was emitted for every series in the library even
+// on a run scoped to one, while the counter beside it was correctly scoped —
+// so a targeted run against a large library printed one line per
+// already-unmonitored season of every OTHER show, and the summary said
+// alreadyUnmonitored=<just the named series'>. The log and the counter now
+// agree.
+func TestRunSonarrDecisionEngine_OnlyID_AlreadyUnmonitoredDebugIsScopedToo(t *testing.T) {
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "]"
+	filesJSON := "[" + episodeFileJSON(500, 1, 200, false) + "]"
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	fake.seriesDetail[2] = sonarrWriteEngineSeriesDetail(2, "Named Show", 1, 1, true)
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+
+	series := []seriesElement{
+		// Both series have a monitored season (so neither takes the bulk
+		// "series has no monitored seasons" path) AND an unmonitored one.
+		testSeries(1, "Other Show", true, 1, []int{}, testSeason(1, true, 1, 1), testSeason(7, false, 1, 1)),
+		testSeries(2, "Named Show", true, 1, []int{}, testSeason(1, true, 1, 1), testSeason(9, false, 1, 1)),
+	}
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", onlyIDScope(2), true)
+
+	out := buf.String()
+	if n := strings.Count(out, `msg="season already unmonitored"`); n != 1 {
+		t.Errorf("expected exactly 1 already-unmonitored debug line (the named series'), got %d:\n%s", n, out)
+	}
+	if strings.Contains(out, `series="Other Show" season=7`) {
+		t.Errorf("a series outside the scope must not fan out per-season debug lines:\n%s", out)
+	}
+	if !strings.Contains(out, "alreadyUnmonitored=1") {
+		t.Errorf("the counter and the log must agree:\n%s", out)
+	}
+}
+
+// --- Phase 8: the shutdown boundary is the SEASON, never the HTTP call -----
+//
+// Binding controller note 4. unmonitorSeason is TWO writes, and interrupting
+// between them manufactures exactly the partial state the recovery path exists
+// to mop up: episodes unmonitored, season still monitored. The shutdown signal
+// is therefore checked BETWEEN ITEMS — a season either finishes both calls or
+// never starts the first.
+
+// sonarrTwoSeasonDecisions names both writable seasons of
+// twoWritableSeasonsSonarrFake as pending would-unmonitor writes.
+func sonarrTwoSeasonDecisions() []seasonDecision {
+	return []seasonDecision{
+		sonarrCandidateDecision(1, 1, true, []seasonCrossCheckEpisode{
+			{episodeID: 100, monitored: boolPtr(true), qualityCutoffNotMet: boolPtr(false)},
+		}),
+		sonarrCandidateDecision(1, 2, true, []seasonCrossCheckEpisode{
+			{episodeID: 200, monitored: boolPtr(true), qualityCutoffNotMet: boolPtr(false)},
+			{episodeID: 201, monitored: boolPtr(true), qualityCutoffNotMet: boolPtr(false)},
+		}),
+	}
+}
+
+// TestRunSonarrWritePass_ShutdownDuringAnInFlightSeason_FinishesBothCallsThenStops
+// is the pin note 4 asks for. Cancellation is delivered the instant the FIRST
+// season's episode write lands — the single worst moment, right between the two
+// calls of a pair — and the assertion is the invariant, not the timing: no
+// season may end up episode-written-but-series-unwritten.
+func TestRunSonarrWritePass_ShutdownDuringAnInFlightSeason_FinishesBothCallsThenStops(t *testing.T) {
+	fake := twoWritableSeasonsSonarrFake(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fake.onRequest = func(method, path string) {
+		if method == http.MethodPut && path == "/api/v3/episode/monitor" {
+			cancel() // shutdown, mid-pair
+		}
+	}
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 2, writeVerified: 2}
+
+	unmonitored, recovered, writeErrors, echoUnverified, refused, withheld := runSonarrWritePass(
+		ctx, logger, NewAPIClient(fake.srv.URL, "key"), fake.instance(), sonarrTwoSeasonDecisions(), cc, 0, false, false)
+
+	out := buf.String()
+	// The invariant. A season whose episodes were written but whose season flag
+	// was not is the exact partial state a mid-pair interruption creates.
+	if !fake.seasonMonitored(1, 1) {
+		// Season 1 completed: both halves must have landed.
+		if fake.episodeMonitored(100) {
+			t.Error("season 1 is unmonitored but its episode is not: the season PUT ran without its episode write")
+		}
+	} else if !fake.episodeMonitored(100) {
+		t.Error("season 1's episode was unmonitored but its season was not: the pair was interrupted mid-write")
+	}
+	// Season 2 was never started: the shutdown was already visible when the
+	// loop reached it.
+	if !fake.seasonMonitored(1, 2) || !fake.episodeMonitored(200) || !fake.episodeMonitored(201) {
+		t.Errorf("season 2 must not have been touched after the shutdown: %s", out)
+	}
+	if withheld != 1 {
+		t.Errorf("withheld = %d, want 1 (season 2): a shutdown must not make a pending write vanish from the accounting\n%s", withheld, out)
+	}
+	if total := unmonitored + recovered + writeErrors + echoUnverified + refused + withheld; total != 2 {
+		t.Errorf("the accounting identity must survive a shutdown: %d != 2 pending\n%s", total, out)
+	}
+	if !strings.Contains(out, "shutdown") {
+		t.Errorf("a pass cut short by shutdown must say so, or its zeros read as 'nothing needed doing':\n%s", out)
+	}
+}
+
+// TestRunWritePass_ShutdownBetweenMovies_WithholdsTheRestAndSaysSo is the
+// Radarr half of the same boundary. A movie is one call, so there is no pair to
+// protect — but the accounting and the explanation matter just as much.
+func TestRunWritePass_ShutdownBetweenMovies_WithholdsTheRestAndSaysSo(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		wouldUnmonitorStatefulMovie(1, "First"),
+		wouldUnmonitorStatefulMovie(2, "Second"),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var once sync.Once
+	fake.onRequest = func(method, path string) {
+		if method == http.MethodPut {
+			once.Do(cancel)
+		}
+	}
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 2, writeVerified: 2}
+	decisions := []movieDecision{
+		{id: 1, title: "First", wouldUnmonitor: true, reason: ReasonCutoffMet},
+		{id: 2, title: "Second", wouldUnmonitor: true, reason: ReasonCutoffMet},
+	}
+
+	unmonitored, writeErrors, echoUnverified, refused, withheld := runWritePass(
+		ctx, logger, NewAPIClient(fake.srv.URL, "key"), fake.instance(), decisions, cc, 0, false, false)
+
+	out := buf.String()
+	if unmonitored != 1 || withheld != 1 {
+		t.Errorf("unmonitored/withheld = %d/%d, want 1/1: the in-flight movie completes, the next one is withheld\n%s", unmonitored, withheld, out)
+	}
+	if total := unmonitored + writeErrors + echoUnverified + refused + withheld; total != 2 {
+		t.Errorf("the accounting identity must survive a shutdown: %d != 2 pending\n%s", total, out)
+	}
+	if !strings.Contains(out, "shutdown") {
+		t.Errorf("a pass cut short by shutdown must say so:\n%s", out)
 	}
 }

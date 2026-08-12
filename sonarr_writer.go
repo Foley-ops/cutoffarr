@@ -237,6 +237,15 @@ var errNotRecoveryAtWrite = errors.New("the season the recovery pass admitted st
 // Errors are returned, never retried (§2.6); the caller logs them and moves
 // to the next season.
 func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, seriesID, seasonNumber, exclusionTagID int, tagActive bool, dryRun bool, requireRecovery bool) (written bool, recovery bool, err error) {
+	// PHASE 8, the shutdown boundary (binding controller note 4). This is the
+	// function that boundary exists for: a season is TWO writes, and a
+	// cancellation landing between them leaves episodes unmonitored inside a
+	// season that is still monitored — the exact partial state the recovery
+	// path exists to mop up. Detaching from the shutdown cancellation makes the
+	// pair atomic with respect to shutdown; the signal is checked BETWEEN
+	// seasons instead, by the write pass, so a season either makes both calls
+	// or never makes the first. See unmonitorMovie for why this is bounded.
+	ctx = context.WithoutCancel(ctx)
 	path := seriesPath(seriesID)
 	subject := fmt.Sprintf("series %d season %d", seriesID, seasonNumber)
 
@@ -303,7 +312,10 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 	if !ok {
 		return false, false, fmt.Errorf("%s: fresh episode data could not be fetched before the write", subject)
 	}
-	seasonEpisodes := episodesOfSeason(logger, episodes, seasonNumber, attrs)
+	seasonEpisodes, err := episodesOfSeason(logger, episodes, seriesID, seasonNumber, subject, attrs)
+	if err != nil {
+		return false, false, err
+	}
 	if err := verifySeasonStillWritable(logger, targetSeason, seasonEpisodes, subject, attrs); err != nil {
 		return false, false, err
 	}
@@ -398,7 +410,7 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 			// left open. Aborting strands nothing: the season stays monitored,
 			// the next cycle re-reads /episode, and the retry is smaller by
 			// whatever really landed.
-			if err := putEpisodeMonitor(ctx, client, episodeIDs, subject); err != nil {
+			if err := putEpisodeMonitor(ctx, logger, client, inst, seriesID, episodeIDs, subject, attrs); err != nil {
 				logger.Warn("episode monitor write could not be confirmed; the season write is withheld and the season is left monitored so the next cycle can retry it",
 					append(append([]any(nil), attrs...), "episodeIds", len(episodeIDs), "error", err)...)
 				return false, recovery, err
@@ -457,7 +469,22 @@ func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient
 // operator saw an unexplained refusal repeat every cycle. Worse, a season
 // whose statistics happen to match absorbs the drop entirely and the guard
 // never fires at all.
-func episodesOfSeason(logger *slog.Logger, episodes []episodeElement, seasonNumber int, attrs []any) []episodeElement {
+//
+// It also enforces, at write time only, the provenance the READ path
+// deliberately does not (DEFERRED DEBT from the Phase 7 branch review, cleared
+// in Phase 8). belongsToSeries (sonarr.go) treats an ABSENT seriesId as
+// belonging, because at decision time "the key is missing" is not evidence of a
+// routing mistake and the count guards backstop a wholesale wrong-series
+// response. Here the consequence is different in kind: an episode of the target
+// season is about to have its id NAMED in PUT /api/v3/episode/monitor, so an
+// unprovenanced record would be written to on the strength of a ?seriesId=X
+// query nothing in the response corroborated. Every other unreadable
+// load-bearing field in this write path refuses; so does this one.
+//
+// The requirement is scoped to the episodes this write actually names. An
+// unprovenanced record sitting in some OTHER season is the read path's problem
+// (it warns there), not a veto over a season whose own episodes all check out.
+func episodesOfSeason(logger *slog.Logger, episodes []episodeElement, seriesID, seasonNumber int, subject string, attrs []any) ([]episodeElement, error) {
 	var out []episodeElement
 	for _, e := range episodes {
 		if e.SeasonNumber == nil {
@@ -468,9 +495,14 @@ func episodesOfSeason(logger *slog.Logger, episodes []episodeElement, seasonNumb
 		if *e.SeasonNumber != seasonNumber {
 			continue
 		}
+		if e.SeriesID == nil || *e.SeriesID != seriesID {
+			logger.Warn("an episode of this season does not state that it belongs to this series in the pre-write fetch; it cannot be named in the episode monitor write, refusing to write",
+				append(append([]any(nil), attrs...), "episodeId", derefOrAbsent(e.ID), "recordSeriesId", derefOrAbsent(e.SeriesID))...)
+			return nil, fmt.Errorf("%s: %w: an episode of this season has an absent or mismatched seriesId in the pre-write fetch", subject, errSeasonUnverifiableAtWrite)
+		}
 		out = append(out, e)
 	}
-	return out
+	return out, nil
 }
 
 // locateTargetSeason finds the target season inside the fresh payload's
@@ -692,7 +724,7 @@ func assembleSeasonWrite(payload map[string]json.RawMessage, seasonElems []json.
 // run is most likely to hit (Sonarr's real /episode/monitor echo shape is
 // unconfirmed by any live write) and it is the one a human has to be able to
 // diagnose from the log alone.
-func putEpisodeMonitor(ctx context.Context, client *APIClient, episodeIDs []int, subject string) error {
+func putEpisodeMonitor(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, seriesID int, episodeIDs []int, subject string, attrs []any) error {
 	body, err := json.Marshal(episodeMonitorRequest{EpisodeIDs: episodeIDs, Monitored: false})
 	if err != nil {
 		return fmt.Errorf("%s: encoding the episode monitor request: %w", subject, err)
@@ -706,14 +738,79 @@ func putEpisodeMonitor(ctx context.Context, client *APIClient, episodeIDs []int,
 
 	echo, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 	if err != nil {
-		return fmt.Errorf("%s: the episode monitor write returned %d but its body could not be read (%w): %v", subject, resp.StatusCode, errEpisodeMonitorUnconfirmed, err)
+		unconfirmed := fmt.Errorf("%s: the episode monitor write returned %d but its body could not be read (%w): %v", subject, resp.StatusCode, errEpisodeMonitorUnconfirmed, err)
+		return confirmEpisodeMonitorByReRead(ctx, logger, client, inst, seriesID, episodeIDs, subject, attrs, unconfirmed)
 	}
 	if err := verifyEpisodeMonitorEcho(echo, episodeIDs); err != nil {
 		if errors.Is(err, errEpisodeMonitorContradicted) {
+			// NOT re-read, deliberately. The server did not fail to answer the
+			// question — it answered it, with "that episode is still
+			// monitored". Re-reading here would be shopping for a second
+			// opinion on a confirmed failure, and a race that flipped the
+			// episode between the echo and the re-read would convert the
+			// server's own "no" into a "yes".
 			return fmt.Errorf("%s: the episode monitor write returned %d but %w", subject, resp.StatusCode, err)
 		}
-		return fmt.Errorf("%s: the episode monitor write returned %d but %v (%w)", subject, resp.StatusCode, err, errEpisodeMonitorUnconfirmed)
+		unconfirmed := fmt.Errorf("%s: the episode monitor write returned %d but %v (%w)", subject, resp.StatusCode, err, errEpisodeMonitorUnconfirmed)
+		return confirmEpisodeMonitorByReRead(ctx, logger, client, inst, seriesID, episodeIDs, subject, attrs, unconfirmed)
 	}
+	return nil
+}
+
+// confirmEpisodeMonitorByReRead is the read-only disambiguation of an episode
+// write the ECHO could not confirm (DEFERRED DEBT from the Phase 7 branch
+// review, cleared in Phase 8 before any live write).
+//
+// The problem it solves is specific and was going to bite on the very first
+// live run: Sonarr's real PUT /api/v3/episode/monitor echo shape is unconfirmed
+// by any live write of ours, and an unrecognized shape made the episode half
+// permanently unconfirmable — every season write on that instance aborted,
+// every cycle, forever. Correct (nothing is stranded, the season stays
+// monitored) but never converging, and indistinguishable in the log from a
+// server that keeps rejecting the write.
+//
+// The answer is more evidence, not more tolerance: GET /api/v3/episode
+// ?seriesId=X — the same read this write path already makes, no new endpoint
+// and no new verb — and require it to say, of EVERY episode this write named,
+// that it exists, states this series as its own, and is now monitored: false.
+// Anything less keeps the original abort, wrapped with what the re-read said.
+//
+// Only reached on a NON-contradicted failure. See putEpisodeMonitor for why a
+// contradicted echo is never re-read.
+func confirmEpisodeMonitorByReRead(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, seriesID int, episodeIDs []int, subject string, attrs []any, unconfirmed error) error {
+	logger.Info("the episode monitor response could not confirm the write; re-reading the season's episodes to settle whether it landed",
+		append(append([]any(nil), attrs...), "episodeIds", len(episodeIDs), "error", unconfirmed)...)
+
+	episodes, ok := fetchEpisodes(ctx, logger, client, inst, seriesID)
+	if !ok {
+		return fmt.Errorf("%s: the read-only re-read of this series' episodes also failed, so the episode write remains unconfirmed: %w", subject, unconfirmed)
+	}
+
+	byID := make(map[int]episodeElement, len(episodes))
+	for _, e := range episodes {
+		if e.ID != nil {
+			byID[*e.ID] = e
+		}
+	}
+	for _, id := range episodeIDs {
+		e, found := byID[id]
+		switch {
+		case !found:
+			return fmt.Errorf("%s: the re-read does not mention episode %d, so the episode write remains unconfirmed: %w", subject, id, unconfirmed)
+		case e.SeriesID == nil || *e.SeriesID != seriesID:
+			// Same write-time provenance rule episodesOfSeason applies: a
+			// record that does not state this series cannot be evidence about
+			// this series' write.
+			return fmt.Errorf("%s: the re-read's episode %d does not state that it belongs to this series, so the episode write remains unconfirmed: %w", subject, id, unconfirmed)
+		case e.Monitored == nil:
+			return fmt.Errorf("%s: the re-read does not say whether episode %d is monitored, so the episode write remains unconfirmed: %w", subject, id, unconfirmed)
+		case *e.Monitored:
+			return fmt.Errorf("%s: the re-read says episode %d is still monitored, so the episode write did not land: %w", subject, id, unconfirmed)
+		}
+	}
+
+	logger.Warn("the episode monitor response could not be recognized, but a read-only re-read confirms every episode this write named is now unmonitored; treating the episode write as confirmed",
+		append(append([]any(nil), attrs...), "episodeIds", len(episodeIDs), "echoError", unconfirmed)...)
 	return nil
 }
 
@@ -899,6 +996,17 @@ func recoveryCandidate(d seasonDecision) bool {
 	if len(d.crossCheckEpisodes) == 0 {
 		return false
 	}
+	// An episode set that lost an episode on the way in (one with no id —
+	// buildSeasonCrossCheckEpisodes) cannot establish "every episode of this
+	// season is already unmonitored": the dropped episode is precisely the one
+	// that might still be monitored, and it is unnameable, so a write could not
+	// have unmonitored it either. Cleared DEFERRED DEBT from the Phase 7 branch
+	// review; the write-time recovery verdict (unmonitorSeason, from fresh
+	// data) remains the backstop, and this keeps the filter from ever handing
+	// it a season on evidence that was never complete.
+	if !d.crossCheckEpisodesComplete {
+		return false
+	}
 	for _, ep := range d.crossCheckEpisodes {
 		if ep.monitored == nil || *ep.monitored {
 			return false
@@ -1061,8 +1169,26 @@ func runSonarrWritePass(ctx context.Context, logger *slog.Logger, client *APICli
 		logger.Warn(msg, attrs...)
 	}
 
+	shutdownNoted := false
 	for _, d := range decisions {
 		if !d.wouldUnmonitor {
+			continue
+		}
+
+		// PHASE 8: the shutdown boundary, and the reason it is drawn HERE
+		// rather than inside the write (binding controller note 4). A season is
+		// two calls; unmonitorSeason detaches both from this cancellation so an
+		// in-flight season finishes the pair, and this check is what stops the
+		// NEXT one from starting. Interrupting mid-pair would manufacture
+		// exactly the episode-written-season-unwritten state the recovery path
+		// exists to mop up.
+		if ctx.Err() != nil {
+			withheld++
+			if !shutdownNoted {
+				shutdownNoted = true
+				logger.Info("shutdown requested: the remaining pending season writes for this instance are withheld and the next cycle will revisit them",
+					"instance", inst.Name, "type", inst.Type, "dryRun", dryRun)
+			}
 			continue
 		}
 

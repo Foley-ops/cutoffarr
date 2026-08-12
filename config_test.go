@@ -544,3 +544,38 @@ func TestConfig_RedactedHidesAPIKeys(t *testing.T) {
 		t.Errorf("Redacted() mutated the original config's APIKey")
 	}
 }
+
+// TestLoadConfig_NegativeWebhookDebounce_IsFatal closes the last unvalidated
+// duration in the config. Phase 8 made webhook_debounce load-bearing: it is the
+// only thing bounding how many full instance scans a burst of webhooks costs,
+// and a negative value would put every key's deadline in the past — turning a
+// 24-episode season pack into 24 full library evaluations, which is precisely
+// the behavior the debounce exists to prevent. Zero is still allowed, and means
+// "evaluate as soon as the loop sees it".
+func TestLoadConfig_NegativeWebhookDebounce_IsFatal(t *testing.T) {
+	path := writeConfig(t, `
+webhook_debounce: -5s
+instances: []
+`)
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("expected a negative webhook_debounce to be fatal")
+	}
+	if !strings.Contains(err.Error(), "webhook_debounce") {
+		t.Errorf("the error must name the field: %v", err)
+	}
+}
+
+func TestLoadConfig_ZeroWebhookDebounce_IsAllowed(t *testing.T) {
+	path := writeConfig(t, `
+webhook_debounce: 0s
+instances: []
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("zero is a legitimate choice (no debounce), got %v", err)
+	}
+	if cfg.WebhookDebounce != 0 {
+		t.Errorf("WebhookDebounce = %v, want 0", cfg.WebhookDebounce)
+	}
+}

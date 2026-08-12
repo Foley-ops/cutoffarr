@@ -115,6 +115,17 @@ type tagElement struct {
 // warned about (they may be the first sign of a /tag shape this code no longer
 // understands); they are fatal only in combination with a label that was not
 // found, which is the one case where the honest answer is "unknowable".
+//
+// PHASE 8 NOTE ON THE LOGGER: this function is called with the engine's
+// UNDEMOTED logger, unlike its neighbours in the read path, and the one line
+// that distinguishes the two is the "not defined in this instance" INFO below.
+// It is a statement about this program's safety posture rather than about the
+// library — §2.5's exclusion tag is the user's only opt-out from being
+// unmonitored, and this line says that opt-out is currently inert — so it is
+// exempt from the idle-cycle noise budget, which exists to suppress per-item
+// report lines that scale with the library. This one is at most one line per
+// instance per cycle. Every other line here is a WARN, which the demotion never
+// touched anyway, so the undemoted logger changes nothing else.
 func resolveExclusionTagID(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, label string) (id int, found bool, ok bool) {
 	body, err := fetchBody(ctx, client, "/api/v3/tag", nil)
 	if err != nil {
@@ -424,11 +435,15 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 // complete picture and approved it, which is impossible if writes are
 // interleaved with the evaluation that produces the cross-check's input.
 //
-// onlyID (the --only-id flag, 0 when absent) narrows what is REPORTED and
-// WRITTEN to the single movie with that id. It deliberately does not narrow
-// what is evaluated: the cross-check validates the data the decision rests
-// on, not the target, so it still samples the whole library (see
-// runWritePass and the plan's Phase 4 acceptance criteria).
+// scope (see scope.go) narrows what is REPORTED and WRITTEN to the movie ids
+// it names — one, from --only-id, or the coalesced set of a debounced webhook
+// cycle — and sets the level of the per-item report lines. It deliberately does
+// not narrow what is EVALUATED: the cross-check validates the data the decision
+// rests on, not the target, so it still samples the whole library (see
+// runWritePass and the plan's Phase 4 acceptance criteria). That is why a
+// webhook event costs a full instance scan, which the per-item debounce
+// (webhook_debounce) is what bounds — the binding full-evidence ruling for
+// Phase 8, with no reduced-evidence path anywhere.
 //
 // It is called only for a radarr instance whose connectivity check and
 // inspectRadarrLibrary fetch both already succeeded (main.go's
@@ -436,8 +451,15 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 // checkInstanceConnectivity and inspectRadarrLibrary, the binding
 // error-handling rule (§2.6) is "skip that instance for the cycle and log a
 // warning" with no further work for a caller to gate on.
-func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, movies []movieListElement, wantedIDs map[int]bool, exclusionTagLabel string, onlyID int, dryRun bool) {
+func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, movies []movieListElement, wantedIDs map[int]bool, exclusionTagLabel string, scope evalScope, dryRun bool) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	// The per-cycle-repetition logger (see demoteInfoTo): the profile fetch,
+	// the exclusion-tag resolution and the cross-check's per-sample lines are
+	// all news exactly once, and this engine runs forever in daemon mode. It is
+	// the same logger on a --once run or a startup scan, where the level is
+	// INFO and demoteInfoTo is a no-op.
+	cycleLogger := demoteInfoTo(logger, scope.itemLevel)
 
 	// An --only-id naming a movie this instance's library does not contain
 	// is checked before anything else is fetched: there is nothing to decide
@@ -454,17 +476,35 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// function could detect it. run() refuses ambiguous --only-id runs up
 	// front, before any instance is contacted, by requiring --instance when
 	// more than one radarr is in scope.
-	if onlyID != 0 && !libraryContainsID(movies, onlyID) {
-		logger.Warn("--only-id movie not found in this instance's library; no decisions for this instance",
-			"instance", inst.Name, "type", inst.Type, "onlyId", onlyID)
-		return
+	//
+	// Phase 8 generalized the single id to a SET (see scope.go): a coalesced
+	// webhook cycle can name several movies of one instance at once. "Not
+	// found" is therefore per id — each missing one is named — and only a scope
+	// with NOTHING left in this library ends the instance's cycle, since the
+	// remaining ids still have real work to do.
+	if scope.active() {
+		missing := scope.missing(func(id int) bool { return libraryContainsID(movies, id) })
+		if len(missing) == len(scope.ids) {
+			attrs := []any{"instance", inst.Name, "type", inst.Type}
+			logger.Warn(scope.origin+" movie not found in this instance's library; no decisions for this instance",
+				append(attrs, scope.summaryAttrs()...)...)
+			return
+		}
+		for _, id := range missing {
+			logger.Warn(scope.origin+" movie not found in this instance's library; it produces no decision",
+				"instance", inst.Name, "type", inst.Type, "movieId", id)
+		}
 	}
 
-	profiles, ok := fetchQualityProfiles(ctx, logger, client, inst)
+	profiles, ok := fetchQualityProfiles(ctx, cycleLogger, client, inst)
 	if !ok {
 		return
 	}
 
+	// The UNDEMOTED logger, deliberately, and the only read-path call that gets
+	// it: see resolveExclusionTagID's own note. Its "not defined in this
+	// instance" line states that §2.5's opt-out is inert here, which stays at
+	// INFO on every cycle forever.
 	exclusionTagID, tagActive, ok := resolveExclusionTagID(ctx, logger, client, inst, exclusionTagLabel)
 	if !ok {
 		return
@@ -482,6 +522,20 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	skipCounts := make(map[string]int)
 
 	for _, m := range movies {
+		// PHASE 8: shutdown, checked between items here too — but with a
+		// different ending than the write pass's. A cycle interrupted
+		// mid-evaluation has an INCOMPLETE picture, and acting on a partial
+		// evaluation is precisely what §2.6 forbids: the cross-check would
+		// sample a truncated candidate pool and the write pass would act on it.
+		// So the instance's cycle is abandoned outright — no cross-check, no
+		// write pass, no summary that would describe a fraction of a library as
+		// if it were the library. The next startup scan re-reads everything.
+		if ctx.Err() != nil {
+			logger.Info("shutdown requested: abandoning this instance's cycle mid-evaluation; a partial evaluation is never cross-checked or written",
+				"instance", inst.Name, "type", inst.Type, "evaluated", len(decisions), "libraryTotal", len(movies))
+			return
+		}
+
 		// FIX 6 (controller-mandated correction after the initial Phase 3
 		// review): "monitored" entirely absent from the JSON (as opposed
 		// to present with monitored: false, a legitimate common value) is
@@ -526,8 +580,8 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 			// debug line and the counter make a second, no-op run of this
 			// project provable rather than merely quiet.
 			//
-			// REVIEW FIX (Phase 5 round 2): the onlyID scope test mirrors
-			// the one the --only-id narrowing block below applies to every
+			// REVIEW FIX (Phase 5 round 2): the scope test mirrors
+			// the one the narrowing block below applies to every
 			// other counter (totalMonitored, wouldUnmonitor, unmonitored).
 			// Without it, this counter and its debug line were populated
 			// library-wide even during a --only-id run — the summary's one
@@ -535,7 +589,16 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 			// and a targeted run against a large library would additionally
 			// emit one debug line per already-unmonitored movie in the
 			// entire library, not just the target.
-			if onlyID == 0 || (m.ID != nil && *m.ID == onlyID) {
+			// !scope.active() first, and not merely scope.contains(*m.ID):
+			// an INACTIVE scope contains everything including a movie whose id
+			// was never observed, while a scoped run cannot show an
+			// unidentifiable movie to be the one it names. Folding the two into
+			// `m.ID != nil && scope.contains(...)` silently stopped counting a
+			// monitored:false movie with no id on UNSCOPED runs — the summary's
+			// alreadyUnmonitored is one of the numbers a human reads to decide a
+			// no-op cycle really was a no-op, so nothing may drop out of it
+			// unannounced.
+			if !scope.active() || (m.ID != nil && scope.contains(*m.ID)) {
 				alreadyUnmonitoredCount++
 				logger.Debug("already unmonitored",
 					"id", derefOrAbsent(m.ID), "title", titleOrAbsent(m.Title), "instance", inst.Name)
@@ -558,19 +621,23 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		// --only-id scoping happens here and nowhere else: every movie is
 		// still evaluated above (the cross-check needs the full candidate
 		// pools), but only the named movie is reported, counted, or written.
-		if onlyID != 0 && d.id != onlyID {
+		if !scope.contains(d.id) {
 			continue
 		}
 		reported = append(reported, d)
 		totalMonitored++
 
+		// scope.itemLevel, not Info: these two lines are the report on a
+		// --once run and pure repetition on the hundredth idle reconciliation
+		// sweep of a daemon (binding controller note 6). Summaries, warnings
+		// and write lines are never demoted.
 		if d.wouldUnmonitor {
 			wouldUnmonitorCount++
-			logger.Info("would-unmonitor",
+			logger.Log(ctx, scope.itemLevel, "would-unmonitor",
 				"id", d.id, "title", d.title, "reason", d.reason, "profile", d.profileName, "instance", inst.Name)
 		} else {
 			skipCounts[d.reason]++
-			logger.Info("skip",
+			logger.Log(ctx, scope.itemLevel, "skip",
 				"id", d.id, "title", d.title, "reason", d.reason, "profile", d.profileName, "instance", inst.Name)
 		}
 	}
@@ -583,20 +650,18 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// that cannot be the explanation. Without this line, --only-id on such a
 	// movie would say nothing whatsoever about the one movie the human
 	// explicitly named.
-	if onlyID != 0 && len(reported) == 0 {
-		logger.Info("--only-id movie produced no decision: it is not monitored, so rule 1 excludes it from the report",
-			"instance", inst.Name, "type", inst.Type, "onlyId", onlyID)
+	if scope.active() && len(reported) == 0 {
+		logger.Info(scope.origin+" movie produced no decision: it is not monitored, so rule 1 excludes it from the report",
+			append([]any{"instance", inst.Name, "type", inst.Type}, scope.summaryAttrs()...)...)
 	}
 
-	cc := runCrossCheck(logger, inst, decisions, wantedIDs)
+	cc := runCrossCheck(cycleLogger, inst, decisions, wantedIDs)
 	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
 
 	unmonitoredCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount := runWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun)
 
 	attrs := []any{"instance", inst.Name, "type", inst.Type}
-	if onlyID != 0 {
-		attrs = append(attrs, "onlyId", onlyID)
-	}
+	attrs = append(attrs, scope.summaryAttrs()...)
 	attrs = append(attrs, "totalMonitored", totalMonitored, "wouldUnmonitor", wouldUnmonitorCount, "unmonitored", unmonitoredCount, "alreadyUnmonitored", alreadyUnmonitoredCount)
 
 	// writeErrors counts failed WRITES, so in dry-run it is unconditionally
@@ -823,8 +888,25 @@ func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, i
 		logger.Warn(msg, attrs...)
 	}
 
+	shutdownNoted := false
 	for _, d := range decisions {
 		if !d.wouldUnmonitor {
+			continue
+		}
+
+		// PHASE 8: the shutdown boundary, checked BETWEEN items and nowhere
+		// else (binding controller note 4). unmonitorMovie detaches its own
+		// requests from this cancellation, so an item already under way
+		// finishes; everything after it is withheld, counted as such, and said
+		// out loud once — a pass that stops early must never look like a pass
+		// that found nothing to do.
+		if ctx.Err() != nil {
+			withheld++
+			if !shutdownNoted {
+				shutdownNoted = true
+				logger.Info("shutdown requested: the remaining pending writes for this instance are withheld and the next cycle will revisit them",
+					"instance", inst.Name, "type", inst.Type, "dryRun", dryRun)
+			}
 			continue
 		}
 
@@ -1257,9 +1339,12 @@ func selectMovieFile(files []movieFileDetail, wantID *int) (movieFileDetail, boo
 // driven sequence than the plan's rule numbering.
 //
 // Never at the series level: unmonitoring only ever happens to a season (and
-// implicitly its episodes); no code path in this engine composes a
-// series-level monitored write, and there is no Sonarr write path in this
-// phase at all (Phase 7).
+// implicitly its episodes). No code path in this engine composes a
+// series-level monitored write, and the Sonarr write path added in Phase 7
+// (sonarr_writer.go, called from runSonarrDecisionEngine below) enforces the
+// same thing from the other side: it READS the series-level monitored flag as
+// a race guard and assembleSeasonWrite refuses to emit a payload whose
+// series-level monitored differs from the fresh GET.
 
 // seasonDecision is the outcome of evaluating one monitored season against
 // the Sonarr season decision rule.
@@ -1309,6 +1394,16 @@ type seasonDecision struct {
 	// needed for the same season.
 	rawEpisodesForCrossCheck []episodeElement
 
+	// crossCheckEpisodesComplete says whether crossCheckEpisodes describes
+	// EVERY episode of the season or lost one on the way in (an episode with
+	// no id, which cannot be joined to anything — see
+	// buildSeasonCrossCheckEpisodes). It exists for exactly one consumer:
+	// recoveryCandidate, whose whole question is "is every episode of this
+	// season already unmonitored?", which an incomplete set cannot answer in
+	// the safe direction. It is false for a season whose set was never built
+	// at all, which is the same conservative answer.
+	crossCheckEpisodesComplete bool
+
 	// cfThreshold is populated once the series' profile is resolved (the
 	// series-level profile check passed, or failed only on upgradeAllowed —
 	// mirrors evaluateMovie's own asymmetry, where cfThreshold is set before
@@ -1346,10 +1441,34 @@ type seasonCrossCheckEpisode struct {
 // own rule-7 candidate path, whose /episodefile fetch already happened
 // during evaluation, and runSonarrCrossCheck's on-demand fetch for sampled
 // skip-side seasons that never reached rule 7 at all.
-func buildSeasonCrossCheckEpisodes(episodes []episodeElement, filesByID map[int]episodeFileElement) []seasonCrossCheckEpisode {
-	var out []seasonCrossCheckEpisode
+//
+// An episode with no id cannot be joined to anything (wanted-set membership is
+// looked up BY id) and is dropped. Two things changed about that drop in Phase
+// 8, clearing DEFERRED DEBT from the Phase 7 branch review:
+//
+//   - It WARNs, naming the season, exactly as every other structurally
+//     identical drop in this engine does (episodesOfSeason's missing
+//     seasonNumber, the episode-file missing seasonNumber). It used to be
+//     silent, so a season quietly missing an episode from every piece of
+//     evidence about it looked identical to a season that had none.
+//   - It is REPORTED, via the second return value. The set's one dangerous
+//     consumer is recoveryCandidate, which asks "is EVERY episode of this
+//     season already unmonitored?" — a question no incomplete set can answer,
+//     because the dropped episode is precisely the one that might still be
+//     monitored. complete=false makes that unanswerable rather than
+//     accidentally answered "yes".
+//
+// The cross-check's own use of the set is unaffected either way: it compares
+// whatever episodes it can see and counts the rest as unverifiable, which is
+// already the conservative direction.
+func buildSeasonCrossCheckEpisodes(logger *slog.Logger, inst Instance, seriesID, seasonNumber int, episodes []episodeElement, filesByID map[int]episodeFileElement) (out []seasonCrossCheckEpisode, complete bool) {
+	complete = true
 	for _, e := range episodes {
 		if e.ID == nil {
+			complete = false
+			logger.Warn("episode of this season has no id; it cannot be joined to its file or to the wanted set, so this season's episode evidence is incomplete",
+				"instance", inst.Name, "type", inst.Type, "seriesId", seriesID, "season", seasonNumber,
+				"episodeNumber", derefOrAbsent(e.EpisodeNumber))
 			continue
 		}
 		var qcnm *bool
@@ -1360,7 +1479,7 @@ func buildSeasonCrossCheckEpisodes(episodes []episodeElement, filesByID map[int]
 		}
 		out = append(out, seasonCrossCheckEpisode{episodeID: *e.ID, monitored: e.Monitored, qualityCutoffNotMet: qcnm})
 	}
-	return out
+	return out, complete
 }
 
 // seriesEvaluation is evaluateSeries's full result for one series: the
@@ -1373,6 +1492,19 @@ type seriesEvaluation struct {
 	// alreadyUnmonitoredCount, scoped to a single series here so the caller
 	// can sum it across the whole library.
 	alreadyUnmonitored int
+
+	// unmonitoredSeasons are those same seasons, handed back for the CALLER to
+	// log one line each — but only when reporting them individually is what the
+	// noise budget calls for. It is empty for a series with zero monitored
+	// seasons, where the binding rule is a single bulk debug line instead.
+	//
+	// The list exists so the fan-out can be scoped, which is the whole point:
+	// evaluateSeries has no idea whether this series is in the report's scope
+	// (--only-id names one, a webhook cycle names a set), and it used to emit
+	// one line per unmonitored season of EVERY series in the library regardless
+	// — the one place the Sonarr engine's logging diverged from its own,
+	// correctly-scoped counters.
+	unmonitoredSeasons []seriesSeasonElement
 }
 
 // episodeAiringStatus reports whether an episode's airDateUtc is in the past
@@ -1511,16 +1643,23 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 			logger.Warn("monitored series produced no season decisions: no seasons, or none had a usable monitored/seasonNumber field",
 				"instance", inst.Name, "type", inst.Type, "seriesId", seriesID, "series", seriesTitle)
 		}
+		// unmonitoredSeasons is deliberately left EMPTY on this path: the
+		// binding noise-budget rule for a series with zero monitored seasons is
+		// one bulk debug line (just logged above), never one line per season.
 		return seriesEvaluation{alreadyUnmonitored: len(explicitlyUnmonitored)}
 	}
 
-	// The complementary case: at least one season IS monitored, so the
-	// individual "already unmonitored" debug lines for the OTHER seasons are
-	// exactly as informative as Radarr's per-movie equivalent, not spam.
-	for _, season := range explicitlyUnmonitored {
-		logger.Debug("season already unmonitored",
-			"instance", inst.Name, "type", inst.Type, "seriesId", seriesID, "series", seriesTitle, "season", derefOrAbsent(season.SeasonNumber))
-	}
+	// The complementary case — at least one season IS monitored, so the
+	// individual "already unmonitored" lines for the OTHER seasons are exactly
+	// as informative as Radarr's per-movie equivalent rather than spam — is
+	// REPORTED BY THE CALLER, not logged here (DEFERRED DEBT from the Phase 7
+	// branch review, cleared in Phase 8). This function used to emit the fan-out
+	// itself, for every series in the library, even on a run scoped to one
+	// series: the counter beside it was correctly scoped, so only the log
+	// diverged, and it diverged from the Radarr precedent (decision.go's
+	// alreadyUnmonitoredCount branch) that was deliberately fixed the same way.
+	// Handing the seasons back instead of logging them puts the reporting
+	// decision where the scope is known.
 
 	// Series-level cheap checks (binding evaluation-order resolution):
 	// profile display-name resolution happens eagerly (mirrors evaluateMovie
@@ -1567,7 +1706,7 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 				reason: seriesLevelReason, profileName: profileName, cfThreshold: threshold,
 			})
 		}
-		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored)}
+		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored), unmonitoredSeasons: explicitlyUnmonitored}
 	}
 
 	// The series survived every series-level check: exactly one
@@ -1582,7 +1721,7 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 				reason: ReasonSeasonEpisodesUnavailable, profileName: profileName, cfThreshold: profile.CutoffFormatScore,
 			})
 		}
-		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored)}
+		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored), unmonitoredSeasons: explicitlyUnmonitored}
 	}
 
 	episodesBySeason := make(map[int][]episodeElement, len(monitoredSeasons))
@@ -1743,7 +1882,7 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 	}
 
 	if len(candidateSeasons) == 0 {
-		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored)}
+		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored), unmonitoredSeasons: explicitlyUnmonitored}
 	}
 
 	// The most expensive fetch, made at most once per series, and only for
@@ -1774,7 +1913,7 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 			// read side.
 			decisions[candidateIndex[sn]].completeOnDisk = false
 		}
-		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored)}
+		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored), unmonitoredSeasons: explicitlyUnmonitored}
 	}
 
 	filesBySeason := make(map[int][]episodeFileElement)
@@ -1817,7 +1956,7 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 		// cross-check data at all: unverifiable by construction, consuming a
 		// sample slot and adding a WARN, even though BOTH halves of the join
 		// it needed were already in scope and cost nothing more to build.
-		decisions[idx].crossCheckEpisodes = buildSeasonCrossCheckEpisodes(seasonEpisodesFor[sn], filesByID)
+		decisions[idx].crossCheckEpisodes, decisions[idx].crossCheckEpisodesComplete = buildSeasonCrossCheckEpisodes(logger, inst, seriesID, sn, seasonEpisodesFor[sn], filesByID)
 
 		// Binding controller resolution #3: fewer files than statistics
 		// claimed is untrusted, not "some files are just missing".
@@ -1857,7 +1996,7 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 		}
 	}
 
-	return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored)}
+	return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored), unmonitoredSeasons: explicitlyUnmonitored}
 }
 
 // runSonarrDecisionEngine is the entry point for a single sonarr instance.
@@ -1873,18 +2012,36 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 //  3. WRITE (Phase 7) — but only if the cross-check's evidence authorizes it
 //     (runSonarrWritePass, gated by the shared writeGateBlockReason).
 //
-// onlyID (the --only-id flag, 0 when absent) is a SERIES id here, and narrows
-// what is REPORTED and WRITTEN to that one series' seasons. It deliberately
-// does not narrow what is EVALUATED: the cross-check validates the data the
-// decisions rest on, not the target, so it still samples the whole library —
-// the same split the Radarr engine makes, for the same reason.
+// scope (see scope.go) names SERIES ids here, and narrows what is REPORTED and
+// WRITTEN to those series' seasons — one series from --only-id, or the
+// coalesced set of a debounced webhook cycle. It deliberately does not narrow
+// what is EVALUATED: the cross-check validates the data the decisions rest on,
+// not the target, so it still samples the whole library — the same split the
+// Radarr engine makes, for the same reason, and the same full-instance cost per
+// webhook event that the debounce bounds.
+//
+// Note the granularity, which is the plan's own: a webhook evaluates "that
+// series' AFFECTED SEASON", so when the payload's episodes named their seasons
+// (binding controller resolution 2), scope.seasons narrows the report and the
+// write set to exactly those. An import of season 2 does not authorize a write
+// to season 1 of the same show, even though season 1 may well be eligible and
+// the next reconciliation sweep will say so — writes stay no wider than the
+// event that asked for them.
+//
+// Where no season was named — --only-id, or a payload whose episodes array was
+// absent or empty — the scope covers every eligible season of the series, which
+// is the mandated behavior for that case and unchanged from --only-id's.
 //
 // Like checkInstanceConnectivity, inspectSonarrLibrary, and
 // runRadarrDecisionEngine, it never returns anything: the binding
 // error-handling rule (§2.6) is "skip that instance for the cycle and log a
 // warning", with no further work for a caller to gate on.
-func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, series []seriesElement, wantedEpisodeIDs map[int]bool, wantedSeasons map[seasonKey]bool, exclusionTagLabel string, onlyID int, dryRun bool) {
+func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, series []seriesElement, wantedEpisodeIDs map[int]bool, wantedSeasons map[seasonKey]bool, exclusionTagLabel string, scope evalScope, dryRun bool) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	// See the Radarr twin: the once-per-cycle informational reads log through
+	// a logger that demotes INFO to this cycle's report level.
+	cycleLogger := demoteInfoTo(logger, scope.itemLevel)
 
 	// An --only-id naming a series this instance's library does not contain is
 	// checked before anything else is fetched: there is nothing to decide or
@@ -1895,17 +2052,33 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// including what it does NOT guard: series ids are per-instance, so an id
 	// aimed at the wrong sonarr is a MATCH here, not a miss — run() refuses
 	// ambiguous --only-id runs up front instead.
-	if onlyID != 0 && !seriesLibraryContainsID(series, onlyID) {
-		logger.Warn("--only-id series not found in this instance's library; no decisions for this instance",
-			"instance", inst.Name, "type", inst.Type, "onlyId", onlyID)
-		return
+	// Phase 8: a SET of ids, for the same reason the Radarr engine takes one
+	// (see scope.go and its twin above) — a coalesced webhook cycle can name
+	// several series of one instance at once. Only a scope with nothing left in
+	// this library ends the instance's cycle.
+	if scope.active() {
+		missing := scope.missing(func(id int) bool { return seriesLibraryContainsID(series, id) })
+		if len(missing) == len(scope.ids) {
+			attrs := []any{"instance", inst.Name, "type", inst.Type}
+			logger.Warn(scope.origin+" series not found in this instance's library; no decisions for this instance",
+				append(attrs, scope.summaryAttrs()...)...)
+			return
+		}
+		for _, id := range missing {
+			logger.Warn(scope.origin+" series not found in this instance's library; it produces no decision",
+				"instance", inst.Name, "type", inst.Type, "seriesId", id)
+		}
 	}
 
-	profiles, ok := fetchQualityProfiles(ctx, logger, client, inst)
+	profiles, ok := fetchQualityProfiles(ctx, cycleLogger, client, inst)
 	if !ok {
 		return
 	}
 
+	// The UNDEMOTED logger, deliberately, and the only read-path call that gets
+	// it: see resolveExclusionTagID's own note. Its "not defined in this
+	// instance" line states that §2.5's opt-out is inert here, which stays at
+	// INFO on every cycle forever.
 	exclusionTagID, tagActive, ok := resolveExclusionTagID(ctx, logger, client, inst, exclusionTagLabel)
 	if !ok {
 		return
@@ -1918,12 +2091,31 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	var allDecisions []seasonDecision
 	var reported []seasonDecision
 	totalSeriesMonitored := 0
+	// seriesEvaluated counts, LIBRARY-WIDE, how many series the loop below
+	// actually got through — every series that reached evaluateSeries, whether
+	// or not the scope reports it. It exists for the shutdown line and only for
+	// it: that line answers "how far did this cycle get before it was cut
+	// short", which is a fact about the library, since the evidence pool the
+	// cross-check samples is built from every series regardless of scope.
+	// totalSeriesMonitored cannot answer it — it is narrowed by the scope, so a
+	// webhook cycle interrupted after evaluating hundreds of series would report
+	// 0 or 1. This is the counterpart of the Radarr engine's len(decisions).
+	seriesEvaluated := 0
 	seasonsEvaluated := 0
 	wouldUnmonitorCount := 0
 	alreadyUnmonitoredCount := 0
 	skipCounts := make(map[string]int)
 
 	for _, s := range series {
+		// PHASE 8: shutdown mid-evaluation abandons this instance's cycle
+		// entirely — see the Radarr twin for why a partial evaluation is never
+		// cross-checked or written.
+		if ctx.Err() != nil {
+			logger.Info("shutdown requested: abandoning this instance's cycle mid-evaluation; a partial evaluation is never cross-checked or written",
+				"instance", inst.Name, "type", inst.Type, "seriesEvaluated", seriesEvaluated, "libraryTotal", len(series))
+			return
+		}
+
 		// Rule 1 (series half): mirrors Radarr's own rule 1 exactly — a
 		// series that is not monitored (or whose monitored field could not
 		// even be observed) is excluded entirely, with no seasonDecision
@@ -1950,26 +2142,80 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		}
 		eval := evaluateSeries(ctx, logger, client, inst, s, profiles, exclusionTagID, tagActive, wantedSeasons)
 		allDecisions = append(allDecisions, eval.decisions...)
+		seriesEvaluated++
 
 		// --only-id scoping happens here and nowhere else: every series is
 		// still evaluated above (the cross-check needs the full candidate
 		// pools), but only the named series is reported, counted, or written.
-		if onlyID != 0 && *s.ID != onlyID {
+		if !scope.contains(*s.ID) {
 			continue
 		}
 		totalSeriesMonitored++
+		// alreadyUnmonitored stays at SERIES granularity even when the scope
+		// names seasons, deliberately. It counts seasons that produced no
+		// decision at all, so it is context about the series rather than part
+		// of the accounting identity — and evaluateSeries's no-monitored-seasons
+		// path returns the count with an EMPTY season list (its noise budget is
+		// one bulk line, not one per season), which leaves nothing to filter by
+		// in the one case where filtering would matter most.
 		alreadyUnmonitoredCount += eval.alreadyUnmonitored
-		reported = append(reported, eval.decisions...)
 
-		for _, d := range eval.decisions {
+		// The SEASON narrowing, and the only place it is applied. Every season
+		// above was still evaluated (the cross-check needs the full pools);
+		// what a scope naming seasons changes is which of the resulting
+		// decisions may be reported, counted, and written.
+		//
+		// It is empty for --only-id and for a webhook whose payload named no
+		// season, both of which mean every eligible season of the series — so
+		// inScope is eval.decisions unchanged on every path but the one that
+		// positively asked for less.
+		inScope := eval.decisions
+		if scope.narrowsSeasons(*s.ID) {
+			inScope = nil
+			for _, d := range eval.decisions {
+				if scope.containsSeason(*s.ID, d.season) {
+					inScope = append(inScope, d)
+				}
+			}
+			if len(inScope) == 0 {
+				// The narrowing's own version of the --only-id "produced no
+				// decision" line below: without it, a cycle that named a season
+				// and then reported nothing would leave the summary's
+				// seasonsEvaluated=0 as the only trace, and a human unable to
+				// tell "already unmonitored" from "that season does not exist".
+				//
+				// At the scope's item level, not Info, because the common cause
+				// is the ordinary steady state — every re-import into a season
+				// an earlier cycle already unmonitored arrives here — and
+				// binding controller note 6 puts a webhook cycle's per-item
+				// lines at DEBUG.
+				logger.Log(ctx, scope.itemLevel, scope.origin+" named seasons produced no decision for this series: none is a monitored season with a decision this cycle (most often an earlier cycle already unmonitored it; otherwise the payload named a season this series does not have)",
+					"instance", inst.Name, "type", inst.Type, "seriesId", *s.ID, "series", titleOrAbsent(s.Title),
+					"scopeSeasons", joinInts(scope.seasons[*s.ID]))
+			}
+		}
+		reported = append(reported, inScope...)
+
+		// The per-season "already unmonitored" fan-out, logged HERE — inside
+		// the scope check — rather than inside evaluateSeries, which cannot
+		// know the scope. Same placement, and same reason, as the Radarr
+		// engine's own alreadyUnmonitored debug line.
+		for _, season := range eval.unmonitoredSeasons {
+			logger.Debug("season already unmonitored",
+				"instance", inst.Name, "type", inst.Type, "seriesId", *s.ID, "series", titleOrAbsent(s.Title),
+				"season", derefOrAbsent(season.SeasonNumber))
+		}
+
+		for _, d := range inScope {
 			seasonsEvaluated++
+			// scope.itemLevel, not Info — see the Radarr twin's note.
 			if d.wouldUnmonitor {
 				wouldUnmonitorCount++
-				logger.Info("would-unmonitor",
+				logger.Log(ctx, scope.itemLevel, "would-unmonitor",
 					"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season, "reason", d.reason, "profile", d.profileName)
 			} else {
 				skipCounts[d.reason]++
-				logger.Info("skip",
+				logger.Log(ctx, scope.itemLevel, "skip",
 					"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season, "reason", d.reason, "profile", d.profileName)
 			}
 		}
@@ -1981,20 +2227,18 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// not monitored, or its monitored key was absent entirely (warned about
 	// separately above). Without this line, --only-id on such a series would
 	// say nothing whatsoever about the one series the human explicitly named.
-	if onlyID != 0 && totalSeriesMonitored == 0 {
-		logger.Info("--only-id series produced no decision: it is not monitored, so rule 1 excludes it from the report",
-			"instance", inst.Name, "type", inst.Type, "onlyId", onlyID)
+	if scope.active() && totalSeriesMonitored == 0 {
+		logger.Info(scope.origin+" series produced no decision: it is not monitored, so rule 1 excludes it from the report",
+			append([]any{"instance", inst.Name, "type", inst.Type}, scope.summaryAttrs()...)...)
 	}
 
-	cc := runSonarrCrossCheck(ctx, logger, client, inst, allDecisions, wantedEpisodeIDs)
+	cc := runSonarrCrossCheck(ctx, cycleLogger, client, inst, allDecisions, wantedEpisodeIDs)
 	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
 
 	unmonitoredCount, recoveredWriteCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount := runSonarrWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun)
 
 	attrs := []any{"instance", inst.Name, "type", inst.Type}
-	if onlyID != 0 {
-		attrs = append(attrs, "onlyId", onlyID)
-	}
+	attrs = append(attrs, scope.summaryAttrs()...)
 	// recoveredWrites is the sonarr-only sixth counter (binding controller
 	// ruling item 4): a confirmed write on the write pass's recovery path — a
 	// season whose every episode was already unmonitored, so only the season
@@ -2149,7 +2393,12 @@ func runSonarrCrossCheck(ctx context.Context, logger *slog.Logger, client *APICl
 				fetchedFilesBySeries[d.seriesID] = filesByID
 			}
 			if filesByID != nil {
-				crossCheckEpisodes = buildSeasonCrossCheckEpisodes(d.rawEpisodesForCrossCheck, filesByID)
+				// The completeness bit is deliberately discarded here: this
+				// on-demand set exists only to let the cross-check compare what
+				// it can see (an episode it cannot see is already counted as
+				// unverifiable), and it is never the input to recoveryCandidate
+				// — a skip-side season sampled here has no pending write at all.
+				crossCheckEpisodes, _ = buildSeasonCrossCheckEpisodes(logger, inst, d.seriesID, d.season, d.rawEpisodesForCrossCheck, filesByID)
 			}
 		}
 
