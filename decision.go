@@ -424,11 +424,15 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 // complete picture and approved it, which is impossible if writes are
 // interleaved with the evaluation that produces the cross-check's input.
 //
-// onlyID (the --only-id flag, 0 when absent) narrows what is REPORTED and
-// WRITTEN to the single movie with that id. It deliberately does not narrow
-// what is evaluated: the cross-check validates the data the decision rests
-// on, not the target, so it still samples the whole library (see
-// runWritePass and the plan's Phase 4 acceptance criteria).
+// scope (see scope.go) narrows what is REPORTED and WRITTEN to the movie ids
+// it names — one, from --only-id, or the coalesced set of a debounced webhook
+// cycle — and sets the level of the per-item report lines. It deliberately does
+// not narrow what is EVALUATED: the cross-check validates the data the decision
+// rests on, not the target, so it still samples the whole library (see
+// runWritePass and the plan's Phase 4 acceptance criteria). That is why a
+// webhook event costs a full instance scan, which the per-item debounce
+// (webhook_debounce) is what bounds — the binding full-evidence ruling for
+// Phase 8, with no reduced-evidence path anywhere.
 //
 // It is called only for a radarr instance whose connectivity check and
 // inspectRadarrLibrary fetch both already succeeded (main.go's
@@ -436,7 +440,7 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 // checkInstanceConnectivity and inspectRadarrLibrary, the binding
 // error-handling rule (§2.6) is "skip that instance for the cycle and log a
 // warning" with no further work for a caller to gate on.
-func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, movies []movieListElement, wantedIDs map[int]bool, exclusionTagLabel string, onlyID int, dryRun bool) {
+func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, movies []movieListElement, wantedIDs map[int]bool, exclusionTagLabel string, scope evalScope, dryRun bool) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	// An --only-id naming a movie this instance's library does not contain
@@ -454,10 +458,24 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// function could detect it. run() refuses ambiguous --only-id runs up
 	// front, before any instance is contacted, by requiring --instance when
 	// more than one radarr is in scope.
-	if onlyID != 0 && !libraryContainsID(movies, onlyID) {
-		logger.Warn("--only-id movie not found in this instance's library; no decisions for this instance",
-			"instance", inst.Name, "type", inst.Type, "onlyId", onlyID)
-		return
+	//
+	// Phase 8 generalized the single id to a SET (see scope.go): a coalesced
+	// webhook cycle can name several movies of one instance at once. "Not
+	// found" is therefore per id — each missing one is named — and only a scope
+	// with NOTHING left in this library ends the instance's cycle, since the
+	// remaining ids still have real work to do.
+	if scope.active() {
+		missing := scope.missing(func(id int) bool { return libraryContainsID(movies, id) })
+		if len(missing) == len(scope.ids) {
+			attrs := []any{"instance", inst.Name, "type", inst.Type}
+			logger.Warn(scope.origin+" movie not found in this instance's library; no decisions for this instance",
+				append(attrs, scope.summaryAttrs()...)...)
+			return
+		}
+		for _, id := range missing {
+			logger.Warn(scope.origin+" movie not found in this instance's library; it produces no decision",
+				"instance", inst.Name, "type", inst.Type, "movieId", id)
+		}
 	}
 
 	profiles, ok := fetchQualityProfiles(ctx, logger, client, inst)
@@ -526,8 +544,8 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 			// debug line and the counter make a second, no-op run of this
 			// project provable rather than merely quiet.
 			//
-			// REVIEW FIX (Phase 5 round 2): the onlyID scope test mirrors
-			// the one the --only-id narrowing block below applies to every
+			// REVIEW FIX (Phase 5 round 2): the scope test mirrors
+			// the one the narrowing block below applies to every
 			// other counter (totalMonitored, wouldUnmonitor, unmonitored).
 			// Without it, this counter and its debug line were populated
 			// library-wide even during a --only-id run — the summary's one
@@ -535,7 +553,7 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 			// and a targeted run against a large library would additionally
 			// emit one debug line per already-unmonitored movie in the
 			// entire library, not just the target.
-			if onlyID == 0 || (m.ID != nil && *m.ID == onlyID) {
+			if m.ID != nil && scope.contains(*m.ID) {
 				alreadyUnmonitoredCount++
 				logger.Debug("already unmonitored",
 					"id", derefOrAbsent(m.ID), "title", titleOrAbsent(m.Title), "instance", inst.Name)
@@ -558,19 +576,23 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		// --only-id scoping happens here and nowhere else: every movie is
 		// still evaluated above (the cross-check needs the full candidate
 		// pools), but only the named movie is reported, counted, or written.
-		if onlyID != 0 && d.id != onlyID {
+		if !scope.contains(d.id) {
 			continue
 		}
 		reported = append(reported, d)
 		totalMonitored++
 
+		// scope.itemLevel, not Info: these two lines are the report on a
+		// --once run and pure repetition on the hundredth idle reconciliation
+		// sweep of a daemon (binding controller note 6). Summaries, warnings
+		// and write lines are never demoted.
 		if d.wouldUnmonitor {
 			wouldUnmonitorCount++
-			logger.Info("would-unmonitor",
+			logger.Log(ctx, scope.itemLevel, "would-unmonitor",
 				"id", d.id, "title", d.title, "reason", d.reason, "profile", d.profileName, "instance", inst.Name)
 		} else {
 			skipCounts[d.reason]++
-			logger.Info("skip",
+			logger.Log(ctx, scope.itemLevel, "skip",
 				"id", d.id, "title", d.title, "reason", d.reason, "profile", d.profileName, "instance", inst.Name)
 		}
 	}
@@ -583,9 +605,9 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// that cannot be the explanation. Without this line, --only-id on such a
 	// movie would say nothing whatsoever about the one movie the human
 	// explicitly named.
-	if onlyID != 0 && len(reported) == 0 {
-		logger.Info("--only-id movie produced no decision: it is not monitored, so rule 1 excludes it from the report",
-			"instance", inst.Name, "type", inst.Type, "onlyId", onlyID)
+	if scope.active() && len(reported) == 0 {
+		logger.Info(scope.origin+" movie produced no decision: it is not monitored, so rule 1 excludes it from the report",
+			append([]any{"instance", inst.Name, "type", inst.Type}, scope.summaryAttrs()...)...)
 	}
 
 	cc := runCrossCheck(logger, inst, decisions, wantedIDs)
@@ -594,9 +616,7 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	unmonitoredCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount := runWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun)
 
 	attrs := []any{"instance", inst.Name, "type", inst.Type}
-	if onlyID != 0 {
-		attrs = append(attrs, "onlyId", onlyID)
-	}
+	attrs = append(attrs, scope.summaryAttrs()...)
 	attrs = append(attrs, "totalMonitored", totalMonitored, "wouldUnmonitor", wouldUnmonitorCount, "unmonitored", unmonitoredCount, "alreadyUnmonitored", alreadyUnmonitoredCount)
 
 	// writeErrors counts failed WRITES, so in dry-run it is unconditionally
@@ -1930,17 +1950,26 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 //  3. WRITE (Phase 7) — but only if the cross-check's evidence authorizes it
 //     (runSonarrWritePass, gated by the shared writeGateBlockReason).
 //
-// onlyID (the --only-id flag, 0 when absent) is a SERIES id here, and narrows
-// what is REPORTED and WRITTEN to that one series' seasons. It deliberately
-// does not narrow what is EVALUATED: the cross-check validates the data the
-// decisions rest on, not the target, so it still samples the whole library —
-// the same split the Radarr engine makes, for the same reason.
+// scope (see scope.go) names SERIES ids here, and narrows what is REPORTED and
+// WRITTEN to those series' seasons — one series from --only-id, or the
+// coalesced set of a debounced webhook cycle. It deliberately does not narrow
+// what is EVALUATED: the cross-check validates the data the decisions rest on,
+// not the target, so it still samples the whole library — the same split the
+// Radarr engine makes, for the same reason, and the same full-instance cost per
+// webhook event that the debounce bounds.
+//
+// Note the granularity: a webhook naming a series scopes to that SERIES and
+// every eligible season of it, exactly as --only-id does. The affected season
+// numbers a Sonarr payload carries are logged as evidence of what triggered the
+// cycle, but they do not narrow further — the season set the engine would act
+// on is a superset of the affected one, decided by the same rules a
+// reconciliation sweep applies.
 //
 // Like checkInstanceConnectivity, inspectSonarrLibrary, and
 // runRadarrDecisionEngine, it never returns anything: the binding
 // error-handling rule (§2.6) is "skip that instance for the cycle and log a
 // warning", with no further work for a caller to gate on.
-func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, series []seriesElement, wantedEpisodeIDs map[int]bool, wantedSeasons map[seasonKey]bool, exclusionTagLabel string, onlyID int, dryRun bool) {
+func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, series []seriesElement, wantedEpisodeIDs map[int]bool, wantedSeasons map[seasonKey]bool, exclusionTagLabel string, scope evalScope, dryRun bool) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	// An --only-id naming a series this instance's library does not contain is
@@ -1952,10 +1981,22 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// including what it does NOT guard: series ids are per-instance, so an id
 	// aimed at the wrong sonarr is a MATCH here, not a miss — run() refuses
 	// ambiguous --only-id runs up front instead.
-	if onlyID != 0 && !seriesLibraryContainsID(series, onlyID) {
-		logger.Warn("--only-id series not found in this instance's library; no decisions for this instance",
-			"instance", inst.Name, "type", inst.Type, "onlyId", onlyID)
-		return
+	// Phase 8: a SET of ids, for the same reason the Radarr engine takes one
+	// (see scope.go and its twin above) — a coalesced webhook cycle can name
+	// several series of one instance at once. Only a scope with nothing left in
+	// this library ends the instance's cycle.
+	if scope.active() {
+		missing := scope.missing(func(id int) bool { return seriesLibraryContainsID(series, id) })
+		if len(missing) == len(scope.ids) {
+			attrs := []any{"instance", inst.Name, "type", inst.Type}
+			logger.Warn(scope.origin+" series not found in this instance's library; no decisions for this instance",
+				append(attrs, scope.summaryAttrs()...)...)
+			return
+		}
+		for _, id := range missing {
+			logger.Warn(scope.origin+" series not found in this instance's library; it produces no decision",
+				"instance", inst.Name, "type", inst.Type, "seriesId", id)
+		}
 	}
 
 	profiles, ok := fetchQualityProfiles(ctx, logger, client, inst)
@@ -2011,7 +2052,7 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		// --only-id scoping happens here and nowhere else: every series is
 		// still evaluated above (the cross-check needs the full candidate
 		// pools), but only the named series is reported, counted, or written.
-		if onlyID != 0 && *s.ID != onlyID {
+		if !scope.contains(*s.ID) {
 			continue
 		}
 		totalSeriesMonitored++
@@ -2030,13 +2071,14 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 
 		for _, d := range eval.decisions {
 			seasonsEvaluated++
+			// scope.itemLevel, not Info — see the Radarr twin's note.
 			if d.wouldUnmonitor {
 				wouldUnmonitorCount++
-				logger.Info("would-unmonitor",
+				logger.Log(ctx, scope.itemLevel, "would-unmonitor",
 					"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season, "reason", d.reason, "profile", d.profileName)
 			} else {
 				skipCounts[d.reason]++
-				logger.Info("skip",
+				logger.Log(ctx, scope.itemLevel, "skip",
 					"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season, "reason", d.reason, "profile", d.profileName)
 			}
 		}
@@ -2048,9 +2090,9 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// not monitored, or its monitored key was absent entirely (warned about
 	// separately above). Without this line, --only-id on such a series would
 	// say nothing whatsoever about the one series the human explicitly named.
-	if onlyID != 0 && totalSeriesMonitored == 0 {
-		logger.Info("--only-id series produced no decision: it is not monitored, so rule 1 excludes it from the report",
-			"instance", inst.Name, "type", inst.Type, "onlyId", onlyID)
+	if scope.active() && totalSeriesMonitored == 0 {
+		logger.Info(scope.origin+" series produced no decision: it is not monitored, so rule 1 excludes it from the report",
+			append([]any{"instance", inst.Name, "type", inst.Type}, scope.summaryAttrs()...)...)
 	}
 
 	cc := runSonarrCrossCheck(ctx, logger, client, inst, allDecisions, wantedEpisodeIDs)
@@ -2059,9 +2101,7 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	unmonitoredCount, recoveredWriteCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount := runSonarrWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun)
 
 	attrs := []any{"instance", inst.Name, "type", inst.Type}
-	if onlyID != 0 {
-		attrs = append(attrs, "onlyId", onlyID)
-	}
+	attrs = append(attrs, scope.summaryAttrs()...)
 	// recoveredWrites is the sonarr-only sixth counter (binding controller
 	// ruling item 4): a confirmed write on the write pass's recovery path — a
 	// season whose every episode was already unmonitored, so only the season

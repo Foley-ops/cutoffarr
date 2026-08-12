@@ -1178,7 +1178,7 @@ func TestRunSonarrDecisionEngine_LogsWouldUnmonitorAndSkipLinesWithMandatedAttrs
 		testSeries(1, "Would Unmonitor Show", true, 1, []int{}, testSeason(1, true, 1, 1)),
 		testSeries(2, "No File Show", true, 1, []int{}, testSeason(1, true, 0, 5)),
 	}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 
@@ -1208,7 +1208,7 @@ func TestRunSonarrDecisionEngine_SeasonLinesNeverCarryMovieStyleAttrs(t *testing
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	series := []seriesElement{testSeries(1, "Some Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	for _, line := range strings.Split(out, "\n") {
@@ -1233,7 +1233,7 @@ func TestRunSonarrDecisionEngine_SummaryCountsCorrect(t *testing.T) {
 		testSeries(3, "Incomplete B", true, 1, []int{}, testSeason(1, true, 0, 5)),
 		testSeries(4, "Not Monitored Show", false, 1, []int{}, testSeason(1, true, 1, 1)),
 	}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if !strings.Contains(out, "totalSeriesMonitored=3") {
@@ -1260,7 +1260,7 @@ func TestRunSonarrDecisionEngine_AlreadyUnmonitoredSeasonsCounted(t *testing.T) 
 	series := []seriesElement{
 		testSeries(1, "Mixed Show", true, 1, []int{}, testSeason(1, true, 0, 1), testSeason(2, false, 5, 5)),
 	}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if !strings.Contains(out, "alreadyUnmonitored=1") {
@@ -1280,7 +1280,7 @@ func TestRunSonarrDecisionEngine_ProfileFetchFailure_NoReportLinesAtAll(t *testi
 	inst := Instance{Name: "sonarr-broken", Type: "sonarr", URL: srv.URL, APIKey: "key"}
 
 	series := []seriesElement{testSeries(1, "Some Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, inst, series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
+	runSonarrDecisionEngine(context.Background(), logger, inst, series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if strings.Contains(out, "msg=would-unmonitor") || strings.Contains(out, "msg=skip") {
@@ -1306,7 +1306,7 @@ func TestRunSonarrDecisionEngine_TagFetchFailure_NoReportLinesAtAll(t *testing.T
 	inst := Instance{Name: "sonarr-broken", Type: "sonarr", URL: srv.URL, APIKey: "key"}
 
 	series := []seriesElement{testSeries(1, "Some Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, inst, series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
+	runSonarrDecisionEngine(context.Background(), logger, inst, series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if strings.Contains(out, "msg=would-unmonitor") || strings.Contains(out, "msg=skip") {
@@ -1319,7 +1319,7 @@ func TestRunSonarrDecisionEngine_SeriesNotMonitored_ExcludedEntirelyFromReport(t
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	series := []seriesElement{testSeries(1, "Unmonitored Show", false, 1, []int{}, testSeason(1, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if strings.Contains(out, "Unmonitored Show") {
@@ -1341,7 +1341,7 @@ func TestRunSonarrDecisionEngine_NeverMakesAWriteRequest(t *testing.T) {
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	series := []seriesElement{testSeries(1, "Would Unmonitor Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	if !strings.Contains(buf.String(), "would-unmonitor") {
 		t.Fatalf("test setup did not actually produce a would-unmonitor decision:\n%s", buf.String())
@@ -1679,7 +1679,7 @@ func TestRunSonarrDecisionEngine_CrossCheckDisagreement_SummaryStatesFailed(t *t
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	series := []seriesElement{testSeries(1, "Disagreeing Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if !strings.Contains(out, "crossCheck=FAILED") {
@@ -1705,7 +1705,7 @@ func TestRunSonarrDecisionEngine_WouldUnmonitorSeasonHasWantedEpisode_CrossCheck
 	series := []seriesElement{testSeries(1, "Contradiction Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
 	wantedEpisodeIDs := map[int]bool{100: true} // episode 100 IS in the wanted set...
 	wantedSeasons := map[seasonKey]bool{}       // ...but its season key is absent, so rule 4 lets the season through
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodeIDs, wantedSeasons, "cutoffarr-exclude", 0, true)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodeIDs, wantedSeasons, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if !strings.Contains(out, "msg=would-unmonitor") {
@@ -1735,7 +1735,7 @@ func TestRunSonarrDecisionEngine_SkipSideCrossCheck_RuleFourSkip_BecomesVerifiab
 	series := []seriesElement{testSeries(1, "Skip Side Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
 	wantedEpisodeIDs := map[int]bool{100: true}
 	wantedSeasons := map[seasonKey]bool{{seriesID: 1, seasonNumber: 1}: true} // rule 4 fails: never reaches rule 7
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodeIDs, wantedSeasons, "cutoffarr-exclude", 0, true)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodeIDs, wantedSeasons, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if !strings.Contains(out, `reason="quality cutoff not met"`) {
@@ -2178,7 +2178,7 @@ func TestRunSonarrDecisionEngine_SkipSideCrossCheck_RuleThreeSkip_BecomesVerifia
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	series := []seriesElement{testSeries(1, "Airing Skip Show", true, 1, []int{}, testSeason(1, true, 2, 2))}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if !strings.Contains(out, `reason="unaired or undated episodes"`) {
@@ -2324,7 +2324,7 @@ func TestRunSonarrDecisionEngine_UntrustedSeriesShapes_WarnAndSkipWithoutPanicki
 
 	runSonarrDecisionEngine(context.Background(), logger, fake.instance(),
 		[]seriesElement{monitoredAbsent, idAbsent, seasonNumberAbsent},
-		map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
+		map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	for _, want := range []string{

@@ -1931,7 +1931,7 @@ func TestRunSonarrDecisionEngine_WriteMode_ConfirmedWriteCountsAsUnmonitored(t *
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	series := []seriesElement{testSeries(1, "Writable Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, false)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
 
 	out := buf.String()
 	c := sonarrSummaryCounters(t, out)
@@ -1965,7 +1965,7 @@ func TestRunSonarrDecisionEngine_DryRun_RehearsesAndWithholds(t *testing.T) {
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	series := []seriesElement{testSeries(1, "Rehearsed Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, true)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
 
 	out := buf.String()
 	if writes := fake.writes(); len(writes) != 0 {
@@ -2120,7 +2120,7 @@ func TestRunSonarrDecisionEngine_EveryWouldUnmonitorSeasonIsAccountedForInTheSum
 
 			logger, buf := newDecisionTestLogger(slog.LevelInfo)
 			series := []seriesElement{testSeries(1, "Accounted Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
-			runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, tc.dryRun)
+			runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), tc.dryRun)
 
 			out := buf.String()
 			c := sonarrSummaryCounters(t, out)
@@ -2177,7 +2177,7 @@ func TestRunSonarrDecisionEngine_TwoPendingSeasons_OneRefuses_IdentityStillHolds
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	series := []seriesElement{testSeries(1, "Two Season Show", true, 1, []int{}, testSeason(1, true, 1, 1), testSeason(2, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, false)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
 
 	out := buf.String()
 	c := sonarrSummaryCounters(t, out)
@@ -2235,7 +2235,7 @@ func TestRunSonarrDecisionEngine_GateBlocked_WithheldWritesAccountsForThePass(t 
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	series := []seriesElement{testSeries(1, "Blocked Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 0, false)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
 
 	out := buf.String()
 	if !strings.Contains(out, "crossCheck=FAILED") {
@@ -2284,7 +2284,7 @@ func TestRunSonarrDecisionEngine_OnlyID_ScopesReportAndWritesToOneSeries(t *test
 		testSeries(1, "Other Show", true, 1, []int{}, testSeason(1, true, 1, 1), testSeason(9, false, 1, 1)),
 		testSeries(2, "Named Show", true, 1, []int{}, testSeason(1, true, 1, 1), testSeason(2, true, 1, 1), testSeason(9, false, 1, 1)),
 	}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 2, false)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", onlyIDScope(2), false)
 
 	out := buf.String()
 	for _, w := range fake.writes() {
@@ -2354,7 +2354,7 @@ func TestRunSonarrDecisionEngine_OnlyID_UnmonitoredSeries_SaysSoRatherThanNothin
 		testSeries(1, "Monitored Show", true, 1, []int{}, testSeason(1, true, 1, 1)),
 		testSeries(2, "Unmonitored Show", false, 1, []int{}, testSeason(1, true, 1, 1)),
 	}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 2, false)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", onlyIDScope(2), false)
 
 	out := buf.String()
 	line := logLineContaining(t, out, "--only-id series produced no decision")
@@ -2384,7 +2384,7 @@ func TestRunSonarrDecisionEngine_OnlyID_UnknownSeries_WarnsAndWritesNothing(t *t
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	series := []seriesElement{testSeries(1, "Only Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 99, false)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", onlyIDScope(99), false)
 
 	out := buf.String()
 	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "onlyId=99") {
@@ -3284,7 +3284,7 @@ func TestRunSonarrDecisionEngine_OnlyID_AlreadyUnmonitoredDebugIsScopedToo(t *te
 		testSeries(1, "Other Show", true, 1, []int{}, testSeason(1, true, 1, 1), testSeason(7, false, 1, 1)),
 		testSeries(2, "Named Show", true, 1, []int{}, testSeason(1, true, 1, 1), testSeason(9, false, 1, 1)),
 	}
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", 2, true)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", onlyIDScope(2), true)
 
 	out := buf.String()
 	if n := strings.Count(out, `msg="season already unmonitored"`); n != 1 {

@@ -163,6 +163,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 		// immediately before each HTTP write call, not just at startup, so
 		// the value has to travel all the way to the write site.
 		samples := parseSamples(*samplesFlag)
+		// --once is the watched, one-shot run: every per-item report line stays
+		// at INFO. The daemon's reconciliation and webhook cycles build their
+		// own scopes with a demoted item level (scope.go).
+		scope := fullLibraryScope(slog.LevelInfo)
+		if onlyIDSet {
+			scope = onlyIDScope(*onlyID)
+		}
 		for _, inst := range cfg.Instances {
 			// An instance the human did not name is not merely left
 			// unwritten: it is not contacted at all. "--instance radarr-4k"
@@ -175,7 +182,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			if ok && inst.Type == "radarr" {
 				movies, wantedIDs, dataOK := inspectRadarrLibrary(context.Background(), logger, inst, samples)
 				if dataOK {
-					runRadarrDecisionEngine(context.Background(), logger, inst, movies, wantedIDs, cfg.ExclusionTag, *onlyID, cfg.DryRun)
+					runRadarrDecisionEngine(context.Background(), logger, inst, movies, wantedIDs, cfg.ExclusionTag, scope, cfg.DryRun)
 				}
 			}
 			// Phase 6/7: the Sonarr equivalent of the two Radarr steps above
@@ -191,7 +198,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			if ok && inst.Type == "sonarr" {
 				series, wantedEpisodeIDs, wantedSeasons, dataOK := inspectSonarrLibrary(context.Background(), logger, inst)
 				if dataOK {
-					runSonarrDecisionEngine(context.Background(), logger, inst, series, wantedEpisodeIDs, wantedSeasons, cfg.ExclusionTag, *onlyID, cfg.DryRun)
+					runSonarrDecisionEngine(context.Background(), logger, inst, series, wantedEpisodeIDs, wantedSeasons, cfg.ExclusionTag, scope, cfg.DryRun)
 				}
 			}
 		}
