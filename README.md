@@ -243,9 +243,19 @@ instance's own web UI**:
    Docker.
 3. Under **Notification Triggers**, tick **On Import** and **On Upgrade**,
    and leave the rest unticked. Those are the only two events cutoffarr acts
-   on; anything else it receives is logged and ignored.
+   on; anything else it receives is answered `200 OK` and ignored — but that
+   is logged only at `log_level: debug`, so at the documented default
+   (`info`) a wrongly-ticked trigger produces **no line at all** in
+   `docker logs cutoffarr`. If you ticked something else by mistake, the
+   *arr side shows a green checkmark either way (cutoffarr never answers
+   4xx/5xx for an event type it just isn't interested in) — set
+   `log_level: debug` temporarily if you need to confirm what actually
+   arrived.
 4. Save, then use the instance's own "Test" button to confirm cutoffarr
    receives it — check `docker logs cutoffarr` for the corresponding line.
+   Unlike step 3's unhandled triggers, **Test** is the one event type that
+   always logs at `info` (naming the instance), so this step works at the
+   default log level with no setup.
 
 Repeat once per configured instance — each one has its own name and its own
 URL. A webhook fires an evaluation of only the movie or season the event
@@ -297,6 +307,15 @@ Tag anything you want left alone with the `exclusion_tag` label (default
 Stdout only, structured text via Go's `log/slog`, at the level set by
 `log_level`. Nothing is ever written to a file or a database — `docker logs
 cutoffarr` is the entire operational surface.
+
+**I ticked a trigger other than On Import/On Upgrade — why do I see nothing in the logs?**
+Because it's genuinely quiet, not broken: cutoffarr answers every webhook
+event `200 OK` (the `*arr` side always shows success), but an event type it
+doesn't act on is logged only at `log_level: debug` — the default (`info`)
+prints nothing at all for it. That is different from the "Test" button
+specifically, which always logs at `info` regardless of `log_level` (see
+[Webhook setup](#webhook-setup)). Set `log_level: debug` temporarily if you
+need to see exactly which event type an `*arr` sent.
 
 ## License
 
