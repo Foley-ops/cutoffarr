@@ -2159,6 +2159,14 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 			// landed have LEFT the monitored=false wanted set, so rule 4 no longer
 			// fires for that season and nothing else would ever look at it again.
 			//
+			// The same state is also what a human leaves by monitoring ONE episode
+			// of a finished unmonitored season, which is why this verdict is a
+			// report and not a write instruction: the write side may only finish
+			// the flag of a season whose episodes are already all monitored, and
+			// refuses anything wider (errMismatchSeasonWouldWriteEpisodes, round
+			// 4). Both shapes are worth telling a human about; only one of them is
+			// ours to complete.
+			//
 			// Decided here rather than earlier because everything above it is a
 			// better answer: a season that is incomplete, still airing, in the
 			// wanted set, below its CF threshold or untrusted already has a reason

@@ -40,6 +40,12 @@ reverse_scan_remonitor: false
                          # exactly like the forward path. Sonarr seasons under
                          # an UNMONITORED series are always report-only: a
                          # series-level unmonitor is a deliberate retirement.
+                         # A season reported only because monitored episodes
+                         # sit inside its unmonitored flag is narrower still:
+                         # its FLAG is finished (and nothing else) when every
+                         # episode inside is already monitored; if any episode
+                         # is unmonitored the whole write is refused, because
+                         # those episodes are somebody's deliberate choice.
 
 instances:
   - name: radarr-main    # unique, used in logs

@@ -1659,6 +1659,72 @@ func TestRunSonarrDecisionEngine_ReverseScan_SeasonThatNowMeetsCriteria_IsRefuse
 	assertReverseIdentity(t, out)
 }
 
+// TestRunSonarrDecisionEngine_ReverseScan_MismatchSeasonWithUnmonitoredEpisodes_IsRefused
+// is the write mandate of the monitor-mismatch finding, which is narrower than
+// the finding itself (REVIEW FIX, Phase 10 round 4).
+//
+// A mismatch season MEETS every criterion — rules 4, 5 and 7 all passed — and is
+// reported for one reason only: an episode inside it is monitored while its own
+// flag is not. Re-monitoring such a season the ordinary way writes EVERY episode
+// that is currently false, and the plan's write mandate does not reach that far:
+// re-monitoring is scoped to "an unmonitored item that FAILS criteria". The
+// state the finding exists for — our own half-done reverse write — always leaves
+// every episode already monitored, so it needs no episode write at all.
+//
+// The staged season is the state this restriction protects: a human monitored
+// episode 1 of an otherwise-finished unmonitored season by hand. Writing it
+// whole would re-monitor episode 2 as well and the next forward cycle would then
+// unmonitor all of it, including the episode the human chose — a state rule 1
+// used to protect.
+func TestRunSonarrDecisionEngine_ReverseScan_MismatchSeasonWithUnmonitoredEpisodes_IsRefused(t *testing.T) {
+	// Season 2 is complete, fully aired, absent from the unmonitored wanted set
+	// and scoring 200 against the profile's 100. Episode 200 is monitored by
+	// hand; episode 201 is not, and is the one an ordinary write would touch.
+	// Season 1 belongs to the cross-check witness, without which the gate never
+	// opens (see sonarrReverseWriteFixtures).
+	episodesJSON := "[" + episodeJSON(900, 1, 1, pastAirDate, 9000) + "," +
+		episodeJSONWithMonitored(200, 2, 1, pastAirDate, 600, true) + "," +
+		episodeJSONWithMonitored(201, 2, 2, pastAirDate, 601, false) + "]"
+	filesJSON := "[" + episodeFileJSON(9000, 1, 200, true) + "," +
+		episodeFileJSON(600, 2, 200, false) + "," + episodeFileJSON(601, 2, 200, false) + "]"
+	series := []seriesElement{
+		testSeries(9, "Ordinary Monitored Show", true, 1, []int{}, testSeason(1, true, 1, 1)),
+		testSeries(1, "Hand Monitored Episode", true, 1, []int{}, testSeason(2, false, 2, 2)),
+	}
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	fake.seriesDetail[1] = sonarrWriteEngineSeriesDetail(1, "Hand Monitored Episode", 2, 2, false)
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series,
+		map[int]bool{900: true}, map[seasonKey]bool{{seriesID: 9, seasonNumber: 1}: true},
+		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+
+	out := buf.String()
+	line := reverseFindingLine(t, out)
+	if !strings.Contains(line, `reason="`+ReasonSeasonMonitorMismatch+`"`) {
+		t.Fatalf("this test proves nothing unless the mismatch was reported first:\n%s", line)
+	}
+	if !strings.Contains(out, `crossCheck="passed (1 verified`) {
+		t.Fatalf("nor unless the write gate really opened:\n%s", out)
+	}
+	// The distinction from a withheld finding: the write path was ENTERED, made
+	// its fresh reads, and stopped at its own predicate.
+	if n := fake.countRequests("/api/v3/series/1"); n == 0 {
+		t.Fatalf("the write path was never entered, so this test says nothing about its predicate:\n%s", out)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("a mismatch season with unmonitored episodes in it may not be written at all — neither the episodes a human left alone nor the flag: %+v", writes)
+	}
+	if !strings.Contains(out, "only the season flag") {
+		t.Errorf("the refusal must say what it would have had to write:\n%s", out)
+	}
+	c := summaryCountersFor(t, out, "sonarr decision summary")
+	if c["reverseFindings"] != 1 || c["remonitorsRefused"] != 1 || c["remonitored"] != 0 {
+		t.Errorf("want reverseFindings=1 remonitorsRefused=1 remonitored=0, got %v:\n%s", c, out)
+	}
+	assertReverseIdentity(t, out)
+}
+
 // TestRun_ReverseScan_Sonarr_DryRun_RehearsesAndWritesNothing is §2.1 for the
 // season path's TWO write calls: both gates hold, and the rehearsal still runs
 // every read and every check in front of them.

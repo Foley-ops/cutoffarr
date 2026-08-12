@@ -65,6 +65,12 @@ func (d scanDirection) wantsMonitored() bool { return d == directionForward }
 // what makes the half-done reverse write converge, since the season is retried
 // as an ordinary finding on the next cycle.
 //
+// Reporting it is wider than WRITING it, and deliberately so (round 4): that
+// season meets every criterion, so the write side may finish its season flag and
+// may not touch its episodes — see errMismatchSeasonWouldWriteEpisodes for the
+// human whose deliberate state the difference protects. This function answers
+// only the reporting question, which is the same for all three.
+//
 // It is deliberately a small, explicit allowlist of EXISTING reason constants
 // rather than "anything that is not wouldUnmonitor", because most of the ways
 // an evaluation can decline are not findings at all and reporting them would be
@@ -688,16 +694,22 @@ func (p reversePass) remonitorMovies(ctx context.Context, findings []movieDecisi
 // The same freshness boundary as the movie path applies (see
 // verifyMovieStillAReverseFinding): everything but rule 4's wanted set is read
 // again here.
-func verifySeasonStillAReverseFinding(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, body []byte, seriesID, seasonNumber, exclusionTagID int, tagActive bool, rev reverseWriteContext, subject string, attrs []any) error {
+//
+// On success it returns the reason the FRESH evaluation reached, and the caller
+// needs it rather than the scan-time one: ReasonSeasonMonitorMismatch carries a
+// narrower write mandate than the other two (only the season flag may be
+// written — see errMismatchSeasonWouldWriteEpisodes), and which of the three a
+// season is, is a property of the world at write time.
+func verifySeasonStillAReverseFinding(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, body []byte, seriesID, seasonNumber, exclusionTagID int, tagActive bool, rev reverseWriteContext, subject string, attrs []any) (string, error) {
 	var fresh seriesElement
 	if err := json.Unmarshal(body, &fresh); err != nil {
 		logger.Warn("the pre-write fetch could not be read as a series, so whether the season still fails the criteria cannot be determined; refusing to re-monitor",
 			append(append([]any(nil), attrs...), "error", err)...)
-		return fmt.Errorf("%s: %w: the pre-write fetch could not be decoded: %v", subject, errNoLongerAReverseFinding, err)
+		return "", fmt.Errorf("%s: %w: the pre-write fetch could not be decoded: %v", subject, errNoLongerAReverseFinding, err)
 	}
 	if fresh.ID == nil || *fresh.ID != seriesID {
 		logger.Warn("the pre-write fetch does not identify the series being re-monitored; refusing to write", attrs...)
-		return fmt.Errorf("%s: %w: the pre-write fetch identifies a different series", subject, errNoLongerAReverseFinding)
+		return "", fmt.Errorf("%s: %w: the pre-write fetch identifies a different series", subject, errNoLongerAReverseFinding)
 	}
 
 	eval := evaluateSeries(ctx, logger, client, inst, fresh, rev.profiles, exclusionTagID, tagActive, rev.wantedSeasons, directionReverse)
@@ -706,17 +718,17 @@ func verifySeasonStillAReverseFinding(ctx context.Context, logger *slog.Logger, 
 			continue
 		}
 		if isReverseFinding(d.reason) {
-			return nil
+			return d.reason, nil
 		}
 		logger.Info("the season no longer fails the criteria as of the pre-write fetch, skipping the re-monitor",
 			append(append([]any(nil), attrs...), "reason", d.reason)...)
-		return fmt.Errorf("%s: %w: it now evaluates as %q", subject, errNoLongerAReverseFinding, d.reason)
+		return "", fmt.Errorf("%s: %w: it now evaluates as %q", subject, errNoLongerAReverseFinding, d.reason)
 	}
 	// No decision at all for the target season: it is no longer an unmonitored
 	// season of this series, or it is no longer readable. Either way the finding
 	// this write rests on cannot be re-established, and §2.6 says never guess.
 	logger.Warn("the pre-write fetch produced no reverse decision for this season, so the finding could not be re-established; refusing to write", attrs...)
-	return fmt.Errorf("%s: %w: the pre-write fetch produced no decision for this season", subject, errNoLongerAReverseFinding)
+	return "", fmt.Errorf("%s: %w: the pre-write fetch produced no decision for this season", subject, errNoLongerAReverseFinding)
 }
 
 // remonitorSeasons is the reverse pass's write half for Sonarr. Like its Radarr

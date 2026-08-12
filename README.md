@@ -7,9 +7,11 @@ asked to search for something better that no release will ever provide.
 
 **It never deletes, moves, or renames a file, and it never touches anything
 but the `monitored` flag.** It does not modify quality profiles, tags,
-indexers, download clients, or any other *arr setting. The only thing
-cutoffarr ever writes is `monitored: false` on an item that has, by the
-profile's own rules, nothing left to download — see
+indexers, download clients, or any other *arr setting. `monitored` is the only
+field it ever writes: `false` on an item that has, by the profile's own rules,
+nothing left to download — and `true` only when you switch on
+`reverse_scan_remonitor`, which is off by default and is the sole way anything
+here is ever re-monitored (see [The reverse scan](#the-reverse-scan)). See
 [Safety and dry-run](#safety-and-dry-run) for exactly how that claim is
 enforced and checked.
 
@@ -169,7 +171,8 @@ deliberately small and independently checked, not just documented:
   object to round-trip. cutoffarr still holds that write to the same
   standard by checking its result instead of its input: it reads the
   server's own echoed response to confirm every requested episode id came
-  back with `monitored: false`, and if the response can't settle that, it
+  back with the value the write asked for (`false` on the forward path,
+  `true` on a reverse re-monitor), and if the response can't settle that, it
   falls back to a read-only re-`GET` of those episodes before trusting the
   write at all — never a second guess in cutoffarr's own favor. Either way,
   no write anywhere calls anything that deletes, imports, renames, or
@@ -231,7 +234,9 @@ goes on searching and upgrading those episodes, and *nothing else in
 cutoffarr can see them* — the forward scan skips the whole season on its
 flag. It is the state a season write interrupted halfway leaves behind, and
 it is also what you get by monitoring one episode of an unmonitored season by
-hand; either way the season is reported until the two agree again.
+hand; either way the season is reported until the two agree again. Reporting
+treats the two the same; writing does not — see
+[Letting it fix them](#letting-it-fix-them).
 
 What is **not** a finding, deliberately:
 
@@ -273,7 +278,7 @@ logged as a warning naming exactly that state, and the next full cycle
 reports the season as `unmonitored season with monitored episodes` and
 finishes the flag on its own.
 
-Two things it will never do:
+Three things it will never do:
 
 - Re-monitor anything unless the cycle's cross-check explicitly passed *and*
   actually verified something. If an instance's data disagreed with itself,
@@ -284,6 +289,16 @@ Two things it will never do:
   series is a human retiring a show; such seasons are reported (with
   `seriesMonitored=false`) and left alone. cutoffarr never writes a
   series-level monitored flag in either direction.
+- Re-monitor the **episodes** of a season it reports as `unmonitored season
+  with monitored episodes`. That season meets every criterion — the only thing
+  wrong with it is that its own flag disagrees with an episode inside it — so
+  the most cutoffarr will ever write there is the season flag, and only when
+  every episode inside is already monitored, which is exactly the state its own
+  interrupted write leaves. Monitor one episode of a finished, unmonitored
+  season by hand and cutoffarr will tell you about it every cycle and touch
+  nothing: re-monitoring the season would drag the episodes you left alone with
+  it, and the next forward cycle would then unmonitor the lot, including the one
+  you chose. The refusal is logged and counted as `remonitorsRefused`.
 
 The summary line tells you which mode you are in: with the switch off it
 carries `reverseFindings=N` and nothing else; with it on, `remonitored`,
@@ -372,7 +387,9 @@ picked up by the next full reconciliation sweep (`poll_interval`, default
 
 **Does it delete anything?**
 No. cutoffarr never sends a delete of any kind, to either `*arr`. The only
-field it ever writes is `monitored`, and only to `false`. This isn't just a
+field it ever writes is `monitored`: `false` on the forward path, and `true`
+only when `reverse_scan_remonitor` is enabled (off by default — see
+[Letting it fix them](#letting-it-fix-them)). This isn't just a
 design intent — see
 [Safety and dry-run](#safety-and-dry-run) for the test that makes it
 checkable: no delete verb (or any write verb outside the two designated
@@ -394,9 +411,13 @@ names, and neither triggers on the same thing cutoffarr does:
   ever being played or which release group provided the file.
 
 **Can it re-monitor something it already unmonitored?**
-No, not in this version. cutoffarr is one-directional: it only ever moves an
-item from monitored to unmonitored. A reverse scan is a possible future
-addition, not something v1 does.
+Only if you ask it to, and by default it can't. The reverse scan reports what
+is unmonitored while still failing the criteria; **writing** those back to
+monitored is a separate switch, `reverse_scan_remonitor`, which is **off by
+default** — with it off that pass composes no write at all, in any mode. See
+[The reverse scan](#the-reverse-scan) for what it reports, and
+[Letting it fix them](#letting-it-fix-them) for exactly what the switch
+permits and the three things it still refuses to do.
 
 **Does it touch quality profiles, tags, indexers, or anything else?**
 No. `monitored` is the only field cutoffarr ever writes, on the one object
