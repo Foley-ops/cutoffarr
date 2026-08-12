@@ -1,19 +1,30 @@
 # release.yml — builds the published image and pushes it to GHCR.
 #
-# Triggered ONLY by a `vX.Y.Z`-shaped tag push, never by an ordinary commit —
-# publishing a new image is a deliberate, human-initiated act (`git tag v1.0.0
-# && git push --tags`), not something that happens as a side effect of merging
-# to main. Nothing here runs until that tag exists.
+# Triggered ONLY by a strict `vX.Y.Z` (all-digit X, Y, Z) tag push, never by
+# an ordinary commit — publishing a new image is a deliberate, human-initiated
+# act (`git tag v1.0.0 && git push --tags`), not something that happens as a
+# side effect of merging to main. The tag filter below,
+# `v[0-9]+.[0-9]+.[0-9]+`, is anchored to the whole ref name (GitHub's
+# filter-pattern syntax, not a general glob/regex), so a prerelease-suffixed
+# tag — `v1.0.0-rc1`, `v2.0.0-beta`, a typo'd `vtest` — does NOT match and
+# does NOT trigger this workflow. That is deliberate, not an oversight: this
+# project has no prerelease channel, and the alternative (a loose `v*` glob)
+# would let a prerelease tag silently re-point `:latest` at a build nobody
+# intended to ship as the recommended image.
 #
 # Builds both linux/amd64 and linux/arm64 from the one Dockerfile via buildx,
-# and pushes both tags: `vX.Y.Z` (this exact release) and `latest`. QEMU
-# (docker/setup-qemu-action below) is still needed for buildx to run the
-# FINAL stage's arm64 manifest entry and any arm64-only step, but NOT for the
-# compile itself: the Dockerfile's build stage is pinned to
-# `--platform=$BUILDPLATFORM`, so it always runs natively on this runner
-# (amd64), and `ARG TARGETARCH` / `GOARCH=$TARGETARCH` is what makes that
-# native stage cross-compile the arm64 binary rather than needing QEMU to
-# emulate the Go toolchain itself.
+# and pushes both tags: `vX.Y.Z` (this exact release) and `latest`. No QEMU
+# setup step is used, and none is needed: the Dockerfile's build stage is
+# pinned to `--platform=$BUILDPLATFORM`, so it always runs natively on this
+# runner (amd64) for both legs, and `ARG TARGETARCH` / `GOARCH=$TARGETARCH`
+# is what makes that native stage cross-compile the arm64 binary rather than
+# needing QEMU to emulate the Go toolchain. The final stage (distroless base
+# + COPY/USER/EXPOSE/ENTRYPOINT/CMD) executes nothing at build time either —
+# no RUN, nothing to run under emulation — so there is no step on either leg,
+# in either stage, that QEMU would ever be asked to do. buildx itself is
+# still required below (it drives the multi-platform build and the manifest
+# list that ties both legs to one tag); only the separate QEMU emulation
+# layer is the unnecessary piece.
 #
 # Authentication is GITHUB_TOKEN — no secret is created or stored for this,
 # and nothing in this workflow ever echoes it; docker/login-action consumes it
@@ -34,7 +45,7 @@ name: release
 on:
   push:
     tags:
-      - 'v*'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
 
 # packages: write is the one elevated permission this workflow needs, to push
 # to GHCR under this repository's own package namespace; contents: read is
@@ -67,9 +78,6 @@ jobs:
           REPOSITORY: ${{ github.repository }}
         run: |
           echo "name=ghcr.io/${REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

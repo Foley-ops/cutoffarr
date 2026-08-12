@@ -16,8 +16,10 @@
 # `docker buildx build --platform linux/amd64,linux/arm64 .`. Without it,
 # BuildKit resolves this stage's own base image per TARGET platform too: the
 # arm64 leg would pull an arm64 golang:alpine and run every RUN line below —
-# including `go mod download` and the whole compile — under QEMU emulation
-# (release.yml's docker/setup-qemu-action exists for exactly that path).
+# including `go mod download` and the whole compile — under QEMU emulation.
+# release.yml carries no QEMU setup step at all, precisely because this pin
+# (plus GOARCH=$TARGETARCH below) makes that emulation path unreachable —
+# see release.yml's own header comment for the full reasoning.
 # Go's own GOARCH already defaults to the host it finds itself running on, so
 # an emulated-arm64 stage would still produce a correctly-arched arm64
 # binary even with no GOARCH set at all — just by compiling the entire

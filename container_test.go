@@ -67,8 +67,9 @@ func TestDockerfile_BuildsWithTheModulesOwnGoVersion(t *testing.T) {
 // `--platform=$BUILDPLATFORM` on the build stage's FROM line, BuildKit
 // resolves the STAGE's own base image per TARGET platform too — the arm64
 // leg already pulls an arm64 golang:alpine and runs every RUN line under
-// QEMU (release.yml's docker/setup-qemu-action exists for exactly that), and
-// Go's own GOARCH default already tracks the host it finds itself running
+// QEMU emulation (release.yml carries no QEMU setup step at all — this pin
+// is what makes that emulation path unreachable), and Go's own GOARCH
+// default already tracks the host it finds itself running
 // on. So even with no GOARCH set at all, that leg's binary comes out the
 // correct architecture — just compiled slowly, under full emulation, for no
 // reason: the actual bottleneck in every future release. `GOARCH=$TARGETARCH`
