@@ -169,6 +169,24 @@ func run(args []string, stdout, stderr io.Writer) int {
 			if instanceSet && inst.Name != *instanceName {
 				continue
 			}
+			// REVIEW FIX (Phase 6 final round, F4, controller ruling):
+			// --only-id is a radarr movie id in this phase (Sonarr gets its
+			// own meaning in Phase 7). Without this guard, a mixed
+			// radarr+sonarr config's --once --only-id run would still run a
+			// FULL unscoped sonarr library report for every sonarr
+			// instance — the flag silently failing to scope half the run,
+			// in a phase whose --instance/--only-id checks above go out of
+			// their way to refuse exactly that kind of silent evaporation
+			// elsewhere. Least-surprise: a targeted run must never fan out
+			// into a full unscoped Sonarr report, so the instance is
+			// skipped entirely — not contacted at all, not even for
+			// connectivity — with one INFO line saying so per sonarr
+			// instance.
+			if onlyIDSet && inst.Type == "sonarr" {
+				logger.Info("--only-id is a radarr-scoped flag; skipping this sonarr instance for the cycle",
+					"instance", inst.Name, "type", inst.Type, "onlyId", *onlyID)
+				continue
+			}
 			ok := checkInstanceConnectivity(context.Background(), logger, inst)
 			if ok && inst.Type == "radarr" {
 				movies, wantedIDs, dataOK := inspectRadarrLibrary(context.Background(), logger, inst, samples)

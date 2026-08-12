@@ -419,3 +419,73 @@ instances:
 		t.Error("the named sonarr instance was never contacted")
 	}
 }
+
+// TestRun_OnlyIDSet_MixedConfig_SkipsSonarrInstancesEntirely pins F4 (Phase
+// 6 final review round, controller ruling): --only-id is a radarr movie id
+// in this phase (Sonarr gets its own meaning in Phase 7), and with a mixed
+// radarr+sonarr config a --once --only-id run used to still run a FULL
+// unscoped sonarr library report for every sonarr instance — no
+// acknowledgment anywhere that the flag left that half of the pass
+// untouched, inverting this project's own precedent of refusing silent flag
+// evaporation (the --instance/--only-id checks in run() itself). Per the
+// controller's least-surprise ruling, a targeted run must never fan out
+// into a full unscoped Sonarr report: every sonarr instance is skipped
+// ENTIRELY — not contacted at all, not even for connectivity — each with
+// one INFO line stating --only-id is radarr-scoped. Radarr behavior must be
+// completely unaffected.
+func TestRun_OnlyIDSet_MixedConfig_SkipsSonarrInstancesEntirely(t *testing.T) {
+	var sonarrHits int
+	sonarrSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sonarrHits++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer sonarrSrv.Close()
+
+	var radarrHits int
+	radarrMux := http.NewServeMux()
+	radarrMux.HandleFunc("/api/v3/system/status", func(w http.ResponseWriter, r *http.Request) {
+		radarrHits++
+		w.Write([]byte(`{"appName": "Radarr", "version": "5.14.0.9383"}`))
+	})
+	radarrMux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
+		radarrHits++
+		w.Write([]byte(`[]`))
+	})
+	radarrMux.HandleFunc("/api/v3/movie", func(w http.ResponseWriter, r *http.Request) {
+		radarrHits++
+		w.Write([]byte(`[]`))
+	})
+	radarrMux.HandleFunc("/api/v3/wanted/cutoff", func(w http.ResponseWriter, r *http.Request) {
+		radarrHits++
+		w.Write([]byte(`{"page":1,"pageSize":100,"totalRecords":0,"records":[]}`))
+	})
+	radarrSrv := httptest.NewServer(radarrMux)
+	defer radarrSrv.Close()
+
+	path := writeMainTestConfig(t, `
+instances:
+  - name: radarr-main
+    type: radarr
+    url: `+radarrSrv.URL+`
+    api_key: key1
+  - name: sonarr-main
+    type: sonarr
+    url: `+sonarrSrv.URL+`
+    api_key: key2
+`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", path, "--once", "--only-id", "42"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if sonarrHits != 0 {
+		t.Errorf("the sonarr instance received %d request(s); --only-id must skip sonarr instances entirely, before any connectivity check ever runs", sonarrHits)
+	}
+	if radarrHits == 0 {
+		t.Error("the radarr instance was never contacted; --only-id must not change radarr behavior")
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "level=INFO") || !strings.Contains(out, "instance=sonarr-main") || !strings.Contains(out, "only-id") {
+		t.Errorf("expected an INFO line naming sonarr-main and stating --only-id is radarr-scoped:\n%s", out)
+	}
+}
