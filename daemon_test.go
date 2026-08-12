@@ -272,6 +272,42 @@ instances:
 	return path
 }
 
+// writeTwoInstanceDaemonConfig writes a config naming BOTH a radarr and a
+// sonarr, which is the shape every real deployment has and which
+// writeDaemonConfig cannot express.
+//
+// It exists because *arr ids are PER INSTANCE: movie 1 of radarr-main and
+// series 7 of sonarr-main are unrelated things that happen to be numbers, and
+// every routing branch in the daemon's webhook path (grouping expired keys by
+// instance, the "an instance the caller did not name is not contacted at all"
+// filter, the between-instances shutdown check) is a no-op with one configured
+// instance. A regression in any of them is invisible to a single-instance
+// suite and writes to the wrong library in production.
+func writeTwoInstanceDaemonConfig(t *testing.T, radarrURL, sonarrURL string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := fmt.Sprintf(`
+dry_run: true
+log_level: debug
+poll_interval: 0
+webhook_debounce: 45s
+instances:
+  - name: radarr-main
+    type: radarr
+    url: %s
+    api_key: key1
+  - name: sonarr-main
+    type: sonarr
+    url: %s
+    api_key: key2
+`, radarrURL, sonarrURL)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing the two-instance daemon test config: %v", err)
+	}
+	return path
+}
+
 // startDaemonWithArgs is startDaemon for a test that needs to pass extra flags
 // (the --only-id/--instance no-effect warnings, which are emitted on the daemon
 // branch before the daemon starts).
@@ -405,6 +441,132 @@ func TestDaemon_TwoItemsOfOneInstance_CoalesceIntoOneEvaluation(t *testing.T) {
 	}
 	if n := strings.Count(cycle, "radarr decision summary"); n != 1 {
 		t.Errorf("expected exactly one summary for the coalesced cycle, got %d:\n%s", n, cycle)
+	}
+}
+
+// TestDaemon_TwoInstances_EachWebhookCycleContactsOnlyItsOwnInstance is the
+// per-instance routing every other daemon test is structurally unable to
+// exercise, because a one-instance config makes the grouping a no-op.
+//
+// The consequence it guards is the worst one in this program's vocabulary: *arr
+// ids are per-instance, so a regression that unioned the coalesced id set
+// across instances, or that dropped scanCycle.instanceName, would take the
+// SONARR event's id 7 into the RADARR cycle and unmonitor whatever film happens
+// to be movie 7 over there — a correct-looking write to the wrong library. Two
+// deliberately DIFFERENT ids are what makes a crossed set visible: with the
+// same id on both sides a union would be indistinguishable from correct
+// routing.
+func TestDaemon_TwoInstances_EachWebhookCycleContactsOnlyItsOwnInstance(t *testing.T) {
+	radarr := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		wouldUnmonitorStatefulMovie(1, "The Radarr One"),
+		wouldUnmonitorStatefulMovie(7, "Movie Seven — the film a crossed id set would unmonitor"),
+	})
+	sonarr := newStatefulSonarrFake(t,
+		[]*statefulSonarrSeries{
+			{id: 7, title: "The Sonarr One", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 1, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1}}},
+		},
+		[]*statefulSonarrEpisode{
+			{id: 700, seriesID: 7, seasonNumber: 1, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 900},
+		},
+		[]*statefulSonarrEpisodeFile{{id: 900, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false}},
+	)
+
+	// Which fake was contacted, in order, recorded only once the startup scan
+	// (which legitimately contacts both) is behind us. Safe to arm after
+	// waitReady without further synchronization only because it is armed
+	// BEFORE: the dispatcher is the same single goroutine that ran the scan, so
+	// nothing is in flight at that instant either way.
+	var mu sync.Mutex
+	recording := false
+	var contacted []string
+	recorder := func(name string) func(string, string) {
+		return func(string, string) {
+			mu.Lock()
+			defer mu.Unlock()
+			if recording {
+				contacted = append(contacted, name)
+			}
+		}
+	}
+	radarr.onRequest = recorder("radarr-main")
+	sonarr.onRequest = recorder("sonarr-main")
+
+	h := startDaemon(t, writeTwoInstanceDaemonConfig(t, radarr.srv.URL, sonarr.srv.URL))
+	h.waitReady()
+	mu.Lock()
+	recording = true
+	mu.Unlock()
+	mark := h.mark()
+
+	h.post("radarr-main", downloadMoviePayload)
+	h.post("sonarr-main", `{"eventType":"Download","series":{"id":7},"episodes":[{"seasonNumber":1}]}`)
+	eventually(t, "both events to be queued", func() bool {
+		return strings.Count(h.out.String(), "webhook queued") == 2
+	})
+
+	// ONE advance past the debounce: both keys come due together, and the loop
+	// must still run them as two separate, instance-scoped evaluations.
+	h.clock.Advance(45 * time.Second)
+	h.awaitLogCount("webhook debounce expired; evaluating", 2)
+	time.Sleep(20 * time.Millisecond)
+	h.stop()
+
+	cycle := h.since(mark)
+
+	// 1. Two evaluations, each naming exactly one instance and exactly its own
+	//    id. A crossed id set shows up here as scopeIds=1,7.
+	for _, want := range []string{
+		`msg="webhook debounce expired; evaluating" instance=radarr-main items=1 ids=1`,
+		`msg="webhook debounce expired; evaluating" instance=sonarr-main items=1 ids=7`,
+	} {
+		if !strings.Contains(cycle, want) {
+			t.Errorf("expected an evaluation line %q; each instance's cycle must carry only its OWN ids:\n%s", want, cycle)
+		}
+	}
+	if strings.Contains(cycle, "scopeIds=") {
+		t.Errorf("two events for two DIFFERENT instances are two one-item scopes, never one coalesced set:\n%s", cycle)
+	}
+
+	// 2. One summary per instance, each scoped to its own id.
+	for _, want := range []string{"radarr decision summary", "sonarr decision summary"} {
+		if n := strings.Count(cycle, want); n != 1 {
+			t.Errorf("expected exactly one %q, got %d:\n%s", want, n, cycle)
+		}
+	}
+	for _, line := range strings.Split(cycle, "\n") {
+		if strings.Contains(line, "radarr decision summary") && !strings.Contains(line, "onlyId=1") {
+			t.Errorf("the radarr summary must be scoped to the movie ITS webhook named:\n%s", line)
+		}
+		if strings.Contains(line, "sonarr decision summary") && !strings.Contains(line, "onlyId=7") {
+			t.Errorf("the sonarr summary must be scoped to the series ITS webhook named:\n%s", line)
+		}
+	}
+
+	// 3. Nothing was looked for in the wrong library. A crossed id set would
+	//    also surface here, as the engine's "named an id this library does not
+	//    have" warning.
+	if strings.Contains(cycle, "not found in this instance's library") {
+		t.Errorf("an id was carried into the wrong instance's evaluation:\n%s", cycle)
+	}
+
+	// 4. The strongest form, at the transport: during each cycle the OTHER
+	//    *arr received no request at all. "Not written to" is a weaker claim
+	//    than "not contacted", and the plan's --instance rule is the latter.
+	mu.Lock()
+	seq := append([]string(nil), contacted...)
+	mu.Unlock()
+	if len(seq) == 0 {
+		t.Fatalf("no requests were recorded after the startup scan; the webhook cycles did not run:\n%s", cycle)
+	}
+	transitions := 0
+	for i := 1; i < len(seq); i++ {
+		if seq[i] != seq[i-1] {
+			transitions++
+		}
+	}
+	if transitions != 1 || seq[0] != "radarr-main" || seq[len(seq)-1] != "sonarr-main" {
+		t.Errorf("each webhook cycle must contact exactly one instance, radarr's first (expired keys are grouped in instance order); got %v", seq)
 	}
 }
 
