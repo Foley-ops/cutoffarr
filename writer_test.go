@@ -450,6 +450,42 @@ func TestUnmonitorMovie_FreshPayloadTagsMalformed_TagActive_RefusesToWriteWithWa
 	}
 }
 
+// TestUnmonitorMovie_FreshPayloadTagsContainNullElement_TagActive_RefusesToWriteWithWarn
+// pins the null-ARRAY-ELEMENT corner (REVIEW FIX, Phase 6, carried forward
+// from the phase-5 branch review): "tags": [3, null, 9] decodes cleanly into
+// a plain []int with NO error at all — encoding/json leaves a non-pointer
+// destination at its zero value when it meets JSON null — silently turning
+// the null into tag id 0. Before decodeTagIDs (shared.go) existed, that
+// meant a corrupted tags array could slip straight past both the
+// "tagsPresent" and "tags == nil" guards and be compared to the exclusion
+// tag id as if id 0 were a real, observed tag. Distinct from the
+// already-covered "tags is not a JSON array at all" case just above: this
+// array decodes structurally fine and only one element is the problem.
+func TestUnmonitorMovie_FreshPayloadTagsContainNullElement_TagActive_RefusesToWriteWithWarn(t *testing.T) {
+	body := `{"id": 7, "title": "Null Tag Element", "monitored": true, "tags": [3, null, 9]}`
+	srv, got := writerTestServer(t, body, http.StatusOK)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := writerTestInstance(srv.URL)
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	written, err := unmonitorMovie(context.Background(), logger, client, inst, 7, 9, true, false)
+	if !errors.Is(err, errTagsUnverifiable) {
+		t.Fatalf("unmonitorMovie error = %v, want errTagsUnverifiable:\n%s", err, buf.String())
+	}
+	if written {
+		t.Error("written = true, want false")
+	}
+	if len(filterRequests(*got, http.MethodPut)) != 0 {
+		t.Errorf("expected zero PUTs when tags contains a JSON null element, got %+v", *got)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "null") {
+		t.Errorf("expected a warning explaining the write was refused because a tag element was JSON null:\n%s", out)
+	}
+}
+
 // TestUnmonitorMovie_TagActive_TagsPresentButNotExcluded_WritesNormally is
 // the mirror the review round found missing: every other tagActive=true test
 // in this suite proves a refusal, and none proves the re-check PERMITTING a

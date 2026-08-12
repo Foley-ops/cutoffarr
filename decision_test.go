@@ -1191,6 +1191,15 @@ func TestRunRadarrDecisionEngine_SummaryCountsCorrect(t *testing.T) {
 	if !strings.Contains(out, "no file=2") {
 		t.Errorf("expected the skip-reason count 'no file=2' in the summary:\n%s", out)
 	}
+	// REVIEW FIX (Phase 6, carried forward from the phase-5 branch review):
+	// writesRefused=0 was never pinned by name in any existing summary
+	// assertion — every always-present-as-0 counter needs at least one test
+	// proving it actually appears as a token (not merely that the
+	// reconciliation identity holds arithmetically), or a bug that dropped
+	// the attr entirely from the summary line could go unnoticed.
+	if !strings.Contains(out, "writesRefused=0") {
+		t.Errorf("expected writesRefused=0 in the summary (nothing here carries the exclusion tag):\n%s", out)
+	}
 }
 
 // TestRunRadarrDecisionEngine_PerMovieMoviefileFailure_DoesNotStopOtherMovies
@@ -2066,6 +2075,49 @@ func TestRunWritePass_UnrecognizedCrossCheckStatus_WritePassBlocked(t *testing.T
 				t.Errorf("a blocked pass must never log a completed unmonitor:\n%s", out)
 			}
 		})
+	}
+}
+
+// TestRunWritePass_UnrecognizedCrossCheckStatus_NothingPending_StillWarns
+// pins the REVIEW FIX (Phase 6, carried forward from the phase-5 branch
+// review) closing a gap the noise-budget fix left open: the "nothing pending
+// means downgrade WARN to INFO" rule (see the sibling test
+// TestRunRadarrDecisionEngine_CrossCheckBlockedWithNothingToWrite_IsInfoNotWarn)
+// is only safe for a status this code actually understands — "inconclusive"
+// or "failed" with nothing to write really is a benign, ignorable cycle. An
+// UNRECOGNIZED status (a typo in a future status constant, a zero-value
+// crossCheckResult that never got its status set) is a sign something is
+// actually broken, and silencing it just because no write happened to be
+// pending this cycle would let that bug hide behind the exact noise-budget
+// mechanism meant to protect a human running this in a daemon loop from
+// missing the warning that matters.
+func TestRunWritePass_UnrecognizedCrossCheckStatus_NothingPending_StillWarns(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{})
+	client := NewAPIClient(fake.instance().URL, fake.instance().APIKey)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	// No would-unmonitor decisions at all: pending == 0, the case the
+	// noise-budget fix downgrades to INFO for a KNOWN status.
+	decisions := []movieDecision{{id: 1, title: "Skipped Movie", wouldUnmonitor: false, reason: ReasonNoFile}}
+	cc := crossCheckResult{status: "partially-verified"} // not one of the three known constants
+	unmonitored, writeErrors, echoUnverified, writesRefused, withheld := runWritePass(context.Background(), logger, client, fake.instance(), decisions, cc, 0, false, false)
+
+	if unmonitored != 0 || writeErrors != 0 || echoUnverified != 0 || writesRefused != 0 || withheld != 0 {
+		t.Errorf("unmonitored/writeErrors/echoUnverified/writesRefused/withheld = %d/%d/%d/%d/%d, want all 0", unmonitored, writeErrors, echoUnverified, writesRefused, withheld)
+	}
+	out := buf.String()
+	var withheldLine string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "withheld") {
+			withheldLine = line
+			break
+		}
+	}
+	if withheldLine == "" {
+		t.Fatalf("expected a line explaining writes were withheld:\n%s", out)
+	}
+	if !strings.Contains(withheldLine, "level=WARN") {
+		t.Errorf("an unrecognized cross-check status must stay WARN even with nothing pending (it is a sign of a bug, not a benign cycle): %s", withheldLine)
 	}
 }
 

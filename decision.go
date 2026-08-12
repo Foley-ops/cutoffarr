@@ -254,21 +254,6 @@ func titleOrAbsent(t *string) string {
 	return *t
 }
 
-// containsTag reports whether id is present in tags. A nil tags pointer
-// (the "tags" key entirely absent from the movie's JSON) is treated as not
-// containing anything, same as a present-but-empty tags list.
-func containsTag(tags *[]int, id int) bool {
-	if tags == nil {
-		return false
-	}
-	for _, t := range *tags {
-		if t == id {
-			return true
-		}
-	}
-	return false
-}
-
 // evaluateMovie applies the STRICT decision rule (rules 2-6; rule 1 —
 // monitored == true — is the caller's responsibility, since a monitored
 // == false movie is excluded from the report entirely rather than
@@ -759,7 +744,17 @@ func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, i
 		// back inconclusive trains a human running this in a daemon loop to
 		// ignore the WARN that actually matters (one that blocked real
 		// writes). Only a pass that actually withheld something stays WARN.
-		if pending > 0 {
+		//
+		// REVIEW FIX (Phase 6, carried forward from the phase-5 branch
+		// review): that downgrade is only safe when cc.status is a status
+		// this code actually recognizes — "failed" or "inconclusive" with
+		// nothing pending really is benign. A status outside the three known
+		// constants (a typo in a future status constant, a zero-value
+		// crossCheckResult) is itself a sign something is broken, and
+		// pending == 0 must not be allowed to silence that: the pass still
+		// downgrades on a known status, but stays WARN whenever pending > 0
+		// OR the status itself is unrecognized.
+		if pending > 0 || !isKnownCrossCheckStatus(cc.status) {
 			logger.Warn(msg, attrs...)
 		} else {
 			logger.Info(msg, attrs...)
@@ -1012,6 +1007,20 @@ const (
 	crossCheckStatusFailed       = "failed"
 	crossCheckStatusInconclusive = "inconclusive"
 )
+
+// isKnownCrossCheckStatus reports whether status is one of the three
+// constants above. Used by runWritePass's noise-budget downgrade (a blocked
+// pass with nothing pending drops to INFO) to scope that downgrade to
+// statuses this code actually understands — an unrecognized status is a bug
+// signal that must stay WARN regardless of how much was pending.
+func isKnownCrossCheckStatus(status string) bool {
+	switch status {
+	case crossCheckStatusPassed, crossCheckStatusFailed, crossCheckStatusInconclusive:
+		return true
+	default:
+		return false
+	}
+}
 
 // crossCheckResult is everything the cross-check learned, not just its
 // verdict. It is a struct rather than a status string plus two counts

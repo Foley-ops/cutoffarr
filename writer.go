@@ -167,23 +167,36 @@ func unmonitorMovie(ctx context.Context, logger *slog.Logger, client *APIClient,
 				"instance", inst.Name, "type", inst.Type, "id", movieID, "title", title)
 			return false, fmt.Errorf("movie %d: %w: %q key absent from the pre-write fetch", movieID, errTagsUnverifiable, "tags")
 		}
-		var tags []int
-		if err := json.Unmarshal(rawTags, &tags); err != nil {
+		// decodeTagIDs (shared.go, REVIEW FIX carried forward to Phase 6):
+		// unlike a bare `json.Unmarshal(rawTags, &tags)` into []int, this also
+		// refuses a null ELEMENT inside an otherwise well-formed array (e.g.
+		// "tags": [3, null, 9]) rather than silently decoding it as tag id 0 —
+		// see decodeTagIDs's doc comment. The nil-slice-on-"tags": null
+		// behavior a plain []int decode has is otherwise preserved exactly, so
+		// the tags == nil check just below is unaffected.
+		tags, err := decodeTagIDs(rawTags)
+		if err != nil {
+			if errors.Is(err, errNullTagElement) {
+				logger.Warn("movie tags in the pre-write fetch contain a JSON null element; cannot verify the exclusion tag is not present, refusing to write",
+					"instance", inst.Name, "type", inst.Type, "id", movieID, "title", title, "error", err)
+				return false, fmt.Errorf("movie %d: %w: %q contains a JSON null element in the pre-write fetch: %v", movieID, errTagsUnverifiable, "tags", err)
+			}
 			logger.Warn("movie tags in the pre-write fetch are not a JSON array of ids; cannot verify the exclusion tag is not present, refusing to write",
 				"instance", inst.Name, "type", inst.Type, "id", movieID, "title", title, "error", err)
 			return false, fmt.Errorf("movie %d: %w: %q is not a JSON array of ids in the pre-write fetch: %v", movieID, errTagsUnverifiable, "tags", err)
 		}
 		// tags == nil here means the fresh payload's "tags" key held the
-		// JSON literal null: json.Unmarshal decodes that into a nil []int
-		// with NO error (distinct from "[]", which decodes to a non-nil,
-		// empty slice), so the tagsPresent/decode-error guards above do not
-		// catch it. Left unchecked, containsIntID(nil, exclusionTagID) is
-		// simply false and the write proceeds with the exclusion tag's
-		// status genuinely unknown — the exact outcome this whole re-check
-		// exists to prevent. The decision side treats the identical wire
-		// shape as untrusted input for the same reason: movieListElement.Tags
-		// is *[]int (radarr.go), so "tags": null leaves m.Tags == nil and
-		// decision.go rule 4 returns ReasonTagsUnknown rather than passing.
+		// JSON literal null: decodeTagIDs (like a plain []int decode) turns
+		// that into a nil slice with NO error (distinct from "[]", which
+		// decodes to a non-nil, empty slice), so the tagsPresent/decode-error
+		// guards above do not catch it. Left unchecked, containsIntID(nil,
+		// exclusionTagID) is simply false and the write proceeds with the
+		// exclusion tag's status genuinely unknown — the exact outcome this
+		// whole re-check exists to prevent. The decision side treats the
+		// identical wire shape as untrusted input for the same reason:
+		// movieListElement.Tags is *[]int (radarr.go), so "tags": null leaves
+		// m.Tags == nil and decision.go rule 4 returns ReasonTagsUnknown
+		// rather than passing.
 		if tags == nil {
 			logger.Warn("movie tags in the pre-write fetch is JSON null; cannot verify the exclusion tag is not present, refusing to write",
 				"instance", inst.Name, "type", inst.Type, "id", movieID, "title", title)
@@ -530,19 +543,4 @@ func titleFromPayload(payload map[string]json.RawMessage) string {
 		return "absent"
 	}
 	return title
-}
-
-// containsIntID reports whether id is present in ids. A small local helper
-// rather than decision.go's containsTag: that one takes a *[]int (to
-// distinguish "tags absent" from "tags present but empty" for the caller),
-// whereas the pre-write tag re-check above has already made that
-// distinction itself (payload["tags"] present/absent) before ever reaching
-// this call, so a plain []int is all that is needed here.
-func containsIntID(ids []int, id int) bool {
-	for _, i := range ids {
-		if i == id {
-			return true
-		}
-	}
-	return false
 }

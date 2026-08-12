@@ -224,6 +224,31 @@ func fetchMovies(ctx context.Context, logger *slog.Logger, client *APIClient, in
 			return counts, nil, nil, false
 		}
 
+		// REVIEW FIX (Phase 6, carried forward from the phase-5 branch
+		// review): movieListElement.Tags is *[]int, so the struct decode
+		// above already tells "tags absent" apart from "tags present" — but
+		// a *[]int destination still silently turns a null ARRAY ELEMENT
+		// ("tags": [3, null, 9]) into tag id 0 with no decode error at all,
+		// since encoding/json leaves a non-pointer destination at its zero
+		// value when it meets JSON null. Re-inspecting the raw "tags" bytes
+		// through decodeTagIDs (shared.go), which decodes through []*int
+		// first specifically to make a null element visible, catches what
+		// the struct decode cannot. This is per-movie, not instance-fatal
+		// (unlike the decode failure above): the movie's Tags is normalized
+		// back to nil, exactly what "tags": null already produces, so it
+		// flows into decision.go rule 4's already-correct, already-tested
+		// untrusted-tags handling instead of silently trusting a corrupted
+		// array.
+		if m.Tags != nil {
+			if rawTags, found := rawObjectField(raw, "tags"); found {
+				if _, err := decodeTagIDs(rawTags); err != nil {
+					logger.Warn("movie tags array contains an unusable element (e.g. JSON null); treating tags as unverifiable",
+						"instance", inst.Name, "type", inst.Type, "title", titleOrAbsent(m.Title), "error", err)
+					m.Tags = nil
+				}
+			}
+		}
+
 		counts.total++
 		if m.Monitored != nil && *m.Monitored {
 			counts.monitored++
