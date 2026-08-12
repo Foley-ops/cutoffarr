@@ -3,11 +3,24 @@
 # Copy this file to config.yml (or set --config to point at your own copy)
 # and fill in real values. config.yml is gitignored — never commit it, since
 # it holds real API keys.
+#
+# Run modes:
+#   cutoffarr --config config.yml           daemon: startup scan, then the
+#                                           webhook listener and a
+#                                           reconciliation sweep every
+#                                           poll_interval, until SIGTERM
+#   cutoffarr --config config.yml --once    a single pass, then exit
 
 dry_run: true            # MUST default to true if absent. Set false only when ready.
 poll_interval: 24h       # reconciliation full sweep; Go duration; min 1h; 0 disables
-webhook_port: 9898       # HTTP port for *arr webhook pushes (later phases)
-webhook_debounce: 45s    # wait after last event per series/movie before evaluating
+webhook_port: 9898       # port the webhook listener binds; endpoint is
+                         #   POST /webhook/{instance-name} — e.g.
+                         #   http://cutoffarr:9898/webhook/radarr-main
+                         # Point each *arr's "Connect -> Webhook" at its OWN
+                         # name here, with On Import and On Upgrade ticked.
+webhook_debounce: 45s    # wait after the LAST event for a movie/series before
+                         # evaluating it; a season-pack import is one evaluation,
+                         # not one per episode. 0 evaluates without waiting.
 log_level: info          # debug | info | warn | error
 exclusion_tag: cutoffarr-exclude
 
