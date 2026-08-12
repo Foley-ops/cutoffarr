@@ -773,16 +773,29 @@ func TestDaemon_SecondCycleWithNothingChanged_LogsSummariesOnlyAtInfo(t *testing
 		t.Errorf("a steady-state cycle must be free of warnings and errors:\n%s", cycle2)
 	}
 
-	// SUMMARIES ONLY, asserted as such rather than as a list of forbidden
-	// messages: an idle cycle's INFO output is the daemon's own two bookends
-	// (the sweep beginning and completing) plus one decision summary per
-	// instance, and NOTHING that scales with the size of the library. A
-	// forbidden-substring test would pass the day someone adds a thirteenth
-	// per-item INFO line nobody thought to list.
+	// SUMMARIES AND POSTURE ONLY, asserted as such rather than as a list of
+	// forbidden messages: an idle cycle's INFO output is the daemon's own two
+	// bookends (the sweep beginning and completing), one decision summary per
+	// instance, and the handful of per-INSTANCE lines listed below — NOTHING
+	// that scales with the size of the library. A forbidden-substring test would
+	// pass the day someone adds a thirteenth per-item INFO line nobody thought
+	// to list.
+	//
+	// "the size of the library" is the whole test, and it is why the exclusion
+	// tag line is admitted rather than demoted. The noise budget exists because
+	// a daemon repeating a full per-item report buries what matters; a line
+	// emitted at most once per instance per cycle cannot do that. What it CAN do
+	// is disappear, and this particular line says §2.5's exclusion tag — the
+	// user's only opt-out from being unmonitored — is inert for this instance.
+	// A tag renamed in the *arr after startup leaves rule 4 excluding nothing,
+	// and demoting the line means the only notice of that scrolled out of
+	// `docker logs` days ago. Widening the allowlist is the deliberate call
+	// (binding ruling R6); every entry added here must clear the same bar.
 	allowedInfo := []string{
 		"reconciliation sweep beginning",
 		"reconciliation sweep complete",
 		"sonarr decision summary",
+		"exclusion tag not defined in this instance",
 	}
 	sawSummary := false
 	for _, line := range strings.Split(cycle2, "\n") {
@@ -811,6 +824,53 @@ func TestDaemon_SecondCycleWithNothingChanged_LogsSummariesOnlyAtInfo(t *testing
 	// on. Proven by the startup scan, which said all of it at INFO.
 	if !strings.Contains(startup, "msg=would-unmonitor") || !strings.Contains(startup, "cross-check season") {
 		t.Errorf("the startup scan must still report in full at INFO:\n%s", startup)
+	}
+}
+
+// TestDaemon_ExclusionTagNotDefined_IsSaidOnEveryCycleNotOnlyTheFirst is the
+// one INFO line the idle-cycle noise budget must not demote, and the reason it
+// is an exception rather than an oversight.
+//
+// §2.5's exclusion tag is the user's ONLY opt-out from being unmonitored. This
+// line says that opt-out is inert for an instance — the tag is not defined
+// there, so rule 4 excludes nothing and every item is a candidate. That is a
+// statement about this program's safety posture, not about the library, and it
+// does not scale with the library the way the per-item report lines the noise
+// budget targets do: it is at most one line per instance per cycle.
+//
+// The failure it prevents is quiet and open-ended. A tag renamed or deleted in
+// the *arr mid-run silently disables rule 4 from that moment on, and at the
+// default log_level: info the only trace was the startup scan's line — which
+// scrolls out of `docker logs` on a daemon that has been up for a week, leaving
+// the operator's exclusions inert and the log saying nothing at all about it.
+func TestDaemon_ExclusionTagNotDefined_IsSaidOnEveryCycleNotOnlyTheFirst(t *testing.T) {
+	// writableSonarrFake serves an empty /tag array, so the configured
+	// exclusion tag resolves to "not defined in this instance".
+	fake := writableSonarrFake(t)
+	h := startDaemon(t, writeDaemonConfig(t, "sonarr", fake.srv.URL, true, "info", "1h", "45s"))
+	h.waitReady()
+	eventually(t, "the reconciliation schedule to be announced", func() bool {
+		return strings.Contains(h.out.String(), "reconciliation sweep scheduled")
+	})
+
+	const line = "exclusion tag not defined in this instance"
+	if !strings.Contains(h.out.String(), line) {
+		t.Fatalf("the startup scan must say the exclusion tag is inert:\n%s", h.out.String())
+	}
+
+	mark := h.mark()
+	h.clock.Advance(time.Hour)
+	h.awaitLogCount("reconciliation sweep complete", 1)
+	cycle2 := h.since(mark)
+	h.stop()
+
+	if !strings.Contains(cycle2, line) {
+		t.Errorf("an idle reconciliation cycle stopped saying that §2.5's only opt-out is inert for this instance; the noise budget demotes per-item report lines, never a safety-posture statement:\n%s", cycle2)
+	}
+	for _, l := range strings.Split(cycle2, "\n") {
+		if strings.Contains(l, line) && !strings.Contains(l, "level=INFO") {
+			t.Errorf("the line is present but below INFO, which at the default log level is the same as absent:\n%s", l)
+		}
 	}
 }
 

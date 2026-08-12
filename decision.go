@@ -115,6 +115,17 @@ type tagElement struct {
 // warned about (they may be the first sign of a /tag shape this code no longer
 // understands); they are fatal only in combination with a label that was not
 // found, which is the one case where the honest answer is "unknowable".
+//
+// PHASE 8 NOTE ON THE LOGGER: this function is called with the engine's
+// UNDEMOTED logger, unlike its neighbours in the read path, and the one line
+// that distinguishes the two is the "not defined in this instance" INFO below.
+// It is a statement about this program's safety posture rather than about the
+// library — §2.5's exclusion tag is the user's only opt-out from being
+// unmonitored, and this line says that opt-out is currently inert — so it is
+// exempt from the idle-cycle noise budget, which exists to suppress per-item
+// report lines that scale with the library. This one is at most one line per
+// instance per cycle. Every other line here is a WARN, which the demotion never
+// touched anyway, so the undemoted logger changes nothing else.
 func resolveExclusionTagID(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, label string) (id int, found bool, ok bool) {
 	body, err := fetchBody(ctx, client, "/api/v3/tag", nil)
 	if err != nil {
@@ -490,7 +501,11 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		return
 	}
 
-	exclusionTagID, tagActive, ok := resolveExclusionTagID(ctx, cycleLogger, client, inst, exclusionTagLabel)
+	// The UNDEMOTED logger, deliberately, and the only read-path call that gets
+	// it: see resolveExclusionTagID's own note. Its "not defined in this
+	// instance" line states that §2.5's opt-out is inert here, which stays at
+	// INFO on every cycle forever.
+	exclusionTagID, tagActive, ok := resolveExclusionTagID(ctx, logger, client, inst, exclusionTagLabel)
 	if !ok {
 		return
 	}
@@ -2060,7 +2075,11 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		return
 	}
 
-	exclusionTagID, tagActive, ok := resolveExclusionTagID(ctx, cycleLogger, client, inst, exclusionTagLabel)
+	// The UNDEMOTED logger, deliberately, and the only read-path call that gets
+	// it: see resolveExclusionTagID's own note. Its "not defined in this
+	// instance" line states that §2.5's opt-out is inert here, which stays at
+	// INFO on every cycle forever.
+	exclusionTagID, tagActive, ok := resolveExclusionTagID(ctx, logger, client, inst, exclusionTagLabel)
 	if !ok {
 		return
 	}
