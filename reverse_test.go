@@ -9,8 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // reverse_test.go covers the Phase 10 reverse scan: the same decision function
@@ -1023,6 +1025,361 @@ func TestRun_ReverseScan_Sonarr_DryRun_RehearsesAndWritesNothing(t *testing.T) {
 	c := summaryCountersFor(t, out, "sonarr decision summary")
 	if c["reverseFindings"] != 1 || c["reverseWithheld"] != 1 || c["remonitored"] != 0 {
 		t.Errorf("want reverseFindings=1 reverseWithheld=1 remonitored=0, got %v:\n%s", c, out)
+	}
+	assertReverseIdentity(t, out)
+}
+
+// --- scheduling: which cycles run a reverse scan at all ---------------------
+//
+// Binding controller resolution 8. The reverse scan belongs to full-library
+// cycles and to nothing else. A webhook cycle is about the one item somebody
+// just imported; an --only-id run is about the one item a human named. Running
+// a whole-library reverse scan inside either would answer a question nobody
+// asked, at the cost of a second pass over the library — in the webhook case,
+// on every import, which is precisely the cost the debounce exists to bound.
+
+// writeReverseDaemonConfig is writeDaemonConfig plus the reverse write switch.
+func writeReverseDaemonConfig(t *testing.T, url string, remonitor bool, pollInterval, logLevel string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yml")
+	content := fmt.Sprintf(`
+dry_run: true
+log_level: %s
+poll_interval: %s
+webhook_debounce: 45s
+reverse_scan_remonitor: %t
+instances:
+  - name: radarr-main
+    type: radarr
+    url: %s
+    api_key: key1
+`, logLevel, pollInterval, remonitor, url)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing the daemon test config: %v", err)
+	}
+	return path
+}
+
+// TestDaemon_StartupScanAndReconciliationSweep_BothRunTheReverseScan is the
+// positive half of the scheduling rule.
+func TestDaemon_StartupScanAndReconciliationSweep_BothRunTheReverseScan(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{reverseFindingStatefulMovie(7, "Accidentally Unmonitored")})
+	h := startDaemon(t, writeReverseDaemonConfig(t, fake.srv.URL, false, "1h", "info"))
+	h.waitReady()
+
+	startup := h.out.String()
+	if !strings.Contains(startup, `msg="reverse-scan finding"`) || !strings.Contains(startup, "reverseFindings=1") {
+		t.Fatalf("the startup scan must run the reverse scan and report it in full:\n%s", startup)
+	}
+
+	mark := h.mark()
+	h.clock.Advance(time.Hour)
+	h.awaitLogCount("reconciliation sweep complete", 1)
+	sweep := h.since(mark)
+	h.stop()
+
+	if !strings.Contains(sweep, "reverseFindings=1") {
+		t.Errorf("the reconciliation sweep must run the reverse scan too:\n%s", sweep)
+	}
+}
+
+// TestDaemon_WebhookCycle_RunsNoReversePass is the negative half, and the one
+// that costs something if it regresses: a busy library imports all day.
+func TestDaemon_WebhookCycle_RunsNoReversePass(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		wouldUnmonitorStatefulMovie(1, "Imported"),
+		reverseFindingStatefulMovie(7, "Accidentally Unmonitored"),
+	})
+	h := startDaemon(t, writeReverseDaemonConfig(t, fake.srv.URL, false, "0", "debug"))
+	h.waitReady()
+	if !strings.Contains(h.out.String(), "reverseFindings=") {
+		t.Fatalf("this test proves nothing unless the startup scan really did run a reverse pass:\n%s", h.out.String())
+	}
+
+	mark := h.mark()
+	h.post("radarr-main", downloadMoviePayload)
+	eventually(t, "the event to be queued", func() bool {
+		return strings.Contains(h.out.String(), "webhook queued")
+	})
+	h.clock.Advance(45 * time.Second)
+	h.awaitLogCount("webhook debounce expired; evaluating", 1)
+	time.Sleep(20 * time.Millisecond)
+	h.stop()
+
+	cycle := h.since(mark)
+	if !strings.Contains(cycle, "radarr decision summary") {
+		t.Fatalf("the webhook cycle must have run at all:\n%s", cycle)
+	}
+	assertNoReversePass(t, cycle)
+}
+
+// TestRun_OnlyID_RunsNoReversePass is the same rule for the scoped one-shot run.
+func TestRun_OnlyID_RunsNoReversePass(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		wouldUnmonitorStatefulMovie(1, "Named"),
+		reverseFindingStatefulMovie(7, "Accidentally Unmonitored"),
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeReverseTestConfig(t, fake.srv.URL, true, true), "--once", "--only-id", "1"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d; stderr=%s", code, stderr.String())
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "onlyId=1") {
+		t.Fatalf("this test proves nothing unless the run really was scoped:\n%s", out)
+	}
+	assertNoReversePass(t, out)
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("a dry-run must write nothing at all: %+v", writes)
+	}
+}
+
+// TestDaemon_IdleCycleWithReverseFindings_StaysWithinTheNoiseBudget is the
+// Phase 8 noise budget extended to the new lines (binding controller resolution
+// 9), and the reason it matters is that findings REPEAT: they stay true until a
+// human acts on them, so a reverse scan that reported at INFO on every sweep
+// would print the same lines every poll interval forever and bury the writes and
+// warnings the log exists for.
+//
+// The rule is the existing one, unchanged: on a repeating cycle nothing that
+// scales with the size of the library may be INFO. The per-instance summary
+// carries the count, and the findings themselves are there at DEBUG for anyone
+// who turns it on — which the startup scan proves, since it printed all of them.
+func TestDaemon_IdleCycleWithReverseFindings_StaysWithinTheNoiseBudget(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		reverseFindingStatefulMovie(7, "Accidentally Unmonitored A"),
+		reverseFindingStatefulMovie(8, "Accidentally Unmonitored B"),
+	})
+	h := startDaemon(t, writeReverseDaemonConfig(t, fake.srv.URL, false, "1h", "info"))
+	h.waitReady()
+
+	startup := h.out.String()
+	if n := strings.Count(startup, `msg="reverse-scan finding"`); n != 2 {
+		t.Fatalf("the startup scan must report both findings in full, got %d:\n%s", n, startup)
+	}
+
+	mark := h.mark()
+	h.clock.Advance(time.Hour)
+	h.awaitLogCount("reconciliation sweep complete", 1)
+	cycle2 := h.since(mark)
+
+	mark3 := h.mark()
+	h.clock.Advance(time.Hour)
+	h.awaitLogCount("reconciliation sweep complete", 2)
+	cycle3 := h.since(mark3)
+	h.stop()
+
+	for i, cycle := range []string{cycle2, cycle3} {
+		// The existing budget, unchanged and now applied to a cycle that has
+		// reverse findings in it: every INFO line must be on the allowlist, so a
+		// per-item finding line at INFO fails here rather than merely being
+		// noticed by a human six months from now.
+		if !assertIdleCycleInfoIsWithinTheBudget(t, cycle) {
+			t.Errorf("cycle %d printed no per-instance decision summary:\n%s", i+2, cycle)
+		}
+		if !strings.Contains(cycle, "reverseFindings=2") {
+			t.Errorf("cycle %d must still COUNT the findings on its summary — the count is what stays visible:\n%s", i+2, cycle)
+		}
+	}
+	// Two idle cycles must say the same thing, which is the strongest form of
+	// "nothing changed, so nothing new was said". nextSweep legitimately differs
+	// (it names a later time), so the sweep-complete line is the one exception.
+	if strip2, strip3 := withoutTimestamps(dropNextSweep(cycle2)), withoutTimestamps(dropNextSweep(cycle3)); strip2 != strip3 {
+		t.Errorf("two idle cycles with nothing changed must say the same thing:\ncycle2:\n%s\ncycle3:\n%s", strip2, strip3)
+	}
+}
+
+// assertNoReversePass fails if a cycle shows any sign of having run one. It
+// matches the reverse scan's own tokens rather than the bare word "reverse",
+// which also appears in the startup config printout (reverse_scan_remonitor=).
+func assertNoReversePass(t *testing.T, cycle string) {
+	t.Helper()
+	for _, token := range []string{"reverse-scan finding", "reverseFindings=", "reverseScan=", "remonitored=", `wantedFilter="monitored=false"`} {
+		if strings.Contains(cycle, token) {
+			t.Errorf("this cycle must run no reverse pass, but its log carries %q:\n%s", token, cycle)
+		}
+	}
+}
+
+// dropNextSweep removes the nextSweep attr, the one thing about an idle
+// reconciliation cycle that legitimately differs from the last one.
+func dropNextSweep(cycle string) string {
+	var out []string
+	for _, line := range strings.Split(cycle, "\n") {
+		if i := strings.Index(line, " nextSweep="); i >= 0 {
+			line = line[:i]
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+// withoutTimestamps strips the leading time= attr from every line, so two
+// cycles that said the same thing compare equal. stripTimeAttr (writer_test.go)
+// does one line; this does a whole cycle.
+func withoutTimestamps(cycle string) string {
+	var out []string
+	for _, line := range strings.Split(cycle, "\n") {
+		out = append(out, stripTimeAttr(line))
+	}
+	return strings.Join(out, "\n")
+}
+
+// TestRunRadarrDecisionEngine_EveryReverseFindingIsAccountedForInTheSummary is
+// the reverse pass's accounting identity, walked ending by ending — the same
+// test the forward write pass has, for the same reason.
+//
+// The forward path grew this test because two separate review rounds each found
+// a different silent path where a promised write evaporated with every counter
+// reading zero. The reverse path is new code with the same shape and the same
+// five outcomes, so it gets the same discipline from the start rather than
+// after the same two rounds:
+//
+//	reverseFindings == remonitored + remonitorsRefused + reverseWithheld
+//	                   + reverseWriteErrors + reverseRehearsalErrors
+//	                   + reverseEchoUnverified
+//
+// (reverseWriteErrors and reverseRehearsalErrors are the same counter under two
+// names — only one is ever printed, decided by dry-run — so summing both is
+// exact in either mode.)
+func TestRunRadarrDecisionEngine_EveryReverseFindingIsAccountedForInTheSummary(t *testing.T) {
+	// The finding: unmonitored, with a file, and in the UNMONITORED wanted set.
+	const findingID = 1
+	reverseWanted := `{"page":1,"pageSize":100,"totalRecords":1,"records":[{"id":1,"title":"Accounted Movie"}]}`
+	unmonitoredDetail := `{"id": 1, "title": "Accounted Movie", "monitored": false, "hasFile": true, "qualityProfileId": 1, "tags": []}`
+
+	cases := []struct {
+		name        string
+		detail      map[int]string
+		tagsJSON    string
+		putStatus   map[int]int
+		putEcho     map[string]string
+		dryRun      bool
+		wantCounter string
+	}{
+		{
+			name:        "confirmed write",
+			detail:      map[int]string{findingID: unmonitoredDetail},
+			wantCounter: "remonitored",
+		},
+		{
+			name:        "the server rejected the PUT",
+			detail:      map[int]string{findingID: unmonitoredDetail},
+			putStatus:   map[int]int{findingID: http.StatusInternalServerError},
+			wantCounter: "reverseWriteErrors",
+		},
+		{
+			name:        "the PUT was accepted but the echo confirms nothing",
+			detail:      map[int]string{findingID: unmonitoredDetail},
+			putEcho:     map[string]string{"1": ""},
+			wantCounter: "reverseEchoUnverified",
+		},
+		{
+			name:        "the movie vanished before the pre-write fetch",
+			detail:      map[int]string{},
+			wantCounter: "reverseWriteErrors",
+		},
+		{
+			name:        "the exclusion tag was added between scan and write",
+			detail:      map[int]string{findingID: `{"id": 1, "title": "Accounted Movie", "monitored": false, "hasFile": true, "qualityProfileId": 1, "tags": [42]}`},
+			tagsJSON:    `[{"id": 42, "label": "cutoffarr-exclude"}]`,
+			wantCounter: "remonitorsRefused",
+		},
+		{
+			name:        "something else re-monitored it first",
+			detail:      map[int]string{findingID: `{"id": 1, "title": "Accounted Movie", "monitored": true, "hasFile": true, "qualityProfileId": 1, "tags": []}`},
+			wantCounter: "remonitorsRefused",
+		},
+		{
+			name:        "the fresh payload's monitored is JSON null",
+			detail:      map[int]string{findingID: `{"id": 1, "title": "Accounted Movie", "monitored": null, "hasFile": true, "qualityProfileId": 1, "tags": []}`},
+			wantCounter: "remonitorsRefused",
+		},
+		{
+			name:        "it no longer fails the criteria (its file is gone)",
+			detail:      map[int]string{findingID: `{"id": 1, "title": "Accounted Movie", "monitored": false, "hasFile": false, "qualityProfileId": 1, "tags": []}`},
+			wantCounter: "remonitorsRefused",
+		},
+		{
+			name:        "dry-run withheld the write at the gate",
+			detail:      map[int]string{findingID: unmonitoredDetail},
+			dryRun:      true,
+			wantCounter: "reverseWithheld",
+		},
+		{
+			name:        "dry-run rehearsal failed before the gate",
+			detail:      map[int]string{},
+			dryRun:      true,
+			wantCounter: "reverseRehearsalErrors",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newRadarrFake(t, "", tc.detail)
+			fake.reverseWantedJSON = reverseWanted
+			if tc.tagsJSON != "" {
+				fake.tagsJSON = tc.tagsJSON
+			}
+			for id, status := range tc.putStatus {
+				fake.putStatus[id] = status
+			}
+			for id, echo := range tc.putEcho {
+				n, err := strconv.Atoi(id)
+				if err != nil {
+					t.Fatalf("bad putEcho key %q: %v", id, err)
+				}
+				fake.putEcho[n] = echo
+			}
+
+			logger, buf := newDecisionTestLogger(slog.LevelInfo)
+			movies := []movieListElement{unmonitoredBelowCutoffMovie(findingID, "Accounted Movie")}
+			runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude",
+				fullLibraryScope(slog.LevelInfo), tc.dryRun, reverseOptions{enabled: true, remonitor: true})
+
+			out := buf.String()
+			c := summaryCounters(t, out)
+			if c["reverseFindings"] != 1 {
+				t.Fatalf("reverseFindings = %d, want 1: this case must actually reach the write pass or it proves nothing:\n%s", c["reverseFindings"], out)
+			}
+			if c[tc.wantCounter] != 1 {
+				t.Errorf("%s = %d, want 1: this outcome must be counted under that name:\n%s", tc.wantCounter, c[tc.wantCounter], out)
+			}
+			assertReverseIdentity(t, out)
+		})
+	}
+}
+
+// TestRunRadarrDecisionEngine_ReverseGateBlocked_WithheldAccountsForThePass is
+// the identity's remaining term, which no case above can reach: when the
+// cross-check refuses to authorize the pass, every finding is withheld before
+// remonitorMovie is called even once.
+func TestRunRadarrDecisionEngine_ReverseGateBlocked_WithheldAccountsForThePass(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{})
+	fake.reverseWantedJSON = `{"page":1,"pageSize":100,"totalRecords":2,"records":[{"id":7,"title":"A"},{"id":8,"title":"B"}]}`
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	movies := []movieListElement{
+		// The forward cross-check fails on this one.
+		{ID: intPtr(1), Title: strPtr("Contradictory"), Monitored: boolPtr(true), HasFile: boolPtr(true),
+			QualityProfileID: intPtr(1), Tags: &noTags,
+			MovieFile: &movieFileElement{ID: intPtr(1), QualityCutoffNotMet: boolPtr(true)}},
+		unmonitoredBelowCutoffMovie(7, "A"),
+		unmonitoredBelowCutoffMovie(8, "B"),
+	}
+
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude",
+		fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("a blocked pass must write nothing, got %+v", writes)
+	}
+	out := buf.String()
+	c := summaryCounters(t, out)
+	if c["reverseFindings"] != 2 || c["reverseWithheld"] != 2 {
+		t.Errorf("want reverseFindings=2 reverseWithheld=2, got %v:\n%s", c, out)
 	}
 	assertReverseIdentity(t, out)
 }
