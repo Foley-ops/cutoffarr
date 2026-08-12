@@ -48,6 +48,22 @@ type evalScope struct {
 	// deterministic regardless of the order events arrived in.
 	ids []int
 
+	// seasons narrows a SONARR scope one level further: for the series id it
+	// keys, only these season numbers may be reported and written. It is the
+	// plan's own granularity — "a webhook event evaluates only that movie
+	// (Radarr) or that series' AFFECTED SEASON (Sonarr)" — derived from the
+	// payload's episodes[].seasonNumber (binding controller resolution 2).
+	//
+	// A series id ABSENT from this map, or present with an empty list, means
+	// every eligible season of that series, which is both --only-id's meaning
+	// and the mandated behavior for an event whose episodes array is absent or
+	// empty. Nil for every Radarr scope, since a movie has no seasons.
+	//
+	// It narrows the WRITE and REPORT set only. What is EVALUATED is unchanged
+	// and still whole-library: the cross-check validates the data the decisions
+	// rest on, not the target.
+	seasons map[int][]int
+
 	// origin names what narrowed the scope, for the two messages that have to
 	// tell a human why an item they named produced nothing.
 	origin string
@@ -72,8 +88,22 @@ func onlyIDScope(id int) evalScope {
 // webhookScope is a debounced webhook cycle's scope: the coalesced set of ids
 // whose timers expired for this instance, reported at DEBUG because these
 // cycles fire unattended and repeatedly.
-func webhookScope(ids []int) evalScope {
-	return evalScope{ids: dedupeSortedIDs(ids), origin: scopeOriginWebhook, itemLevel: slog.LevelDebug}
+//
+// seasons is the Sonarr-only second level of narrowing, keyed by series id (nil
+// for Radarr, and nil for any series whose events never named a season). See
+// the field's own comment, and containsSeason for what an absent entry means.
+func webhookScope(ids []int, seasons map[int][]int) evalScope {
+	s := evalScope{ids: dedupeSortedIDs(ids), origin: scopeOriginWebhook, itemLevel: slog.LevelDebug}
+	for id, within := range seasons {
+		if len(within) == 0 {
+			continue
+		}
+		if s.seasons == nil {
+			s.seasons = make(map[int][]int, len(seasons))
+		}
+		s.seasons[id] = dedupeSortedIDs(within)
+	}
+	return s
 }
 
 // dedupeSortedIDs returns ids sorted ascending with duplicates removed, leaving
@@ -105,6 +135,30 @@ func (s evalScope) contains(id int) bool {
 	}
 	return containsIntID(s.ids, id)
 }
+
+// containsSeason reports whether season of itemID is in scope. It is
+// contains() plus the Sonarr-only second level, and it answers the question
+// "may this SEASON be reported and written", which is the granularity the plan
+// text sets for a Sonarr webhook.
+//
+// The two "absent means everything" rules compose, and both are widening:
+// an INACTIVE scope contains every item and therefore every season, and an
+// item with no season entry contains every season of that item. Narrowing only
+// ever happens because an event positively named the seasons it touched.
+func (s evalScope) containsSeason(itemID, season int) bool {
+	if !s.contains(itemID) {
+		return false
+	}
+	within := s.seasons[itemID]
+	if len(within) == 0 {
+		return true
+	}
+	return containsIntID(within, season)
+}
+
+// narrowsSeasons reports whether this scope names specific seasons for itemID,
+// as opposed to admitting every season of it.
+func (s evalScope) narrowsSeasons(itemID int) bool { return len(s.seasons[itemID]) > 0 }
 
 // missing returns the scoped ids that inLibrary says this instance's library
 // does not have, in scope order. It is how both engines tell "the id names
@@ -139,14 +193,42 @@ func (s evalScope) String() string {
 // scopeIds="a,b,c", a shape that can only occur on a coalesced webhook cycle
 // and that must not be mistaken for the flag.
 func (s evalScope) summaryAttrs() []any {
+	var attrs []any
 	switch {
 	case !s.active():
 		return nil
 	case len(s.ids) == 1:
-		return []any{"onlyId", s.ids[0]}
+		attrs = []any{"onlyId", s.ids[0]}
 	default:
-		return []any{"scopeIds", s.String()}
+		attrs = []any{"scopeIds", s.String()}
 	}
+	if seasons := s.seasonScopeString(); seasons != "" {
+		attrs = append(attrs, "scopeSeasons", seasons)
+	}
+	return attrs
+}
+
+// seasonScopeString renders the season narrowing as "1:2,3 7:all" — one entry
+// per in-scope series, in id order — or "" when no series is narrowed at all.
+//
+// Every in-scope id appears once ANY of them is narrowed, including the ones
+// that are not (as "all"). A line that listed only the narrowed series would
+// leave a human to infer what the others meant, and "which seasons is this
+// cycle allowed to write" is exactly the question the attribute exists to
+// answer.
+func (s evalScope) seasonScopeString() string {
+	if len(s.seasons) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(s.ids))
+	for _, id := range s.ids {
+		within := "all"
+		if s.narrowsSeasons(id) {
+			within = joinInts(s.seasons[id])
+		}
+		parts = append(parts, strconv.Itoa(id)+":"+within)
+	}
+	return strings.Join(parts, " ")
 }
 
 // --- the idle-cycle noise budget -------------------------------------------

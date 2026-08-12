@@ -475,15 +475,29 @@ func (d *daemon) runWebhookCycles(ctx context.Context, due []queueKey, seasons m
 		}
 		ids := byInstance[name]
 		attrs := []any{"instance", name, "items", len(ids), "ids", joinInts(dedupeSortedIDs(ids)), "dryRun", d.cfg.DryRun}
+
+		// The affected seasons are the WRITE SCOPE, not merely evidence about
+		// what triggered the cycle: the plan's granularity for a Sonarr webhook
+		// is "that series' affected season", so a season-2 import must not
+		// unmonitor season 1 of the same show in an unattended cycle 45 seconds
+		// later. A key with no seasons here — a Radarr movie, or a Sonarr
+		// payload whose episodes array was absent or empty — carries no entry
+		// and is evaluated across every eligible season, exactly as --only-id
+		// is (binding controller resolution 2).
+		var scopeSeasons map[int][]int
 		for _, k := range due {
 			if k.instance == name && len(seasons[k]) > 0 {
+				if scopeSeasons == nil {
+					scopeSeasons = make(map[int][]int)
+				}
+				scopeSeasons[k.id] = seasons[k]
 				attrs = append(attrs, "affectedSeasons/"+strconv.Itoa(k.id), joinInts(seasons[k]))
 			}
 		}
 		d.logger.Info("webhook debounce expired; evaluating", attrs...)
 		runScanCycle(ctx, d.logger, d.cfg, scanCycle{
 			instanceName: name,
-			scope:        webhookScope(ids),
+			scope:        webhookScope(ids, scopeSeasons),
 			dryRun:       d.cfg.DryRun,
 		})
 	}

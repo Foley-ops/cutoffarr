@@ -103,12 +103,16 @@ type webhookEpisodeRef struct {
 // affectedSeasons returns the deduplicated, sorted season numbers a Sonarr
 // payload's episodes name. An absent or empty episodes array yields none.
 //
-// These are EVIDENCE, not scope. The evaluation a webhook triggers is scoped to
-// the SERIES, exactly as --only-id is, because that is the machinery the
-// binding full-evidence ruling says to reuse (controller resolution 4) — and
-// the season set the engine then acts on is a superset of the affected one,
-// decided by the same rules a reconciliation sweep applies. Logging what
-// arrived is what lets a human confirm the hookup end to end.
+// These are the WRITE SCOPE, which is the plan's own granularity: "a webhook
+// event evaluates only that movie (Radarr) or that series' affected season
+// (Sonarr)". The EVIDENCE the evaluation rests on is unchanged and still
+// whole-library — the full-evidence ruling (controller resolution 4) is about
+// what is read and cross-checked, not about how much may be written — so a
+// webhook cycle still costs a full instance scan, bounded by the debounce.
+//
+// Yielding NONE is meaningful and widening: an event that named no season
+// claims the whole series, and is evaluated across every eligible season of it
+// exactly as --only-id is (controller resolution 2).
 func (p webhookPayload) affectedSeasons() []int {
 	if p.Episodes == nil {
 		return nil
@@ -136,6 +140,22 @@ type debounceQueue struct {
 	seasons  map[queueKey][]int
 	limit    int
 
+	// wholeItem records the keys for which some event claimed the ENTIRE item
+	// rather than particular seasons — a Sonarr payload with no episodes array
+	// (binding controller resolution 2: "absent/empty episodes array →
+	// evaluate all seasons of the series"), and every Radarr payload, which has
+	// no seasons to name.
+	//
+	// It is STICKY, and that is the whole point. A burst for one series can
+	// mix events that name their seasons with events that do not, and those two
+	// kinds of event make different claims: "season 2 changed" and "something
+	// in this series changed". Accumulating only the named numbers would let the
+	// event that claimed the MOST silently narrow the scope, so once a key has
+	// been claimed whole it stays whole until it is evaluated. Widening is the
+	// safe direction for a write scope; narrowing on the strength of an event
+	// that said nothing about seasons is not.
+	wholeItem map[queueKey]bool
+
 	// notify carries "something changed, recompute your wait" to the daemon
 	// loop. Buffered with room for one, and sent to non-blockingly: the loop
 	// only ever needs to know THAT something changed.
@@ -144,10 +164,11 @@ type debounceQueue struct {
 
 func newDebounceQueue(limit int) *debounceQueue {
 	return &debounceQueue{
-		deadline: make(map[queueKey]time.Time),
-		seasons:  make(map[queueKey][]int),
-		limit:    limit,
-		notify:   make(chan struct{}, 1),
+		deadline:  make(map[queueKey]time.Time),
+		seasons:   make(map[queueKey][]int),
+		wholeItem: make(map[queueKey]bool),
+		limit:     limit,
+		notify:    make(chan struct{}, 1),
 	}
 }
 
@@ -182,12 +203,21 @@ func (q *debounceQueue) add(key queueKey, seasons []int, now time.Time, debounce
 		}
 		delete(q.deadline, oldest)
 		delete(q.seasons, oldest)
+		delete(q.wholeItem, oldest)
 		dropped = &oldest
 	}
 
 	deadline = now.Add(debounce)
 	q.deadline[key] = deadline
-	if len(seasons) > 0 {
+	switch {
+	case len(seasons) == 0:
+		// This event named no seasons, so it claims the whole item. See
+		// wholeItem: the claim is sticky and anything already accumulated is
+		// discarded, because a set of season numbers can only ever be narrower
+		// than "all of it".
+		q.wholeItem[key] = true
+		delete(q.seasons, key)
+	case !q.wholeItem[key]:
 		q.seasons[key] = dedupeSortedIDs(append(q.seasons[key], seasons...))
 	}
 
@@ -222,11 +252,14 @@ func (q *debounceQueue) expired(now time.Time) ([]queueKey, map[queueKey][]int) 
 	})
 	seasons := make(map[queueKey][]int, len(due))
 	for _, k := range due {
-		if s := q.seasons[k]; len(s) > 0 {
+		// A key claimed whole yields NO seasons, which downstream reads as
+		// "every season of this item" — the same thing an absent entry means.
+		if s := q.seasons[k]; len(s) > 0 && !q.wholeItem[k] {
 			seasons[k] = s
 		}
 		delete(q.deadline, k)
 		delete(q.seasons, k)
+		delete(q.wholeItem, k)
 	}
 	return due, seasons
 }

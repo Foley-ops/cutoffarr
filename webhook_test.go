@@ -398,6 +398,65 @@ func TestDebounceQueue_SeasonNumbersAccumulateAcrossEventsForOneKey(t *testing.T
 	}
 }
 
+// TestDebounceQueue_AnEventNamingNoSeasons_WidensTheKeyToTheWholeItem is the
+// coalescing rule the season-scoped write set depends on, in both orders.
+//
+// Two kinds of event arrive for one series: some name the seasons their
+// episodes touched, some name no seasons at all. Those are different claims —
+// "season 2 changed" and "something in this series changed" — and the second is
+// the larger one. Accumulating only the numbers would let the event that
+// claimed the MOST end up narrowing the write scope, which is exactly the wrong
+// direction for a decision about what to unmonitor.
+func TestDebounceQueue_AnEventNamingNoSeasons_WidensTheKeyToTheWholeItem(t *testing.T) {
+	key := queueKey{instance: "sonarr-main", kind: webhookKindSeries, id: 7}
+
+	t.Run("seasons then none", func(t *testing.T) {
+		q := newDebounceQueue(webhookQueueLimit)
+		clock := newFakeClock()
+		q.add(key, []int{2}, clock.Now(), time.Minute)
+		q.add(key, nil, clock.Now(), time.Minute)
+
+		clock.Advance(2 * time.Minute)
+		due, seasons := q.expired(clock.Now())
+		if len(due) != 1 {
+			t.Fatalf("expected the one key, got %v", due)
+		}
+		if got := seasons[due[0]]; len(got) != 0 {
+			t.Errorf("seasons = %v, want none (which downstream reads as EVERY season): an event that named no season claims the whole series", got)
+		}
+	})
+
+	t.Run("none then seasons: the whole-item claim is sticky", func(t *testing.T) {
+		q := newDebounceQueue(webhookQueueLimit)
+		clock := newFakeClock()
+		q.add(key, nil, clock.Now(), time.Minute)
+		q.add(key, []int{2}, clock.Now(), time.Minute)
+
+		clock.Advance(2 * time.Minute)
+		due, seasons := q.expired(clock.Now())
+		if got := seasons[due[0]]; len(got) != 0 {
+			t.Errorf("seasons = %v, want none: a later event naming one season must not narrow a claim already made on the whole series", got)
+		}
+	})
+
+	t.Run("a fresh key after expiry starts over", func(t *testing.T) {
+		q := newDebounceQueue(webhookQueueLimit)
+		clock := newFakeClock()
+		q.add(key, nil, clock.Now(), time.Minute)
+		clock.Advance(2 * time.Minute)
+		q.expired(clock.Now())
+
+		// A new import, later, that DOES name its season: the previous cycle's
+		// whole-series claim was consumed with it and must not linger.
+		q.add(key, []int{4}, clock.Now(), time.Minute)
+		clock.Advance(2 * time.Minute)
+		due, seasons := q.expired(clock.Now())
+		if got := joinInts(seasons[due[0]]); got != "4" {
+			t.Errorf("seasons = %q, want %q: an expired key's accumulated claims are consumed with it", got, "4")
+		}
+	})
+}
+
 // --- overflow, through the handler ------------------------------------------
 //
 // The queue's own overflow behavior is unit-tested above, but the WARN that

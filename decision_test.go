@@ -3372,7 +3372,7 @@ func TestRunRadarrDecisionEngine_WebhookScope_CoalescedIDs_ReportsAndWritesEachO
 		wouldUnmonitorMovie(3, "Second Import"),
 	}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", webhookScope([]int{3, 1}), false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", webhookScope([]int{3, 1}, nil), false)
 
 	out := buf.String()
 	if !strings.Contains(out, `scopeIds=1,3`) {
@@ -3409,7 +3409,7 @@ func TestRunRadarrDecisionEngine_WebhookScope_DemotesPerItemLinesButNotTheSummar
 		skippedMovie(2, "Skipped Movie"),
 	}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", webhookScope([]int{1}), false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", webhookScope([]int{1}, nil), false)
 
 	out := buf.String()
 	if strings.Contains(out, "msg=would-unmonitor") || strings.Contains(out, "msg=skip") {
@@ -3432,7 +3432,7 @@ func TestRunRadarrDecisionEngine_ScopedIDMissing_NamesItButStillProcessesTheRest
 	logger, buf := newDecisionTestLogger(slog.LevelDebug)
 	movies := []movieListElement{wouldUnmonitorMovie(1, "Present Movie")}
 
-	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", webhookScope([]int{1, 4242}), false)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", webhookScope([]int{1, 4242}, nil), false)
 
 	out := buf.String()
 	if !strings.Contains(out, "movieId=4242") {

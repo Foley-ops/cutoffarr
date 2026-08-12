@@ -21,6 +21,10 @@ webhook_port: 9898       # port the webhook listener binds; endpoint is
 webhook_debounce: 45s    # wait after the LAST event for a movie/series before
                          # evaluating it; a season-pack import is one evaluation,
                          # not one per episode. 0 evaluates without waiting.
+                         # An event is decided against the WHOLE library as
+                         # evidence but may only WRITE what it named: that movie,
+                         # or that series' affected season(s). Anything else that
+                         # has become eligible waits for the reconciliation sweep.
 log_level: info          # debug | info | warn | error
 exclusion_tag: cutoffarr-exclude
 

@@ -1149,6 +1149,145 @@ func TestDaemon_Sonarr_WebhookTriggeredSeasonWrite_HappensAndIsScoped(t *testing
 	}
 }
 
+// TestDaemon_Sonarr_WebhookNamingOneSeason_WritesThatSeasonAndNeverItsSiblings
+// is the plan's own sentence, machine-verified: "a webhook event evaluates only
+// that movie (Radarr) or that series' AFFECTED SEASON (Sonarr)".
+//
+// The scenario is the one that makes it matter. A show has two seasons that are
+// both, right now, eligible to be unmonitored. An episode of season 2 is
+// imported, so Sonarr fires a webhook naming season 2 — and 45 seconds later,
+// unattended, with its per-item report lines demoted to DEBUG, this daemon must
+// not quietly unmonitor season 1 as well. Season 1 IS eligible and the
+// reconciliation sweep will get to it; the point is that a season-2 import is
+// not the event that authorizes a season-1 write, and this project's whole
+// discipline is writes no wider than what was asked for.
+//
+// Both seasons are held below their cutoff during the startup scan so that the
+// only write in this test is the one the webhook triggered.
+func TestDaemon_Sonarr_WebhookNamingOneSeason_WritesThatSeasonAndNeverItsSiblings(t *testing.T) {
+	fake := twoWritableSeasonsSonarrFake(t)
+	for _, ep := range []int{100, 200, 201} {
+		fake.setEpisodeWanted(ep, true) // below cutoff: the startup scan writes nothing
+	}
+	h := startDaemon(t, writeDaemonConfig(t, "sonarr", fake.srv.URL, false, "debug", "0", "45s"))
+	h.waitReady()
+
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("the startup scan should have had nothing to write, got %+v", writes)
+	}
+
+	// The import completes. BOTH seasons are now eligible; only season 2 was
+	// imported, and only season 2 is named by the event.
+	for _, ep := range []int{100, 200, 201} {
+		fake.setEpisodeWanted(ep, false)
+	}
+	h.post("sonarr-main", `{"eventType":"Download","series":{"id":1,"title":"Write Both"},"episodes":[{"seasonNumber":2,"episodeNumber":1}]}`)
+	h.clock.Advance(45 * time.Second)
+	h.awaitLogCount("webhook debounce expired; evaluating", 1)
+	eventually(t, "season 2's write to land", func() bool { return len(fake.writes()) == 2 })
+	// Room for a wider write to appear before anything is asserted absent.
+	h.clock.Advance(10 * time.Minute)
+	time.Sleep(20 * time.Millisecond)
+	h.stop()
+
+	if fake.seasonMonitored(1, 2) {
+		t.Error("season 2 — the season the webhook named — must be unmonitored")
+	}
+	if fake.episodeMonitored(200) || fake.episodeMonitored(201) {
+		t.Error("season 2's episodes must be unmonitored with it: a season write is two calls and both must have landed")
+	}
+	if !fake.seasonMonitored(1, 1) {
+		t.Error("season 1 was unmonitored by an import that named season 2; a webhook's write scope is the AFFECTED season, not the whole series")
+	}
+	if !fake.episodeMonitored(100) {
+		t.Error("season 1's episode was unmonitored by a season 2 import")
+	}
+	if writes := fake.writes(); len(writes) != 2 {
+		t.Errorf("expected exactly the 2 calls of ONE season write, got %d: %+v", len(writes), writes)
+	}
+	out := h.out.String()
+	if !strings.Contains(out, "unmonitored=1") {
+		t.Errorf("exactly one season must be counted as written:\n%s", out)
+	}
+	if !strings.Contains(out, "scopeSeasons=1:2") {
+		t.Errorf("the cycle must SAY what it narrowed to, or a human cannot tell a scoped cycle from a whole-series one:\n%s", out)
+	}
+}
+
+// TestDaemon_Sonarr_WebhookWithNoEpisodes_EvaluatesEverySeasonOfTheSeries is the
+// other half of binding resolution 2: "absent/empty episodes array → evaluate
+// all seasons of the series". Not every event that names a series can say which
+// season it touched, and the safe direction there is the whole series — the
+// same set --only-id acts on.
+func TestDaemon_Sonarr_WebhookWithNoEpisodes_EvaluatesEverySeasonOfTheSeries(t *testing.T) {
+	fake := twoWritableSeasonsSonarrFake(t)
+	for _, ep := range []int{100, 200, 201} {
+		fake.setEpisodeWanted(ep, true)
+	}
+	h := startDaemon(t, writeDaemonConfig(t, "sonarr", fake.srv.URL, false, "debug", "0", "45s"))
+	h.waitReady()
+	for _, ep := range []int{100, 200, 201} {
+		fake.setEpisodeWanted(ep, false)
+	}
+
+	h.post("sonarr-main", `{"eventType":"Download","series":{"id":1,"title":"Write Both"}}`)
+	h.clock.Advance(45 * time.Second)
+	h.awaitLogCount("webhook debounce expired; evaluating", 1)
+	eventually(t, "both seasons' writes to land", func() bool { return len(fake.writes()) == 4 })
+	h.stop()
+
+	if fake.seasonMonitored(1, 1) || fake.seasonMonitored(1, 2) {
+		t.Error("an event that names no season evaluates every season of the series, exactly as --only-id does")
+	}
+	if !fake.seasonMonitored(1, 3) {
+		t.Error("season 3 is still airing; the decision rules exclude it, whatever the scope says")
+	}
+	out := h.out.String()
+	if strings.Contains(out, "scopeSeasons=") {
+		t.Errorf("an unnarrowed series scope must not claim a season narrowing:\n%s", out)
+	}
+}
+
+// TestDaemon_Sonarr_ABurstThatNamesASeasonAndThenNothing_WidensToTheWholeSeries
+// is the coalescing edge the season narrowing creates, and the safe direction
+// is the wide one.
+//
+// A season-pack import fires many events for one series; if one of them carries
+// its episodes and another does not, the two claims are "season 2" and "every
+// season". Accumulating only the named numbers would let the second event —
+// which said the MOST — narrow the scope, and a write set must never be
+// narrowed by an event that made no claim about seasons at all.
+func TestDaemon_Sonarr_ABurstThatNamesASeasonAndThenNothing_WidensToTheWholeSeries(t *testing.T) {
+	fake := twoWritableSeasonsSonarrFake(t)
+	for _, ep := range []int{100, 200, 201} {
+		fake.setEpisodeWanted(ep, true)
+	}
+	h := startDaemon(t, writeDaemonConfig(t, "sonarr", fake.srv.URL, false, "debug", "0", "45s"))
+	h.waitReady()
+	for _, ep := range []int{100, 200, 201} {
+		fake.setEpisodeWanted(ep, false)
+	}
+
+	h.post("sonarr-main", `{"eventType":"Download","series":{"id":1},"episodes":[{"seasonNumber":2}]}`)
+	h.post("sonarr-main", `{"eventType":"Download","series":{"id":1}}`) // says nothing about seasons
+	h.post("sonarr-main", `{"eventType":"Download","series":{"id":1},"episodes":[{"seasonNumber":2}]}`)
+	eventually(t, "all three events to be queued as one key", func() bool {
+		return strings.Count(h.out.String(), "webhook queued") == 3
+	})
+
+	h.clock.Advance(45 * time.Second)
+	h.awaitLogCount("webhook debounce expired; evaluating", 1)
+	eventually(t, "both seasons' writes to land", func() bool { return len(fake.writes()) == 4 })
+	h.stop()
+
+	if fake.seasonMonitored(1, 1) {
+		t.Error("an event carrying no episodes claims the whole series, and a later season-2 event must not narrow it back")
+	}
+	if fake.seasonMonitored(1, 2) {
+		t.Error("season 2 must be written too")
+	}
+}
+
 // TestDaemon_Sonarr_DryRun_ZeroWritesAcrossStartupAndAWebhookCycle is §2.1 on
 // the Sonarr side, over the catch-all writes() accessor: every non-GET request
 // to any path, stubbed or not.

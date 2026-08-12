@@ -2005,12 +2005,17 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 // Radarr engine makes, for the same reason, and the same full-instance cost per
 // webhook event that the debounce bounds.
 //
-// Note the granularity: a webhook naming a series scopes to that SERIES and
-// every eligible season of it, exactly as --only-id does. The affected season
-// numbers a Sonarr payload carries are logged as evidence of what triggered the
-// cycle, but they do not narrow further — the season set the engine would act
-// on is a superset of the affected one, decided by the same rules a
-// reconciliation sweep applies.
+// Note the granularity, which is the plan's own: a webhook evaluates "that
+// series' AFFECTED SEASON", so when the payload's episodes named their seasons
+// (binding controller resolution 2), scope.seasons narrows the report and the
+// write set to exactly those. An import of season 2 does not authorize a write
+// to season 1 of the same show, even though season 1 may well be eligible and
+// the next reconciliation sweep will say so — writes stay no wider than the
+// event that asked for them.
+//
+// Where no season was named — --only-id, or a payload whose episodes array was
+// absent or empty — the scope covers every eligible season of the series, which
+// is the mandated behavior for that case and unchanged from --only-id's.
 //
 // Like checkInstanceConnectivity, inspectSonarrLibrary, and
 // runRadarrDecisionEngine, it never returns anything: the binding
@@ -2116,8 +2121,50 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 			continue
 		}
 		totalSeriesMonitored++
+		// alreadyUnmonitored stays at SERIES granularity even when the scope
+		// names seasons, deliberately. It counts seasons that produced no
+		// decision at all, so it is context about the series rather than part
+		// of the accounting identity — and evaluateSeries's no-monitored-seasons
+		// path returns the count with an EMPTY season list (its noise budget is
+		// one bulk line, not one per season), which leaves nothing to filter by
+		// in the one case where filtering would matter most.
 		alreadyUnmonitoredCount += eval.alreadyUnmonitored
-		reported = append(reported, eval.decisions...)
+
+		// The SEASON narrowing, and the only place it is applied. Every season
+		// above was still evaluated (the cross-check needs the full pools);
+		// what a scope naming seasons changes is which of the resulting
+		// decisions may be reported, counted, and written.
+		//
+		// It is empty for --only-id and for a webhook whose payload named no
+		// season, both of which mean every eligible season of the series — so
+		// inScope is eval.decisions unchanged on every path but the one that
+		// positively asked for less.
+		inScope := eval.decisions
+		if scope.narrowsSeasons(*s.ID) {
+			inScope = nil
+			for _, d := range eval.decisions {
+				if scope.containsSeason(*s.ID, d.season) {
+					inScope = append(inScope, d)
+				}
+			}
+			if len(inScope) == 0 {
+				// The narrowing's own version of the --only-id "produced no
+				// decision" line below: without it, a cycle that named a season
+				// and then reported nothing would leave the summary's
+				// seasonsEvaluated=0 as the only trace, and a human unable to
+				// tell "already unmonitored" from "that season does not exist".
+				//
+				// At the scope's item level, not Info, because the common cause
+				// is the ordinary steady state — every re-import into a season
+				// an earlier cycle already unmonitored arrives here — and
+				// binding controller note 6 puts a webhook cycle's per-item
+				// lines at DEBUG.
+				logger.Log(ctx, scope.itemLevel, scope.origin+" named seasons produced no decision for this series: none is a monitored season with a decision this cycle (most often an earlier cycle already unmonitored it; otherwise the payload named a season this series does not have)",
+					"instance", inst.Name, "type", inst.Type, "seriesId", *s.ID, "series", titleOrAbsent(s.Title),
+					"scopeSeasons", joinInts(scope.seasons[*s.ID]))
+			}
+		}
+		reported = append(reported, inScope...)
 
 		// The per-season "already unmonitored" fan-out, logged HERE — inside
 		// the scope check — rather than inside evaluateSeries, which cannot
@@ -2129,7 +2176,7 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 				"season", derefOrAbsent(season.SeasonNumber))
 		}
 
-		for _, d := range eval.decisions {
+		for _, d := range inScope {
 			seasonsEvaluated++
 			// scope.itemLevel, not Info — see the Radarr twin's note.
 			if d.wouldUnmonitor {

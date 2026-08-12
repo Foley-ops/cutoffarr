@@ -2334,6 +2334,111 @@ func TestRunSonarrDecisionEngine_OnlyID_ScopesReportAndWritesToOneSeries(t *test
 	}
 }
 
+// TestRunSonarrDecisionEngine_WebhookSeasonScope_ReportsAndWritesOnlyThatSeason
+// is the engine's half of the plan's granularity: "a webhook event evaluates
+// only that movie (Radarr) or that series' AFFECTED SEASON (Sonarr)".
+//
+// Series 2 has two seasons that are BOTH eligible right now. A webhook naming
+// season 2 must produce exactly one decision, one report line, and one write —
+// not because season 1 is ineligible (it is not; the next reconciliation sweep
+// will write it) but because a season 2 import is not the event that authorizes
+// a season 1 write.
+//
+// The counters are asserted alongside the writes on purpose: wouldUnmonitor and
+// seasonsEvaluated feed the accounting identity, and a narrowing that moved the
+// writes without moving the numbers would produce a summary that does not add
+// up.
+func TestRunSonarrDecisionEngine_WebhookSeasonScope_ReportsAndWritesOnlyThatSeason(t *testing.T) {
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "," + episodeJSON(200, 2, 1, pastAirDate, 600) + "]"
+	filesJSON := "[" + episodeFileJSON(500, 1, 200, false) + "," + episodeFileJSON(600, 2, 200, false) + "]"
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	fake.seriesDetail[2] = `{"id":2,"title":"Named Show","monitored":true,"qualityProfileId":1,"tags":[],"seasons":[` +
+		`{"seasonNumber":1,"monitored":true,"statistics":{"episodeFileCount":1,"totalEpisodeCount":1}},` +
+		`{"seasonNumber":2,"monitored":true,"statistics":{"episodeFileCount":1,"totalEpisodeCount":1}}]}`
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+
+	series := []seriesElement{
+		testSeries(2, "Named Show", true, 1, []int{}, testSeason(1, true, 1, 1), testSeason(2, true, 1, 1)),
+	}
+	scope := webhookScope([]int{2}, map[int][]int{2: {2}})
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", scope, false)
+
+	out := buf.String()
+	seriesPuts := 0
+	for _, w := range fake.writes() {
+		if w.path == "/api/v3/series/2" {
+			seriesPuts++
+		}
+	}
+	if seriesPuts != 1 {
+		t.Errorf("series PUTs = %d, want 1 — a webhook naming season 2 writes season 2, not every eligible season of the show: %+v", seriesPuts, fake.writes())
+	}
+	c := sonarrSummaryCounters(t, out)
+	if c["wouldUnmonitor"] != 1 || c["unmonitored"] != 1 {
+		t.Errorf("wouldUnmonitor/unmonitored = %d/%d, want 1/1:\n%s", c["wouldUnmonitor"], c["unmonitored"], out)
+	}
+	if c["seasonsEvaluated"] != 1 {
+		t.Errorf("seasonsEvaluated = %d, want 1 — the report covers the season in scope, and the counters must move with it:\n%s", c["seasonsEvaluated"], out)
+	}
+	if !strings.Contains(out, "scopeSeasons=2:2") {
+		t.Errorf("the summary must say which seasons the cycle could write:\n%s", out)
+	}
+	// The report names season 2 and never season 1.
+	for _, line := range strings.Split(out, "\n") {
+		isReport := strings.Contains(line, "msg=would-unmonitor") || strings.Contains(line, "msg=skip") || strings.Contains(line, "msg=unmonitor ")
+		if isReport && strings.Contains(line, "season=1 ") {
+			t.Errorf("a season the event did not name must not be reported: %q", line)
+		}
+	}
+	if !strings.Contains(out, "msg=would-unmonitor") || !strings.Contains(out, "season=2") {
+		t.Errorf("the named season must still be reported in full:\n%s", out)
+	}
+	// The evidence half is unchanged: the cross-check still samples the whole
+	// library, season 1 included, because it validates the data the decision
+	// rests on rather than the target.
+	if !strings.Contains(out, `msg="cross-check season"`) {
+		t.Errorf("a season-scoped write must not shrink the evidence the cross-check works from:\n%s", out)
+	}
+}
+
+// TestRunSonarrDecisionEngine_WebhookSeasonScope_SeasonWithNoDecision_SaysSoRatherThanNothing
+// closes the one new way the season narrowing lets a scoped cycle produce
+// nothing: the named season has no decision this cycle — most often because an
+// earlier cycle already unmonitored it, sometimes because the payload named a
+// season this series does not have.
+//
+// The summary alone would show seasonsEvaluated=0 and leave a human to guess
+// which. It is logged at the scope's own item level (DEBUG for a webhook, per
+// the idle-cycle noise budget) because the common cause is the ordinary steady
+// state: every re-import into an already-unmonitored season reaches this.
+func TestRunSonarrDecisionEngine_WebhookSeasonScope_SeasonWithNoDecision_SaysSoRatherThanNothing(t *testing.T) {
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "]"
+	filesJSON := "[" + episodeFileJSON(500, 1, 200, false) + "]"
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+
+	series := []seriesElement{testSeries(2, "Named Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
+	// The event named season 9; this series has only season 1.
+	scope := webhookScope([]int{2}, map[int][]int{2: {9}})
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude", scope, false)
+
+	out := buf.String()
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("a season with no decision must produce no write: %+v", writes)
+	}
+	line := logLineContaining(t, out, "named seasons produced no decision")
+	for _, want := range []string{"seriesId=2", "scopeSeasons=9", "level=DEBUG"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("the line must carry %q so the cycle is explicable from it alone:\n%s", want, line)
+		}
+	}
+	c := sonarrSummaryCounters(t, out)
+	if c["seasonsEvaluated"] != 0 || c["wouldUnmonitor"] != 0 {
+		t.Errorf("seasonsEvaluated/wouldUnmonitor = %d/%d, want 0/0 — this test only proves something while the report really is empty:\n%s",
+			c["seasonsEvaluated"], c["wouldUnmonitor"], out)
+	}
+}
+
 // TestRunSonarrDecisionEngine_OnlyID_UnmonitoredSeries_SaysSoRatherThanNothing
 // pins the one line standing between a scoped run on an unmonitored series and
 // total silence about the series a human explicitly named.

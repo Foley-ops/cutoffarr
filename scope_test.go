@@ -44,7 +44,7 @@ func TestOnlyIDScope_NarrowsToOneItemAndRendersAsOnlyId(t *testing.T) {
 // data half (binding controller note 2): several expired keys for the same
 // instance become ONE evaluation whose write scope is their union.
 func TestWebhookScope_CoalescesDeduplicatesAndSorts(t *testing.T) {
-	s := webhookScope([]int{77, 42, 77, 103, 42})
+	s := webhookScope([]int{77, 42, 77, 103, 42}, nil)
 	if got := s.String(); got != "42,77,103" {
 		t.Errorf("String() = %q, want %q (sorted, deduplicated — the rendering must not depend on event arrival order)", got, "42,77,103")
 	}
@@ -68,14 +68,94 @@ func TestWebhookScope_CoalescesDeduplicatesAndSorts(t *testing.T) {
 // TestWebhookScope_SingleID_StillRendersAsOnlyId: the common webhook case is
 // one item, and "onlyId" describes it exactly.
 func TestWebhookScope_SingleID_StillRendersAsOnlyId(t *testing.T) {
-	attrs := webhookScope([]int{5}).summaryAttrs()
+	attrs := webhookScope([]int{5}, nil).summaryAttrs()
 	if len(attrs) != 2 || attrs[0] != "onlyId" || attrs[1] != 5 {
 		t.Errorf("summaryAttrs = %v, want [onlyId 5]", attrs)
 	}
 }
 
+// --- the season narrowing ---------------------------------------------------
+//
+// The plan's granularity for a Sonarr webhook is "that series' AFFECTED
+// SEASON", and every rule below is a widening one: narrowing happens only
+// because an event positively named the seasons it touched. The alternative —
+// treating an absent season list as "no seasons" — would silently stop writing
+// anything at all, which is the failure mode this project is least able to see.
+
+func TestEvalScope_ContainsSeason_AbsentNarrowingMeansEverySeason(t *testing.T) {
+	// An inactive scope: every item, every season.
+	var whole evalScope
+	if !whole.containsSeason(1, 1) || !whole.containsSeason(999, 42) {
+		t.Error("an inactive scope contains every season of every item")
+	}
+	if whole.narrowsSeasons(1) {
+		t.Error("an inactive scope narrows no seasons")
+	}
+
+	// A scope naming a series but no seasons — --only-id, and the mandated
+	// behavior for a payload whose episodes array was absent or empty.
+	s := webhookScope([]int{7}, nil)
+	if !s.containsSeason(7, 1) || !s.containsSeason(7, 99) {
+		t.Error("a series in scope with no season narrowing contains every season of it")
+	}
+	if s.containsSeason(8, 1) {
+		t.Error("a series OUT of scope contains no season, whatever the season narrowing says")
+	}
+
+	// An empty list is the same claim as no list at all, and must never be
+	// read as "no seasons are in scope".
+	empty := webhookScope([]int{7}, map[int][]int{7: {}})
+	if !empty.containsSeason(7, 3) || empty.narrowsSeasons(7) {
+		t.Error("an EMPTY season list must widen to every season, never collapse to none")
+	}
+}
+
+func TestEvalScope_ContainsSeason_NarrowsToTheSeasonsTheEventNamed(t *testing.T) {
+	s := webhookScope([]int{7, 9}, map[int][]int{7: {3, 2, 3}})
+
+	if !s.containsSeason(7, 2) || !s.containsSeason(7, 3) {
+		t.Error("the named seasons must be in scope")
+	}
+	if s.containsSeason(7, 1) || s.containsSeason(7, 4) {
+		t.Error("a season the event did not name must NOT be in scope: an import of season 3 does not authorize a write to season 1")
+	}
+	// The other series of the same coalesced cycle is untouched by 7's
+	// narrowing.
+	if !s.containsSeason(9, 1) || !s.containsSeason(9, 77) {
+		t.Error("one series' season narrowing must not narrow another series in the same cycle")
+	}
+	if !s.narrowsSeasons(7) || s.narrowsSeasons(9) {
+		t.Error("narrowsSeasons must be per series")
+	}
+}
+
+// TestEvalScope_SummaryAttrs_SaysWhichSeasonsACycleMayWrite: an unattended
+// cycle whose per-item lines are demoted to DEBUG leaves the summary as the
+// only INFO record describing it, so the summary is where the write scope has
+// to be legible.
+func TestEvalScope_SummaryAttrs_SaysWhichSeasonsACycleMayWrite(t *testing.T) {
+	one := webhookScope([]int{7}, map[int][]int{7: {2, 3}}).summaryAttrs()
+	if len(one) != 4 || one[0] != "onlyId" || one[1] != 7 || one[2] != "scopeSeasons" || one[3] != "7:2,3" {
+		t.Errorf("summaryAttrs = %v, want [onlyId 7 scopeSeasons 7:2,3]", one)
+	}
+
+	// A coalesced cycle where only ONE of the two series was narrowed: both
+	// appear, because "which seasons may this cycle write" must not be left to
+	// inference.
+	two := webhookScope([]int{9, 7}, map[int][]int{7: {2}}).summaryAttrs()
+	if len(two) != 4 || two[0] != "scopeIds" || two[1] != "7,9" || two[2] != "scopeSeasons" || two[3] != "7:2 9:all" {
+		t.Errorf("summaryAttrs = %v, want [scopeIds 7,9 scopeSeasons \"7:2 9:all\"]", two)
+	}
+
+	// No narrowing anywhere: the attribute is absent entirely rather than
+	// present and empty, so a Radarr cycle's summary is byte-unchanged.
+	if attrs := webhookScope([]int{7}, nil).summaryAttrs(); len(attrs) != 2 {
+		t.Errorf("summaryAttrs = %v, want just [onlyId 7]: an unnarrowed scope claims no season scope", attrs)
+	}
+}
+
 func TestEvalScope_Missing_NamesOnlyWhatTheLibraryLacks(t *testing.T) {
-	s := webhookScope([]int{1, 2, 3})
+	s := webhookScope([]int{1, 2, 3}, nil)
 	library := map[int]bool{1: true, 3: true}
 	got := s.missing(func(id int) bool { return library[id] })
 	if len(got) != 1 || got[0] != 2 {
