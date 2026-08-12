@@ -1811,6 +1811,87 @@ func TestEvaluateSeries_EpisodeCountMismatch_NotSkipPoolEligible(t *testing.T) {
 	}
 }
 
+// TestEvaluateSeries_EpisodefileFetchFailure_NotSkipPoolEligible is the third
+// and last shape of the same evidence-touching defect class, and the binding
+// Phase 6 branch note ordered all three closed BEFORE the write gate went
+// live: when the per-series /episodefile fetch fails, every candidate season
+// of that series is stamped "could not fetch custom format score" — but
+// completeOnDisk was set by rule 2 and never cleared, so each one entered the
+// cross-check's skip pool carrying NEITHER crossCheckEpisodes NOR
+// rawEpisodesForCrossCheck: unverifiable by construction.
+//
+// The cost is not theoretical. Such a season consumes one of only 10 skip-side
+// sample slots, always adds a WARN, and pushes the verdict toward inconclusive
+// — and the write gate reads that verdict for the WHOLE instance, so a broken
+// /episodefile endpoint on one series could withhold every write on every
+// other one. A season whose file data could not be read has nothing to
+// contribute as evidence, so it is not sample-eligible at all.
+func TestEvaluateSeries_EpisodefileFetchFailure_NotSkipPoolEligible(t *testing.T) {
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "]"
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/episode", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(episodesJSON))
+	})
+	mux.HandleFunc("/api/v3/episodefile", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-broken", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	s := testSeries(1, "Broken Episodefile Show", true, 1, []int{}, testSeason(1, true, 1, 1))
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+
+	if len(eval.decisions) != 1 {
+		t.Fatalf("expected 1 decision, got %d", len(eval.decisions))
+	}
+	d := eval.decisions[0]
+	if d.reason != ReasonCouldNotFetchCFScore {
+		t.Fatalf("reason = %q, want %q", d.reason, ReasonCouldNotFetchCFScore)
+	}
+	if len(d.crossCheckEpisodes) != 0 || len(d.rawEpisodesForCrossCheck) != 0 {
+		t.Fatalf("this test only proves something while the season really has no cross-check data: episodes=%d raw=%d",
+			len(d.crossCheckEpisodes), len(d.rawEpisodesForCrossCheck))
+	}
+	if d.completeOnDisk {
+		t.Errorf("a season whose /episodefile fetch failed must not be skip-pool eligible: it can never be verified, so it would consume one of ten sample slots, add a WARN, and push the instance's cross-check — which the write gate reads — toward inconclusive")
+	}
+}
+
+// TestRunSonarrCrossCheck_EpisodefileFetchFailureSeason_IsNeverSampled is the
+// consequence the test above exists for, asserted where it actually bites: the
+// skip-side pool is built from completeOnDisk seasons, so clearing the flag is
+// what keeps an unverifiable-by-construction season out of the sample and off
+// the verdict.
+func TestRunSonarrCrossCheck_EpisodefileFetchFailureSeason_IsNeverSampled(t *testing.T) {
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr"}
+
+	// One verifiable would-unmonitor season, plus the shape evaluateSeries now
+	// produces for a failed /episodefile fetch: no cross-check data of any
+	// kind, and therefore not skip-pool eligible.
+	decisions := []seasonDecision{
+		sonarrCandidateDecision(1, 1, true, []seasonCrossCheckEpisode{
+			{episodeID: 100, monitored: boolPtr(true), qualityCutoffNotMet: boolPtr(false)},
+		}),
+		{seriesID: 2, series: "Broken Episodefile Show", season: 1, reason: ReasonCouldNotFetchCFScore, completeOnDisk: false},
+	}
+	cc := runSonarrCrossCheck(context.Background(), logger, nil, inst, decisions, map[int]bool{})
+
+	if cc.unverifiable != 0 {
+		t.Errorf("unverifiable = %d, want 0: the fetch-failure season must not have been sampled at all:\n%s", cc.unverifiable, buf.String())
+	}
+	if cc.status != crossCheckStatusPassed || cc.verified != 1 {
+		t.Errorf("status/verified = %q/%d, want %q/1: one unverifiable-by-construction season must not drag the instance's verdict down:\n%s",
+			cc.status, cc.verified, crossCheckStatusPassed, buf.String())
+	}
+	if strings.Contains(buf.String(), "seriesId=2") {
+		t.Errorf("nothing may be logged about a season that was never sampled:\n%s", buf.String())
+	}
+}
+
 // TestEvaluateSeries_FileCountMismatch_StillCarriesCrossCheckEpisodes is the
 // same minor's other half: a file-count-mismatch season DOES have a validated
 // episode list and a fetched /episodefile map in scope, so it can be made

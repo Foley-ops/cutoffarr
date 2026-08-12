@@ -1753,6 +1753,26 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 	if !ok {
 		for _, sn := range candidateSeasons {
 			decisions[candidateIndex[sn]].reason = ReasonCouldNotFetchCFScore
+			// REVIEW FIX (Phase 7 final, evidence-touching — the write gate
+			// reads this verdict): the third and last shape of the defect
+			// class the binding Phase 6 branch note ordered closed before the
+			// gate went live. completeOnDisk was set by rule 2 above and never
+			// cleared here, so a season whose /episodefile fetch just FAILED
+			// entered the cross-check's skip pool carrying neither
+			// crossCheckEpisodes nor rawEpisodesForCrossCheck — unverifiable
+			// by construction, consuming one of only ten skip-side sample
+			// slots, adding a WARN, and pushing the instance's verdict toward
+			// inconclusive. One series' broken /episodefile endpoint could
+			// therefore withhold every write on every other series of the
+			// instance. A season whose file data could not be read has nothing
+			// to contribute as evidence, so it is not sample-eligible at all.
+			//
+			// Clearing the flag rather than retaining the raw episodes for the
+			// cross-check's own on-demand fetch is deliberate: that fetch would
+			// hit the endpoint that just failed, on the same series, in the
+			// same cycle — §2.6's "no retries within a cycle" applied to the
+			// read side.
+			decisions[candidateIndex[sn]].completeOnDisk = false
 		}
 		return seriesEvaluation{decisions: decisions, alreadyUnmonitored: len(explicitlyUnmonitored)}
 	}
