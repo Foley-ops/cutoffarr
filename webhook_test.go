@@ -184,11 +184,13 @@ func TestWebhookHandler_MalformedPayloads_AreAll200AndWarn(t *testing.T) {
 		{name: "eventType is JSON null", body: `{"eventType":null,"movie":{"id":42}}`, want: "no eventType"},
 		{name: "download with no movie", body: `{"eventType":"Download"}`, want: "no id"},
 		{name: "download with a null movie id", body: `{"eventType":"Download","movie":{"id":null}}`, want: "no id"},
-		// The one every sibling field already refuses and this one used to
-		// wave through as the WIDEST possible claim: an explicit JSON null in
-		// the position that decides how much of a series may be unmonitored.
-		{name: "episodes is JSON null", body: `{"eventType":"Download","series":{"id":7},"episodes":null}`, want: "not an array of episode records", sonarr: true},
 		{name: "episodes is a string", body: `{"eventType":"Download","series":{"id":7},"episodes":"season 2"}`, want: "not an array of episode records", sonarr: true},
+		{name: "episodes is an object", body: `{"eventType":"Download","series":{"id":7},"episodes":{"seasonNumber":2}}`, want: "not an array of episode records", sonarr: true},
+		// The null episodes key falls back to the whole-series scope, but ONLY
+		// when the rest of the payload validated (the binding ruling's own
+		// condition). Without a series id there is nothing to fall back TO, and
+		// the id check must be what decides that — not the episodes key.
+		{name: "null series id beside null episodes", body: `{"eventType":"Download","series":{"id":null},"episodes":null}`, want: "no id", sonarr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -254,12 +256,16 @@ func TestWebhookHandler_SonarrPayload_NoEpisodes_StillQueuesTheSeries(t *testing
 
 // --- episodes present but unreadable ----------------------------------------
 //
-// These four pin the gap between the two things a Sonarr payload can mean when
-// no season number comes out of it, which the code used to collapse into one.
+// These pin the gap between the three things a Sonarr payload can mean when no
+// season number comes out of it, which the code used to collapse into one.
 //
 //	episodes ABSENT or EMPTY      -> "something in this series changed", the
 //	                                 mandated whole-series claim (binding
-//	                                 controller resolution 2).
+//	                                 controller resolution 2). Silent.
+//	episodes an explicit JSON
+//	null                           -> the same mandated claim, taken from a VALUE
+//	                                 rather than from silence, so it is warned
+//	                                 about (binding ruling R2).
 //	episodes PRESENT but with no
 //	readable seasonNumber          -> untrusted input. It is NOT a claim about
 //	                                 the whole series; it is a payload we could
@@ -374,25 +380,31 @@ func TestWebhookHandler_UnreadableEpisodes_AreDistinguishableFromNoEpisodesInThe
 // was absent" from "the key was present with the zero value", and it works for
 // every JSON value except null: encoding/json leaves a pointer field nil for a
 // missing key AND sets it nil for an explicit null, so `{"episodes":null}` and a
-// payload with no episodes key at all decoded to the same thing. Those two mean
-// OPPOSITE things here — one is the mandated whole-series claim, the other is a
-// value this program could not read — and this field decides how much of a
-// series may be unmonitored, so the raw bytes are kept and the telling apart is
-// done here.
+// payload with no episodes key at all decode to the same thing.
+//
+// Under the binding ruling those two reach the SAME claim — the whole series —
+// and differ in what the program owes the log for taking it: an absent key is a
+// payload that never spoke about episodes, a null is a value this program read
+// in the position that decides how much of a series may be unmonitored. So the
+// shape is asserted here beside the claim, because the shape is the only thing
+// that separates them and the WARN downstream is keyed on it.
 func TestWebhookPayload_AffectedSeasons_TellsAnAbsentEpisodesKeyFromAnExplicitNull(t *testing.T) {
 	cases := []struct {
 		name        string
 		body        string
 		wantClaim   scopeClaim
+		wantShape   episodesShape
 		wantSeasons string
 	}{
-		{"absent: the mandated whole-series claim", `{}`, claimWholeItem, ""},
-		{"empty array: the same mandated claim, spelled out", `{"episodes":[]}`, claimWholeItem, ""},
-		{"a readable season", `{"episodes":[{"seasonNumber":2}]}`, claimSeasons, "2"},
-		{"an array whose records name no season", `{"episodes":[{}]}`, claimNothing, ""},
-		{"an explicit null", `{"episodes":null}`, claimNothing, ""},
-		{"a string where the array should be", `{"episodes":"season 2"}`, claimNothing, ""},
-		{"an object where the array should be", `{"episodes":{"seasonNumber":2}}`, claimNothing, ""},
+		{"absent: the mandated whole-series claim", `{}`, claimWholeItem, episodesAbsent, ""},
+		{"empty array: the same mandated claim, spelled out", `{"episodes":[]}`, claimWholeItem, episodesReadable, ""},
+		{"a readable season", `{"episodes":[{"seasonNumber":2}]}`, claimSeasons, episodesReadable, "2"},
+		{"an array whose records name no season", `{"episodes":[{}]}`, claimNothing, episodesReadable, ""},
+		// The same claim as an absent key, reached from a value rather than
+		// from silence — which is exactly why the shape must not collapse.
+		{"an explicit null", `{"episodes":null}`, claimWholeItem, episodesNull, ""},
+		{"a string where the array should be", `{"episodes":"season 2"}`, claimNothing, episodesUnreadable, ""},
+		{"an object where the array should be", `{"episodes":{"seasonNumber":2}}`, claimNothing, episodesUnreadable, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -401,10 +413,13 @@ func TestWebhookPayload_AffectedSeasons_TellsAnAbsentEpisodesKeyFromAnExplicitNu
 				t.Fatalf("this body is valid JSON and must decode: %v", err)
 			}
 
-			seasons, _, claim := payload.affectedSeasons()
+			seasons, _, claim, shape := payload.affectedSeasons()
 
 			if claim != tc.wantClaim {
 				t.Errorf("claim = %s, want %s", claim, tc.wantClaim)
+			}
+			if shape != tc.wantShape {
+				t.Errorf("shape = %d, want %d: the claim alone cannot tell an absent episodes key from a null one, and the WARN is keyed on the shape", shape, tc.wantShape)
 			}
 			if got := joinInts(seasons); got != tc.wantSeasons {
 				t.Errorf("seasons = %q, want %q", got, tc.wantSeasons)
@@ -413,42 +428,50 @@ func TestWebhookPayload_AffectedSeasons_TellsAnAbsentEpisodesKeyFromAnExplicitNu
 	}
 }
 
-// TestWebhookHandler_SonarrEpisodesJSONNull_IsNotAWholeSeriesClaim is the
-// handler's half, and the failure it pins is the sticky one: a null episodes key
-// used to reach the queue as claimWholeItem, which escalates the write scope for
-// the whole burst from the affected season to every eligible season of the
-// series, cannot be narrowed back by any later well-formed event, and said so in
-// a log line byte-identical to a legitimate no-episodes event's.
-func TestWebhookHandler_SonarrEpisodesJSONNull_IsNotAWholeSeriesClaim(t *testing.T) {
-	handler, queue, buf, _ := newWebhookTestServer(t, map[string]string{"sonarr-main": "sonarr"}, 45*time.Second, slog.LevelDebug)
+// TestWebhookHandler_SonarrEpisodesJSONNull_FallsBackToTheWholeSeriesAndSaysSo
+// is the handler's half of the binding ruling on a null episodes key: the event
+// is queued with the whole-series scope an absent episodes array gets, and the
+// widest claim this program makes is stated out loud rather than assumed.
+//
+// Both halves matter and neither is sufficient. Refusing the event would drop a
+// real import on the floor — null is what a serializer emits for an empty
+// collection, so this is an *arr saying "no episodes to name" by value instead
+// of by omission. Accepting it silently is how it went unnoticed: the queued
+// line only appends affectedSeasons when there ARE seasons, so a null and a
+// legitimate no-episodes event produced byte-identical output while one of them
+// was untrusted input in the position that decides an unmonitor's width.
+func TestWebhookHandler_SonarrEpisodesJSONNull_FallsBackToTheWholeSeriesAndSaysSo(t *testing.T) {
+	handler, queue, buf, clock := newWebhookTestServer(t, map[string]string{"sonarr-main": "sonarr"}, 45*time.Second, slog.LevelDebug)
 
 	rec := postWebhook(t, handler, "sonarr-main", `{"eventType":"Download","series":{"id":7},"episodes":null}`)
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200: an unreadable payload never makes an *arr's webhook look broken", rec.Code)
+		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if queue.size() != 0 {
-		t.Errorf("queue size = %d, want 0: a null episodes key is a value this program could not read, and queueing it claims every season of the series", queue.size())
+	if queue.size() != 1 {
+		t.Fatalf("queue size = %d, want 1: a null episodes key names no season, and the mandated fallback for an event that names no season is the whole series", queue.size())
+	}
+	due, seasons := queue.expired(clock.Now().Add(time.Hour))
+	if len(due) != 1 || len(seasons[due[0]]) != 0 {
+		t.Errorf("queued %+v with seasons %v, want the series key with NO season narrowing (which downstream reads as every season)", due, seasons)
 	}
 	out := buf.String()
 	if !strings.Contains(out, "level=WARN") {
-		t.Errorf("input this program could not read, deciding how much it may unmonitor, must warn:\n%s", out)
+		t.Errorf("a value read in the position that decides how much this program may unmonitor is never read silently:\n%s", out)
 	}
-	if strings.Contains(out, "scopeClaim=whole-item") {
-		t.Errorf("a null episodes key must never make the widest claim available:\n%s", out)
-	}
-	for _, want := range []string{"sonarr-main", "sonarr-main/series/7"} {
+	for _, want := range []string{"field=episodes", "sonarr-main/series/7", "scopeClaim=whole-item", "every eligible season"} {
 		if !strings.Contains(out, want) {
-			t.Errorf("the warning must name the instance and the item; %q is missing:\n%s", want, out)
+			t.Errorf("the warning must name the field, the item, and the width of the scope it just took; %q is missing:\n%s", want, out)
 		}
 	}
 }
 
-// TestWebhookHandler_EpisodesJSONNull_NeitherWidensNorNarrowsAPendingKey: the
-// burst case. A null arriving among well-formed events must do exactly what
-// every other unreadable payload does — reset the timer of an item something is
-// already known to have happened to, and nothing else.
-func TestWebhookHandler_EpisodesJSONNull_NeitherWidensNorNarrowsAPendingKey(t *testing.T) {
+// TestWebhookHandler_EpisodesJSONNull_WidensAPendingKeyToTheWholeSeries: the
+// burst case. A null makes the same claim an absent episodes array makes, so it
+// inherits the same stickiness — a season-2 event followed by a null leaves the
+// key claimed WHOLE, because widening is the safe direction for a write scope
+// and an event that named no season cannot narrow one that did.
+func TestWebhookHandler_EpisodesJSONNull_WidensAPendingKeyToTheWholeSeries(t *testing.T) {
 	handler, queue, _, clock := newWebhookTestServer(t, map[string]string{"sonarr-main": "sonarr"}, 45*time.Second, slog.LevelDebug)
 
 	postWebhook(t, handler, "sonarr-main", `{"eventType":"Download","series":{"id":7},"episodes":[{"seasonNumber":2}]}`)
@@ -458,15 +481,16 @@ func TestWebhookHandler_EpisodesJSONNull_NeitherWidensNorNarrowsAPendingKey(t *t
 		t.Fatalf("queue size = %d, want 1: both events name the same series", queue.size())
 	}
 	due, seasons := queue.expired(clock.Now().Add(time.Hour))
-	if got := joinInts(seasons[due[0]]); got != "2" {
-		t.Errorf("write scope = %q, want %q: a null episodes key must neither widen the scope to every season nor discard the one a readable event established", got, "2")
+	if got := joinInts(seasons[due[0]]); got != "" {
+		t.Errorf("write scope = %q, want the whole series (no season entry): a null claims every season, exactly as an absent episodes array does, and a claim on the whole item is never narrowed back", got)
 	}
 }
 
 // TestWebhookHandler_EpisodesJSONNull_IsDistinguishableFromNoEpisodesInTheLog is
-// the observability half, and the reason this survived the round that closed the
-// rest of this bug class: the two events made opposite claims about the write
-// scope and produced identical output.
+// the observability half, and it survives the ruling that made the two events
+// claim the SAME scope: identical claims reached from different evidence must
+// still be told apart, or the log cannot show that untrusted input was what
+// widened a write.
 func TestWebhookHandler_EpisodesJSONNull_IsDistinguishableFromNoEpisodesInTheLog(t *testing.T) {
 	mandated, _, mandatedLog, _ := newWebhookTestServer(t, map[string]string{"sonarr-main": "sonarr"}, 45*time.Second, slog.LevelDebug)
 	postWebhook(t, mandated, "sonarr-main", `{"eventType":"Download","series":{"id":7}}`)
@@ -475,10 +499,13 @@ func TestWebhookHandler_EpisodesJSONNull_IsDistinguishableFromNoEpisodesInTheLog
 	postWebhook(t, null, "sonarr-main", `{"eventType":"Download","series":{"id":7},"episodes":null}`)
 
 	if strings.Contains(mandatedLog.String(), "level=WARN") {
-		t.Errorf("an absent episodes array is the MANDATED whole-series claim, not a problem:\n%s", mandatedLog.String())
+		t.Errorf("an absent episodes array is the MANDATED whole-series claim, and nothing was read that could be doubted:\n%s", mandatedLog.String())
+	}
+	if !strings.Contains(nullLog.String(), "level=WARN") {
+		t.Errorf("the same claim, taken on the strength of a value this program read, owes a warning:\n%s", nullLog.String())
 	}
 	if mandatedLog.String() == nullLog.String() {
-		t.Errorf("these two events make opposite claims about the write scope and produced identical output:\n%s", mandatedLog.String())
+		t.Errorf("these two events reach the same scope from different evidence and produced identical output:\n%s", mandatedLog.String())
 	}
 }
 

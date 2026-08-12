@@ -97,11 +97,13 @@ type webhookPayload struct {
 	// decoded `{"episodes":null}` and a body with no episodes key at all to the
 	// same nil.
 	//
-	// Those two mean opposite things (see scopeClaim): an absent array is the
-	// mandated claim on the whole series, a null is a value this program could
-	// not read. This is the field that decides how much of a series may be
-	// unmonitored, so the distinction the decoder cannot make is made from the
-	// bytes instead, in episodeRecords.
+	// Those two are not the same event (see episodesShape). An absent array is a
+	// payload that never spoke about episodes and takes the mandated
+	// whole-series claim silently; a null is a VALUE, read in the position that
+	// decides how much of a series may be unmonitored, and it takes the same
+	// claim only with a WARN that says so out loud. This is the field that
+	// decides that scope, so the distinction the decoder cannot make is made
+	// from the bytes instead, in episodeRecords.
 	Episodes json.RawMessage `json:"episodes"`
 }
 
@@ -129,9 +131,12 @@ type scopeClaim int
 const (
 	// claimWholeItem: the event named no seasons because there were none to
 	// name. Every Radarr payload (a movie has no seasons), and the Sonarr
-	// payload whose episodes array is absent or empty, which binding controller
-	// resolution 2 defines as "evaluate all seasons of the series". This is a
-	// real, mandated claim on the whole item.
+	// payload whose episodes array is absent, empty, or an explicit JSON null,
+	// all of which binding controller resolution 2 defines as "evaluate all
+	// seasons of the series". This is a real, mandated claim on the whole item.
+	// The null reaches it with a WARN the other two do not need (see
+	// warnNullEpisodes); the CLAIM is identical, and only a claim reaches the
+	// queue.
 	claimWholeItem scopeClaim = iota
 
 	// claimSeasons: the event named at least one readable season number. Those
@@ -141,11 +146,10 @@ const (
 	// claimNothing: the episodes key was PRESENT and this program could not
 	// read a season out of it — either a non-empty array not one element of
 	// which yielded a season number, or a value that is not an array of episode
-	// records at all (a JSON null, a string, an object). That is not a
-	// statement about the series; it is a payload this program could not read,
-	// and §2.6's rule for untrusted input is to refuse it loudly rather than
-	// guess. Guessing "the whole series" here is the widest possible guess
-	// about an unmonitor.
+	// records at all (a string, an object). That is not a statement about the
+	// series; it is a payload this program could not read, and §2.6's rule for
+	// untrusted input is to refuse it loudly rather than guess. Guessing "the
+	// whole series" here is the widest possible guess about an unmonitor.
 	claimNothing
 )
 
@@ -180,23 +184,28 @@ func (c scopeClaim) String() string {
 // The count is RECORDS, so it is 0 for a value that is not an array of records
 // at all; claimNothing is what the caller warns on, and the count only says
 // which sentence to print.
-func (p webhookPayload) affectedSeasons() (seasons []int, unreadable int, claim scopeClaim) {
+func (p webhookPayload) affectedSeasons() (seasons []int, unreadable int, claim scopeClaim, shape episodesShape) {
 	records, shape := p.episodeRecords()
 	switch shape {
 	case episodesAbsent:
 		// No episodes key at all: the mandated whole-series claim.
-		return nil, 0, claimWholeItem
+		return nil, 0, claimWholeItem, shape
+	case episodesNull:
+		// The key is present and explicitly null. See episodesNull for why this
+		// is the mandated fallback rather than a refusal, and the caller for the
+		// WARN that fallback owes.
+		return nil, 0, claimWholeItem, shape
 	case episodesUnreadable:
 		// The key is there and holds something this program cannot read. There
 		// are no records to count as unreadable — the whole VALUE is — so the
 		// count is 0 and the claim is what carries the refusal. See the caller,
 		// which warns on the claim rather than on the count for exactly this.
-		return nil, 0, claimNothing
+		return nil, 0, claimNothing, shape
 	}
 	if len(records) == 0 {
 		// An empty array, which resolution 2 defines the same way as an absent
 		// one: evaluate all seasons of the series.
-		return nil, 0, claimWholeItem
+		return nil, 0, claimWholeItem, shape
 	}
 	for _, e := range records {
 		if e.SeasonNumber != nil {
@@ -206,9 +215,9 @@ func (p webhookPayload) affectedSeasons() (seasons []int, unreadable int, claim 
 		unreadable++
 	}
 	if len(seasons) == 0 {
-		return nil, unreadable, claimNothing
+		return nil, unreadable, claimNothing, shape
 	}
-	return dedupeSortedIDs(seasons), unreadable, claimSeasons
+	return dedupeSortedIDs(seasons), unreadable, claimSeasons, shape
 }
 
 // episodesShape is what the episodes KEY turned out to hold, which is a
@@ -222,20 +231,37 @@ const (
 	episodesAbsent episodesShape = iota
 	// episodesReadable: a JSON array, possibly empty, whose elements decoded.
 	episodesReadable
+	// episodesNull: the key is present and holds an explicit JSON null — what a
+	// serializer emits for an empty collection, and therefore what an *arr event
+	// carries when it has no episodes to name and says so by value rather than
+	// by omission.
+	//
+	// It is UNTRUSTED INPUT in the position that decides how much of a series
+	// may be unmonitored, and the binding ruling on it is neither "refuse" nor
+	// "wave through": WARN naming the field, then fall back to the same
+	// whole-series scope an absent key gets, provided the rest of the payload
+	// validated (which the handler establishes before ever asking — an event
+	// with no series id never reaches here). The fallback is the mandated one;
+	// what the null changes is that the widest scope this program takes is
+	// stated out loud rather than assumed, so it can never again be
+	// indistinguishable from the legitimate absent case.
+	episodesNull
 	// episodesUnreadable: the key is present and holds something that is not
-	// an array of episode records — a JSON null (what a Sonarr event carries
-	// when it has no episodes to name and says so explicitly), a string, an
-	// object, or an array whose elements are not objects.
+	// an array of episode records — a string, an object, or an array whose
+	// elements are not objects. Unlike a null, none of these is a shape an *arr
+	// has any reason to send, so none of them is read as a claim at all.
 	episodesUnreadable
 )
 
-// episodeRecords decodes the raw episodes value into those three shapes.
+// episodeRecords decodes the raw episodes value into those four shapes.
 //
 // The nil check on the decoded slice is the null case and the whole point of
 // keeping the bytes: `json.Unmarshal([]byte("null"), &records)` succeeds and
 // leaves records nil, while an empty array yields a non-nil empty slice. That
-// is the only signal in the standard library that separates them, and this
-// program has to separate them.
+// is the only signal in the standard library that separates a present null from
+// an absent key, and this program has to separate them — not because they claim
+// different scopes (both end at the whole series) but because one of them is a
+// value that was READ and must be reported as such.
 func (p webhookPayload) episodeRecords() ([]webhookEpisodeRef, episodesShape) {
 	if len(p.Episodes) == 0 {
 		return nil, episodesAbsent
@@ -245,7 +271,7 @@ func (p webhookPayload) episodeRecords() ([]webhookEpisodeRef, episodesShape) {
 		return nil, episodesUnreadable
 	}
 	if records == nil {
-		return nil, episodesUnreadable
+		return nil, episodesNull
 	}
 	return records, episodesReadable
 }
@@ -566,16 +592,22 @@ func (s *webhookServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	// configured instance type and a movie has no seasons to name: an episodes
 	// array arriving on a radarr's endpoint is part of the same misconfiguration
 	// the ref check above surfaces, and must not be allowed to make a claim.
-	seasons, unreadable, claim := []int(nil), 0, claimWholeItem
+	seasons, unreadable, claim, shape := []int(nil), 0, claimWholeItem, episodesAbsent
 	if kind == webhookKindSeries {
-		seasons, unreadable, claim = payload.affectedSeasons()
+		seasons, unreadable, claim, shape = payload.affectedSeasons()
 	}
 	deadline, dropped, queued := s.queue.add(key, seasons, claim, s.now(), s.debounce)
-	// The WARN is owed for every claimNothing, not merely for every unreadable
-	// RECORD: an episodes key holding a JSON null (or a string, or an object)
-	// has no records to count, and it is the shape that used to pass through
-	// silently as the widest claim available.
-	if unreadable > 0 || claim == claimNothing {
+	switch {
+	case shape == episodesNull:
+		// The one shape that makes the WIDEST claim and is nonetheless a value
+		// this program read rather than one it assumed. It is warned about
+		// FIRST, and separately, precisely because its claim is indistinguishable
+		// from the legitimate absent case everywhere else in this log line.
+		s.warnNullEpisodes(name, instType, key)
+	case unreadable > 0 || claim == claimNothing:
+		// The WARN is owed for every claimNothing, not merely for every
+		// unreadable RECORD: an episodes key holding a string or an object has
+		// no records to count.
 		s.warnUnreadableEpisodes(name, instType, key, unreadable, seasons, claim, queued)
 	}
 	if !queued {
@@ -623,6 +655,30 @@ func (s *webhookServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	writeWebhookAccepted(w)
 }
 
+// warnNullEpisodes is the noise an explicitly null episodes key is required to
+// make, and it is a WARN about something this program then goes ahead and DOES
+// — which is unusual enough here to state why.
+//
+// The binding ruling is that a null episodes key falls back to the same
+// whole-series scope an absent key gets, on the condition the handler has
+// already enforced above: a payload with no series id never reaches this point,
+// so the fallback only ever applies to an event that otherwise validated. What
+// separates it from the absent case is not the scope but the EVIDENCE — an
+// absent key is a payload that never spoke about episodes, while a null is a
+// value in the position that decides how much of a series may be unmonitored,
+// and §2.6 does not let this program read such a value silently.
+//
+// So the line's whole job is to make the wide claim visible: it names the field,
+// says what the value was, and states the consequence in seasons rather than in
+// JSON, because "every eligible season of this series may be unmonitored by the
+// cycle this event triggered" is the fact an operator needs and "episodes was
+// null" is not.
+func (s *webhookServer) warnNullEpisodes(name, instType string, key queueKey) {
+	s.logger.Warn("webhook payload: the episodes key is present and holds an explicit JSON null, so it names no season; the rest of the payload validated, so this event falls back to the whole-series scope an absent episodes array gets — meaning EVERY eligible season of this series, not one affected season, is in the write scope of the cycle it triggered",
+		"instance", name, "type", instType, "key", key.String(), "field", "episodes",
+		"scopeClaim", claimWholeItem.String(), "writeScope", "every eligible season of this series")
+}
+
 // warnUnreadableEpisodes is the noise an episode record with no readable
 // seasonNumber is required to make.
 //
@@ -651,14 +707,15 @@ func (s *webhookServer) warnUnreadableEpisodes(name, instType string, key queueK
 
 	// claimNothing, reached two ways, and the line says which. Either a
 	// non-empty episodes array yielded no season number at all, or the episodes
-	// key held something that is not an array of episode records — a JSON null
-	// most often, which is what an *arr sends when it has no episodes to name
-	// and says so explicitly rather than by omission. Only the second is
-	// invisible to a pointer decode, and it is the one that used to arrive here
-	// as a claim on the entire series.
+	// key held something that is not an array of episode records at all. A JSON
+	// null is deliberately NOT one of those: it is a shape a serializer really
+	// emits for an empty collection, so it has its own ruling and its own line
+	// (warnNullEpisodes). What is left here is a string, an object, or an array
+	// of things that are not episode records — none of which an *arr has any
+	// reason to send, and none of which is read as a claim.
 	cause := "the episodes array names no readable seasonNumber at all"
 	if unreadable == 0 {
-		cause = "the episodes key is present but holds something that is not an array of episode records (a JSON null, or a value of some other type)"
+		cause = "the episodes key is present but holds something that is not an array of episode records at all (a string, an object, or an array of values that are not episode records)"
 	}
 	// Saying WHY this is not treated as a whole-series claim matters, because
 	// the neighbouring, legitimate case (no episodes key at all) IS one, and an
