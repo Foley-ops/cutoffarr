@@ -854,49 +854,7 @@ func TestDaemon_SecondCycleWithNothingChanged_LogsSummariesOnlyAtInfo(t *testing
 		t.Errorf("a steady-state cycle must be free of warnings and errors:\n%s", cycle2)
 	}
 
-	// SUMMARIES AND POSTURE ONLY, asserted as such rather than as a list of
-	// forbidden messages: an idle cycle's INFO output is the daemon's own two
-	// bookends (the sweep beginning and completing), one decision summary per
-	// instance, and the handful of per-INSTANCE lines listed below — NOTHING
-	// that scales with the size of the library. A forbidden-substring test would
-	// pass the day someone adds a thirteenth per-item INFO line nobody thought
-	// to list.
-	//
-	// "the size of the library" is the whole test, and it is why the exclusion
-	// tag line is admitted rather than demoted. The noise budget exists because
-	// a daemon repeating a full per-item report buries what matters; a line
-	// emitted at most once per instance per cycle cannot do that. What it CAN do
-	// is disappear, and this particular line says §2.5's exclusion tag — the
-	// user's only opt-out from being unmonitored — is inert for this instance.
-	// A tag renamed in the *arr after startup leaves rule 4 excluding nothing,
-	// and demoting the line means the only notice of that scrolled out of
-	// `docker logs` days ago. Widening the allowlist is the deliberate call
-	// (binding ruling R6); every entry added here must clear the same bar.
-	allowedInfo := []string{
-		"reconciliation sweep beginning",
-		"reconciliation sweep complete",
-		"sonarr decision summary",
-		"exclusion tag not defined in this instance",
-	}
-	sawSummary := false
-	for _, line := range strings.Split(cycle2, "\n") {
-		if !strings.Contains(line, "level=INFO") {
-			continue
-		}
-		matched := ""
-		for _, allowed := range allowedInfo {
-			if strings.Contains(line, allowed) {
-				matched = allowed
-			}
-		}
-		if matched == "" {
-			t.Errorf("an idle reconciliation cycle printed an INFO line that is not a summary:\n%s\n(whole cycle:\n%s)", line, cycle2)
-		}
-		if matched == "sonarr decision summary" {
-			sawSummary = true
-		}
-	}
-	if !sawSummary {
+	if !assertIdleCycleInfoIsWithinTheBudget(t, cycle2) {
 		t.Errorf("the summary is what an idle cycle DOES print — it is how a human sees the daemon is alive and idle:\n%s", cycle2)
 	}
 
@@ -905,6 +863,147 @@ func TestDaemon_SecondCycleWithNothingChanged_LogsSummariesOnlyAtInfo(t *testing
 	// on. Proven by the startup scan, which said all of it at INFO.
 	if !strings.Contains(startup, "msg=would-unmonitor") || !strings.Contains(startup, "cross-check season") {
 		t.Errorf("the startup scan must still report in full at INFO:\n%s", startup)
+	}
+}
+
+// idleCycleAllowedInfo is what an idle daemon cycle is permitted to say at
+// INFO, and the property it encodes is one sentence: NOTHING THAT SCALES WITH
+// THE SIZE OF THE LIBRARY. The daemon repeats this cycle forever, so a per-item
+// line printed here is printed a thousand times a day and buries the writes and
+// warnings the log exists for; a line printed at most once per INSTANCE per
+// cycle cannot.
+//
+// It is expressed as an allowlist rather than a list of forbidden messages
+// deliberately: a forbidden-substring test would pass the day someone adds a
+// thirteenth per-item INFO line nobody thought to list. The cost is that every
+// legitimate addition has to be argued for here, which is the point — each of
+// the entries below is per-instance, and each says something no other line
+// says:
+//
+//   - the sweep's two bookends and the per-instance decision summary: the cycle
+//     happened at all, and what it decided.
+//   - "exclusion tag not defined in this instance": §2.5's exclusion tag is the
+//     user's ONLY opt-out from being unmonitored, and this line says that
+//     opt-out is currently inert here. A tag renamed in the *arr after startup
+//     disables rule 4 from that moment on; demoted, the only notice of it
+//     scrolled out of `docker logs` days ago (binding ruling R6).
+//   - "writes withheld for this instance": the write gate is shut for this
+//     instance, which is the difference between "nothing needed writing" and
+//     "something did and was refused". This is the INFO variant, reached only
+//     when nothing was pending (with pending writes the same line is a WARN and
+//     was never in question). It is reachable on a genuinely idle cycle — an
+//     inconclusive cross-check shuts the gate whether or not anything was
+//     waiting — which is what
+//     TestDaemon_IdleCycleWithAnInconclusiveCrossCheck_StaysWithinTheNoiseBudget
+//     exists to construct.
+var idleCycleAllowedInfo = []string{
+	"reconciliation sweep beginning",
+	"reconciliation sweep complete",
+	"sonarr decision summary",
+	"exclusion tag not defined in this instance",
+	"writes withheld for this instance",
+}
+
+// assertIdleCycleInfoIsWithinTheBudget fails the test for every INFO line of
+// cycle that is not in idleCycleAllowedInfo, and reports whether the
+// per-instance decision summary was among them.
+func assertIdleCycleInfoIsWithinTheBudget(t *testing.T, cycle string) (sawSummary bool) {
+	t.Helper()
+	for _, line := range strings.Split(cycle, "\n") {
+		if !strings.Contains(line, "level=INFO") {
+			continue
+		}
+		matched := ""
+		for _, allowed := range idleCycleAllowedInfo {
+			if strings.Contains(line, allowed) {
+				matched = allowed
+			}
+		}
+		if matched == "" {
+			t.Errorf("an idle reconciliation cycle printed an INFO line that is not on the noise budget's allowlist:\n%s\n(whole cycle:\n%s)", line, cycle)
+		}
+		if matched == "sonarr decision summary" {
+			sawSummary = true
+		}
+	}
+	return sawSummary
+}
+
+// unverifiableSonarrFake is one series whose single season is complete on disk
+// and aired, and for which /episodefile returns NOTHING — a real *arr state (a
+// file gone from disk with stale season statistics), and the smallest way to
+// produce the combination the allowlist has to survive: a cycle with no pending
+// writes AND an inconclusive cross-check.
+//
+// Nothing is decided as would-unmonitor (the season is skipped for the file
+// count mismatch), so the cycle is idle; the season is still SAMPLED by the
+// cross-check on the skip side, has no comparable episodeFile.qualityCutoffNotMet,
+// and therefore lands the whole verdict on inconclusive.
+func unverifiableSonarrFake(t *testing.T) *statefulSonarrFake {
+	t.Helper()
+	return newStatefulSonarrFake(t,
+		[]*statefulSonarrSeries{
+			{id: 1, title: "No Files", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 1, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1}}},
+		},
+		[]*statefulSonarrEpisode{
+			{id: 100, seriesID: 1, seasonNumber: 1, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 500},
+		},
+		[]*statefulSonarrEpisodeFile{},
+	)
+}
+
+// TestDaemon_IdleCycleWithAnInconclusiveCrossCheck_StaysWithinTheNoiseBudget is
+// the sub-case the noise-budget test could not reach on its own, and the reason
+// it matters is that the allowlist is a claim about the DAEMON, not about one
+// fixture.
+//
+// TestDaemon_SecondCycleWithNothingChanged runs against writableSonarrFake,
+// whose cross-check always passes, so the write gate is never shut and the
+// per-instance "writes withheld for this instance" line never appears. It is
+// undemoted (the write passes log it through the engine's own logger), it is
+// INFO whenever nothing was pending, and an inconclusive cross-check on an idle
+// cycle is an ordinary, reachable configuration — so an allowlist that had
+// never seen it was encoding a rule the daemon does not follow.
+//
+// Unlike its sibling this cycle is NOT warning-free, and that is inherent
+// rather than incidental: an inconclusive verdict always carries the WARN
+// saying pass or fail could not be determined. The noise budget is about INFO.
+func TestDaemon_IdleCycleWithAnInconclusiveCrossCheck_StaysWithinTheNoiseBudget(t *testing.T) {
+	fake := unverifiableSonarrFake(t)
+	h := startDaemon(t, writeDaemonConfig(t, "sonarr", fake.srv.URL, true, "info", "1h", "45s"))
+	h.waitReady()
+	eventually(t, "the reconciliation schedule to be announced", func() bool {
+		return strings.Contains(h.out.String(), "reconciliation sweep scheduled")
+	})
+
+	mark := h.mark()
+	h.clock.Advance(time.Hour)
+	h.awaitLogCount("reconciliation sweep complete", 1)
+	cycle2 := h.since(mark)
+	h.stop()
+
+	if !strings.Contains(cycle2, "crossCheck=inconclusive") {
+		t.Fatalf("this test is only meaningful if the cycle's cross-check really is inconclusive:\n%s", cycle2)
+	}
+	gate := ""
+	for _, line := range strings.Split(cycle2, "\n") {
+		if strings.Contains(line, "writes withheld for this instance") {
+			gate = line
+		}
+	}
+	if gate == "" {
+		t.Fatalf("a shut write gate must say so on every cycle: 'nothing was written' and 'nothing needed writing' are different facts:\n%s", cycle2)
+	}
+	if !strings.Contains(gate, "level=INFO") || !strings.Contains(gate, "withheldWrites=0") {
+		t.Fatalf("the case this pins is the INFO one — the gate shut with nothing pending; with pending writes the same line is a WARN:\n%s", gate)
+	}
+
+	if !assertIdleCycleInfoIsWithinTheBudget(t, cycle2) {
+		t.Errorf("the summary is what an idle cycle DOES print:\n%s", cycle2)
+	}
+	if len(fake.writes()) != 0 {
+		t.Errorf("a shut gate writes nothing, got %+v", fake.writes())
 	}
 }
 
