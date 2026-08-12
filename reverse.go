@@ -1,5 +1,10 @@
 package main
 
+import (
+	"context"
+	"log/slog"
+)
+
 // reverse.go is the Phase 10 reverse scan: the same decision function, run over
 // the opposite population, to catch items that are UNMONITORED but do NOT meet
 // the criteria — almost always an accidental unmonitor, and invisible to
@@ -90,4 +95,286 @@ func isReverseFinding(reason string) bool {
 	default:
 		return false
 	}
+}
+
+// reverseOptions is what a CYCLE says about the reverse scan: whether to run it
+// at all, and whether it may write.
+//
+// The two are separate because they answer to different things. enabled is
+// SCHEDULING — the reverse scan belongs to full-library cycles (the startup
+// scan, the reconciliation sweep, a --once run) and never to a webhook or an
+// --only-id run, which are surgical and forward-looking by construction.
+// remonitor is CONFIGURATION — cfg.ReverseScanRemonitor, default false, the
+// only thing that lets the reverse scan write anything ever.
+//
+// The zero value is "do not run", which is what every scoped cycle wants and
+// what a caller that forgot about this phase gets.
+type reverseOptions struct {
+	enabled   bool
+	remonitor bool
+}
+
+// reverseCounts is one instance's reverse-scan accounting for one cycle.
+//
+// findings is what the report-only default produces. The five write counters
+// exist only when the remonitor flag is on, and they exist so that every
+// finding ends in exactly one of them:
+//
+//	findings == remonitored + remonitorsRefused + reverseWithheld
+//	            + reverseWriteErrors + reverseEchoUnverified
+//
+// That identity is the same discipline the forward passes are held to, and for
+// the same reason: two separate review rounds of the forward write path found
+// silent paths where promised writes evaporated with every counter reading
+// zero, and the only structural defense is numbers that are required to add up.
+type reverseCounts struct {
+	// skipped means the pass could not run for this instance — the unmonitored
+	// wanted set was incomplete, or a shutdown interrupted the evaluation — so
+	// findings says nothing and must not be printed as though it did.
+	skipped bool
+
+	findings int
+
+	// noFile is the pool statistic binding controller resolution 2 asks for at
+	// debug only: unmonitored movies with no file are a deliberate user choice
+	// and are never findings, but knowing how many there are explains the gap
+	// between "unmonitored items" and "items the reverse scan looked at".
+	noFile int
+
+	remonitored    int
+	refused        int
+	writeErrors    int
+	echoUnverified int
+	withheld       int
+}
+
+// summaryAttrs renders this cycle's reverse-scan accounting for the engine's
+// summary line.
+//
+// Three distinct states, all of which must be tellable apart at a glance:
+//
+//   - the pass did not run (a webhook or --only-id cycle): NOTHING is printed.
+//     A reverseFindings=0 on a cycle that never looked would be a false
+//     all-clear, and those cycles are the majority in a busy daemon.
+//   - the pass ran but could not be trusted: reverseScan=skipped, and no count.
+//   - the pass ran: reverseFindings=N, plus — only when the write switch is on
+//     — the five write counters, always present including as 0.
+//
+// The write counters being ABSENT with the switch off is itself the point
+// (binding controller resolution 7): report-only and write-enabled cycles must
+// not look alike, and the presence of the word remonitored on the line is the
+// cheapest possible way for a human to tell which one they are reading.
+func (c reverseCounts) summaryAttrs(opts reverseOptions, dryRun bool) []any {
+	if !opts.enabled {
+		return nil
+	}
+	if c.skipped {
+		return []any{"reverseScan", "skipped"}
+	}
+	attrs := []any{"reverseFindings", c.findings}
+	if !opts.remonitor {
+		return attrs
+	}
+	attrs = append(attrs, "remonitored", c.remonitored, "remonitorsRefused", c.refused, "reverseWithheld", c.withheld)
+	// The same mode-dependent split the forward summaries make, for the same
+	// reason: writeErrors counts failed WRITES, so in dry-run it is
+	// unconditionally 0 and the rehearsal's own failures are reported under a
+	// name that cannot be misread as "N writes failed"; an unverifiable echo
+	// cannot happen in dry-run, where no PUT is ever sent.
+	if dryRun {
+		attrs = append(attrs, "reverseWriteErrors", 0, "reverseRehearsalErrors", c.writeErrors)
+	} else {
+		attrs = append(attrs, "reverseWriteErrors", c.writeErrors, "reverseEchoUnverified", c.echoUnverified)
+	}
+	return attrs
+}
+
+// reversePass is one instance's reverse scan, assembled by the decision engine
+// that already holds every input it needs. It is a struct rather than a
+// twelve-parameter function purely for legibility; nothing here outlives the
+// cycle that built it.
+type reversePass struct {
+	// logger is the engine's UNDEMOTED logger: this pass decides the level of
+	// each line it writes (findings ride the cycle's item level, warnings and
+	// the summary do not), which a pre-demoted logger would take away from it.
+	logger *slog.Logger
+	// cycleLogger demotes INFO on repeating cycles, and exists here for exactly
+	// one line: the unmonitored wanted/cutoff fetch's own totals, which are
+	// news once and repetition forever after.
+	cycleLogger *slog.Logger
+
+	client *APIClient
+	inst   Instance
+
+	profiles       map[int]qualityProfile
+	exclusionTagID int
+	tagActive      bool
+
+	// cc is the FORWARD cross-check's result for this cycle. The reverse scan
+	// never runs a cross-check of its own — it has no second signal to compare
+	// against — so what it uses this for is narrow and stated where it is used
+	// (reverseWriteGateBlockReason): a data-layer health signal, not evidence
+	// about any individual finding.
+	cc crossCheckResult
+
+	itemLevel slog.Level
+	dryRun    bool
+	opts      reverseOptions
+}
+
+// runRadarr is the Radarr reverse scan: every UNMONITORED movie, evaluated by
+// evaluateMovie — the forward decision function, unchanged — against the
+// unmonitored wanted set.
+//
+// The pool is binding controller resolution 2's: monitored == false AND hasFile
+// == true. Rule 1's half (monitored) is applied here, exactly as the forward
+// engine applies its own; rule 2's (hasFile) is left to evaluateMovie so that
+// "has a file" keeps meaning what it means in one place, and the resulting
+// no-file decisions are counted rather than reported.
+//
+// It costs one /moviefile fetch per unmonitored movie that reaches rule 6 —
+// that is, one per unmonitored movie whose quality cutoff IS met, since the
+// ones below it stop at rule 5. That is inherent to evaluating the real
+// criteria rather than a cheaper approximation of them, and it is the price of
+// the literal-reuse mandate; it is bounded by the unmonitored population and
+// runs only on full-library cycles.
+func (p reversePass) runRadarr(ctx context.Context, movies []movieListElement) reverseCounts {
+	var c reverseCounts
+
+	wantedIDs, ok := fetchWantedCutoff(ctx, p.cycleLogger, p.client, p.inst, unmonitoredWantedFilter())
+	if !ok {
+		// The completeness contract, in the direction where an incomplete set
+		// is a different kind of wrong: absence from this set means "its
+		// quality cutoff is met", so a short set turns healthy movies into
+		// findings — and, with the remonitor flag on, into writes. The forward
+		// pass above never consulted it and is unaffected.
+		p.logger.Warn("skipping the reverse scan for this instance: the unmonitored wanted/cutoff set could not be fetched completely, and an incomplete set would report movies as below cutoff that are not; the forward pass is unaffected",
+			"instance", p.inst.Name, "type", p.inst.Type)
+		c.skipped = true
+		return c
+	}
+
+	for _, m := range movies {
+		// The same shutdown boundary the forward evaluation draws, and the same
+		// ending: a partial reverse scan is not a reverse scan, so nothing it
+		// half-saw is reported or counted as a finding total.
+		if ctx.Err() != nil {
+			p.logger.Info("shutdown requested: abandoning this instance's reverse scan mid-evaluation; a partial reverse scan is never reported as a finding count",
+				"instance", p.inst.Name, "type", p.inst.Type, "evaluated", c.findings+c.noFile)
+			c.skipped = true
+			return c
+		}
+
+		// monitored absent is untrusted input, not a state — the forward loop
+		// has already warned about this exact movie via warnIfFieldAbsent, so
+		// this excludes it without saying so twice.
+		if m.Monitored == nil || *m.Monitored {
+			continue
+		}
+		if m.ID == nil {
+			// The forward loop never reaches its own missing-id guard for an
+			// unmonitored movie (rule 1 excludes it first), so this is the only
+			// place an unmonitored movie with no id is ever noticed.
+			p.logger.Warn("reverse scan: skipping movie: missing id field",
+				"instance", p.inst.Name, "type", p.inst.Type, "title", titleOrAbsent(m.Title))
+			continue
+		}
+
+		d := evaluateMovie(ctx, p.logger, p.client, p.inst, m, p.profiles, p.exclusionTagID, p.tagActive, wantedIDs)
+		if d.reason == ReasonNoFile {
+			c.noFile++
+			continue
+		}
+		if !isReverseFinding(d.reason) {
+			continue
+		}
+		c.findings++
+		p.logger.Log(ctx, p.itemLevel, "reverse-scan finding",
+			"id", d.id, "title", d.title, "reason", d.reason, "profile", d.profileName, "instance", p.inst.Name)
+	}
+
+	if c.noFile > 0 {
+		p.logger.Debug("reverse scan: unmonitored movies with no file are not findings; leaving a movie unmonitored and undownloaded is a deliberate choice",
+			"instance", p.inst.Name, "type", p.inst.Type, "reverseNoFile", c.noFile)
+	}
+
+	return c
+}
+
+// fullScanReverseOptions is what a FULL-LIBRARY cycle asks for: run the reverse
+// scan, and let it write only if the config says so.
+//
+// It exists so the three full-scan call sites — the startup scan, the
+// reconciliation sweep, and a --once run — cannot drift apart from each other,
+// and so that the scoped cycles' "no reverse pass" stays the plain zero value
+// rather than something they have to spell.
+func fullScanReverseOptions(cfg Config) reverseOptions {
+	return reverseOptions{enabled: true, remonitor: cfg.ReverseScanRemonitor}
+}
+
+// runSonarr is the Sonarr reverse scan: every UNMONITORED season, of a
+// monitored OR unmonitored series, evaluated by evaluateSeries — the forward
+// decision function in its reverse direction — against the unmonitored wanted
+// set.
+//
+// The pool includes seasons of unmonitored series deliberately (binding
+// controller resolution 3): the plan asks for both, and "this retired show has
+// a season that never finished upgrading" is exactly the kind of thing a human
+// wants told to them once. What differs is only what may be DONE about it.
+//
+// Cost: evaluateSeries returns before its /episode fetch for any series with no
+// unmonitored season at all, so a fully-monitored library pays nothing here
+// beyond the series-level checks. A series with seasons in BOTH states is
+// evaluated twice per cycle — once per direction — which is the price of asking
+// two different questions about it with one implementation.
+func (p reversePass) runSonarr(ctx context.Context, series []seriesElement) reverseCounts {
+	var c reverseCounts
+
+	_, wantedSeasons, ok := fetchSonarrWantedCutoff(ctx, p.cycleLogger, p.client, p.inst, unmonitoredWantedFilter())
+	if !ok {
+		p.logger.Warn("skipping the reverse scan for this instance: the unmonitored wanted/cutoff set could not be fetched completely, and an incomplete set would report seasons as below cutoff that are not; the forward pass is unaffected",
+			"instance", p.inst.Name, "type", p.inst.Type)
+		c.skipped = true
+		return c
+	}
+
+	for _, s := range series {
+		if ctx.Err() != nil {
+			p.logger.Info("shutdown requested: abandoning this instance's reverse scan mid-evaluation; a partial reverse scan is never reported as a finding count",
+				"instance", p.inst.Name, "type", p.inst.Type, "findings", c.findings)
+			c.skipped = true
+			return c
+		}
+
+		// monitored absent is untrusted input, not a state, and it is the one
+		// thing the write side keys on — so a series whose own monitored flag
+		// could not be read produces no finding in either direction. The forward
+		// loop has already warned about this exact series.
+		if s.Monitored == nil {
+			continue
+		}
+		if s.ID == nil {
+			// The forward loop reaches its own missing-id guard only for a
+			// MONITORED series, so an unmonitored one with no id is noticed here
+			// or nowhere.
+			if !*s.Monitored {
+				p.logger.Warn("reverse scan: skipping series: missing id field",
+					"instance", p.inst.Name, "type", p.inst.Type, "title", titleOrAbsent(s.Title))
+			}
+			continue
+		}
+
+		eval := evaluateSeries(ctx, p.logger, p.client, p.inst, s, p.profiles, p.exclusionTagID, p.tagActive, wantedSeasons, directionReverse)
+		for _, d := range eval.decisions {
+			if !isReverseFinding(d.reason) {
+				continue
+			}
+			c.findings++
+			p.logger.Log(ctx, p.itemLevel, "reverse-scan finding",
+				"instance", p.inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season,
+				"reason", d.reason, "profile", d.profileName, "seriesMonitored", *s.Monitored)
+		}
+	}
+
+	return c
 }

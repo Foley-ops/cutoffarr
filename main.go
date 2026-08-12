@@ -181,11 +181,20 @@ func run(args []string, stdout, stderr io.Writer, daemonOpts ...daemonOptions) i
 		if onlyIDSet {
 			scope = onlyIDScope(*onlyID)
 		}
+		// The reverse scan runs on a full --once pass and NOT on a scoped one:
+		// --only-id names one item to report and write, and a whole-library
+		// reverse scan inside it would answer a question nobody asked, at the
+		// cost of a second pass over the entire library.
+		reverse := fullScanReverseOptions(*cfg)
+		if onlyIDSet {
+			reverse = reverseOptions{}
+		}
 		runScanCycle(context.Background(), logger, *cfg, scanCycle{
 			instanceName: *instanceName,
 			samples:      parseSamples(*samplesFlag),
 			scope:        scope,
 			dryRun:       cfg.DryRun,
+			reverse:      reverse,
 		})
 	} else {
 		// --only-id and --instance stay --once-only. Daemon mode DOES run

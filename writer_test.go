@@ -1034,13 +1034,20 @@ type radarrFake struct {
 
 	// Fixtures. Set directly by a test after construction and before the
 	// run under test starts; the handlers read them under the same mutex.
-	moviesJSON   string
-	wantedJSON   string
-	tagsJSON     string
-	profilesJSON string
-	cfScore      int
-	detail       map[int]string // GET /api/v3/movie/{id} bodies, by id
-	putStatus    map[int]int    // PUT /api/v3/movie/{id} status, by id (default 200)
+	moviesJSON string
+	// wantedJSON is the FORWARD /wanted/cutoff body (no monitored parameter);
+	// reverseWantedJSON is what the same endpoint answers with when the reverse
+	// scan narrows it to monitored=false. They are separate fixtures because the
+	// live endpoint really does answer differently (3 records against 131), and a
+	// fake that served one body for both would let a reverse pass that consulted
+	// the WRONG set pass every test in this suite.
+	wantedJSON        string
+	reverseWantedJSON string
+	tagsJSON          string
+	profilesJSON      string
+	cfScore           int
+	detail            map[int]string // GET /api/v3/movie/{id} bodies, by id
+	putStatus         map[int]int    // PUT /api/v3/movie/{id} status, by id (default 200)
 
 	// putEcho overrides what a successful PUT answers with, by id. Unset
 	// means "behave like Radarr": echo the object that was sent. Set to ""
@@ -1059,14 +1066,15 @@ type radarrFake struct {
 func newRadarrFake(t *testing.T, moviesJSON string, detail map[int]string) *radarrFake {
 	t.Helper()
 	f := &radarrFake{
-		moviesJSON:   moviesJSON,
-		wantedJSON:   emptyWantedCutoffJSON,
-		tagsJSON:     decisionEngineNoTagsJSON,
-		profilesJSON: decisionEngineProfilesJSON,
-		cfScore:      200,
-		detail:       detail,
-		putStatus:    map[int]int{},
-		putEcho:      map[int]string{},
+		moviesJSON:        moviesJSON,
+		wantedJSON:        emptyWantedCutoffJSON,
+		reverseWantedJSON: emptyWantedCutoffJSON,
+		tagsJSON:          decisionEngineNoTagsJSON,
+		profilesJSON:      decisionEngineProfilesJSON,
+		cfScore:           200,
+		detail:            detail,
+		putStatus:         map[int]int{},
+		putEcho:           map[int]string{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v3/system/status", f.handle(func(w http.ResponseWriter, r *http.Request) {
@@ -1079,7 +1087,7 @@ func newRadarrFake(t *testing.T, moviesJSON string, detail map[int]string) *rada
 		w.Write([]byte(f.tagsJSON))
 	}))
 	mux.HandleFunc("/api/v3/wanted/cutoff", f.handle(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(f.wantedJSON))
+		w.Write([]byte(f.wantedFor(r.URL.Query().Get("monitored"))))
 	}))
 	mux.HandleFunc("/api/v3/moviefile", f.handle(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `[{"id": 1, "customFormatScore": %d}]`, f.cfScore)
@@ -1182,6 +1190,35 @@ func (f *radarrFake) puts() []recordedRequest {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return filterRequests(f.requests, http.MethodPut)
+}
+
+// wantedFor answers with the body for the requested wanted set. Only the
+// explicit monitored=false the reverse scan sends selects the unmonitored one;
+// everything else (no parameter, monitored=true) gets the forward body, which
+// is the live behavior the controller probed — default and monitored=true are
+// identical.
+func (f *radarrFake) wantedFor(monitored string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if monitored == "false" {
+		return f.reverseWantedJSON
+	}
+	return f.wantedJSON
+}
+
+// countRequests reports how many requests this fake received for a path,
+// whatever their method or query — the shape "this endpoint was never called"
+// assertions need.
+func (f *radarrFake) countRequests(path string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, r := range f.requests {
+		if r.path == path {
+			n++
+		}
+	}
+	return n
 }
 
 func (f *radarrFake) instance() Instance {

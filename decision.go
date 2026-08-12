@@ -451,7 +451,14 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 // checkInstanceConnectivity and inspectRadarrLibrary, the binding
 // error-handling rule (§2.6) is "skip that instance for the cycle and log a
 // warning" with no further work for a caller to gate on.
-func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, movies []movieListElement, wantedIDs map[int]bool, exclusionTagLabel string, scope evalScope, dryRun bool) {
+// reverse (Phase 10) is the fourth pass, and it runs AFTER the write pass
+// rather than beside the evaluation, deliberately: it is a second, independent
+// question about the same library ("what is unmonitored that should not be"),
+// its findings must never enter the forward cross-check's candidate pools, and
+// — when its own write switch is on — the cross-check verdict it answers to is
+// the one this cycle already produced. It is silent and free on any cycle that
+// did not ask for it.
+func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, movies []movieListElement, wantedIDs map[int]bool, exclusionTagLabel string, scope evalScope, dryRun bool, reverse reverseOptions) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	// The per-cycle-repetition logger (see demoteInfoTo): the profile fetch,
@@ -660,6 +667,15 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 
 	unmonitoredCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount := runWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun)
 
+	var rev reverseCounts
+	if reverse.enabled {
+		rev = reversePass{
+			logger: logger, cycleLogger: cycleLogger, client: client, inst: inst,
+			profiles: profiles, exclusionTagID: exclusionTagID, tagActive: tagActive,
+			cc: cc, itemLevel: scope.itemLevel, dryRun: dryRun, opts: reverse,
+		}.runRadarr(ctx, movies)
+	}
+
 	attrs := []any{"instance", inst.Name, "type", inst.Type}
 	attrs = append(attrs, scope.summaryAttrs()...)
 	attrs = append(attrs, "totalMonitored", totalMonitored, "wouldUnmonitor", wouldUnmonitorCount, "unmonitored", unmonitoredCount, "alreadyUnmonitored", alreadyUnmonitoredCount)
@@ -712,6 +728,11 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// writeEchoUnverified always is in write mode: an absent number must never
 	// be readable as "none happened".
 	attrs = append(attrs, "writesRefused", writesRefusedCount, "withheldWrites", withheldWriteCount)
+
+	// The reverse scan's own accounting, and nothing at all when this cycle ran
+	// no reverse pass — see reverseCounts.summaryAttrs for why the three states
+	// (did not run / could not be trusted / ran) must not look alike.
+	attrs = append(attrs, rev.summaryAttrs(reverse, dryRun)...)
 
 	attrs = append(attrs, "skipReasons", formatSkipCounts(skipCounts), "crossCheck", crossCheckSummary)
 	logger.Info("radarr decision summary", attrs...)
@@ -2124,7 +2145,11 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 // runRadarrDecisionEngine, it never returns anything: the binding
 // error-handling rule (§2.6) is "skip that instance for the cycle and log a
 // warning", with no further work for a caller to gate on.
-func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, series []seriesElement, wantedEpisodeIDs map[int]bool, wantedSeasons map[seasonKey]bool, exclusionTagLabel string, scope evalScope, dryRun bool) {
+// reverse (Phase 10) is the fourth pass, run after the write pass for the same
+// reasons the Radarr engine runs it there: it is a separate question about the
+// same library, its findings must never enter the forward cross-check's pools,
+// and its own write gate reads the verdict this cycle already produced.
+func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, series []seriesElement, wantedEpisodeIDs map[int]bool, wantedSeasons map[seasonKey]bool, exclusionTagLabel string, scope evalScope, dryRun bool, reverse reverseOptions) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	// See the Radarr twin: the once-per-cycle informational reads log through
@@ -2325,6 +2350,15 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 
 	unmonitoredCount, recoveredWriteCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount := runSonarrWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun)
 
+	var rev reverseCounts
+	if reverse.enabled {
+		rev = reversePass{
+			logger: logger, cycleLogger: cycleLogger, client: client, inst: inst,
+			profiles: profiles, exclusionTagID: exclusionTagID, tagActive: tagActive,
+			cc: cc, itemLevel: scope.itemLevel, dryRun: dryRun, opts: reverse,
+		}.runSonarr(ctx, series)
+	}
+
 	attrs := []any{"instance", inst.Name, "type", inst.Type}
 	attrs = append(attrs, scope.summaryAttrs()...)
 	// recoveredWrites is the sonarr-only sixth counter (binding controller
@@ -2365,6 +2399,9 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// pinned by
 	// TestRunSonarrDecisionEngine_EveryWouldUnmonitorSeasonIsAccountedForInTheSummary.
 	attrs = append(attrs, "writesRefused", writesRefusedCount, "withheldWrites", withheldWriteCount)
+
+	// The reverse scan's own accounting — see reverseCounts.summaryAttrs.
+	attrs = append(attrs, rev.summaryAttrs(reverse, dryRun)...)
 
 	attrs = append(attrs, "skipReasons", formatSkipCounts(skipCounts), "crossCheck", crossCheckSummary)
 	logger.Info("sonarr decision summary", attrs...)
