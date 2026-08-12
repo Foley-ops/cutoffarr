@@ -237,6 +237,15 @@ var errNotRecoveryAtWrite = errors.New("the season the recovery pass admitted st
 // Errors are returned, never retried (§2.6); the caller logs them and moves
 // to the next season.
 func unmonitorSeason(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, seriesID, seasonNumber, exclusionTagID int, tagActive bool, dryRun bool, requireRecovery bool) (written bool, recovery bool, err error) {
+	// PHASE 8, the shutdown boundary (binding controller note 4). This is the
+	// function that boundary exists for: a season is TWO writes, and a
+	// cancellation landing between them leaves episodes unmonitored inside a
+	// season that is still monitored — the exact partial state the recovery
+	// path exists to mop up. Detaching from the shutdown cancellation makes the
+	// pair atomic with respect to shutdown; the signal is checked BETWEEN
+	// seasons instead, by the write pass, so a season either makes both calls
+	// or never makes the first. See unmonitorMovie for why this is bounded.
+	ctx = context.WithoutCancel(ctx)
 	path := seriesPath(seriesID)
 	subject := fmt.Sprintf("series %d season %d", seriesID, seasonNumber)
 
@@ -1160,8 +1169,26 @@ func runSonarrWritePass(ctx context.Context, logger *slog.Logger, client *APICli
 		logger.Warn(msg, attrs...)
 	}
 
+	shutdownNoted := false
 	for _, d := range decisions {
 		if !d.wouldUnmonitor {
+			continue
+		}
+
+		// PHASE 8: the shutdown boundary, and the reason it is drawn HERE
+		// rather than inside the write (binding controller note 4). A season is
+		// two calls; unmonitorSeason detaches both from this cancellation so an
+		// in-flight season finishes the pair, and this check is what stops the
+		// NEXT one from starting. Interrupting mid-pair would manufacture
+		// exactly the episode-written-season-unwritten state the recovery path
+		// exists to mop up.
+		if ctx.Err() != nil {
+			withheld++
+			if !shutdownNoted {
+				shutdownNoted = true
+				logger.Info("shutdown requested: the remaining pending season writes for this instance are withheld and the next cycle will revisit them",
+					"instance", inst.Name, "type", inst.Type, "dryRun", dryRun)
+			}
 			continue
 		}
 

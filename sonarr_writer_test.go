@@ -3297,3 +3297,110 @@ func TestRunSonarrDecisionEngine_OnlyID_AlreadyUnmonitoredDebugIsScopedToo(t *te
 		t.Errorf("the counter and the log must agree:\n%s", out)
 	}
 }
+
+// --- Phase 8: the shutdown boundary is the SEASON, never the HTTP call -----
+//
+// Binding controller note 4. unmonitorSeason is TWO writes, and interrupting
+// between them manufactures exactly the partial state the recovery path exists
+// to mop up: episodes unmonitored, season still monitored. The shutdown signal
+// is therefore checked BETWEEN ITEMS — a season either finishes both calls or
+// never starts the first.
+
+// sonarrTwoSeasonDecisions names both writable seasons of
+// twoWritableSeasonsSonarrFake as pending would-unmonitor writes.
+func sonarrTwoSeasonDecisions() []seasonDecision {
+	return []seasonDecision{
+		sonarrCandidateDecision(1, 1, true, []seasonCrossCheckEpisode{
+			{episodeID: 100, monitored: boolPtr(true), qualityCutoffNotMet: boolPtr(false)},
+		}),
+		sonarrCandidateDecision(1, 2, true, []seasonCrossCheckEpisode{
+			{episodeID: 200, monitored: boolPtr(true), qualityCutoffNotMet: boolPtr(false)},
+			{episodeID: 201, monitored: boolPtr(true), qualityCutoffNotMet: boolPtr(false)},
+		}),
+	}
+}
+
+// TestRunSonarrWritePass_ShutdownDuringAnInFlightSeason_FinishesBothCallsThenStops
+// is the pin note 4 asks for. Cancellation is delivered the instant the FIRST
+// season's episode write lands — the single worst moment, right between the two
+// calls of a pair — and the assertion is the invariant, not the timing: no
+// season may end up episode-written-but-series-unwritten.
+func TestRunSonarrWritePass_ShutdownDuringAnInFlightSeason_FinishesBothCallsThenStops(t *testing.T) {
+	fake := twoWritableSeasonsSonarrFake(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fake.onRequest = func(method, path string) {
+		if method == http.MethodPut && path == "/api/v3/episode/monitor" {
+			cancel() // shutdown, mid-pair
+		}
+	}
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 2, writeVerified: 2}
+
+	unmonitored, recovered, writeErrors, echoUnverified, refused, withheld := runSonarrWritePass(
+		ctx, logger, NewAPIClient(fake.srv.URL, "key"), fake.instance(), sonarrTwoSeasonDecisions(), cc, 0, false, false)
+
+	out := buf.String()
+	// The invariant. A season whose episodes were written but whose season flag
+	// was not is the exact partial state a mid-pair interruption creates.
+	if !fake.seasonMonitored(1, 1) {
+		// Season 1 completed: both halves must have landed.
+		if fake.episodeMonitored(100) {
+			t.Error("season 1 is unmonitored but its episode is not: the season PUT ran without its episode write")
+		}
+	} else if !fake.episodeMonitored(100) {
+		t.Error("season 1's episode was unmonitored but its season was not: the pair was interrupted mid-write")
+	}
+	// Season 2 was never started: the shutdown was already visible when the
+	// loop reached it.
+	if !fake.seasonMonitored(1, 2) || !fake.episodeMonitored(200) || !fake.episodeMonitored(201) {
+		t.Errorf("season 2 must not have been touched after the shutdown: %s", out)
+	}
+	if withheld != 1 {
+		t.Errorf("withheld = %d, want 1 (season 2): a shutdown must not make a pending write vanish from the accounting\n%s", withheld, out)
+	}
+	if total := unmonitored + recovered + writeErrors + echoUnverified + refused + withheld; total != 2 {
+		t.Errorf("the accounting identity must survive a shutdown: %d != 2 pending\n%s", total, out)
+	}
+	if !strings.Contains(out, "shutdown") {
+		t.Errorf("a pass cut short by shutdown must say so, or its zeros read as 'nothing needed doing':\n%s", out)
+	}
+}
+
+// TestRunWritePass_ShutdownBetweenMovies_WithholdsTheRestAndSaysSo is the
+// Radarr half of the same boundary. A movie is one call, so there is no pair to
+// protect — but the accounting and the explanation matter just as much.
+func TestRunWritePass_ShutdownBetweenMovies_WithholdsTheRestAndSaysSo(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		wouldUnmonitorStatefulMovie(1, "First"),
+		wouldUnmonitorStatefulMovie(2, "Second"),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var once sync.Once
+	fake.onRequest = func(method, path string) {
+		if method == http.MethodPut {
+			once.Do(cancel)
+		}
+	}
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 2, writeVerified: 2}
+	decisions := []movieDecision{
+		{id: 1, title: "First", wouldUnmonitor: true, reason: ReasonCutoffMet},
+		{id: 2, title: "Second", wouldUnmonitor: true, reason: ReasonCutoffMet},
+	}
+
+	unmonitored, writeErrors, echoUnverified, refused, withheld := runWritePass(
+		ctx, logger, NewAPIClient(fake.srv.URL, "key"), fake.instance(), decisions, cc, 0, false, false)
+
+	out := buf.String()
+	if unmonitored != 1 || withheld != 1 {
+		t.Errorf("unmonitored/withheld = %d/%d, want 1/1: the in-flight movie completes, the next one is withheld\n%s", unmonitored, withheld, out)
+	}
+	if total := unmonitored + writeErrors + echoUnverified + refused + withheld; total != 2 {
+		t.Errorf("the accounting identity must survive a shutdown: %d != 2 pending\n%s", total, out)
+	}
+	if !strings.Contains(out, "shutdown") {
+		t.Errorf("a pass cut short by shutdown must say so:\n%s", out)
+	}
+}

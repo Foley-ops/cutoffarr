@@ -14,15 +14,21 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
-// run loads the config, prints it redacted, and (in --once mode) checks
-// connectivity against every configured instance before exiting. It takes
-// stdout/stderr explicitly so it is testable without touching the real
-// process streams.
-func run(args []string, stdout, stderr io.Writer) int {
+// run parses the flags, loads and prints the config, and then either performs
+// a single pass (--once) or starts the daemon. It takes stdout/stderr
+// explicitly so it is testable without touching the real process streams.
+//
+// daemonOpts is a variadic tail purely so it can be OMITTED: production calls
+// run(args, stdout, stderr) and gets the zero options, which is what the daemon
+// uses in earnest. A test that needs to drive the daemon — an ephemeral
+// listener, a virtual clock, a shutdown it can deliver without signalling the
+// test process — passes one. Only the first is used; more than one is a
+// programming error and is refused rather than silently ignored.
+func run(args []string, stdout, stderr io.Writer, daemonOpts ...daemonOptions) int {
 	fs := flag.NewFlagSet("cutoffarr", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	configPath := fs.String("config", "/config/config.yml", "path to the cutoffarr YAML config file")
-	once := fs.Bool("once", false, "run a single pass and exit (daemon mode arrives in a later phase)")
+	once := fs.Bool("once", false, "run a single pass and exit; without it, cutoffarr runs as a daemon (startup scan, webhook listener, reconciliation sweep every poll_interval)")
 	forceDryRun := fs.Bool("dry-run", false, "force dry-run mode on; cannot be used to disable dry-run set by config")
 	samplesFlag := fs.String("samples", "", "comma-separated movie titles to dump full detail for during Radarr library inspection (--once only)")
 	onlyID := fs.Int("only-id", 0, "report and (outside dry-run) write only the item with this id — a radarr movie, or a sonarr series and its eligible seasons — in the single in-scope instance's library; the rest of that library is still READ, so the cross-check can still validate the data behind the decision (--once only)")
@@ -30,6 +36,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+
+	if len(daemonOpts) > 1 {
+		fmt.Fprintf(stderr, "cutoffarr: fatal: run was given %d daemon option sets; it takes at most one\n", len(daemonOpts))
+		return 2
+	}
+	var opts daemonOptions
+	if len(daemonOpts) == 1 {
+		opts = daemonOpts[0]
 	}
 
 	// A movie id is always a positive integer, so 0 and negatives are user
@@ -137,81 +152,51 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	if *once {
-		// Phase 1: for each configured instance, run the read-only
-		// connectivity check sequentially. Any one instance's failure is
-		// logged as a warning by checkInstanceConnectivity itself and
-		// must not stop the remaining instances or affect the exit code.
+		// Phases 1-7 built this pass; Phase 8 moved its body into
+		// runScanCycle (daemon.go) unchanged, so the daemon runs the same
+		// pipeline verbatim rather than a second copy of it. What each step
+		// does and why is documented there and in the engines themselves:
+		// connectivity first, then the library read, then the decision engine
+		// for the instance's type — each gated on the previous one having
+		// produced a complete, trustworthy result, since a partial read must
+		// never reach a decision that means "unmonitor".
 		//
-		// Phase 2: for radarr instances only, follow up with the read-only
-		// library inspection (GET /movie, paged GET /wanted/cutoff) — but
-		// only if connectivity actually succeeded; an instance already
-		// declared skipped for the cycle must not go on to further calls.
-		// Sonarr instances are connectivity-only until Phase 6.
+		// dryRun and the scope are threaded down rather than consulted here:
+		// §2.1 requires the dry-run flag to be checked immediately before each
+		// HTTP write call, not once at startup, so the value has to travel all
+		// the way to the write site.
 		//
-		// Phase 3: feed inspectRadarrLibrary's returned movies/wantedIDs
-		// into the decision engine — but only if that fetch itself
-		// succeeded and produced a complete (non-partial) result; a
-		// partial wanted/cutoff id set (refactor a) must never reach the
-		// decision engine, since absence-from-set means "would-unmonitor"
-		// and a partial set would manufacture false positives in that
-		// dangerous direction.
-		//
-		// Phase 4: the decision engine also runs the write pass, gated on
-		// cfg.DryRun (which --dry-run can force on but never off) and
-		// scoped by --only-id. Both are passed down rather than consulted
-		// at this level: §2.1 requires the dry-run flag to be checked
-		// immediately before each HTTP write call, not just at startup, so
-		// the value has to travel all the way to the write site.
-		samples := parseSamples(*samplesFlag)
-		// --once is the watched, one-shot run: every per-item report line stays
-		// at INFO. The daemon's reconciliation and webhook cycles build their
-		// own scopes with a demoted item level (scope.go).
+		// --once is the watched, one-shot run, so every per-item report line
+		// stays at INFO. The daemon's reconciliation and webhook cycles build
+		// their own scopes with a demoted item level (scope.go).
 		scope := fullLibraryScope(slog.LevelInfo)
 		if onlyIDSet {
 			scope = onlyIDScope(*onlyID)
 		}
-		for _, inst := range cfg.Instances {
-			// An instance the human did not name is not merely left
-			// unwritten: it is not contacted at all. "--instance radarr-4k"
-			// has to mean the run touches radarr-4k and nothing else, or it
-			// would be a weaker statement than it looks.
-			if instanceSet && inst.Name != *instanceName {
-				continue
-			}
-			ok := checkInstanceConnectivity(context.Background(), logger, inst)
-			if ok && inst.Type == "radarr" {
-				movies, wantedIDs, dataOK := inspectRadarrLibrary(context.Background(), logger, inst, samples)
-				if dataOK {
-					runRadarrDecisionEngine(context.Background(), logger, inst, movies, wantedIDs, cfg.ExclusionTag, scope, cfg.DryRun)
-				}
-			}
-			// Phase 6/7: the Sonarr equivalent of the two Radarr steps above
-			// — read the library (series + paged wanted/cutoff), evaluate
-			// every monitored series' monitored seasons against the season
-			// decision rule, report, and (Phase 7) run the season write pass.
-			// dry-run and --only-id are threaded down for exactly the reasons
-			// the Radarr call above threads them: §2.1 requires the dry-run
-			// flag to be checked immediately before each HTTP write call
-			// rather than once at startup, so the value has to travel all the
-			// way to the write site, and --only-id names a SERIES here whose
-			// seasons are the only ones this run may report or write.
-			if ok && inst.Type == "sonarr" {
-				series, wantedEpisodeIDs, wantedSeasons, dataOK := inspectSonarrLibrary(context.Background(), logger, inst)
-				if dataOK {
-					runSonarrDecisionEngine(context.Background(), logger, inst, series, wantedEpisodeIDs, wantedSeasons, cfg.ExclusionTag, scope, cfg.DryRun)
-				}
-			}
-		}
+		runScanCycle(context.Background(), logger, *cfg, scanCycle{
+			instanceName: *instanceName,
+			samples:      parseSamples(*samplesFlag),
+			scope:        scope,
+			dryRun:       cfg.DryRun,
+		})
 	} else {
+		// --only-id and --instance stay --once-only. Daemon mode DOES run
+		// passes now, but it decides their scope itself — from the webhook
+		// events it receives and from the reconciliation schedule — and a flag
+		// that silently pinned every one of them to a single item would be a
+		// daemon that reconciles nothing. Warning rather than refusing keeps
+		// the established shape: a scoping flag that is quietly ignored is
+		// worse than one that is rejected, because the human believes the run
+		// was narrowed.
 		if onlyIDSet {
-			logger.Warn("--only-id has no effect without --once: it scopes a single pass, and daemon mode does not run one yet",
+			logger.Warn("--only-id has no effect without --once: it scopes a single pass, while daemon mode scopes its own passes from webhooks and reconciles the whole library on the poll interval",
 				"onlyId", *onlyID)
 		}
 		if instanceSet {
-			logger.Warn("--instance has no effect without --once: it scopes a single pass, and daemon mode does not run one yet",
+			logger.Warn("--instance has no effect without --once: it scopes a single pass, while daemon mode reconciles every configured instance",
 				"instance", *instanceName)
 		}
-		logger.Info("daemon mode is not implemented yet; it arrives in a later phase")
+		return runDaemon(context.Background(), logger, *cfg, opts)
 	}
 
 	return 0

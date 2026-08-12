@@ -126,6 +126,19 @@ func moviePath(movieID int) string {
 // automatically within a cycle"); the caller logs them and moves to the
 // next item.
 func unmonitorMovie(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, movieID, exclusionTagID int, tagActive bool, dryRun bool) (written bool, err error) {
+	// PHASE 8, the shutdown boundary (binding controller note 4): once a write
+	// operation has STARTED, it runs to its own end. context.WithoutCancel
+	// detaches every request below from the daemon's shutdown cancellation, so
+	// a SIGTERM landing between the pre-write GET and the PUT cannot turn a
+	// clean write into a "context canceled" write error — or, on the Sonarr
+	// twin, into a half-written season. The shutdown is instead checked
+	// BETWEEN items, by the write pass, before this function is entered at all:
+	// an item either completes or never starts.
+	//
+	// Nothing is unbounded here: every request still carries the client's
+	// 15-second timeout (client.go), and the write pass withholds every
+	// REMAINING item, so a shutdown is delayed by at most one item's writes.
+	ctx = context.WithoutCancel(ctx)
 	path := moviePath(movieID)
 
 	body, err := fetchBody(ctx, client, path, nil)

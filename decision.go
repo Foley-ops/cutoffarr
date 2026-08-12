@@ -500,6 +500,20 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	skipCounts := make(map[string]int)
 
 	for _, m := range movies {
+		// PHASE 8: shutdown, checked between items here too — but with a
+		// different ending than the write pass's. A cycle interrupted
+		// mid-evaluation has an INCOMPLETE picture, and acting on a partial
+		// evaluation is precisely what §2.6 forbids: the cross-check would
+		// sample a truncated candidate pool and the write pass would act on it.
+		// So the instance's cycle is abandoned outright — no cross-check, no
+		// write pass, no summary that would describe a fraction of a library as
+		// if it were the library. The next startup scan re-reads everything.
+		if ctx.Err() != nil {
+			logger.Info("shutdown requested: abandoning this instance's cycle mid-evaluation; a partial evaluation is never cross-checked or written",
+				"instance", inst.Name, "type", inst.Type, "evaluated", len(decisions), "libraryTotal", len(movies))
+			return
+		}
+
 		// FIX 6 (controller-mandated correction after the initial Phase 3
 		// review): "monitored" entirely absent from the JSON (as opposed
 		// to present with monitored: false, a legitimate common value) is
@@ -843,8 +857,25 @@ func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, i
 		logger.Warn(msg, attrs...)
 	}
 
+	shutdownNoted := false
 	for _, d := range decisions {
 		if !d.wouldUnmonitor {
+			continue
+		}
+
+		// PHASE 8: the shutdown boundary, checked BETWEEN items and nowhere
+		// else (binding controller note 4). unmonitorMovie detaches its own
+		// requests from this cancellation, so an item already under way
+		// finishes; everything after it is withheld, counted as such, and said
+		// out loud once — a pass that stops early must never look like a pass
+		// that found nothing to do.
+		if ctx.Err() != nil {
+			withheld++
+			if !shutdownNoted {
+				shutdownNoted = true
+				logger.Info("shutdown requested: the remaining pending writes for this instance are withheld and the next cycle will revisit them",
+					"instance", inst.Name, "type", inst.Type, "dryRun", dryRun)
+			}
 			continue
 		}
 
@@ -2022,6 +2053,15 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	skipCounts := make(map[string]int)
 
 	for _, s := range series {
+		// PHASE 8: shutdown mid-evaluation abandons this instance's cycle
+		// entirely — see the Radarr twin for why a partial evaluation is never
+		// cross-checked or written.
+		if ctx.Err() != nil {
+			logger.Info("shutdown requested: abandoning this instance's cycle mid-evaluation; a partial evaluation is never cross-checked or written",
+				"instance", inst.Name, "type", inst.Type, "seriesEvaluated", totalSeriesMonitored, "libraryTotal", len(series))
+			return
+		}
+
 		// Rule 1 (series half): mirrors Radarr's own rule 1 exactly — a
 		// series that is not monitored (or whose monitored field could not
 		// even be observed) is excluded entirely, with no seasonDecision

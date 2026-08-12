@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -3451,4 +3452,44 @@ func containsString(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// TestRunRadarrDecisionEngine_ShutdownMidEvaluation_AbandonsTheCycleWithoutWriting
+// is the other half of the Phase 8 shutdown boundary. The write pass withholds
+// and accounts for what it did not do; an interrupted EVALUATION cannot do even
+// that, because its picture of the library is a fraction of one — so the cycle
+// is abandoned before the cross-check ever samples that truncated pool, and no
+// summary is printed that would describe part of a library as if it were the
+// whole thing.
+func TestRunRadarrDecisionEngine_ShutdownMidEvaluation_AbandonsTheCycleWithoutWriting(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{
+		wouldUnmonitorStatefulMovie(1, "First"),
+		wouldUnmonitorStatefulMovie(2, "Second"),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var once sync.Once
+	fake.onRequest = func(method, path string) {
+		if method == http.MethodGet && path == "/api/v3/moviefile" {
+			once.Do(cancel) // partway through the FIRST movie's evaluation
+		}
+	}
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	movies := []movieListElement{
+		wouldUnmonitorMovie(1, "First"),
+		wouldUnmonitorMovie(2, "Second"),
+	}
+
+	runRadarrDecisionEngine(ctx, logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false)
+
+	out := buf.String()
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("a partial evaluation must never reach the write pass, got %+v", writes)
+	}
+	if strings.Contains(out, "radarr decision summary") {
+		t.Errorf("no summary may be printed for a cycle that saw part of the library:\n%s", out)
+	}
+	if !strings.Contains(out, "abandoning this instance's cycle mid-evaluation") {
+		t.Errorf("the abandonment must be stated, or the silence reads as a clean no-op cycle:\n%s", out)
+	}
 }

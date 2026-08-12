@@ -2252,6 +2252,12 @@ type statefulRadarrFake struct {
 
 	profilesJSON string
 	tagsJSON     string
+
+	// onRequest mirrors statefulSonarrFake's hook (sonarr_test.go): called
+	// with every request's method and path before the fake answers it, so a
+	// Phase 8 shutdown test can deliver a cancellation at an exact instant
+	// inside a write pass.
+	onRequest func(method, path string)
 }
 
 // newStatefulRadarrFake starts a fake Radarr backed by movies. Order is
@@ -2309,7 +2315,11 @@ func (f *statefulRadarrFake) handle(next http.HandlerFunc) http.HandlerFunc {
 		body, _ := io.ReadAll(r.Body)
 		f.mu.Lock()
 		f.requests = append(f.requests, recordedRequest{method: r.Method, path: r.URL.Path, body: body, contentType: r.Header.Get("Content-Type")})
+		hook := f.onRequest
 		f.mu.Unlock()
+		if hook != nil {
+			hook(r.Method, r.URL.Path)
+		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		next(w, r)
 	}
@@ -2444,6 +2454,21 @@ func (f *statefulRadarrFake) puts() []recordedRequest {
 
 func (f *statefulRadarrFake) instance() Instance {
 	return Instance{Name: "radarr-main", Type: "radarr", URL: f.srv.URL, APIKey: "key"}
+}
+
+// setWanted moves a movie in or out of the fake's /wanted/cutoff set while it
+// is serving, under the same lock every other accessor takes. It models the one
+// world-change a Download webhook actually announces: a file landed, and this
+// movie is no longer below its cutoff. Without it, a daemon test could only
+// observe a write the STARTUP scan would already have made, which proves
+// nothing about the webhook path.
+func (f *statefulRadarrFake) setWanted(id int, wanted bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if m, found := f.movies[id]; found {
+		m.inWantedSet = wanted
+		m.qualityCutoffNotMet = wanted
+	}
 }
 
 // writeNoOpTestConfig writes a config with the given dry_run and log_level,

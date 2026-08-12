@@ -866,6 +866,14 @@ type statefulSonarrFake struct {
 	// apply the write and echo the updated resource.
 	seriesPutStatus      map[int]int
 	episodeMonitorStatus int
+
+	// onRequest, when set, is called with every request's method and path
+	// BEFORE the fake answers it, from the serving goroutine and outside the
+	// fake's own lock. It exists for the Phase 8 shutdown tests, which have to
+	// deliver a cancellation at an exact point inside a multi-season write pass
+	// — between two items, or between a season's two write calls — and no other
+	// mechanism can name those instants.
+	onRequest func(method, path string)
 }
 
 // newStatefulSonarrFake starts a fake Sonarr backed by series/episodes/
@@ -952,7 +960,11 @@ func (f *statefulSonarrFake) handle(next http.HandlerFunc) http.HandlerFunc {
 		body, _ := io.ReadAll(r.Body)
 		f.mu.Lock()
 		f.requests = append(f.requests, recordedRequest{method: r.Method, path: r.URL.Path, body: body, contentType: r.Header.Get("Content-Type")})
+		hook := f.onRequest
 		f.mu.Unlock()
+		if hook != nil {
+			hook(r.Method, r.URL.Path)
+		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		next(w, r)
 	}

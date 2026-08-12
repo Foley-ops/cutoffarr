@@ -100,18 +100,29 @@ instances: []
 	}
 }
 
-func TestRun_WithoutOnceLogsDaemonModeMessageAndExitsZero(t *testing.T) {
+// TestRun_WithoutOnce_RunsAsADaemonAndExitsZeroOnShutdown replaces the Phase 0
+// placeholder ("daemon mode is not implemented yet; it arrives in a later
+// phase"), which this phase is. Without --once the process now starts the
+// listener, performs a full startup scan, and stays up until it is asked to
+// stop — exiting 0 on a clean shutdown.
+func TestRun_WithoutOnce_RunsAsADaemonAndExitsZeroOnShutdown(t *testing.T) {
 	path := writeMainTestConfig(t, `
 instances: []
 `)
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"--config", path}, &stdout, &stderr)
+	h := startDaemon(t, path)
+	h.waitReady()
 
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	if code := h.stop(); code != 0 {
+		t.Fatalf("exit code = %d, want 0 for a clean shutdown:\n%s", code, h.out.String())
 	}
-	if !strings.Contains(stdout.String(), "later phase") {
-		t.Errorf("stdout does not mention daemon mode arriving later:\n%s", stdout.String())
+	out := h.out.String()
+	if strings.Contains(out, "later phase") {
+		t.Errorf("the placeholder message must be gone; daemon mode is this phase:\n%s", out)
+	}
+	for _, want := range []string{"webhook listener started", "startup scan beginning", "startup scan complete", "shutdown complete"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected the daemon to announce %q:\n%s", want, out)
+		}
 	}
 }
 
@@ -218,11 +229,12 @@ instances:
 	}
 }
 
-func TestRun_WithoutOnce_DoesNotRunConnectivityChecks(t *testing.T) {
-	// A URL with nothing listening: if run() attempted a connectivity
-	// check here in daemon mode, it would still merely warn rather than
-	// crash, but no connectivity-related log lines should appear at all
-	// since this phase's connectivity check is scoped to --once.
+// TestRun_WithoutOnce_StartupScanContactsEveryInstance is the exact inversion
+// of the Phase 0 test it replaces, which asserted that daemon mode contacted
+// NOTHING. Daemon mode now begins with a full scan, so an unreachable instance
+// must produce the same warn-and-skip a --once run produces — and the daemon
+// must survive it.
+func TestRun_WithoutOnce_StartupScanContactsEveryInstance(t *testing.T) {
 	path := writeMainTestConfig(t, `
 instances:
   - name: radarr-main
@@ -230,15 +242,15 @@ instances:
     url: http://127.0.0.1:1
     api_key: key1
 `)
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"--config", path}, &stdout, &stderr)
+	h := startDaemon(t, path)
+	h.waitReady()
 
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
+	out := h.out.String()
+	if !strings.Contains(out, "skipping instance") {
+		t.Errorf("the startup scan must contact every configured instance and warn about the ones it cannot reach:\n%s", out)
 	}
-	out := stdout.String()
-	if strings.Contains(out, "system status") || strings.Contains(out, "skipping instance") {
-		t.Errorf("daemon mode (no --once) should not run connectivity checks:\n%s", out)
+	if code := h.stop(); code != 0 {
+		t.Fatalf("exit code = %d, want 0: one unreachable instance never fails the daemon:\n%s", code, h.out.String())
 	}
 }
 
@@ -327,9 +339,11 @@ instances: []
 	}
 }
 
-// TestRun_OnlyIDWithoutOnce_WarnsThatItHasNoEffect: the flag scopes a
-// single pass, and daemon mode does not run one yet. Ignoring it silently
-// would let someone believe a run was scoped when it was not.
+// TestRun_OnlyIDWithoutOnce_WarnsThatItHasNoEffect: the flag scopes a single
+// pass, while daemon mode scopes its own passes (from webhooks) and reconciles
+// the whole library on the poll interval. Ignoring the flag silently would let
+// someone believe a daemon was scoped when it was not — and a daemon pinned to
+// one item forever would reconcile nothing.
 //
 // The config names a radarr (it is never contacted — without --once nothing
 // is) so this test exercises the one thing it is about. An empty instance
@@ -344,13 +358,11 @@ instances:
     url: http://radarr.invalid:7878
     api_key: key1
 `)
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"--config", path, "--only-id", "42"}, &stdout, &stderr)
+	h := startDaemonWithArgs(t, []string{"--config", path, "--only-id", "42"})
+	h.waitReady()
+	out := h.out.String()
+	h.stop()
 
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
-	}
-	out := stdout.String()
 	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "only-id") {
 		t.Errorf("expected a warning that --only-id has no effect without --once:\n%s", out)
 	}
@@ -367,13 +379,11 @@ instances:
     url: http://radarr:7878
     api_key: key1
 `)
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"--config", path, "--instance", "radarr-main"}, &stdout, &stderr)
+	h := startDaemonWithArgs(t, []string{"--config", path, "--instance", "radarr-main"})
+	h.waitReady()
+	out := h.out.String()
+	h.stop()
 
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr=%s", code, stderr.String())
-	}
-	out := stdout.String()
 	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "instance") {
 		t.Errorf("expected a warning that --instance has no effect without --once:\n%s", out)
 	}
