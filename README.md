@@ -156,11 +156,23 @@ deliberately small and independently checked, not just documented:
   string literal like `"PUT"`. Add a fourth write site anywhere in the
   project and this test fails until someone comes here and updates it
   deliberately.
-- **A write changes exactly one JSON field, on an object fetched fresh
-  first.** Every write path does GET → flip `monitored` → PUT the same
-  object back, never constructing a partial payload from scratch. It never
-  calls anything that deletes, imports, renames, or triggers a search —
-  `deleteFiles` and `/api/v3/command` are never touched.
+- **Two of the three write sites change exactly one field on an object
+  fetched fresh first; the third uses Sonarr's own bulk endpoint, which
+  has no "object" to fetch.** The Radarr movie write and the Sonarr season
+  write both do GET → flip `monitored` → PUT the same object back, never
+  constructing a partial payload from scratch. The Sonarr episode write is
+  different by necessity, not by exception: Sonarr has no per-episode PUT,
+  only a bulk `PUT /api/v3/episode/monitor` whose body can only ever be a
+  list of episode ids plus a single `monitored` bool — there is no fuller
+  object to round-trip. cutoffarr still holds that write to the same
+  standard by checking its result instead of its input: it reads the
+  server's own echoed response to confirm every requested episode id came
+  back with `monitored: false`, and if the response can't settle that, it
+  falls back to a read-only re-`GET` of those episodes before trusting the
+  write at all — never a second guess in cutoffarr's own favor. Either way,
+  no write anywhere calls anything that deletes, imports, renames, or
+  triggers a search — `deleteFiles` and `/api/v3/command` are never
+  touched.
 - **A Sonarr season write is atomic with respect to shutdown.** Unmonitoring
   a season is two sequential API calls (the episodes, then the season flag),
   and the state in between — episodes unmonitored, season still monitored —
