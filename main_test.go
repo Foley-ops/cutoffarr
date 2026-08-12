@@ -10,6 +10,20 @@ import (
 	"testing"
 )
 
+// EVERY instance URL in this file is 127.0.0.1 or an httptest server, and that
+// is a rule rather than a habit. Both run modes tested here CONTACT what they
+// are configured with: --once scans immediately, and daemon mode now begins
+// with a startup scan that reaches every configured instance. A bare hostname
+// like "radarr" — this project's own container name, and a plausible
+// DHCP/mDNS name on a developer's LAN — makes `go test` do a DNS lookup and,
+// if it resolves, an outbound GET carrying an api_key: either it finds a real
+// *arr, or it finds something firewalled and the connect hangs for
+// apiClientTimeout (15s) while the harness gives up at 5s, failing the test for
+// a reason it says nothing about. Port 1 refuses instantly and locally, which
+// is the warn-and-skip path these tests want anyway.
+//
+// The exception is a config that is REJECTED before anything is contacted (a
+// bad type, a bad flag); those may name anything, because nothing reads it.
 func writeMainTestConfig(t *testing.T, content string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -26,7 +40,7 @@ func TestRun_OnceModePrintsRedactedConfigAndExitsZero(t *testing.T) {
 instances:
   - name: radarr-main
     type: radarr
-    url: http://radarr:7878
+    url: http://127.0.0.1:1
     api_key: ${MAIN_TEST_API_KEY}
 `)
 	var stdout, stderr bytes.Buffer
@@ -133,7 +147,7 @@ log_level: warn
 instances:
   - name: radarr-main
     type: radarr
-    url: http://radarr:7878
+    url: http://127.0.0.1:1
     api_key: ${MAIN_TEST_WARN_API_KEY}
 `)
 	var stdout, stderr bytes.Buffer
@@ -160,7 +174,7 @@ log_level: error
 instances:
   - name: sonarr-main
     type: sonarr
-    url: http://sonarr:8989
+    url: http://127.0.0.1:1
     api_key: ${MAIN_TEST_ERROR_API_KEY}
 `)
 	var stdout, stderr bytes.Buffer
@@ -345,17 +359,29 @@ instances: []
 // someone believe a daemon was scoped when it was not — and a daemon pinned to
 // one item forever would reconcile nothing.
 //
-// The config names a radarr (it is never contacted — without --once nothing
-// is) so this test exercises the one thing it is about. An empty instance
-// list would now be refused earlier and for a different reason: a --only-id
-// that no configured radarr could apply to is a fatal flag error in its own
-// right, which is a separate pin (writer_test.go's --only-id scope tests).
+// The config names a radarr because the warning is only reachable with one
+// configured: an empty instance list would be refused earlier and for a
+// different reason (a --only-id that no configured radarr could apply to is a
+// fatal flag error in its own right, pinned separately by writer_test.go's
+// --only-id scope tests).
+//
+// That instance IS contacted. This test boots the real daemon, and daemon mode
+// begins with a startup scan that reaches every configured instance — so the
+// URL has to be one no test may ever leave the machine for. 127.0.0.1:1 is a
+// port nothing listens on: the connect is refused locally and instantly, the
+// startup scan warns and skips exactly as TestRun_WithoutOnce_
+// StartupScanContactsEveryInstance asserts, and no DNS lookup or outbound
+// packet happens on the way. A bare hostname here would be worse than slow —
+// "radarr" is this project's own container name and a plausible name on the
+// developer's LAN, so a resolving one would point the suite at a real *arr,
+// and a resolving-but-firewalled one would hang the connect past waitReady's
+// 5s deadline and fail this test for a reason it says nothing about.
 func TestRun_OnlyIDWithoutOnce_WarnsThatItHasNoEffect(t *testing.T) {
 	path := writeMainTestConfig(t, `
 instances:
   - name: radarr-main
     type: radarr
-    url: http://radarr.invalid:7878
+    url: http://127.0.0.1:1
     api_key: key1
 `)
 	h := startDaemonWithArgs(t, []string{"--config", path, "--only-id", "42"})
@@ -371,12 +397,16 @@ instances:
 // TestRun_InstanceWithoutOnce_WarnsThatItHasNoEffect is the same courtesy
 // for --instance: a scoping flag that is silently ignored is worse than one
 // that is rejected, because the human believes the run was narrowed.
+//
+// Same loopback-only URL, for the same reason as the test above: this boots the
+// real daemon, and the daemon's startup scan contacts every configured
+// instance.
 func TestRun_InstanceWithoutOnce_WarnsThatItHasNoEffect(t *testing.T) {
 	path := writeMainTestConfig(t, `
 instances:
   - name: radarr-main
     type: radarr
-    url: http://radarr:7878
+    url: http://127.0.0.1:1
     api_key: key1
 `)
 	h := startDaemonWithArgs(t, []string{"--config", path, "--instance", "radarr-main"})
