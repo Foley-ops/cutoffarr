@@ -44,6 +44,19 @@ func monitoredWriteValue(rev *reverseWriteContext) json.RawMessage {
 
 func monitoredWriteTarget(rev *reverseWriteContext) bool { return rev != nil }
 
+// monitoredWriteVerb is the same fact as a word, for the messages a human reads.
+// Every shared write-path sentence that names what is being done has to come
+// through here or through an explicit per-direction branch: those sentences were
+// all written when only one direction existed, and a wrong one is not cosmetic —
+// the reverse pass surfaces this exact string in its ERROR line, where "the
+// write that failed was an unmonitor" is the opposite of what happened.
+func monitoredWriteVerb(rev *reverseWriteContext) string {
+	if rev != nil {
+		return "re-monitoring"
+	}
+	return "unmonitoring"
+}
+
 // moviePath returns the /api/v3/movie/{id} path used for both halves of the
 // write path (the fresh GET and the PUT), so the two can never drift apart.
 func moviePath(movieID int) string {
@@ -411,9 +424,19 @@ var errAlreadyUnmonitoredAtWrite = errors.New("already unmonitored as of the pre
 var errAlreadyMonitoredAtWrite = errors.New("already monitored as of the pre-write fetch")
 
 // errNoLongerAReverseFinding marks the reverse direction's own pre-write
-// re-verification refusing: the movie or season no longer FAILS the criteria as
-// of the fresh data, so re-monitoring it would be acting on a finding that has
-// stopped being true.
+// re-verification refusing: the finding this write rests on could not be
+// re-established from the fresh data, so re-monitoring would be acting on
+// something nothing currently says is true.
+//
+// Its text names the re-establishment rather than the outcome (REVIEW FIX, Phase
+// 10 round 5) because it covers two different endings, and only one of them is
+// "it now meets the criteria": the fresh evaluation can also come back with
+// untrusted input — an unknown profile, unreadable tags, a score that could not
+// be fetched — where nothing about the item was established at all. Both refuse,
+// both are counted the same, and each wrapping error says which happened; a
+// sentinel that asserted the first would put a claim nobody observed into the
+// error chain of the second. The log lines make the same distinction (see
+// verifyMovieStillAReverseFinding).
 //
 // This is the reverse mirror of the forward path's airing and completeness
 // re-checks, and it exists for a sharper reason than tidiness. The reverse and
@@ -423,7 +446,7 @@ var errAlreadyMonitoredAtWrite = errors.New("already monitored as of the pre-wri
 // against each other forever. The re-check is the decision function itself
 // (evaluateMovie / evaluateSeries) re-run on fresh data, so "still a finding"
 // can never drift from "is a finding".
-var errNoLongerAReverseFinding = errors.New("the item no longer fails the criteria as of the pre-write fetch")
+var errNoLongerAReverseFinding = errors.New("the finding could not be re-established from the pre-write fetch")
 
 // errMonitoredUnverifiable marks the pre-write fetch's own "monitored" field
 // being unreadable: the key absent (this Radarr version may not have the field

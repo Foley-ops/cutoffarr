@@ -107,6 +107,40 @@ func isReverseFinding(reason string) bool {
 	}
 }
 
+// isUntrustedInputReason reports whether a reason means "this item could not be
+// checked", as opposed to a real observation about it.
+//
+// It exists for one job (REVIEW FIX, Phase 10 round 5): the pre-write
+// re-verification refuses on every reason that is not a finding, and it used to
+// announce all of them as "no longer fails the criteria" at INFO — including
+// these, where nothing whatsoever was established about the item. "We could not
+// read it" asserted as "it now passes" is the never-observed-claim class §2.6
+// exists to forbid, and the reason attr on the same line said so.
+//
+// The split is by what produced the reason, not by how bad it is. Each of these
+// six is a fetch, a decode or a lookup that did not answer: an unknown profile
+// (rule 3 has no rules to apply), unreadable tags (§2.5 cannot be checked), a
+// custom-format score that could not be fetched (rule 6 has no number), and the
+// three Sonarr season-data reasons where /episode disagreed with statistics or
+// could not be read at all. Everything else — cutoff met, no file, excluded by
+// tag, upgrades disabled, incomplete, not fully aired — is something the
+// evaluation OBSERVED, and is honestly reported as such.
+//
+// Kept beside isReverseFinding, and audited by the same exhaustive census
+// (TestReverseFindingReasons_UntrustedInputIsClassifiedExhaustively), because
+// the safe default differs between the two questions: an unclassified new reason
+// is silently "not a finding" here, which is safe, and silently "trusted", which
+// is not.
+func isUntrustedInputReason(reason string) bool {
+	switch reason {
+	case ReasonUnknownProfile, ReasonTagsUnknown, ReasonCouldNotFetchCFScore,
+		ReasonSeasonEpisodesUnavailable, ReasonSeasonEpisodeDataInconsistent, ReasonSeasonFileCountMismatch:
+		return true
+	default:
+		return false
+	}
+}
+
 // reverseOptions is what a CYCLE says about the reverse scan: whether to run it
 // at all, and whether it may write.
 //
@@ -298,6 +332,15 @@ func (p reversePass) runRadarr(ctx context.Context, movies []movieListElement) r
 		return c
 	}
 
+	// evaluated counts the movies this pass ran the decision function over,
+	// whatever each one decided. It exists only for the abandonment line below,
+	// and it is a counter of its own rather than an expression over the outcome
+	// counters (REVIEW FIX, Phase 10 round 5, binding controller ruling R4): that
+	// line used to print findings+noFile, which excludes every ReasonCutoffMet,
+	// skip and untrusted-input outcome — that is, nearly everything a healthy
+	// library produces — so a pass cut short after hundreds of movies said
+	// evaluated=0 on the one line explaining how far it got.
+	evaluated := 0
 	var findings []movieDecision
 	for _, m := range movies {
 		// The same shutdown boundary the forward evaluation draws, and the same
@@ -305,7 +348,7 @@ func (p reversePass) runRadarr(ctx context.Context, movies []movieListElement) r
 		// half-saw is reported or counted as a finding total.
 		if ctx.Err() != nil {
 			p.logger.Info("shutdown requested: abandoning this instance's reverse scan mid-evaluation; a partial reverse scan is never reported as a finding count",
-				"instance", p.inst.Name, "type", p.inst.Type, "evaluated", c.findings+c.noFile)
+				"instance", p.inst.Name, "type", p.inst.Type, "evaluated", evaluated, "libraryTotal", len(movies))
 			c.skipped = true
 			return c
 		}
@@ -326,6 +369,7 @@ func (p reversePass) runRadarr(ctx context.Context, movies []movieListElement) r
 		}
 
 		d := evaluateMovie(ctx, p.logger, p.client, p.inst, m, p.profiles, p.exclusionTagID, p.tagActive, wantedIDs)
+		evaluated++
 		if d.reason == ReasonNoFile {
 			c.noFile++
 			continue
@@ -396,11 +440,17 @@ func (p reversePass) runSonarr(ctx context.Context, series []seriesElement) reve
 		return c
 	}
 
+	// The Radarr twin's counter, in this engine's own vocabulary: the forward
+	// Sonarr abandonment line says seriesEvaluated/libraryTotal, and how far a
+	// pass got is the same fact whichever direction it was going. This line used
+	// to print findings=, a count of what was WRONG — zero on a healthy library,
+	// and never what the reader is asking.
+	seriesEvaluated := 0
 	var findings []reverseSeasonFinding
 	for _, s := range series {
 		if ctx.Err() != nil {
 			p.logger.Info("shutdown requested: abandoning this instance's reverse scan mid-evaluation; a partial reverse scan is never reported as a finding count",
-				"instance", p.inst.Name, "type", p.inst.Type, "findings", c.findings)
+				"instance", p.inst.Name, "type", p.inst.Type, "seriesEvaluated", seriesEvaluated, "libraryTotal", len(series))
 			c.skipped = true
 			return c
 		}
@@ -424,6 +474,7 @@ func (p reversePass) runSonarr(ctx context.Context, series []seriesElement) reve
 		}
 
 		eval := evaluateSeries(ctx, p.logger, p.client, p.inst, s, p.profiles, p.exclusionTagID, p.tagActive, wantedSeasons, directionReverse)
+		seriesEvaluated++
 		for _, d := range eval.decisions {
 			if !isReverseFinding(d.reason) {
 				continue
@@ -509,6 +560,17 @@ func verifyMovieStillAReverseFinding(ctx context.Context, logger *slog.Logger, c
 
 	d := evaluateMovie(ctx, logger, client, inst, fresh, rev.profiles, exclusionTagID, tagActive, rev.wantedIDs)
 	if !isReverseFinding(d.reason) {
+		if isUntrustedInputReason(d.reason) {
+			// REVIEW FIX (Phase 10 round 5): this used to be the INFO line below,
+			// which states an observation nothing made. Refusing is right either
+			// way — and it is the same refusal, counted the same — but a human
+			// reading "no longer fails the criteria, reason=could not fetch custom
+			// format score" is being told the two opposite things at once, and the
+			// one they will believe is the sentence.
+			logger.Warn("the finding could not be re-established from the pre-write fetch: this movie's own data could not be read, which is not evidence that it now meets the criteria; refusing to re-monitor",
+				append(append([]any(nil), attrs...), "reason", d.reason)...)
+			return fmt.Errorf("movie %d: %w: it could not be re-evaluated (%s)", movieID, errNoLongerAReverseFinding, d.reason)
+		}
 		logger.Info("the movie no longer fails the criteria as of the pre-write fetch, skipping the re-monitor",
 			append(append([]any(nil), attrs...), "reason", d.reason)...)
 		return fmt.Errorf("movie %d: %w: it now evaluates as %q", movieID, errNoLongerAReverseFinding, d.reason)
@@ -719,6 +781,15 @@ func verifySeasonStillAReverseFinding(ctx context.Context, logger *slog.Logger, 
 		}
 		if isReverseFinding(d.reason) {
 			return d.reason, nil
+		}
+		if isUntrustedInputReason(d.reason) {
+			// The movie path's twin, and reachable by more roads here: the season
+			// data reasons all mean /episode disagreed with the series' own
+			// statistics or could not be read, which establishes nothing about the
+			// season's cutoff. See verifyMovieStillAReverseFinding.
+			logger.Warn("the finding could not be re-established from the pre-write fetch: this season's own data could not be read, which is not evidence that it now meets the criteria; refusing to re-monitor",
+				append(append([]any(nil), attrs...), "reason", d.reason)...)
+			return "", fmt.Errorf("%s: %w: it could not be re-evaluated (%s)", subject, errNoLongerAReverseFinding, d.reason)
 		}
 		logger.Info("the season no longer fails the criteria as of the pre-write fetch, skipping the re-monitor",
 			append(append([]any(nil), attrs...), "reason", d.reason)...)

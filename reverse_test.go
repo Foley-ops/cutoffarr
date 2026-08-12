@@ -11,6 +11,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -366,22 +368,37 @@ func TestReverseScan_EveryReasonConstantIsDeliberatelyClassified(t *testing.T) {
 		"ReasonSeasonEpisodesUnavailable":     false,
 	}
 
-	src, err := os.ReadFile("decision.go")
-	if err != nil {
-		t.Fatalf("reading decision.go: %v", err)
-	}
-	declared := regexp.MustCompile(`(?m)^\t(Reason[A-Za-z]+)\s+=\s+"`).FindAllStringSubmatch(string(src), -1)
-	if len(declared) == 0 {
-		t.Fatal("found no Reason* constants in decision.go; this audit's pattern has stopped matching the source it audits")
-	}
-	for _, m := range declared {
-		if _, named := census[m[1]]; !named {
-			t.Errorf("%s is not classified by this test: decide whether the reverse scan should report it as a finding, then add it to the census and to isReverseFinding", m[1])
+	declared := declaredReasonConstants(t)
+	for _, name := range declared {
+		if _, named := census[name]; !named {
+			t.Errorf("%s is not classified by this test: decide whether the reverse scan should report it as a finding, then add it to the census and to isReverseFinding", name)
 		}
 	}
 	if len(declared) != len(census) {
 		t.Errorf("decision.go declares %d Reason* constants but the census names %d; the census must be exhaustive", len(declared), len(census))
 	}
+}
+
+// declaredReasonConstants is the source audit both censuses read: every
+// Reason* constant decision.go declares, by name. Shared so the two
+// classifications the reverse scan makes of a reason — is it a finding, and is
+// it untrusted input — are both held to the same exhaustiveness, against one
+// pattern that can only stop matching in one place.
+func declaredReasonConstants(t *testing.T) []string {
+	t.Helper()
+	src, err := os.ReadFile("decision.go")
+	if err != nil {
+		t.Fatalf("reading decision.go: %v", err)
+	}
+	matches := regexp.MustCompile(`(?m)^\t(Reason[A-Za-z]+)\s+=\s+"`).FindAllStringSubmatch(string(src), -1)
+	if len(matches) == 0 {
+		t.Fatal("found no Reason* constants in decision.go; this audit's pattern has stopped matching the source it audits")
+	}
+	names := make([]string, 0, len(matches))
+	for _, m := range matches {
+		names = append(names, m[1])
+	}
+	return names
 }
 
 // --- Sonarr -----------------------------------------------------------------
@@ -2176,6 +2193,15 @@ func TestRunRadarrDecisionEngine_ReverseScan_ShutdownMidEvaluation_ReportsNoFind
 	if strings.Contains(out, "reverseFindings=") {
 		t.Errorf("a partial reverse scan must never print a count that reads as the whole library:\n%s", out)
 	}
+	// REVIEW FIX (Phase 10 round 5, binding controller ruling R4): the one
+	// number the abandonment line does carry is how far it got, and it used to
+	// be findings+noFile — neither of which this movie produced, so a pass that
+	// really did evaluate a movie reported evaluated=0. On a real library that is
+	// hundreds of movies reported as none, on the single line explaining what
+	// happened to the pass.
+	if !strings.Contains(out, "evaluated=1") || !strings.Contains(out, "libraryTotal=2") {
+		t.Errorf("the abandonment line must say how far the pass got, counting every movie it evaluated whatever the outcome:\n%s", out)
+	}
 }
 
 // TestRunRadarrDecisionEngine_ReverseFindings_NeverEnterTheForwardCrossCheck
@@ -2256,4 +2282,324 @@ func TestRun_ReverseScan_Sonarr_WriteMode_SeasonFlagOnly_NeedsNoEpisodeWrite(t *
 		t.Errorf("a reverse write must never be reported as a forward recovery:\n%s", out)
 	}
 	assertReverseIdentity(t, out)
+}
+
+// --- round 5: what the shared write path SAYS, and what its numbers mean -----
+//
+// Everything below this line is about the same class of defect, found once the
+// reverse direction had been threaded through the shared Sonarr write path: a
+// message or a number written when only one direction existed, still stating
+// that direction's fact on a cycle that did the opposite. None of them changes
+// what is written; every one of them changes what a human reading the log
+// believes happened, which is the only evidence anybody has that this daemon is
+// safe.
+
+// reverseSeasonWriteEngineFake is the smallest engine fixture a Sonarr reverse
+// WRITE test needs: the series under test with one unmonitored, qualifying
+// season, the cross-check witness that opens the gate, and the pre-write series
+// payload the write path re-fetches.
+func reverseSeasonWriteEngineFake(t *testing.T) (*sonarrEngineFake, []seriesElement, map[int]bool, map[seasonKey]bool) {
+	t.Helper()
+	episodesJSON, filesJSON, series, wantedEpisodes, wantedSeasons := sonarrReverseWriteFixtures(false, 200, true)
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	fake.reverseWantedJSON = `{"page":1,"pageSize":100,"totalRecords":1,"records":[{"id":200,"seriesId":1,"seasonNumber":2}]}`
+	fake.seriesDetail[1] = sonarrWriteEngineSeriesDetail(1, "Reverse Write Candidate", 2, 1, false)
+	return fake, series, wantedEpisodes, wantedSeasons
+}
+
+// TestSeasonEpisodeMonitorWrite_TransportFailure_NamesTheDirectionItAttempted
+// is the episode half's transport error, which wrapped its cause with the word
+// "unmonitoring" in BOTH directions (REVIEW FIX, Phase 10 round 5).
+//
+// That wrap is not an internal detail: it is surfaced verbatim by
+// reverseCounts.record's ERROR line, so a failed re-monitor told a human
+// `msg="remonitor write failed" error="...unmonitoring the season's episodes..."`
+// — the opposite of what was attempted, on the one line they have to diagnose it
+// from.
+func TestSeasonEpisodeMonitorWrite_TransportFailure_NamesTheDirectionItAttempted(t *testing.T) {
+	t.Run("forward", func(t *testing.T) {
+		fake := newSonarrWriterFake(t, sonarrWriterSeriesJSON, sonarrWriterEpisodesJSON)
+		fake.episodeMonitorStatus = http.StatusInternalServerError
+		logger, _ := newDecisionTestLogger(slog.LevelInfo)
+
+		written, _, err := unmonitorSeason(context.Background(), logger, fake.client(), fake.instance(), 3, 1, 0, false, false, false)
+		if written || err == nil {
+			t.Fatalf("written = %t, err = %v; want no write and an error", written, err)
+		}
+		if !strings.Contains(err.Error(), "unmonitoring the season's episodes") {
+			t.Errorf("the forward direction must still name its own verb: %v", err)
+		}
+	})
+
+	t.Run("reverse", func(t *testing.T) {
+		fake, series, wantedEpisodes, wantedSeasons := reverseSeasonWriteEngineFake(t)
+		fake.episodeMonitorStatus = http.StatusInternalServerError
+		logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+		runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodes, wantedSeasons,
+			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+
+		out := buf.String()
+		if !strings.Contains(out, `msg="remonitor write failed`) {
+			t.Fatalf("this test proves nothing unless the re-monitor really failed:\n%s", out)
+		}
+		if strings.Contains(out, "unmonitoring the season's episodes") {
+			t.Errorf("a failed RE-monitor must never report itself as an unmonitor:\n%s", out)
+		}
+		if !strings.Contains(out, "re-monitoring the season's episodes") {
+			t.Errorf("the error must name the direction it attempted:\n%s", out)
+		}
+		c := summaryCountersFor(t, out, "sonarr decision summary")
+		if c["reverseWriteErrors"] != 1 {
+			t.Errorf("reverseWriteErrors = %d, want 1:\n%s", c["reverseWriteErrors"], out)
+		}
+		assertReverseIdentity(t, out)
+	})
+}
+
+// TestRunSonarrDecisionEngine_ReverseScan_UnreadableEpisodeAtWrite_GivesTheReverseRationale
+// is the same class on the two episode-loop refusals. The refusals themselves
+// are right in both directions — an episode this write cannot name, or whose
+// state it cannot read, is untrusted input on a load-bearing field — but their
+// stated RATIONALE is the forward one: "unmonitoring the season would strand
+// it", meaning rule 1 would hide the episode from every future cycle. Coming
+// back, nothing is stranded by anything, and the true reason is the opposite
+// one: the episode would be left UNMONITORED inside a season this write is
+// making monitored, so the write cannot do what it says it does.
+func TestRunSonarrDecisionEngine_ReverseScan_UnreadableEpisodeAtWrite_GivesTheReverseRationale(t *testing.T) {
+	cases := []struct {
+		name          string
+		seasonEpisode string
+		wantInWarn    string
+	}{
+		{
+			name:          "the episode cannot be named",
+			seasonEpisode: `{"seasonNumber":2,"episodeNumber":1,"monitored":false,"hasFile":true,"airDateUtc":"2015-01-01T00:00:00Z","episodeFileId":600}`,
+			wantInWarn:    "could not be named in the episode monitor write",
+		},
+		{
+			name:          "the episode's own monitored value cannot be read",
+			seasonEpisode: `{"id":200,"seasonNumber":2,"episodeNumber":1,"monitored":null,"hasFile":true,"airDateUtc":"2015-01-01T00:00:00Z","episodeFileId":600}`,
+			wantInWarn:    "unknown state",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake, series, wantedEpisodes, wantedSeasons := reverseSeasonWriteEngineFake(t)
+			// The world as the WRITE path finds it: the scan saw a clean season
+			// (that is what made the finding), and the pre-write episode re-read
+			// is where the unreadable field appears.
+			fake.writeTimeEpisodeJSON = "[" + episodeJSON(900, 1, 1, pastAirDate, 9000) + "," + tc.seasonEpisode + "]"
+			logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+			runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodes, wantedSeasons,
+				"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+
+			out := buf.String()
+			if writes := fake.writes(); len(writes) != 0 {
+				t.Errorf("an unreadable episode must stop both halves of the write: %+v", writes)
+			}
+			if strings.Contains(out, "strand") {
+				t.Errorf("a re-monitor strands nothing; the forward rationale must not be printed on a reverse write:\n%s", out)
+			}
+			if !strings.Contains(out, tc.wantInWarn) || !strings.Contains(out, "re-monitoring the season") {
+				t.Errorf("the refusal must state the reverse direction's own rationale:\n%s", out)
+			}
+			c := summaryCountersFor(t, out, "sonarr decision summary")
+			if c["reverseFindings"] != 1 || c["remonitorsRefused"] != 1 || c["remonitored"] != 0 {
+				t.Errorf("want reverseFindings=1 remonitorsRefused=1 remonitored=0, got %v:\n%s", c, out)
+			}
+			assertReverseIdentity(t, out)
+		})
+	}
+}
+
+// TestRunSonarrDecisionEngine_ReverseScan_ShutdownMidEvaluation_CountsWhatItEvaluated
+// is the Sonarr half of the abandonment line's own honesty (REVIEW FIX, Phase 10
+// round 5, binding controller ruling R4), and the mirror of the forward pass's
+// TestRunSonarrDecisionEngine_ShutdownMidEvaluation_CountsSeriesEvaluatedNotSeriesInScope.
+//
+// The line exists to say how far the abandoned pass got. It used to print
+// findings=, which is the count of things that were WRONG — zero on a healthy
+// library — so a reverse scan cut short after hundreds of series reported 0 on
+// the one line explaining what happened to it.
+func TestRunSonarrDecisionEngine_ReverseScan_ShutdownMidEvaluation_CountsWhatItEvaluated(t *testing.T) {
+	// Two ordinary series, each with an unmonitored season that MEETS the
+	// criteria: nothing here is a finding, which is the whole point — the count
+	// must reflect work done, not findings made.
+	fake := newStatefulSonarrFake(t,
+		[]*statefulSonarrSeries{
+			{id: 1, title: "First Show", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 1, monitored: false, episodeFileCount: 1, totalEpisodeCount: 1}}},
+			{id: 2, title: "Second Show", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 2, monitored: false, episodeFileCount: 1, totalEpisodeCount: 1}}},
+		},
+		[]*statefulSonarrEpisode{
+			{id: 100, seriesID: 1, seasonNumber: 1, episodeNumber: 1, monitored: false, hasFile: true,
+				airDateUtc: pastAirDate, episodeFileID: 500, inWantedSet: false},
+			{id: 200, seriesID: 2, seasonNumber: 2, episodeNumber: 1, monitored: false, hasFile: true,
+				airDateUtc: pastAirDate, episodeFileID: 600, inWantedSet: false},
+		},
+		[]*statefulSonarrEpisodeFile{
+			{id: 500, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false},
+			{id: 600, seasonNumber: 2, customFormatScore: 200, qualityCutoffNotMet: false},
+		},
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The forward pass's own wanted set is handed to the engine as an argument,
+	// so the ONLY /wanted/cutoff request of this cycle is the reverse pass's:
+	// it is what arms the cancellation, which then lands partway through the
+	// first series of the REVERSE evaluation rather than the forward one.
+	var armed atomic.Bool
+	var once sync.Once
+	fake.onRequest = func(method, path string) {
+		switch {
+		case path == "/api/v3/wanted/cutoff":
+			armed.Store(true)
+		case armed.Load() && path == "/api/v3/episode":
+			once.Do(cancel)
+		}
+	}
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	series := []seriesElement{
+		testSeries(1, "First Show", true, 1, []int{}, testSeason(1, false, 1, 1)),
+		testSeries(2, "Second Show", true, 1, []int{}, testSeason(2, false, 1, 1)),
+	}
+	runSonarrDecisionEngine(ctx, logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{},
+		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn())
+
+	out := buf.String()
+	if !strings.Contains(out, "abandoning this instance's reverse scan mid-evaluation") {
+		t.Fatalf("this test proves nothing unless the reverse scan really was interrupted:\n%s", out)
+	}
+	if strings.Contains(out, "findings=0") {
+		t.Errorf("the abandonment line must not report a finding count at all — it is a number this cycle is in no position to state:\n%s", out)
+	}
+	if !strings.Contains(out, "seriesEvaluated=1") || !strings.Contains(out, "libraryTotal=2") {
+		t.Errorf("the line must say how far the abandoned pass got, in the same words the forward twin uses:\n%s", out)
+	}
+}
+
+// TestReverseScan_UntrustedPreWriteData_IsNeverReportedAsNowMeetingTheCriteria
+// is R5's second half. The pre-write re-verification refuses on EVERY reason
+// that is not a finding, which is correct — but it announced all of them at INFO
+// as "no longer fails the criteria", including the ones that mean "this could
+// not be checked at all" (an unknown profile, unreadable tags, a file score that
+// could not be fetched). That is the never-observed-claim class this project has
+// fixed repeatedly: "we could not read it" is not evidence that it now passes,
+// and the reason attr on the same line contradicted the message.
+func TestReverseScan_UntrustedPreWriteData_IsNeverReportedAsNowMeetingTheCriteria(t *testing.T) {
+	t.Run("radarr", func(t *testing.T) {
+		// The pre-write fetch names a quality profile this instance does not
+		// have, so rule 3 cannot evaluate the movie at all.
+		detail := map[int]string{7: `{"id":7,"title":"Accidentally Unmonitored","monitored":false,"hasFile":true,"qualityProfileId":99,"tags":[]}`}
+		fake := newRadarrFake(t, "", detail)
+		fake.reverseWantedJSON = `{"page":1,"pageSize":100,"totalRecords":1,"records":[{"id":7,"title":"Accidentally Unmonitored"}]}`
+
+		logger, buf := newDecisionTestLogger(slog.LevelInfo)
+		movies := []movieListElement{crossCheckWitnessMovie(5, "Ordinary Monitored"), unmonitoredBelowCutoffMovie(7, "Accidentally Unmonitored")}
+		runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{5: true},
+			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+
+		out := buf.String()
+		if !strings.Contains(out, `crossCheck="passed (1 verified`) {
+			t.Fatalf("this test proves nothing unless the write gate really opened:\n%s", out)
+		}
+		if puts := fake.puts(); len(puts) != 0 {
+			t.Errorf("untrusted input must never be written through: %+v", puts)
+		}
+		assertUntrustedReVerification(t, out, ReasonUnknownProfile)
+		c := summaryCounters(t, out)
+		if c["reverseFindings"] != 1 || c["remonitorsRefused"] != 1 || c["remonitored"] != 0 {
+			t.Errorf("want reverseFindings=1 remonitorsRefused=1 remonitored=0, got %v:\n%s", c, out)
+		}
+		assertReverseIdentity(t, out)
+	})
+
+	t.Run("sonarr", func(t *testing.T) {
+		fake, series, wantedEpisodes, wantedSeasons := reverseSeasonWriteEngineFake(t)
+		fake.seriesDetail[1] = `{"id":1,"title":"Reverse Write Candidate","monitored":true,"qualityProfileId":99,"tags":[],` +
+			`"seasons":[{"seasonNumber":2,"monitored":false,"statistics":{"episodeFileCount":1,"totalEpisodeCount":1}}]}`
+
+		logger, buf := newDecisionTestLogger(slog.LevelInfo)
+		runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodes, wantedSeasons,
+			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+
+		out := buf.String()
+		if !strings.Contains(out, `crossCheck="passed (1 verified`) {
+			t.Fatalf("this test proves nothing unless the write gate really opened:\n%s", out)
+		}
+		if writes := fake.writes(); len(writes) != 0 {
+			t.Errorf("untrusted input must never be written through: %+v", writes)
+		}
+		assertUntrustedReVerification(t, out, ReasonUnknownProfile)
+		c := summaryCountersFor(t, out, "sonarr decision summary")
+		if c["reverseFindings"] != 1 || c["remonitorsRefused"] != 1 || c["remonitored"] != 0 {
+			t.Errorf("want reverseFindings=1 remonitorsRefused=1 remonitored=0, got %v:\n%s", c, out)
+		}
+		assertReverseIdentity(t, out)
+	})
+}
+
+// assertUntrustedReVerification is the shared shape of both halves above: the
+// refusal is a WARNING that names the untrusted reason and does not claim the
+// item now meets the criteria.
+func assertUntrustedReVerification(t *testing.T, out, reason string) {
+	t.Helper()
+	var line string
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "could not be re-established from the pre-write fetch") {
+			line = l
+			break
+		}
+	}
+	if line == "" {
+		t.Fatalf("the refusal must say the finding could not be re-established:\n%s", out)
+	}
+	if !strings.Contains(line, "level=WARN") {
+		t.Errorf("an untrusted-input refusal is a warning, not an informational note:\n%s", line)
+	}
+	if !strings.Contains(line, `reason="`+reason+`"`) {
+		t.Errorf("the refusal must name the untrusted reason:\n%s", line)
+	}
+	if strings.Contains(out, "no longer fails the criteria") {
+		t.Errorf("nothing established that this item now meets the criteria; the log must not say it did:\n%s", out)
+	}
+}
+
+// TestReverseFindingReasons_UntrustedInputIsClassifiedExhaustively is the
+// census guard for the classification the two tests above rest on. Same
+// rationale as isReverseFinding's own audit: a reason nobody has written yet
+// must not silently default into "this is a real observation about the item",
+// which is what would let a future "we could not read X" reason be announced as
+// "it now meets the criteria".
+func TestReverseFindingReasons_UntrustedInputIsClassifiedExhaustively(t *testing.T) {
+	untrusted := []string{
+		ReasonUnknownProfile, ReasonTagsUnknown, ReasonCouldNotFetchCFScore,
+		ReasonSeasonEpisodesUnavailable, ReasonSeasonEpisodeDataInconsistent, ReasonSeasonFileCountMismatch,
+	}
+	trusted := []string{
+		ReasonCutoffMet, ReasonNoFile, ReasonExcludedByTag, ReasonUpgradesDisabled,
+		ReasonSeasonIncomplete, ReasonSeasonNotFullyAired,
+		ReasonQualityCutoffNotMet, ReasonCFCutoffNotMet, ReasonSeasonMonitorMismatch, "",
+	}
+	for _, r := range untrusted {
+		if !isUntrustedInputReason(r) {
+			t.Errorf("%q means the item could not be checked, and must never be reported as an observation about it", r)
+		}
+	}
+	for _, r := range trusted {
+		if isUntrustedInputReason(r) {
+			t.Errorf("%q is a real observation about the item, not untrusted input", r)
+		}
+	}
+	// -1 for the empty string, which is not a declared constant but is the
+	// value a decision carries before any rule has spoken.
+	if named, declared := len(untrusted)+len(trusted)-1, len(declaredReasonConstants(t)); named != declared {
+		t.Errorf("this census names %d reason constants; decision.go declares %d, and every one of them must be classified as trusted or not",
+			named, declared)
+	}
 }

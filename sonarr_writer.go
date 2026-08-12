@@ -452,15 +452,33 @@ func writeSeasonMonitored(ctx context.Context, logger *slog.Logger, client *APIC
 	// episodes-first order was chosen to prevent, arrived at by a different
 	// road. Every other unreadable load-bearing field in this write path
 	// refuses; so does this one.
+	//
+	// Both refusals are the same in either direction; their stated RATIONALE is
+	// not, and it was the forward one in both (REVIEW FIX, Phase 10 round 5).
+	// Stranding is a forward consequence: rule 1 hides an unmonitored season from
+	// every future cycle, so an episode left monitored inside one is never looked
+	// at again. A re-monitor strands nothing — the season it produces is
+	// monitored, and the forward pass will evaluate it next cycle. What is true
+	// coming back is the mirror: the episode this write could not name or read
+	// would be left UNMONITORED inside a season this write is making monitored,
+	// so the write cannot do the thing it claims to do, on data it could not
+	// read. Same refusal, opposite reason, and a human diagnosing it needs the
+	// one that applies.
+	noIDRationale := "so unmonitoring the season would strand it, refusing to write"
+	unreadableRationale := "unmonitoring the season would strand it in an unknown state, refusing to write"
+	if rev != nil {
+		noIDRationale = "so re-monitoring the season would leave it unmonitored inside a monitored season, refusing to write"
+		unreadableRationale = "re-monitoring the season would leave it in an unknown state inside a monitored season, refusing to write"
+	}
 	var episodeIDs []int
 	for _, e := range seasonEpisodes {
 		if e.ID == nil {
-			logger.Warn("an episode of this season has no id in the pre-write fetch; it could not be named in the episode monitor write, so unmonitoring the season would strand it, refusing to write",
+			logger.Warn("an episode of this season has no id in the pre-write fetch; it could not be named in the episode monitor write, "+noIDRationale,
 				append(append([]any(nil), attrs...), "episodeNumber", derefOrAbsent(e.EpisodeNumber))...)
 			return false, false, fmt.Errorf("%s: %w: an episode of this season has no id in the pre-write fetch", subject, errSeasonUnverifiableAtWrite)
 		}
 		if e.Monitored == nil {
-			logger.Warn("an episode of this season has an absent or JSON-null monitored field in the pre-write fetch; unmonitoring the season would strand it in an unknown state, refusing to write",
+			logger.Warn("an episode of this season has an absent or JSON-null monitored field in the pre-write fetch; "+unreadableRationale,
 				append(append([]any(nil), attrs...), "episodeId", *e.ID)...)
 			return false, false, fmt.Errorf("%s: %w: episode %d has no readable monitored field in the pre-write fetch", subject, errSeasonUnverifiableAtWrite, *e.ID)
 		}
@@ -926,7 +944,12 @@ func putEpisodeMonitor(ctx context.Context, logger *slog.Logger, client *APIClie
 
 	resp, err := client.DoJSON(ctx, http.MethodPut, episodeMonitorPath, body)
 	if err != nil {
-		return fmt.Errorf("%s: unmonitoring the season's episodes: %w", subject, err)
+		// The verb, not a fixed word (REVIEW FIX, Phase 10 round 5): this error
+		// is what reverseCounts.record prints on its ERROR line, so a failed
+		// re-monitor used to tell the human `msg="remonitor write failed"
+		// error="...unmonitoring the season's episodes..."` — the two halves of
+		// one line contradicting each other about what was attempted.
+		return fmt.Errorf("%s: %s the season's episodes: %w", subject, monitoredWriteVerb(rev), err)
 	}
 	defer resp.Body.Close()
 
