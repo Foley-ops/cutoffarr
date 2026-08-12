@@ -1995,6 +1995,26 @@ func runSonarrCrossCheck(ctx context.Context, logger *slog.Logger, client *APICl
 
 			inWantedSet := wantedEpisodeIDs[ep.episodeID]
 
+			// IMPORTANT REVIEW FIX: a would-unmonitor season is rule 4's own
+			// claim that NO episode of this season appears in the wanted set
+			// — decided via the SEASON key (seriesID, seasonNumber) against
+			// wantedSeasons. This cross-check independently consults
+			// wantedEpisodeIDs at the EPISODE level for the very same
+			// /wanted/cutoff fetch. If an episode of a would-unmonitor season
+			// IS in wantedEpisodeIDs, that is a flat contradiction of the
+			// rule that produced the decision — not something the
+			// qualityCutoffNotMet comparison below can explain away (in the
+			// qualityCutoffNotMet==true case it would otherwise fall straight
+			// through as a "verified" agreement). Check and flag it BEFORE
+			// the nil/CF-only continues below so no per-field shape can ever
+			// suppress it.
+			if d.wouldUnmonitor && inWantedSet {
+				disagreementFound = true
+				logger.Error("cross-check disagreement: a would-unmonitor season contains an episode in the wanted/cutoff set",
+					"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season,
+					"episodeId", ep.episodeID, "inWantedSet", inWantedSet, "qualityCutoffNotMet", derefOrAbsent(ep.qualityCutoffNotMet))
+			}
+
 			attrs := []any{
 				"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season,
 				"episodeId", ep.episodeID, "inWantedSet", inWantedSet, "qualityCutoffNotMet", derefOrAbsent(ep.qualityCutoffNotMet),

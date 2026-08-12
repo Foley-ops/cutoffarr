@@ -995,6 +995,29 @@ func (f *sonarrEngineFake) all() []recordedRequest {
 	return append([]recordedRequest(nil), f.requests...)
 }
 
+// reportLineWithMsg isolates the single log line whose msg attr is an EXACT
+// match for want (not merely a substring of the whole buffer) so callers can
+// assert the mandated per-line attrs against ONLY that line. IMPORTANT
+// REVIEW FIX: asserting against the whole buffer is not sufficient here —
+// the cross-check's own "cross-check" log line (decision.go) also carries
+// instance/seriesId/series/season for the very same season a would-unmonitor
+// or skip report line describes, so a season-attr assertion made against the
+// whole buffer can pass even when the report line itself dropped the attr
+// entirely.
+func reportLineWithMsg(t *testing.T, out, want string) string {
+	t.Helper()
+	token := "msg=" + want
+	for _, line := range strings.Split(out, "\n") {
+		for _, field := range strings.Fields(line) {
+			if field == token {
+				return line
+			}
+		}
+	}
+	t.Fatalf("expected a log line with %s:\n%s", token, out)
+	return ""
+}
+
 func TestRunSonarrDecisionEngine_LogsWouldUnmonitorAndSkipLinesWithMandatedAttrs(t *testing.T) {
 	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "]"
 	filesJSON := "[" + episodeFileJSON(500, 1, 200, false) + "]"
@@ -1008,20 +1031,18 @@ func TestRunSonarrDecisionEngine_LogsWouldUnmonitorAndSkipLinesWithMandatedAttrs
 	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude")
 
 	out := buf.String()
-	if !strings.Contains(out, "msg=would-unmonitor") {
-		t.Errorf("expected a would-unmonitor log line:\n%s", out)
-	}
-	for _, want := range []string{"seriesId=1", `series="Would Unmonitor Show"`, "season=1", `reason="cutoff met"`, "profile=HD-1080p", "instance=sonarr-main"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("expected would-unmonitor line to contain %q:\n%s", want, out)
+
+	wouldUnmonitorLine := reportLineWithMsg(t, out, "would-unmonitor")
+	for _, want := range []string{"instance=sonarr-main", "seriesId=1", `series="Would Unmonitor Show"`, "season=1", `reason="cutoff met"`, "profile=HD-1080p"} {
+		if !strings.Contains(wouldUnmonitorLine, want) {
+			t.Errorf("expected would-unmonitor line to contain %q:\n%s", want, wouldUnmonitorLine)
 		}
 	}
-	if !strings.Contains(out, "msg=skip") {
-		t.Errorf("expected a skip log line:\n%s", out)
-	}
-	for _, want := range []string{"seriesId=2", `series="No File Show"`, `reason="season incomplete on disk"`} {
-		if !strings.Contains(out, want) {
-			t.Errorf("expected skip line to contain %q:\n%s", want, out)
+
+	skipLine := reportLineWithMsg(t, out, "skip")
+	for _, want := range []string{"instance=sonarr-main", "seriesId=2", `series="No File Show"`, "season=1", `reason="season incomplete on disk"`, "profile=HD-1080p"} {
+		if !strings.Contains(skipLine, want) {
+			t.Errorf("expected skip line to contain %q:\n%s", want, skipLine)
 		}
 	}
 }
@@ -1253,6 +1274,38 @@ func TestRunSonarrCrossCheck_Disagreement_FailsWithErrorLog(t *testing.T) {
 	}
 }
 
+// TestRunSonarrCrossCheck_WouldUnmonitorSeasonHasWantedEpisode_Disagreement
+// pins the IMPORTANT review fix: rule 4 (decision.go) decides would-unmonitor
+// via the SEASON key (seriesId, seasonNumber) against wantedSeasons, while
+// this cross-check independently consults wantedEpisodeIDs at the EPISODE
+// level for the very same season. If those two views of the same
+// /wanted/cutoff fetch ever disagree — a mis-built or transposed key on
+// either side, or drift between the two fetches — a would-unmonitor season
+// containing an episode that IS in the wanted set is a direct contradiction
+// of the rule that produced the decision, and must fail the cross-check
+// regardless of qualityCutoffNotMet. This is deliberately the WORST case:
+// qualityCutoffNotMet=true here reads as an ordinary verified agreement
+// under the old per-field comparison alone (inWantedSet == qualityCutoffNotMet,
+// both true) — the exact shape the finding says could count as "evidence of
+// correctness" instead of the problem it actually is.
+func TestRunSonarrCrossCheck_WouldUnmonitorSeasonHasWantedEpisode_Disagreement(t *testing.T) {
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr"}
+
+	wanted := map[int]bool{100: true}
+	decisions := []seasonDecision{
+		sonarrCandidateDecision(1, 1, true, []seasonCrossCheckEpisode{{episodeID: 100, monitored: boolPtr(true), qualityCutoffNotMet: boolPtr(true)}}),
+	}
+	cc := runSonarrCrossCheck(context.Background(), logger, nil, inst, decisions, wanted)
+
+	if cc.status != crossCheckStatusFailed {
+		t.Fatalf("status = %q, want %q (would-unmonitor season contains a wanted episode):\n%s", cc.status, crossCheckStatusFailed, buf.String())
+	}
+	if !strings.Contains(buf.String(), "level=ERROR") || !strings.Contains(buf.String(), "wanted/cutoff set") {
+		t.Errorf("expected an error log naming the would-unmonitor/wanted-set contradiction:\n%s", buf.String())
+	}
+}
+
 // TestRunSonarrCrossCheck_CFOnlyWantedReason_TreatedAsUnverifiable pins the
 // IMPORTANT review fix, shape (b): an episode IN the wanted set (because
 // its custom-format score is below the profile's cutoff) whose file's
@@ -1392,6 +1445,35 @@ func TestRunSonarrDecisionEngine_CrossCheckDisagreement_SummaryStatesFailed(t *t
 	out := buf.String()
 	if !strings.Contains(out, "crossCheck=FAILED") {
 		t.Errorf("expected crossCheck=FAILED in the summary:\n%s", out)
+	}
+}
+
+// TestRunSonarrDecisionEngine_WouldUnmonitorSeasonHasWantedEpisode_CrossCheckFails
+// is the IMPORTANT review fix's end-to-end regression proof, driven through
+// the full engine: wantedEpisodeIDs contains episode 100, but wantedSeasons
+// deliberately OMITS that episode's (seriesId, seasonNumber) key — modeling
+// the exact drift/mis-keyed shape the finding describes between the two
+// views the same /wanted/cutoff fetch produces. Rule 4, which consults only
+// wantedSeasons, lets the season through as would-unmonitor; the
+// independent, episode-keyed cross-check must catch the contradiction and
+// fail the whole cross-check rather than count it as verified agreement.
+func TestRunSonarrDecisionEngine_WouldUnmonitorSeasonHasWantedEpisode_CrossCheckFails(t *testing.T) {
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "]"
+	filesJSON := "[" + episodeFileJSON(500, 1, 200, true) + "]" // qualityCutoffNotMet=true: reads as ordinary agreement without the fix
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+
+	series := []seriesElement{testSeries(1, "Contradiction Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
+	wantedEpisodeIDs := map[int]bool{100: true} // episode 100 IS in the wanted set...
+	wantedSeasons := map[seasonKey]bool{}       // ...but its season key is absent, so rule 4 lets the season through
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodeIDs, wantedSeasons, "cutoffarr-exclude")
+
+	out := buf.String()
+	if !strings.Contains(out, "msg=would-unmonitor") {
+		t.Fatalf("test setup did not actually produce a would-unmonitor season:\n%s", out)
+	}
+	if !strings.Contains(out, "crossCheck=FAILED") {
+		t.Errorf("expected crossCheck=FAILED: a would-unmonitor season contained an episode in the wanted set:\n%s", out)
 	}
 }
 

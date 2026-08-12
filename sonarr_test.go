@@ -1098,20 +1098,37 @@ instances:
 	}
 	out := stdout.String()
 
+	// IMPORTANT REVIEW FIX: track whether the season-2 and season-3 report
+	// lines were actually found, and Fatalf if either was not — without
+	// this, a report line silently missing its "season" attr (e.g. an
+	// accidental deletion of "season", d.season from the logger.Info calls)
+	// would make BOTH `if strings.Contains(line, "season=N")` guards below
+	// never fire, so the whole per-season branch is skipped and the test
+	// passes vacuously instead of catching the regression.
+	season2LineFound := false
+	season3LineFound := false
 	for _, line := range strings.Split(out, "\n") {
 		if !strings.Contains(line, "msg=skip") && !strings.Contains(line, "msg=would-unmonitor") {
 			continue // report lines only — the cross-check's own "cross-check" lines also carry seriesId/season attrs.
 		}
 		if strings.Contains(line, "seriesId=7") && strings.Contains(line, "season=2") {
+			season2LineFound = true
 			if !strings.Contains(line, "msg=skip") || !strings.Contains(line, `reason="quality cutoff not met"`) {
 				t.Errorf("season 2 (in the wanted set) line = %q, want msg=skip reason=\"quality cutoff not met\"", line)
 			}
 		}
 		if strings.Contains(line, "seriesId=7") && strings.Contains(line, "season=3") {
+			season3LineFound = true
 			if !strings.Contains(line, "msg=would-unmonitor") || !strings.Contains(line, `reason="cutoff met"`) {
 				t.Errorf("season 3 (NOT in the wanted set) line = %q, want msg=would-unmonitor reason=\"cutoff met\"", line)
 			}
 		}
+	}
+	if !season2LineFound {
+		t.Fatalf("expected a report line for seriesId=7 season=2 (msg=skip):\n%s", out)
+	}
+	if !season3LineFound {
+		t.Fatalf("expected a report line for seriesId=7 season=3 (msg=would-unmonitor):\n%s", out)
 	}
 	if !strings.Contains(out, `reason="quality cutoff not met"`) {
 		t.Errorf("expected season 2's skip line:\n%s", out)
