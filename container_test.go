@@ -122,8 +122,19 @@ func TestDockerfile_CrossBuildsForTARGETARCH(t *testing.T) {
 // three properties that make the image what the plan asked for: nothing in it
 // but the binary, never running as root, and no libc dependency (which is what
 // would break a distroless/static base at runtime rather than at build time).
+//
+// Checked with comments stripped (uncommented — same helper and same reason
+// as TestDockerfile_CrossBuildsForTARGETARCH above): the prose block
+// immediately preceding the real RUN line explains CGO_ENABLED=0 and
+// -trimpath in exactly those words, so a raw strings.Contains over the whole
+// file is satisfied by the comment alone. Deleting either token from the
+// live RUN line — dynamically linking libc against distroless/static, or
+// leaving local filesystem paths in the binary — left this test green before
+// this fix (reproduced with a comment-preserving mutation of the RUN line,
+// confirmed red after switching to the stripped text, then reverted).
 func TestDockerfile_FinalStageIsDistrolessNonRootAndStaticallyLinked(t *testing.T) {
 	dockerfile := readRepoFile(t, "Dockerfile")
+	stripped := uncommented(dockerfile)
 
 	for _, want := range []string{
 		"FROM gcr.io/distroless/static:nonroot",
@@ -133,12 +144,12 @@ func TestDockerfile_FinalStageIsDistrolessNonRootAndStaticallyLinked(t *testing.
 		`-ldflags "-s -w"`,
 		`ENTRYPOINT ["/cutoffarr"]`,
 	} {
-		if !strings.Contains(dockerfile, want) {
-			t.Errorf("Dockerfile must contain %q:\n%s", want, dockerfile)
+		if !strings.Contains(stripped, want) {
+			t.Errorf("Dockerfile must contain %q OUTSIDE a comment:\n%s", want, dockerfile)
 		}
 	}
 	// A shell in the final image would defeat the point of distroless.
-	if strings.Contains(dockerfile, "FROM alpine") || strings.Contains(dockerfile, "FROM debian") {
+	if strings.Contains(stripped, "FROM alpine") || strings.Contains(stripped, "FROM debian") {
 		t.Errorf("the FINAL stage must be distroless; a shell-bearing base defeats it:\n%s", dockerfile)
 	}
 }
@@ -168,8 +179,19 @@ func TestDockerfile_DefaultsMatchTheProgramsOwnDefaults(t *testing.T) {
 // TestComposeExample_MatchesThePlansDeploymentShape pins the compose example
 // against the plan's own list, item by item, plus the config path the image
 // expects.
+//
+// Checked against the UNCOMMENTED text, the same hardening
+// TestDockerfile_CrossBuildsForTARGETARCH and
+// TestDockerfile_FinalStageIsDistrolessNonRootAndStaticallyLinked apply above:
+// this file's own prose explains several of these substrings (e.g. "TZ=",
+// "restart: unless-stopped" are named in comments elsewhere in the file), so
+// a raw strings.Contains over the whole file could stay green after the real
+// setting was deleted, as long as a comment mentioning it survived. No
+// substring here false-positives on today's file — this is preventive
+// hardening against the same latent class, not a fix to an active bug.
 func TestComposeExample_MatchesThePlansDeploymentShape(t *testing.T) {
 	compose := readRepoFile(t, "docker-compose.example.yml")
+	stripped := uncommented(compose)
 
 	port := strconv.Itoa(defaultWebhookPort)
 	for _, want := range []struct{ what, substr string }{
@@ -183,8 +205,8 @@ func TestComposeExample_MatchesThePlansDeploymentShape(t *testing.T) {
 		{"the Unraid icon label", "net.unraid.docker.icon"},
 		{"the Unraid shell label", "net.unraid.docker.shell"},
 	} {
-		if !strings.Contains(compose, want.substr) {
-			t.Errorf("the compose example must carry %s (%q):\n%s", want.what, want.substr, compose)
+		if !strings.Contains(stripped, want.substr) {
+			t.Errorf("the compose example must carry %s (%q) OUTSIDE a comment:\n%s", want.what, want.substr, compose)
 		}
 	}
 
