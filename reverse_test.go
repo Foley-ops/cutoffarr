@@ -553,6 +553,50 @@ func TestRunSonarrDecisionEngine_ReverseScan_IncompleteWantedSet_SkipsOnlyTheRev
 	}
 }
 
+// TestRunSonarrDecisionEngine_ReverseScan_FindingsFollowTheCycleReportLevel is
+// the Sonarr twin of the Radarr level pin above (binding controller resolution
+// 9), and it needs to exist separately because the Sonarr finding is a SEPARATE
+// LOG STATEMENT: the Radarr pin — and the daemon noise-budget pin beside it —
+// both run Radarr only, so nothing anywhere failed when this call site printed
+// at INFO.
+//
+// The cost of that regression is not symmetric between the two engines. The live
+// Sonarr's unmonitored wanted set holds 1213 records against Radarr's 3, so an
+// INFO finding line here means one line per accidental unmonitor, per season, on
+// every sweep, forever — precisely what the noise budget exists to prevent, on
+// the larger of the two libraries.
+func TestRunSonarrDecisionEngine_ReverseScan_FindingsFollowTheCycleReportLevel(t *testing.T) {
+	episodesJSON := "[" + episodeJSON(200, 2, 1, pastAirDate, 600) + "]"
+	filesJSON := "[" + episodeFileJSON(600, 2, 200, true) + "]"
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	fake.reverseWantedJSON = `{"page":1,"pageSize":100,"totalRecords":1,"records":[{"id":200,"seriesId":1,"seasonNumber":2}]}`
+
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+	series := []seriesElement{testSeries(1, "Accidentally Unmonitored Season", true, 1, []int{}, testSeason(2, false, 1, 1))}
+
+	// A repeating cycle: everything that scales with the library is demoted.
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{},
+		"cutoffarr-exclude", fullLibraryScope(slog.LevelDebug), true, reverseScanOn())
+
+	out := buf.String()
+	found := false
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, "reverse-scan finding") {
+			continue
+		}
+		found = true
+		if !strings.Contains(line, "level=DEBUG") {
+			t.Errorf("on a repeating cycle a season finding must be DEBUG:\n%s", line)
+		}
+	}
+	if !found {
+		t.Fatalf("this test proves nothing unless a finding was made:\n%s", out)
+	}
+	if c := summaryCountersFor(t, out, "sonarr decision summary"); c["reverseFindings"] != 1 {
+		t.Errorf("the summary still counts it at INFO: reverseFindings = %d, want 1:\n%s", c["reverseFindings"], out)
+	}
+}
+
 // TestRunSonarrDecisionEngine_ReverseScanDisabled_MakesNoUnmonitoredWantedFetch
 // is the Sonarr twin of the Radarr scheduling pin.
 func TestRunSonarrDecisionEngine_ReverseScanDisabled_MakesNoUnmonitoredWantedFetch(t *testing.T) {
@@ -1493,6 +1537,124 @@ func TestRunSonarrDecisionEngine_ReverseScan_CrossCheckFailed_WithholdsEverySeas
 	c := summaryCountersFor(t, out, "sonarr decision summary")
 	if c["reverseFindings"] != 1 || c["reverseWithheld"] != 1 || c["remonitored"] != 0 {
 		t.Errorf("want reverseFindings=1 reverseWithheld=1 remonitored=0, got %v:\n%s", c, out)
+	}
+	assertReverseIdentity(t, out)
+}
+
+// sonarrReverseWriteFixtures is the smallest library a Sonarr reverse WRITE test
+// can be built from: the series under test (1), plus the cross-check witness (9)
+// without which the gate never opens and every such test would prove only that a
+// blocked pass writes nothing.
+//
+// The two series share the fake's single /episode and /episodefile fixture — the
+// fake stamps the requested seriesId onto every episode — so each season number
+// is used by exactly one of them, which is what keeps the shared fixture honest.
+// Season 1 belongs to the witness; season 2 to the series under test.
+func sonarrReverseWriteFixtures(seasonTwoEpisodeMonitored bool, seasonTwoScore int, seasonTwoCutoffNotMet bool) (episodesJSON, filesJSON string, series []seriesElement, wantedEpisodes map[int]bool, wantedSeasons map[seasonKey]bool) {
+	episodesJSON = "[" + episodeJSON(900, 1, 1, pastAirDate, 9000) + "," +
+		episodeJSONWithMonitored(200, 2, 1, pastAirDate, 600, seasonTwoEpisodeMonitored) + "]"
+	filesJSON = "[" + episodeFileJSON(9000, 1, 200, true) + "," + episodeFileJSON(600, 2, seasonTwoScore, seasonTwoCutoffNotMet) + "]"
+	series = []seriesElement{
+		// The witness: monitored, complete, aired, in the FORWARD wanted set with
+		// its own file agreeing. A plain forward skip that is never written in
+		// either direction — its only job is to give the cross-check something
+		// real to verify.
+		testSeries(9, "Ordinary Monitored Show", true, 1, []int{}, testSeason(1, true, 1, 1)),
+		testSeries(1, "Reverse Write Candidate", true, 1, []int{}, testSeason(2, false, 1, 1)),
+	}
+	return episodesJSON, filesJSON, series, map[int]bool{900: true}, map[seasonKey]bool{{seriesID: 9, seasonNumber: 1}: true}
+}
+
+// TestRunSonarrDecisionEngine_ReverseScan_SeriesRetiredBeforeTheWrite_IsRefused
+// is binding controller resolution 3's SECOND enforcement point: the reverse
+// half of the write path's own series-monitored guard.
+//
+// The first enforcement — remonitorSeasons withholding a season whose series the
+// SCAN saw unmonitored — is pinned elsewhere, and that test asserts the write
+// path is never entered at all, so it cannot reach this line. What is only
+// checkable here is the window between the two: a human retires the show after
+// the scan has already decided, and the pre-write fetch is the first thing to
+// see it. Re-monitoring seasons of a deliberately retired show is the single
+// behaviour resolution 3 exists to forbid.
+func TestRunSonarrDecisionEngine_ReverseScan_SeriesRetiredBeforeTheWrite_IsRefused(t *testing.T) {
+	episodesJSON, filesJSON, series, wantedEpisodes, wantedSeasons := sonarrReverseWriteFixtures(false, 200, true)
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	fake.reverseWantedJSON = `{"page":1,"pageSize":100,"totalRecords":1,"records":[{"id":200,"seriesId":1,"seasonNumber":2}]}`
+	// The pre-write fetch, and the only thing that differs from the scan: the
+	// series itself is no longer monitored.
+	fake.seriesDetail[1] = `{"id":1,"title":"Reverse Write Candidate","monitored":false,"qualityProfileId":1,"tags":[],` +
+		`"seasons":[{"seasonNumber":2,"monitored":false,"statistics":{"episodeFileCount":1,"totalEpisodeCount":1}}]}`
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodes, wantedSeasons,
+		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+
+	out := buf.String()
+	if !strings.Contains(out, `crossCheck="passed (1 verified`) {
+		t.Fatalf("this test proves nothing unless the write gate really opened:\n%s", out)
+	}
+	// The distinction this test exists for: the write path was ENTERED — it made
+	// its own pre-write fetch — and stopped at its own guard, rather than being
+	// withheld before any of that (which is the other test's subject).
+	if n := fake.countRequests("/api/v3/series/1"); n == 0 {
+		t.Fatalf("the write path was never entered, so this test says nothing about its guard:\n%s", out)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("a season whose series is no longer monitored must never be written: %+v", writes)
+	}
+	if !strings.Contains(out, "series is no longer monitored as of the pre-write fetch") {
+		t.Errorf("the refusal must say which guard stopped it:\n%s", out)
+	}
+	c := summaryCountersFor(t, out, "sonarr decision summary")
+	if c["reverseFindings"] != 1 || c["remonitorsRefused"] != 1 || c["remonitored"] != 0 {
+		t.Errorf("want reverseFindings=1 remonitorsRefused=1 remonitored=0, got %v:\n%s", c, out)
+	}
+	assertReverseIdentity(t, out)
+}
+
+// TestRunSonarrDecisionEngine_ReverseScan_SeasonThatNowMeetsCriteria_IsRefused
+// is the season path's own fresh-GET re-verification (binding controller
+// resolution 5: "still FAILS criteria on fresh data"), which had no
+// discriminating test — only the happy path's PASS through it, so the whole
+// check could be deleted with nothing failing.
+//
+// It is the Sonarr twin of the Radarr pin that stages a CF-score rise, and it
+// has to be staged that way here too: the airing and completeness levers cannot
+// reach this code, because verifySeasonStillWritable refuses first with a
+// different sentinel. The season is below its custom-format cutoff when it is
+// found, and above it by the time the write pass re-reads /episodefile — so
+// re-monitoring it would undo this project's own correct work, after which the
+// next forward cycle would unmonitor it again, forever.
+func TestRunSonarrDecisionEngine_ReverseScan_SeasonThatNowMeetsCriteria_IsRefused(t *testing.T) {
+	// Absent from the unmonitored wanted set (its quality cutoff is met) and
+	// scoring 10 against the profile's 100: a custom-format finding.
+	episodesJSON, filesJSON, series, wantedEpisodes, wantedSeasons := sonarrReverseWriteFixtures(false, 10, false)
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	fake.seriesDetail[1] = sonarrWriteEngineSeriesDetail(1, "Reverse Write Candidate", 2, 1, false)
+	// The world changes between the scan and the write: the file was upgraded and
+	// now scores above the cutoff.
+	fake.writeTimeFileJSON = "[" + episodeFileJSON(9000, 1, 200, true) + "," + episodeFileJSON(600, 2, 200, false) + "]"
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, wantedEpisodes, wantedSeasons,
+		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), false, reverseOptions{enabled: true, remonitor: true})
+
+	out := buf.String()
+	if !strings.Contains(out, `reason="`+ReasonCFCutoffNotMet+`"`) {
+		t.Fatalf("this test proves nothing unless the CF-score finding was made first:\n%s", out)
+	}
+	if !strings.Contains(out, `crossCheck="passed (1 verified`) {
+		t.Fatalf("nor unless the write gate really opened:\n%s", out)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("a season that now meets the criteria must not be re-monitored: %+v", writes)
+	}
+	if !strings.Contains(out, "no longer fails the criteria") {
+		t.Errorf("the refusal must say why:\n%s", out)
+	}
+	c := summaryCountersFor(t, out, "sonarr decision summary")
+	if c["reverseFindings"] != 1 || c["remonitorsRefused"] != 1 || c["remonitored"] != 0 {
+		t.Errorf("want reverseFindings=1 remonitorsRefused=1 remonitored=0, got %v:\n%s", c, out)
 	}
 	assertReverseIdentity(t, out)
 }

@@ -973,7 +973,18 @@ type sonarrEngineFake struct {
 	// by something else — which is the entire subject of the pre-write
 	// re-verification.
 	writeTimeEpisodeJSON string
-	writePassStarted     bool
+
+	// writeTimeFileJSON is the same lever for /api/v3/episodefile, and it exists
+	// for the one world-change the REVERSE direction's pre-write re-verification
+	// is really about: a file upgraded between the decision and the write, so the
+	// season that was below its custom-format cutoff now meets it. Nothing else
+	// can stage that — rule 7 reads the score from this endpoint and from nowhere
+	// else — and the airing/completeness levers cannot stand in for it, because
+	// verifySeasonStillWritable refuses first, with a different sentinel, without
+	// the re-verification ever being reached.
+	writeTimeFileJSON string
+
+	writePassStarted bool
 }
 
 func newSonarrEngineFake(t *testing.T, episodeJSON, fileJSON string) *sonarrEngineFake {
@@ -1037,7 +1048,7 @@ func newSonarrEngineFake(t *testing.T, episodeJSON, fileJSON string) *sonarrEngi
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		w.Write([]byte(f.fileJSON))
+		w.Write([]byte(f.filesFor()))
 	}))
 	// Catch-all: records every request to any path this fake does not
 	// explicitly stub — including /api/v3/series/{id}, /api/v3/command, or
@@ -1088,6 +1099,17 @@ func (f *sonarrEngineFake) episodesFor() string {
 		return f.writeTimeEpisodeJSON
 	}
 	return f.episodeJSON
+}
+
+// filesFor is episodesFor's twin for /api/v3/episodefile: the decision-time
+// fixture until the write pass starts, then writeTimeFileJSON if a test set one.
+func (f *sonarrEngineFake) filesFor() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.writePassStarted && f.writeTimeFileJSON != "" {
+		return f.writeTimeFileJSON
+	}
+	return f.fileJSON
 }
 
 // serveSeriesDetail is GET/PUT /api/v3/series/{id}: the write path's fresh
