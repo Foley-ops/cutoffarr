@@ -262,6 +262,17 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 		}),
 	}
 
+	// The shutdown handler is installed BEFORE anything long-running starts, so
+	// a signal arriving during the startup scan is a clean stop rather than the
+	// default disposition killing the process mid-cycle. It is installed AFTER
+	// the bind, deliberately: the fatal-bind path above returns without ever
+	// subscribing to signals, which matters to any caller (a test, a future
+	// embedding) that is not a process about to exit.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	loopDone := make(chan struct{})
+	installShutdownHandler(logger, opts.signals, cancel, forceExit, loopDone)
+
 	serveDone := make(chan struct{})
 	go func() {
 		defer close(serveDone)
@@ -273,11 +284,6 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 	logger.Info("webhook listener started",
 		"address", listener.Addr().String(), "endpoint", "POST /webhook/{instance-name}",
 		"debounce", cfg.WebhookDebounce, "pollInterval", cfg.PollInterval, "dryRun", cfg.DryRun)
-
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	loopDone := make(chan struct{})
-	installShutdownHandler(logger, opts.signals, cancel, forceExit, loopDone)
 
 	// The startup full scan (plan §8's "full scan on startup"), reported at
 	// INFO in full: it is the one daemon cycle a human is watching, the
