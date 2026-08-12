@@ -178,13 +178,13 @@ func TestEvaluateFileReportRoot_GroupCountReflectsSiblingDuplicates(t *testing.T
 func TestEvaluateFileReportRoot_MismatchedSeasonWalkedFileIsSkippedUntrusted(t *testing.T) {
 	dir := t.TempDir()
 	writeFixtureFiles(t, dir,
-		"Show/Show.S01E05.mkv",     // tracked
-		"Show/Show.S01E05 (2).mkv", // skipped-untrusted: season 1 is mismatched
-		"Show/Show.S02E01.mkv",     // duplicate: season 2 is not mismatched
+		"Show/Season 01/Show.S01E05.mkv",     // tracked
+		"Show/Season 01/Show.S01E05 (2).mkv", // skipped-untrusted: season 1 is mismatched (by folder)
+		"Show/Season 02/Show.S02E01.mkv",     // duplicate: season 2 is not mismatched (by folder)
 	)
 	root := mediaRoot{arrPath: "/tv_shows", diskPath: dir}
 	set := instanceTrackedSet{
-		files:             map[string]bool{filepath.Join(dir, "Show/Show.S01E05.mkv"): true},
+		files:             map[string]bool{filepath.Join(dir, "Show/Season 01/Show.S01E05.mkv"): true},
 		folders:           map[string]string{filepath.Join(dir, "Show"): "Show"},
 		seriesFolder:      map[string]bool{filepath.Join(dir, "Show"): true},
 		mismatchedSeasons: map[string]map[int]bool{filepath.Join(dir, "Show"): {1: true}},
@@ -205,6 +205,56 @@ func TestEvaluateFileReportRoot_MismatchedSeasonWalkedFileIsSkippedUntrusted(t *
 		t.Errorf("findings = %+v, want exactly one duplicate (season 2, not excluded)", outcome.findings)
 	}
 	assertFileReportIdentity(t, 3, outcome)
+}
+
+// TestEvaluateFileReportRoot_MismatchedSeasonExclusionIsByFolderNotFilename
+// is the walk-level pin for binding controller resolution 5's "never
+// guessed" requirement, covering both shapes the classify-level tests above
+// pin individually: (1) a file physically inside the distrusted "Season 01"
+// folder but misleadingly NAMED as season 2 must still be excluded, and (2) a
+// season-folders-disabled series (files flat in the series folder) with any
+// mismatched season must withhold ALL its extra files from duplicate
+// candidacy, since none of their seasons can be determined from location.
+func TestEvaluateFileReportRoot_MismatchedSeasonExclusionIsByFolderNotFilename(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureFiles(t, dir,
+		"Show A/Season 01/Show A.S01E05.mkv", // tracked
+		"Show A/Season 01/Show A.S02E01.mkv", // skipped-untrusted: folder says season 1 (mismatched), filename lies
+		"Flat Show/Flat Show.S01E01.mkv",     // tracked
+		"Flat Show/Flat Show.S02E09.mkv",     // skipped-untrusted: season folders off, season 1 of this series is mismatched, cannot rule this file out
+	)
+	root := mediaRoot{arrPath: "/tv_shows", diskPath: dir}
+	set := instanceTrackedSet{
+		files: map[string]bool{
+			filepath.Join(dir, "Show A/Season 01/Show A.S01E05.mkv"): true,
+			filepath.Join(dir, "Flat Show/Flat Show.S01E01.mkv"):     true,
+		},
+		folders: map[string]string{
+			filepath.Join(dir, "Show A"):    "Show A",
+			filepath.Join(dir, "Flat Show"): "Flat Show",
+		},
+		seriesFolder: map[string]bool{
+			filepath.Join(dir, "Show A"):    true,
+			filepath.Join(dir, "Flat Show"): true,
+		},
+		mismatchedSeasons: map[string]map[int]bool{
+			filepath.Join(dir, "Show A"):    {1: true},
+			filepath.Join(dir, "Flat Show"): {1: true},
+		},
+	}
+	logger, _ := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "sonarr-main", Type: "sonarr"}, root, set)
+
+	if outcome.skipped {
+		t.Fatalf("outcome unexpectedly skipped: %+v", outcome)
+	}
+	if len(outcome.findings) != 0 {
+		t.Errorf("findings = %+v, want none: both extra files must be withheld as skipped-untrusted, never guessed as duplicates", outcome.findings)
+	}
+	if outcome.seenSkippedUntrusted != 2 {
+		t.Errorf("seenSkippedUntrusted = %d, want 2", outcome.seenSkippedUntrusted)
+	}
+	assertFileReportIdentity(t, 4, outcome)
 }
 
 // --- mount-problem heuristic (binding controller resolution 4) -------------
@@ -305,22 +355,64 @@ func TestEvaluateFileReportRoot_ZeroTrackedFilesSkipsHeuristicB(t *testing.T) {
 	}
 }
 
+// TestEvaluateFileReportRoot_TrackedFoldersButZeroTrackedFilesAborts pins the
+// mount-problem heuristic's missing symmetric guard: heuristics (b) and (c)
+// are both gated on len(tracked) > 0, so an EMPTY tracked-FILE set (e.g.
+// every movieFile.path was absent or wrongly named — a systemic bug, not a
+// mount problem) disables the whole safeguard while set.folders stays
+// populated from movie.path. Without this guard, every real file in those
+// folders matches its containing folder but no tracked file and is reported
+// as kind=duplicate — the whole library, confidently. A root that tracks
+// FOLDERS (movies/series are known to live under it) but has ZERO tracked
+// FILES under it is exactly as untrustworthy as heuristic (b)'s missing-
+// files case, so it must abort the same way, before ever walking.
+func TestEvaluateFileReportRoot_TrackedFoldersButZeroTrackedFilesAborts(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureFiles(t, dir, "Movie A/Movie A.mkv")
+	root := mediaRoot{arrPath: "/movies", diskPath: dir}
+	set := instanceTrackedSet{
+		files:   map[string]bool{}, // every movieFile.path failed to map/read
+		folders: map[string]string{filepath.Join(dir, "Movie A"): "Movie A"},
+	}
+	logger, buf := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "radarr-main", Type: "radarr"}, root, set)
+	if !outcome.skipped {
+		t.Fatal("a root tracking folders but zero files under it must abort rather than report every real file as a duplicate")
+	}
+	if len(outcome.findings) != 0 {
+		t.Errorf("an aborted root must report nothing: %+v", outcome.findings)
+	}
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("expected a WARN naming the root:\n%s", buf.String())
+	}
+}
+
+// TestEvaluateFileReportRoot_TrackedFilesButZeroVideoFilesOnWalkAborts must
+// actually exercise heuristic (c), not (b): the tracked file has to EXIST on
+// disk (so heuristic (b)'s "≥90% of sampled tracked files present" check
+// legitimately passes and lets the walk run at all) but under an
+// unrecognized extension, so classifyFileReportPath's extension check (which
+// runs BEFORE the set.files lookup, by design — resolution 6) filters it out
+// before it can ever be recognized as fileKindTracked, and the walk
+// therefore finds zero files of any recognized video kind. This is the real
+// scenario heuristic (c) exists for: a library whose real media files all
+// carry an extension outside the frozen 6-item videoExtensions set
+// (.m4v/.mov/.iso), not merely "the file happens to be missing" (which is
+// heuristic (b)'s job, already covered by
+// TestEvaluateFileReportRoot_MostTrackedFilesMissingAborts).
 func TestEvaluateFileReportRoot_TrackedFilesButZeroVideoFilesOnWalkAborts(t *testing.T) {
 	dir := t.TempDir()
-	// The tracked file itself is missing (so heuristic b already would catch a
-	// LARGE tracked set) but here there is exactly one tracked file and NO
-	// video files anywhere on disk at all — heuristic (c) specifically.
-	writeFixtureFiles(t, dir, "Movie A/poster.jpg")
-	files := map[string]bool{filepath.Join(dir, "Movie A", "Movie A.mkv"): true}
+	present := writeFixtureFiles(t, dir, "Movie A/Movie A.m4v")
+	files := map[string]bool{present[0]: true}
 	root := mediaRoot{arrPath: "/movies", diskPath: dir}
 	set := instanceTrackedSet{files: files, folders: map[string]string{filepath.Join(dir, "Movie A"): "Movie A"}}
 	logger, buf := newFileReportTestLogger(slog.LevelDebug)
 	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "radarr-main", Type: "radarr"}, root, set)
 	if !outcome.skipped {
-		t.Fatal("a root tracking N>0 files with zero video files found on walk must abort (mount-problem heuristic c)")
+		t.Fatal("a root tracking N>0 files (present on disk) with zero RECOGNIZED video files found on walk must abort (mount-problem heuristic c)")
 	}
-	if !strings.Contains(buf.String(), "level=WARN") {
-		t.Errorf("expected a WARN naming the root:\n%s", buf.String())
+	if !strings.Contains(buf.String(), "it tracks files but the walk found zero video files of any kind") {
+		t.Errorf("expected heuristic (c)'s own WARN text, not just any WARN (a bare level=WARN match would not have caught this test previously tripping heuristic (b) instead):\n%s", buf.String())
 	}
 }
 
@@ -381,6 +473,74 @@ func TestEvaluateFileReportRoot_ShutdownAbortsTheWalk(t *testing.T) {
 	if !outcome.skipped {
 		t.Fatal("a cancelled context must abort the walk rather than report a partial root")
 	}
+}
+
+// --- symlinks (binding controller resolution 2: "symlinks NOT resolved
+// (lexical comparison on mapped paths)") ------------------------------------
+//
+// Nothing in filereport.go ever calls filepath.EvalSymlinks or os.Readlink —
+// comparison is purely lexical on the strings mapArrPathToDisk produces —
+// so these tests pin the two consequences a live read-only mount will
+// actually meet: a symlink pointing AT a tracked file is a different lexical
+// path, so its own name is reported as a duplicate; and fs.WalkDir never
+// follows a symlinked directory (a symlink's DirEntry.IsDir() is false
+// regardless of what it points to), so nothing behind one is ever visited.
+
+func TestEvaluateFileReportRoot_SymlinkToTrackedFileIsReportedAsDuplicate(t *testing.T) {
+	dir := t.TempDir()
+	real := writeFixtureFiles(t, dir, "Movie A/Movie A.mkv")[0]
+	symlinkPath := filepath.Join(dir, "Movie A", "Movie A (2).mkv")
+	if err := os.Symlink(real, symlinkPath); err != nil {
+		t.Skipf("symlinks unavailable on this filesystem: %v", err)
+	}
+
+	root := mediaRoot{arrPath: "/movies", diskPath: dir}
+	set := instanceTrackedSet{
+		files:   map[string]bool{real: true},
+		folders: map[string]string{filepath.Join(dir, "Movie A"): "Movie A"},
+	}
+	logger, _ := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "radarr-main", Type: "radarr"}, root, set)
+	if outcome.skipped {
+		t.Fatalf("outcome unexpectedly skipped: %+v", outcome)
+	}
+	if len(outcome.findings) != 1 || outcome.findings[0].kind != fileKindDuplicate || outcome.findings[0].diskPath != symlinkPath {
+		t.Errorf("findings = %+v, want exactly one duplicate at the symlink's own (unresolved) path %q", outcome.findings, symlinkPath)
+	}
+}
+
+func TestEvaluateFileReportRoot_SymlinkedSubdirectoryIsNotDescendedInto(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureFiles(t, dir, "Movie A/Movie A.mkv")
+	// A real directory OUTSIDE the walked root, containing a real video
+	// file, symlinked in as a subdirectory of a tracked folder.
+	outside := t.TempDir()
+	writeFixtureFiles(t, outside, "hidden.mkv")
+	symlinkDir := filepath.Join(dir, "Movie A", "Linked")
+	if err := os.Symlink(outside, symlinkDir); err != nil {
+		t.Skipf("symlinks unavailable on this filesystem: %v", err)
+	}
+
+	root := mediaRoot{arrPath: "/movies", diskPath: dir}
+	set := instanceTrackedSet{
+		files:   map[string]bool{filepath.Join(dir, "Movie A", "Movie A.mkv"): true},
+		folders: map[string]string{filepath.Join(dir, "Movie A"): "Movie A"},
+	}
+	logger, _ := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "radarr-main", Type: "radarr"}, root, set)
+	if outcome.skipped {
+		t.Fatalf("outcome unexpectedly skipped: %+v", outcome)
+	}
+	for _, f := range outcome.findings {
+		if strings.Contains(f.diskPath, "hidden.mkv") {
+			t.Errorf("the walk must never descend into a symlinked directory: found %q", f.diskPath)
+		}
+	}
+	// The symlink entry itself is visited (as a non-directory DirEntry, per
+	// fs.WalkDir's own contract) but has no recognized video extension by
+	// name ("Linked"), so it resolves as skipped-by-rule/extension — one
+	// more file seen by the walk, not a directory descended into.
+	assertFileReportIdentity(t, 2, outcome)
 }
 
 // --- path mapping (binding controller resolution 2) -------------------------
@@ -460,6 +620,29 @@ func TestMapArrPathToDisk_TrailingSlashesNormalized(t *testing.T) {
 	got, ok := mapArrPathToDisk("/movies/Title/", root)
 	if !ok || got != "/data/media/Movies/Title" {
 		t.Errorf("mapArrPathToDisk with trailing slash = %q, %v", got, ok)
+	}
+}
+
+// TestMapArrPathToDisk_RootArrPathIsSlash pins a real config
+// (media_root_map: {"/": "/data/media"}) that validateConfig accepts (both
+// sides are absolute and non-empty). hasPathPrefix special-cases prefix=="/"
+// to match everything without the usual "prefix+/" construction, so the
+// mapping side must special-case it too, or the leading separator gets
+// stripped from the suffix and every path silently mis-maps (e.g.
+// "/movies/X/y.mkv" would become "/data/mediamovies/X/y.mkv" instead of
+// "/data/media/movies/X/y.mkv") — corrupted mapped paths that fall outside
+// root.diskPath entirely, disarming both mount-problem heuristics (they
+// sample/require tracked files actually under the root) and reporting the
+// whole library as orphans.
+func TestMapArrPathToDisk_RootArrPathIsSlash(t *testing.T) {
+	root := mediaRoot{arrPath: "/", diskPath: "/data/media"}
+	got, ok := mapArrPathToDisk("/movies/X/y.mkv", root)
+	if !ok {
+		t.Fatal("expected a mapping")
+	}
+	want := "/data/media/movies/X/y.mkv"
+	if got != want {
+		t.Errorf("mapArrPathToDisk = %q, want %q", got, want)
 	}
 }
 
@@ -577,6 +760,31 @@ func TestClassifyFileReportPath_ExtraFileInTrackedFolderIsDuplicate(t *testing.T
 	}
 }
 
+// TestClassifyFileReportPath_ExcludedFolderWithholdsExtraFilesFromDuplicates
+// pins the exclusion_tag fix: README.md says the tag "opts an item out of
+// everything cutoffarr does, in every mode, including dry-run reporting".
+// An extra file inside an excluded item's folder must not be printed as
+// kind=duplicate naming that item.
+func TestClassifyFileReportPath_ExcludedFolderWithholdsExtraFilesFromDuplicates(t *testing.T) {
+	root := mediaRoot{arrPath: "/movies", diskPath: "/data/Movies"}
+	set := instanceTrackedSet{
+		files:           map[string]bool{"/data/Movies/Title/movie.mkv": true},
+		folders:         map[string]string{"/data/Movies/Title": "Title"},
+		excludedFolders: map[string]bool{"/data/Movies/Title": true},
+	}
+	// The movie's own tracked file is still "tracked" — the exclusion tag
+	// must never make it look like an orphan of itself.
+	if c := classifyFileReportPath("/data/Movies/Title/movie.mkv", root, set); c.kind != fileKindTracked {
+		t.Errorf("classify(the excluded item's own file) = %+v, want tracked", c)
+	}
+	// An extra file in that same folder must be withheld, not reported as a
+	// duplicate.
+	c := classifyFileReportPath("/data/Movies/Title/movie (2).mkv", root, set)
+	if c.kind != fileKindSkippedByRule || c.reason != FileSkipReasonExcludedByTag {
+		t.Errorf("classify(extra file in an excluded folder) = %+v, want skipped-by-rule/excluded-by-tag", c)
+	}
+}
+
 func TestClassifyFileReportPath_FileOutsideAnyTrackedFolderIsOrphan(t *testing.T) {
 	root := mediaRoot{arrPath: "/movies", diskPath: "/data/Movies"}
 	set := instanceTrackedSet{files: map[string]bool{}, folders: map[string]string{"/data/Movies/Title": "Title"}}
@@ -594,7 +802,7 @@ func TestClassifyFileReportPath_SonarrSeasonMismatchExcludesFromDuplicateCandida
 		seriesFolder:      map[string]bool{"/data/TV/Show": true},
 		mismatchedSeasons: map[string]map[int]bool{"/data/TV/Show": {1: true}},
 	}
-	c := classifyFileReportPath("/data/TV/Show/Show.S01E05.mkv", root, set)
+	c := classifyFileReportPath("/data/TV/Show/Season 01/Show.S01E05.mkv", root, set)
 	if c.kind != fileKindSkippedUntrusted || c.reason != FileSkipReasonMismatchedSeason {
 		t.Errorf("classify(mismatched season extra) = %+v, want skipped-untrusted/mismatched-season", c)
 	}
@@ -608,9 +816,53 @@ func TestClassifyFileReportPath_SonarrNonMismatchedSeasonIsDuplicate(t *testing.
 		seriesFolder:      map[string]bool{"/data/TV/Show": true},
 		mismatchedSeasons: map[string]map[int]bool{"/data/TV/Show": {1: true}},
 	}
-	c := classifyFileReportPath("/data/TV/Show/Show.S02E05.mkv", root, set)
+	c := classifyFileReportPath("/data/TV/Show/Season 02/Show.S02E05.mkv", root, set)
 	if c.kind != fileKindDuplicate {
 		t.Errorf("classify(season 2, mismatch only on season 1) = %+v, want duplicate", c)
+	}
+}
+
+// TestClassifyFileReportPath_SeasonDeterminedByFolderNotMisleadingFilename
+// pins binding controller resolution 5's "never guessed" requirement against
+// its most direct violation: a file physically living inside a DISTRUSTED
+// "Season 01" folder but named as though it belongs to season 2. The
+// filename must never override the folder it actually sits in.
+func TestClassifyFileReportPath_SeasonDeterminedByFolderNotMisleadingFilename(t *testing.T) {
+	root := mediaRoot{arrPath: "/tv_shows", diskPath: "/data/TV"}
+	set := instanceTrackedSet{
+		files:             map[string]bool{},
+		folders:           map[string]string{"/data/TV/Show": "Show"},
+		seriesFolder:      map[string]bool{"/data/TV/Show": true},
+		mismatchedSeasons: map[string]map[int]bool{"/data/TV/Show": {1: true}},
+	}
+	// Filename claims season 2 (not mismatched); the containing folder says
+	// season 1 (mismatched). Location must win.
+	c := classifyFileReportPath("/data/TV/Show/Season 01/Show.S02E01.mkv", root, set)
+	if c.kind != fileKindSkippedUntrusted || c.reason != FileSkipReasonMismatchedSeason {
+		t.Errorf("classify(misleading filename inside a mismatched season folder) = %+v, want skipped-untrusted/mismatched-season", c)
+	}
+}
+
+// TestClassifyFileReportPath_FlatLayoutSeriesWithAnyMismatchWithheldFromDuplicates
+// pins the second shape resolution 5 forbids guessing on: Sonarr's
+// season-folder option is off (or the file otherwise sits directly in the
+// series folder), so there is no folder name to derive a season from at all.
+// With at least one season of this series already distrusted, the file's
+// season cannot be ruled safe, so it must NOT be reported as a confident
+// duplicate — regardless of what its filename claims.
+func TestClassifyFileReportPath_FlatLayoutSeriesWithAnyMismatchWithheldFromDuplicates(t *testing.T) {
+	root := mediaRoot{arrPath: "/tv_shows", diskPath: "/data/TV"}
+	set := instanceTrackedSet{
+		files:             map[string]bool{},
+		folders:           map[string]string{"/data/TV/Show": "Show"},
+		seriesFolder:      map[string]bool{"/data/TV/Show": true},
+		mismatchedSeasons: map[string]map[int]bool{"/data/TV/Show": {1: true}},
+	}
+	// Filename claims season 2; there is no "Season NN" folder anywhere
+	// between this file and the series folder (season folders disabled).
+	c := classifyFileReportPath("/data/TV/Show/Show.S02E05.mkv", root, set)
+	if c.kind != fileKindSkippedUntrusted || c.reason != FileSkipReasonMismatchedSeason {
+		t.Errorf("classify(flat layout, season undeterminable, series has a mismatch) = %+v, want skipped-untrusted/mismatched-season, not a guessed duplicate", c)
 	}
 }
 
@@ -652,7 +904,7 @@ func TestBuildRadarrTrackedSet_MapsFolderAndFile(t *testing.T) {
 		},
 	}
 	logger, _ := newFileReportTestLogger(slog.LevelDebug)
-	set := buildRadarrTrackedSet(logger, Instance{Name: "radarr-main", Type: "radarr"}, roots, movies)
+	set, _ := buildRadarrTrackedSet(logger, Instance{Name: "radarr-main", Type: "radarr"}, roots, movies, 0, false)
 
 	if set.folders["/data/Movies/Movie A (2020)"] != "Movie A" {
 		t.Errorf("folders = %v, want the mapped folder keyed to the title", set.folders)
@@ -668,7 +920,7 @@ func TestBuildRadarrTrackedSet_NoFileMeansOnlyFolderTracked(t *testing.T) {
 		{ID: intPtr(1), Title: strPtr("Not Downloaded"), HasFile: boolPtr(false), Path: strPtr("/movies/Not Downloaded")},
 	}
 	logger, _ := newFileReportTestLogger(slog.LevelDebug)
-	set := buildRadarrTrackedSet(logger, Instance{Name: "radarr-main", Type: "radarr"}, roots, movies)
+	set, _ := buildRadarrTrackedSet(logger, Instance{Name: "radarr-main", Type: "radarr"}, roots, movies, 0, false)
 	if set.folders["/data/Movies/Not Downloaded"] != "Not Downloaded" {
 		t.Errorf("folders = %v, want the folder tracked even with no file", set.folders)
 	}
@@ -693,7 +945,7 @@ func TestBuildRadarrTrackedSet_AbsentMoviePathStillTracksItsOwnFile(t *testing.T
 		},
 	}
 	logger, buf := newFileReportTestLogger(slog.LevelDebug)
-	set := buildRadarrTrackedSet(logger, Instance{Name: "radarr-main", Type: "radarr"}, roots, movies)
+	set, _ := buildRadarrTrackedSet(logger, Instance{Name: "radarr-main", Type: "radarr"}, roots, movies, 0, false)
 	if !set.files["/data/Movies/Mystery Path/file.mkv"] {
 		t.Errorf("files = %v, want the tracked file protected even without a known folder", set.files)
 	}
@@ -705,13 +957,46 @@ func TestBuildRadarrTrackedSet_AbsentMoviePathStillTracksItsOwnFile(t *testing.T
 	}
 }
 
+// TestBuildRadarrTrackedSet_HasFileNilButMovieFilePathReadableStillTracksFile
+// pins the fix for the false-orphan-of-your-own-file bug: HasFile absent
+// (untrusted input — could mean "not yet imported" OR could mean the field
+// simply wasn't parsed) must never be treated as "this movie's file cannot
+// be readable," because a perfectly readable movieFile.path is independent
+// evidence the movie file protection should ride on. Gating the tracked-FILE
+// half on HasFile==true (decision.go's forward-engine idiom, safe there
+// because absent-as-false only means "do not unmonitor") inverts to unsafe
+// here: it would silently drop the movie's own real file from set.files,
+// after which the SAME file gets classified as a duplicate/orphan of itself
+// by classifyFileReportPath.
+func TestBuildRadarrTrackedSet_HasFileNilButMovieFilePathReadableStillTracksFile(t *testing.T) {
+	roots := []mediaRoot{{arrPath: "/movies", diskPath: "/data/Movies"}}
+	movies := []movieListElement{
+		{
+			ID: intPtr(1), Title: strPtr("Untrusted HasFile"), HasFile: nil,
+			Path:      strPtr("/movies/Untrusted HasFile"),
+			MovieFile: &movieFileElement{Path: strPtr("/movies/Untrusted HasFile/file.mkv")},
+		},
+	}
+	logger, buf := newFileReportTestLogger(slog.LevelDebug)
+	set, _ := buildRadarrTrackedSet(logger, Instance{Name: "radarr-main", Type: "radarr"}, roots, movies, 0, false)
+	if !set.files["/data/Movies/Untrusted HasFile/file.mkv"] {
+		t.Errorf("files = %v, want the movie's own readable file tracked even though hasFile is absent", set.files)
+	}
+	// hasFile absent with a readable path is not itself a contradiction (no
+	// warning demanded): the warning exists for hasFile=true with an
+	// UNREADABLE path (the genuinely suspicious combination), pinned by
+	// TestBuildRadarrTrackedSet_HasFileButAbsentMovieFilePathWarnsAndExcludes
+	// below.
+	_ = buf
+}
+
 func TestBuildRadarrTrackedSet_HasFileButAbsentMovieFilePathWarnsAndExcludes(t *testing.T) {
 	roots := []mediaRoot{{arrPath: "/movies", diskPath: "/data/Movies"}}
 	movies := []movieListElement{
 		{ID: intPtr(1), Title: strPtr("Broken"), HasFile: boolPtr(true), Path: strPtr("/movies/Broken"), MovieFile: nil},
 	}
 	logger, buf := newFileReportTestLogger(slog.LevelDebug)
-	set := buildRadarrTrackedSet(logger, Instance{Name: "radarr-main", Type: "radarr"}, roots, movies)
+	set, _ := buildRadarrTrackedSet(logger, Instance{Name: "radarr-main", Type: "radarr"}, roots, movies, 0, false)
 	if len(set.files) != 0 {
 		t.Errorf("files = %v, want none: movieFile.path could not be read", set.files)
 	}
@@ -725,7 +1010,16 @@ func TestBuildRadarrTrackedSet_HasFileButAbsentMovieFilePathWarnsAndExcludes(t *
 	}
 }
 
-func TestBuildRadarrTrackedSet_PathOutsideAnyRootIsIgnoredSilently(t *testing.T) {
+// TestBuildRadarrTrackedSet_PathOutsideAnyRootIsCountedNotSilentlyDropped
+// pins the [plan-mandated] fix: the Phase 10 binding "Next phase inputs"
+// require "a tracked path that matches NO mapping is a skip+warn counted
+// under a skip reason, never an orphan". A movie's path/movieFile.path
+// mapping to none of the configured roots is still not worth a per-item
+// WARN (that would flood the log for every legitimately out-of-scope movie
+// on a multi-root instance), but it MUST be counted so a media_root_map typo
+// that silently maps nothing is distinguishable, on the always-INFO summary,
+// from a genuinely clean library.
+func TestBuildRadarrTrackedSet_PathOutsideAnyRootIsCountedNotSilentlyDropped(t *testing.T) {
 	roots := []mediaRoot{{arrPath: "/movies", diskPath: "/data/Movies"}}
 	movies := []movieListElement{
 		{
@@ -735,12 +1029,46 @@ func TestBuildRadarrTrackedSet_PathOutsideAnyRootIsIgnoredSilently(t *testing.T)
 		},
 	}
 	logger, buf := newFileReportTestLogger(slog.LevelDebug)
-	set := buildRadarrTrackedSet(logger, Instance{Name: "radarr-main", Type: "radarr"}, roots, movies)
+	set, skipCounts := buildRadarrTrackedSet(logger, Instance{Name: "radarr-main", Type: "radarr"}, roots, movies, 0, false)
 	if len(set.files) != 0 || len(set.folders) != 0 {
-		t.Errorf("a movie entirely outside every configured root must contribute nothing: %+v", set)
+		t.Errorf("a movie entirely outside every configured root must contribute nothing to the tracked set: %+v", set)
 	}
 	if strings.Contains(buf.String(), "level=WARN") {
-		t.Errorf("a movie outside every configured root is not this instance's problem and must not warn:\n%s", buf.String())
+		t.Errorf("a movie outside every configured root is not this instance's problem and must not warn per-item:\n%s", buf.String())
+	}
+	// Both the folder (movie.path) and the file (movieFile.path) are outside
+	// every configured root, so both must be counted.
+	if got := skipCounts[FileSkipReasonOutsideConfiguredRoots]; got != 2 {
+		t.Errorf("skipCounts[outside configured roots] = %d, want 2 (folder + file)", got)
+	}
+}
+
+// TestBuildRadarrTrackedSet_ExclusionTagMarksTheFolderExcluded pins the
+// exclusion_tag fix: a tagged movie's folder is still tracked (so its own
+// file is protected) but is also recorded in excludedFolders, and a movie
+// WITHOUT the tag is not.
+func TestBuildRadarrTrackedSet_ExclusionTagMarksTheFolderExcluded(t *testing.T) {
+	const exclusionTagID = 9
+	roots := []mediaRoot{{arrPath: "/movies", diskPath: "/data/Movies"}}
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("Tagged"), HasFile: boolPtr(true), Tags: &[]int{exclusionTagID},
+			Path: strPtr("/movies/Tagged"), MovieFile: &movieFileElement{Path: strPtr("/movies/Tagged/Tagged.mkv")}},
+		{ID: intPtr(2), Title: strPtr("Untagged"), HasFile: boolPtr(true), Tags: &[]int{},
+			Path: strPtr("/movies/Untagged"), MovieFile: &movieFileElement{Path: strPtr("/movies/Untagged/Untagged.mkv")}},
+	}
+	logger, _ := newFileReportTestLogger(slog.LevelDebug)
+	set, _ := buildRadarrTrackedSet(logger, Instance{Name: "radarr-main", Type: "radarr"}, roots, movies, exclusionTagID, true)
+	if !set.excludedFolders["/data/Movies/Tagged"] {
+		t.Errorf("excludedFolders = %v, want the tagged movie's folder excluded", set.excludedFolders)
+	}
+	if set.excludedFolders["/data/Movies/Untagged"] {
+		t.Errorf("excludedFolders = %v, want the untagged movie's folder NOT excluded", set.excludedFolders)
+	}
+	// The tag must never affect whether tagActive is false: with the feature
+	// inactive, nothing is ever excluded.
+	setInactive, _ := buildRadarrTrackedSet(logger, Instance{Name: "radarr-main", Type: "radarr"}, roots, movies, exclusionTagID, false)
+	if len(setInactive.excludedFolders) != 0 {
+		t.Errorf("excludedFolders = %v, want none when tagActive is false", setInactive.excludedFolders)
 	}
 }
 
@@ -752,7 +1080,7 @@ func TestBuildRadarrTrackedSet_PathOutsideAnyRootIsIgnoredSilently(t *testing.T)
 
 func TestRunRadarrFileReport_NoMediaRootMapIsOff(t *testing.T) {
 	logger, _ := newFileReportTestLogger(slog.LevelDebug)
-	c := runRadarrFileReport(context.Background(), logger, slog.LevelInfo, Instance{Name: "radarr-main", Type: "radarr"}, nil)
+	c := runRadarrFileReport(context.Background(), logger, slog.LevelInfo, Instance{Name: "radarr-main", Type: "radarr"}, nil, 0, false)
 	if c.state() != "off" {
 		t.Errorf("state() = %q, want off when media_root_map is absent", c.state())
 	}
@@ -767,12 +1095,42 @@ func TestRunRadarrFileReport_CleanLibraryRansWithZeroFindings(t *testing.T) {
 			Path: strPtr("/movies/Movie A"), MovieFile: &movieFileElement{Path: strPtr("/movies/Movie A/Movie A.mkv")}},
 	}
 	logger, _ := newFileReportTestLogger(slog.LevelDebug)
-	c := runRadarrFileReport(context.Background(), logger, slog.LevelInfo, inst, movies)
+	c := runRadarrFileReport(context.Background(), logger, slog.LevelInfo, inst, movies, 0, false)
 	if c.state() != "ran" {
 		t.Errorf("state() = %q, want ran", c.state())
 	}
 	if c.duplicates != 0 || c.orphans != 0 {
 		t.Errorf("duplicates=%d orphans=%d, want 0/0 for a clean library", c.duplicates, c.orphans)
+	}
+}
+
+// TestRunRadarrFileReport_ExcludedMoviesExtraFilesAreWithheldEndToEnd is the
+// end-to-end pin for honoring exclusion_tag in the file report: README.md
+// states the tag "opts an item out of everything cutoffarr does, in every
+// mode, including dry-run reporting" — an extra file inside a tagged
+// movie's own folder must never be printed as kind=duplicate.
+func TestRunRadarrFileReport_ExcludedMoviesExtraFilesAreWithheldEndToEnd(t *testing.T) {
+	const exclusionTagID = 9
+	dir := t.TempDir()
+	writeFixtureFiles(t, dir, "Tagged/Tagged.mkv", "Tagged/Tagged (2).mkv")
+	inst := Instance{Name: "radarr-main", Type: "radarr", MediaRootMap: map[string]string{"/movies": dir}}
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("Tagged"), HasFile: boolPtr(true), Tags: &[]int{exclusionTagID},
+			Path: strPtr("/movies/Tagged"), MovieFile: &movieFileElement{Path: strPtr("/movies/Tagged/Tagged.mkv")}},
+	}
+	logger, buf := newFileReportTestLogger(slog.LevelDebug)
+	c := runRadarrFileReport(context.Background(), logger, slog.LevelInfo, inst, movies, exclusionTagID, true)
+	if c.state() != "ran" {
+		t.Fatalf("state() = %q, want ran", c.state())
+	}
+	if c.duplicates != 0 {
+		t.Errorf("duplicates=%d, want 0: the extra file belongs to an excluded movie and must never be reported", c.duplicates)
+	}
+	if got := c.skipReasons[FileSkipReasonExcludedByTag]; got != 1 {
+		t.Errorf("skipReasons[excluded by tag] = %d, want 1", got)
+	}
+	if strings.Contains(buf.String(), `kind=duplicate`) {
+		t.Errorf("no duplicate finding may be logged for an excluded movie's folder:\n%s", buf.String())
 	}
 }
 
@@ -789,7 +1147,7 @@ func TestRunRadarrFileReport_FindingsAreCountedAndAbortedRootIsSkipped(t *testin
 			Path: strPtr("/movies/Movie A"), MovieFile: &movieFileElement{Path: strPtr("/movies/Movie A/Movie A.mkv")}},
 	}
 	logger, buf := newFileReportTestLogger(slog.LevelDebug)
-	c := runRadarrFileReport(context.Background(), logger, slog.LevelInfo, inst, movies)
+	c := runRadarrFileReport(context.Background(), logger, slog.LevelInfo, inst, movies, 0, false)
 	if c.state() != "skipped" {
 		t.Errorf("state() = %q, want skipped: one of two roots aborted", c.state())
 	}
@@ -800,6 +1158,64 @@ func TestRunRadarrFileReport_FindingsAreCountedAndAbortedRootIsSkipped(t *testin
 	}
 	if !strings.Contains(buf.String(), "level=WARN") {
 		t.Errorf("the aborted root must still warn:\n%s", buf.String())
+	}
+}
+
+// TestRunRadarrFileReport_UnmappedTrackedPathSurfacesOnTheSummary is the
+// [plan-mandated] end-to-end pin: the Phase 10 binding "Next phase inputs"
+// require an unmapped tracked path be "counted under a skip reason" so a
+// media_root_map typo — configuring "/Movies" while Radarr reports
+// "/movies" (comparison is deliberately case-SENSITIVE) — is distinguishable
+// on the always-INFO summary from a genuinely clean, fully-mapped library:
+// both would otherwise log fileReport=ran duplicates=0 orphans=0
+// fileSkipReasons="none".
+func TestRunRadarrFileReport_UnmappedTrackedPathSurfacesOnTheSummary(t *testing.T) {
+	dir := t.TempDir()
+	inst := Instance{Name: "radarr-main", Type: "radarr", MediaRootMap: map[string]string{"/movies": dir}}
+	movies := []movieListElement{
+		// The configured root is "/movies"; this movie's arr-side path is
+		// "/Movies" (case mismatch) — a config typo that maps NOTHING.
+		{ID: intPtr(1), Title: strPtr("Movie A"), HasFile: boolPtr(true),
+			Path: strPtr("/Movies/Movie A"), MovieFile: &movieFileElement{Path: strPtr("/Movies/Movie A/Movie A.mkv")}},
+	}
+	logger, buf := newFileReportTestLogger(slog.LevelInfo)
+	c := runRadarrFileReport(context.Background(), logger, slog.LevelInfo, inst, movies, 0, false)
+	if c.state() != "ran" {
+		t.Fatalf("state() = %q, want ran (the root itself is healthy; only the movie's own path failed to map)", c.state())
+	}
+	if got := c.skipReasons[FileSkipReasonOutsideConfiguredRoots]; got != 2 {
+		t.Errorf("skipReasons[outside configured roots] = %d, want 2 (folder + file)", got)
+	}
+	logFileReportSummary(logger, inst, c)
+	out := buf.String()
+	if !strings.Contains(out, FileSkipReasonOutsideConfiguredRoots) {
+		t.Errorf("the summary line must name the reason, so this is never indistinguishable from a clean library:\n%s", out)
+	}
+}
+
+// TestRunRadarrFileReport_UntrackedPathIsAlsoCountedOnTheSummary is
+// UnmappedTrackedPathSurfacesOnTheSummary's twin for the OTHER build-time
+// skip reason: a path absent/unreadable altogether (FileSkipReasonUntrackedPath)
+// already warned per-item, but was NOT folded into the summary's
+// fileSkipReasons before this fix — so a cycle whose tracked set was
+// knowingly incomplete could still summarize as fileSkipReasons="none".
+func TestRunRadarrFileReport_UntrackedPathIsAlsoCountedOnTheSummary(t *testing.T) {
+	dir := t.TempDir()
+	inst := Instance{Name: "radarr-main", Type: "radarr", MediaRootMap: map[string]string{"/movies": dir}}
+	movies := []movieListElement{
+		// No Path at all: movie.path absent.
+		{ID: intPtr(1), Title: strPtr("No Path"), HasFile: boolPtr(false)},
+	}
+	logger, _ := newFileReportTestLogger(slog.LevelInfo)
+	c := runRadarrFileReport(context.Background(), logger, slog.LevelInfo, inst, movies, 0, false)
+	if got := c.skipReasons[FileSkipReasonUntrackedPath]; got != 1 {
+		t.Errorf("skipReasons[untracked path] = %d, want 1", got)
+	}
+	var buf bytes.Buffer
+	summaryLogger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logFileReportSummary(summaryLogger, inst, c)
+	if !strings.Contains(buf.String(), FileSkipReasonUntrackedPath) {
+		t.Errorf("the summary line must name the reason:\n%s", buf.String())
 	}
 }
 
@@ -818,7 +1234,7 @@ func TestRunRadarrFileReport_ShutdownBetweenRootsAbandonsRemainingRoots(t *testi
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	c := runRadarrFileReport(ctx, logger, slog.LevelInfo, inst, movies)
+	c := runRadarrFileReport(ctx, logger, slog.LevelInfo, inst, movies, 0, false)
 	if c.state() != "skipped" {
 		t.Errorf("state() = %q, want skipped: a cancelled context must abandon the remaining roots rather than report a partial picture", c.state())
 	}
@@ -940,7 +1356,7 @@ func TestBuildSonarrTrackedSet_HappyPath_TracksFolderAndFiles(t *testing.T) {
 	series := []seriesElement{{ID: intPtr(1), Title: strPtr("Show"), Path: strPtr("/tv_shows/Show")}}
 
 	logger, _ := newFileReportTestLogger(slog.LevelDebug)
-	set, ok := buildSonarrTrackedSet(context.Background(), logger, client, inst, roots, series, nil)
+	set, _, ok := buildSonarrTrackedSet(context.Background(), logger, client, inst, roots, series, nil, 0, false)
 	if !ok {
 		t.Fatal("buildSonarrTrackedSet returned ok=false")
 	}
@@ -961,12 +1377,32 @@ func TestBuildSonarrTrackedSet_MismatchedSeasonsCarriedThroughByFolder(t *testin
 	mismatched := map[int]map[int]bool{1: {2: true}}
 
 	logger, _ := newFileReportTestLogger(slog.LevelDebug)
-	set, ok := buildSonarrTrackedSet(context.Background(), logger, client, inst, roots, series, mismatched)
+	set, _, ok := buildSonarrTrackedSet(context.Background(), logger, client, inst, roots, series, mismatched, 0, false)
 	if !ok {
 		t.Fatal("buildSonarrTrackedSet returned ok=false")
 	}
 	if !set.mismatchedSeasons["/data/TV/Show"][2] {
 		t.Errorf("mismatchedSeasons = %v, want season 2 excluded under the mapped folder", set.mismatchedSeasons)
+	}
+}
+
+// TestBuildSonarrTrackedSet_ExclusionTagMarksTheFolderExcluded is the Sonarr
+// twin of TestBuildRadarrTrackedSet_ExclusionTagMarksTheFolderExcluded.
+func TestBuildSonarrTrackedSet_ExclusionTagMarksTheFolderExcluded(t *testing.T) {
+	const exclusionTagID = 9
+	fake := newEpisodeFileFakeServer(t, map[string]string{"1": `[]`})
+	client := NewAPIClient(fake.srv.URL, "key")
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: fake.srv.URL, APIKey: "key"}
+	roots := []mediaRoot{{arrPath: "/tv_shows", diskPath: "/data/TV"}}
+	series := []seriesElement{{ID: intPtr(1), Title: strPtr("Show"), Path: strPtr("/tv_shows/Show"), Tags: &[]int{exclusionTagID}}}
+
+	logger, _ := newFileReportTestLogger(slog.LevelDebug)
+	set, _, ok := buildSonarrTrackedSet(context.Background(), logger, client, inst, roots, series, nil, exclusionTagID, true)
+	if !ok {
+		t.Fatal("buildSonarrTrackedSet returned ok=false")
+	}
+	if !set.excludedFolders["/data/TV/Show"] {
+		t.Errorf("excludedFolders = %v, want the tagged series' folder excluded", set.excludedFolders)
 	}
 }
 
@@ -980,7 +1416,7 @@ func TestBuildSonarrTrackedSet_AbsentSeriesPathStillFetchesAndTracksFiles(t *tes
 	series := []seriesElement{{ID: intPtr(1), Title: strPtr("Show"), Path: nil}}
 
 	logger, buf := newFileReportTestLogger(slog.LevelDebug)
-	set, ok := buildSonarrTrackedSet(context.Background(), logger, client, inst, roots, series, nil)
+	set, _, ok := buildSonarrTrackedSet(context.Background(), logger, client, inst, roots, series, nil, 0, false)
 	if !ok {
 		t.Fatal("buildSonarrTrackedSet returned ok=false")
 	}
@@ -995,6 +1431,11 @@ func TestBuildSonarrTrackedSet_AbsentSeriesPathStillFetchesAndTracksFiles(t *tes
 	}
 }
 
+// TestBuildSonarrTrackedSet_SeriesPathOutsideEveryRootSkipsTheFetchEntirely
+// is also the [plan-mandated] pin for the Sonarr twin of
+// TestBuildRadarrTrackedSet_PathOutsideAnyRootIsCountedNotSilentlyDropped:
+// no per-item warn (still avoids flooding a multi-root instance), but the
+// occurrence IS counted so it surfaces on the summary.
 func TestBuildSonarrTrackedSet_SeriesPathOutsideEveryRootSkipsTheFetchEntirely(t *testing.T) {
 	fake := newEpisodeFileFakeServer(t, map[string]string{"1": `[]`})
 	client := NewAPIClient(fake.srv.URL, "key")
@@ -1003,15 +1444,50 @@ func TestBuildSonarrTrackedSet_SeriesPathOutsideEveryRootSkipsTheFetchEntirely(t
 	series := []seriesElement{{ID: intPtr(1), Title: strPtr("Elsewhere"), Path: strPtr("/anime/Elsewhere")}}
 
 	logger, buf := newFileReportTestLogger(slog.LevelDebug)
-	_, ok := buildSonarrTrackedSet(context.Background(), logger, client, inst, roots, series, nil)
+	_, skipCounts, ok := buildSonarrTrackedSet(context.Background(), logger, client, inst, roots, series, nil, 0, false)
 	if !ok {
 		t.Fatal("buildSonarrTrackedSet returned ok=false")
+	}
+	if got := skipCounts[FileSkipReasonOutsideConfiguredRoots]; got != 1 {
+		t.Errorf("skipCounts[outside configured roots] = %d, want 1", got)
 	}
 	if n := fake.requestCount(); n != 0 {
 		t.Errorf("a series known to be outside every configured root must not cost an /episodefile fetch, got %d requests", n)
 	}
 	if strings.Contains(buf.String(), "level=WARN") {
 		t.Errorf("a series outside every configured root is not this instance's problem and must not warn:\n%s", buf.String())
+	}
+}
+
+// TestBuildSonarrTrackedSet_MissingSeriesIDDoesNotTrackTheFolder pins the
+// fix for a full-series false-duplicate flood: a series with a readable,
+// in-root path but an absent id can never have its episode files fetched (no
+// way to call /episodefile), so leaving its folder in set.folders would make
+// EVERY real episode on disk classify as a duplicate of a series report has
+// zero tracked files for — the exact "reads as delete this" outcome §2.6
+// exists to prevent. The fix must warn and exclude the folder entirely,
+// mirroring this project's established "missing id field" convention
+// (decision.go).
+func TestBuildSonarrTrackedSet_MissingSeriesIDDoesNotTrackTheFolder(t *testing.T) {
+	fake := newEpisodeFileFakeServer(t, map[string]string{})
+	client := NewAPIClient(fake.srv.URL, "key")
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: fake.srv.URL, APIKey: "key"}
+	roots := []mediaRoot{{arrPath: "/tv_shows", diskPath: "/data/TV"}}
+	series := []seriesElement{{ID: nil, Title: strPtr("No ID"), Path: strPtr("/tv_shows/No ID")}}
+
+	logger, buf := newFileReportTestLogger(slog.LevelDebug)
+	set, _, ok := buildSonarrTrackedSet(context.Background(), logger, client, inst, roots, series, nil, 0, false)
+	if !ok {
+		t.Fatal("buildSonarrTrackedSet returned ok=false")
+	}
+	if len(set.folders) != 0 {
+		t.Errorf("folders = %v, want none: a series with no id can never have its episode files fetched, so its folder must not become a duplicate-generator", set.folders)
+	}
+	if n := fake.requestCount(); n != 0 {
+		t.Errorf("a series with no id must never attempt an /episodefile fetch, got %d requests", n)
+	}
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("a series with no id must warn:\n%s", buf.String())
 	}
 }
 
@@ -1026,7 +1502,7 @@ func TestBuildSonarrTrackedSet_EpisodeFileAbsentPathWarnsAndExcludesJustThatFile
 	series := []seriesElement{{ID: intPtr(1), Title: strPtr("Show"), Path: strPtr("/tv_shows/Show")}}
 
 	logger, buf := newFileReportTestLogger(slog.LevelDebug)
-	set, ok := buildSonarrTrackedSet(context.Background(), logger, client, inst, roots, series, nil)
+	set, _, ok := buildSonarrTrackedSet(context.Background(), logger, client, inst, roots, series, nil, 0, false)
 	if !ok {
 		t.Fatal("buildSonarrTrackedSet returned ok=false")
 	}
@@ -1046,7 +1522,7 @@ func TestBuildSonarrTrackedSet_EpisodeFileFetchFailureAbortsTheWholeInstance(t *
 	series := []seriesElement{{ID: intPtr(1), Title: strPtr("Show"), Path: strPtr("/tv_shows/Show")}}
 
 	logger, buf := newFileReportTestLogger(slog.LevelDebug)
-	_, ok := buildSonarrTrackedSet(context.Background(), logger, client, inst, roots, series, nil)
+	_, _, ok := buildSonarrTrackedSet(context.Background(), logger, client, inst, roots, series, nil, 0, false)
 	if ok {
 		t.Fatal("buildSonarrTrackedSet returned ok=true, want false: a partial tracked set must never be reported as complete")
 	}
@@ -1068,9 +1544,69 @@ func TestBuildSonarrTrackedSet_ShutdownAborts(t *testing.T) {
 	logger, _ := newFileReportTestLogger(slog.LevelDebug)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, ok := buildSonarrTrackedSet(ctx, logger, client, inst, roots, series, nil)
+	_, _, ok := buildSonarrTrackedSet(ctx, logger, client, inst, roots, series, nil, 0, false)
 	if ok {
 		t.Fatal("buildSonarrTrackedSet returned ok=true on a cancelled context, want false")
+	}
+}
+
+// --- buildMismatchedSeasonsIndex ---------------------------------------------
+//
+// buildMismatchedSeasonsIndex had no test of any kind before this: it is the
+// one piece that derives binding controller resolution 5's exclusion index
+// from THIS CYCLE's real forward decisions, and a wrong field, a wrong
+// reason constant, or an empty return would leave the rest of the suite
+// green while every extra file in an untrusted season is confidently
+// reported as a duplicate.
+
+func TestBuildMismatchedSeasonsIndex_TableOfReasonsAndSeries(t *testing.T) {
+	decisions := []seasonDecision{
+		{seriesID: 1, series: "Show A", season: 2, reason: ReasonSeasonFileCountMismatch},
+		// Same series, a DIFFERENT reason on another season: must not be
+		// indexed (reverse.go treats several reasons as alike for OTHER
+		// purposes, but this index is specifically about the file-count
+		// mismatch reason and no other).
+		{seriesID: 1, series: "Show A", season: 3, reason: ReasonSeasonEpisodesUnavailable},
+		// A different series entirely, also file-count-mismatched: must be
+		// indexed under its OWN seriesID, never merged with series 1.
+		{seriesID: 2, series: "Show B", season: 1, reason: ReasonSeasonFileCountMismatch},
+		// A season that passed cleanly: never indexed.
+		{seriesID: 1, series: "Show A", season: 1, reason: ""},
+	}
+	got := buildMismatchedSeasonsIndex(decisions)
+
+	want := map[int]map[int]bool{
+		1: {2: true},
+		2: {1: true},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("buildMismatchedSeasonsIndex = %v, want %v", got, want)
+	}
+	for seriesID, seasons := range want {
+		if len(got[seriesID]) != len(seasons) {
+			t.Errorf("index[%d] = %v, want %v", seriesID, got[seriesID], seasons)
+			continue
+		}
+		for season := range seasons {
+			if !got[seriesID][season] {
+				t.Errorf("index[%d][%d] = false, want true", seriesID, season)
+			}
+		}
+	}
+	if got[1][3] {
+		t.Error("a season skipped for a DIFFERENT reason (ReasonSeasonEpisodesUnavailable) must not be indexed as a file-count mismatch")
+	}
+	if got[1][1] {
+		t.Error("a cleanly-passing season must not be indexed")
+	}
+}
+
+func TestBuildMismatchedSeasonsIndex_NoMismatchesReturnsEmptyIndex(t *testing.T) {
+	decisions := []seasonDecision{
+		{seriesID: 1, series: "Show A", season: 1, reason: ReasonSeasonEpisodesUnavailable},
+	}
+	if got := buildMismatchedSeasonsIndex(decisions); len(got) != 0 {
+		t.Errorf("buildMismatchedSeasonsIndex = %v, want an empty index", got)
 	}
 }
 
@@ -1079,7 +1615,7 @@ func TestBuildSonarrTrackedSet_ShutdownAborts(t *testing.T) {
 func TestRunSonarrFileReport_NoMediaRootMapIsOff(t *testing.T) {
 	logger, _ := newFileReportTestLogger(slog.LevelDebug)
 	client := NewAPIClient("http://unused.invalid", "key")
-	c := runSonarrFileReport(context.Background(), logger, slog.LevelInfo, client, Instance{Name: "sonarr-main", Type: "sonarr"}, nil, nil)
+	c := runSonarrFileReport(context.Background(), logger, slog.LevelInfo, client, Instance{Name: "sonarr-main", Type: "sonarr"}, nil, nil, 0, false)
 	if c.state() != "off" {
 		t.Errorf("state() = %q, want off", c.state())
 	}
@@ -1100,7 +1636,7 @@ func TestRunSonarrFileReport_FindingsAreCounted(t *testing.T) {
 	series := []seriesElement{{ID: intPtr(1), Title: strPtr("Show"), Path: strPtr("/tv_shows/Show")}}
 
 	logger, _ := newFileReportTestLogger(slog.LevelDebug)
-	c := runSonarrFileReport(context.Background(), logger, slog.LevelInfo, client, inst, series, nil)
+	c := runSonarrFileReport(context.Background(), logger, slog.LevelInfo, client, inst, series, nil, 0, false)
 	if c.state() != "ran" {
 		t.Fatalf("state() = %q, want ran", c.state())
 	}
@@ -1118,7 +1654,7 @@ func TestRunSonarrFileReport_TrackedSetBuildFailureIsSkipped(t *testing.T) {
 	series := []seriesElement{{ID: intPtr(1), Title: strPtr("Show"), Path: strPtr("/tv_shows/Show")}}
 
 	logger, buf := newFileReportTestLogger(slog.LevelDebug)
-	c := runSonarrFileReport(context.Background(), logger, slog.LevelInfo, client, inst, series, nil)
+	c := runSonarrFileReport(context.Background(), logger, slog.LevelInfo, client, inst, series, nil, 0, false)
 	if c.state() != "skipped" {
 		t.Errorf("state() = %q, want skipped when the tracked set could not be built", c.state())
 	}
@@ -1302,6 +1838,86 @@ func TestRunSonarrDecisionEngine_FileReportWiring(t *testing.T) {
 			t.Errorf("expected the file report to have run for a configured sonarr instance:\n%s", out)
 		}
 	})
+}
+
+// TestRunSonarrDecisionEngine_FileCountMismatchExcludesSeasonFromDuplicates
+// is the end-to-end pin buildMismatchedSeasonsIndex's own tests can't reach
+// on their own: it drives THIS CYCLE's real forward decision for a
+// file-count-mismatched season all the way through
+// buildMismatchedSeasonsIndex, buildSonarrTrackedSet and the walk, proving
+// an extra file in that season lands in fileSkipReasons under
+// FileSkipReasonMismatchedSeason rather than being counted as a duplicate —
+// while a non-mismatched season's own extra file IS still reported as an
+// ordinary duplicate, so this is a discriminating test, not a vacuous one.
+func TestRunSonarrDecisionEngine_FileCountMismatchExcludesSeasonFromDuplicates(t *testing.T) {
+	episodesJSON := "[" +
+		episodeJSON(100, 1, 1, pastAirDate, 500) + "," +
+		episodeJSON(101, 1, 2, pastAirDate, 501) + "," +
+		episodeJSON(200, 2, 1, pastAirDate, 600) +
+		"]"
+	// Season 1's statistics (below) claim 2 files, but only ONE episodefile
+	// record actually comes back for it — the file-count mismatch. Season
+	// 2's statistics claim 1, and exactly 1 comes back — clean. Both
+	// entries carry "path" (which forward-engine decoding simply ignores)
+	// so buildSonarrTrackedSet's OWN /episodefile fetch — the same
+	// endpoint, reused here for both purposes — can track real files.
+	filesJSON := `[` +
+		`{"id":500,"seasonNumber":1,"customFormatScore":200,"qualityCutoffNotMet":false,"seriesId":1,"path":"/tv_shows/Mismatch Show/Season 01/Show.S01E01.mkv"},` +
+		`{"id":600,"seasonNumber":2,"customFormatScore":200,"qualityCutoffNotMet":false,"seriesId":1,"path":"/tv_shows/Mismatch Show/Season 02/Show.S02E01.mkv"}` +
+		`]`
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[{"id":1,"name":"HD","upgradeAllowed":true,"cutoffFormatScore":100}]`))
+	})
+	mux.HandleFunc("/api/v3/tag", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`[]`)) })
+	mux.HandleFunc("/api/v3/episode", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(episodesJSON)) })
+	mux.HandleFunc("/api/v3/episodefile", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(filesJSON)) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	writeFixtureFiles(t, dir,
+		"Mismatch Show/Season 01/Show.S01E01.mkv", // tracked
+		"Mismatch Show/Season 01/Show.S01E02.mkv", // extra, in the MISMATCHED season 1 -> must be withheld
+		"Mismatch Show/Season 02/Show.S02E01.mkv", // tracked
+		"Mismatch Show/Season 02/Show.S02E02.mkv", // extra, in clean season 2 -> ordinary duplicate
+	)
+
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key",
+		MediaRootMap: map[string]string{"/tv_shows": dir}}
+	s := testSeries(1, "Mismatch Show", true, 1, []int{}, testSeason(1, true, 2, 2), testSeason(2, true, 1, 1))
+	s.Path = strPtr("/tv_shows/Mismatch Show")
+	series := []seriesElement{s}
+	// Season 2 is placed in the wanted set so rule 4 skips it (ReasonQualityCutoffNotMet)
+	// before ever reaching the forward engine's own rule-7 /episodefile
+	// fetch — keeping this fixture's forward-pass shape minimal (no
+	// would-unmonitor decision on either season, so the write pass has
+	// nothing to do). buildSonarrTrackedSet fetches /episodefile
+	// independently regardless of what the forward pass decided, so season
+	// 2's own file is still tracked and its extra file is still classified.
+	wantedSeasons := map[seasonKey]bool{{seriesID: 1, seasonNumber: 2}: true}
+
+	logger, buf := newFileReportTestLogger(slog.LevelDebug)
+	runSonarrDecisionEngine(context.Background(), logger, inst, series, map[int]bool{}, wantedSeasons,
+		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseOptions{}, fullScanFileReportOptions())
+
+	out := buf.String()
+	if !strings.Contains(out, "fileReport=ran") {
+		t.Fatalf("the file report must have run:\n%s", out)
+	}
+	if !strings.Contains(out, `kind=duplicate`) || !strings.Contains(out, `group=S02E02`) {
+		t.Errorf("season 2's extra file must still be reported as an ordinary duplicate:\n%s", out)
+	}
+	if strings.Contains(out, `kind=duplicate`) && strings.Contains(out, `S01E02`) {
+		t.Errorf("season 1's extra file must NEVER be reported as a duplicate (file-count mismatch season):\n%s", out)
+	}
+	if !strings.Contains(out, "duplicates=1") {
+		t.Errorf("want exactly 1 duplicate finding (season 2's extra only):\n%s", out)
+	}
+	if !strings.Contains(out, FileSkipReasonMismatchedSeason) {
+		t.Errorf("want the mismatched-season skip reason on the summary:\n%s", out)
+	}
 }
 
 // --- noise budget: the two-cycle idle test, extended (binding controller
@@ -1494,7 +2110,7 @@ func TestAcceptance_Phase11_DuplicateAndOrphanScenario(t *testing.T) {
 	series := []seriesElement{{ID: intPtr(1), Title: strPtr("Show"), Path: strPtr("/tv_shows/Show")}}
 
 	logger, buf := newFileReportTestLogger(slog.LevelInfo)
-	c := runSonarrFileReport(context.Background(), logger, slog.LevelInfo, client, inst, series, nil)
+	c := runSonarrFileReport(context.Background(), logger, slog.LevelInfo, client, inst, series, nil, 0, false)
 
 	if c.state() != "ran" {
 		t.Fatalf("state() = %q, want ran:\n%s", c.state(), buf.String())
@@ -1540,7 +2156,7 @@ func TestAcceptance_Phase11_UnmountTriggersTheMountProblemAbort(t *testing.T) {
 	series := []seriesElement{{ID: intPtr(1), Title: strPtr("Show"), Path: strPtr("/tv_shows/Show")}}
 
 	logger, buf := newFileReportTestLogger(slog.LevelInfo)
-	c := runSonarrFileReport(context.Background(), logger, slog.LevelInfo, client, inst, series, nil)
+	c := runSonarrFileReport(context.Background(), logger, slog.LevelInfo, client, inst, series, nil, 0, false)
 
 	if c.state() != "skipped" {
 		t.Fatalf("state() = %q, want skipped: the mount-problem heuristic must abort an unmounted root", c.state())

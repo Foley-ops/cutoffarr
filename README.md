@@ -446,6 +446,19 @@ extras subfolders (`Featurettes`, `Behind The Scenes`, `Trailers`, `Extras`,
 `Shorts`, `Featurette`) are excluded from candidacy entirely — never reported
 as either kind of finding.
 
+Anything carrying the [`exclusion_tag`](#configuration-reference) is excluded
+too, exactly like every other pass: the item's own tracked file is still
+protected (it is never reported as an orphan of itself), but any extra file
+sitting in its folder is withheld rather than printed as a duplicate finding
+naming it.
+
+Symlinks are never resolved — comparison is purely lexical on the mapped disk
+paths, matching the rest of cutoffarr's path handling. A symlink pointing at
+a tracked file is a *different* path, so it is reported as a duplicate under
+its own (unresolved) name; a symlinked subdirectory is never descended into,
+because a symlink's own directory entry never reports itself as a directory
+to the walk, regardless of what it points to.
+
 ```
 level=INFO msg="file-report finding" kind=duplicate instance=radarr-main root=/data/media/Movies path="/data/media/Movies/Some Film (2020)/Some Film (2020) (2).mkv" title="Some Film (2020)" groupCount=1
 level=INFO msg="file-report finding" kind=orphan instance=radarr-main root=/data/media/Movies path="/data/media/Movies/Stray Folder/something.mkv"
@@ -479,6 +492,18 @@ from duplicate candidacy too, for the same reason: cutoffarr cannot trust
 which files in that season are "extra" when it already couldn't trust the
 count. Such files are counted under `fileSkipReasons`, never guessed at.
 
+That exclusion is decided by **where a file physically sits** — its
+containing `Season NN` folder — never by parsing a season number out of its
+filename; a stray file's `SxxEyy`-shaped name is used only to LABEL a
+duplicate finding for display, never to decide whether it's a duplicate at
+all. Two consequences follow from that, both intentional: a file inside a
+distrusted season's folder is withheld even if its filename claims to belong
+to a different, trusted season (the folder wins); and if season folders are
+disabled for a series entirely (every episode file sits flat in the series
+folder) and *any* one of that series' seasons is currently distrusted, every
+extra file in that series is withheld rather than guessed at, because there
+is no folder boundary left to tell them apart by.
+
 ### The mount-problem safeguard
 
 The single most dangerous failure mode here isn't a bug in the matching
@@ -491,7 +516,16 @@ finds, cutoffarr checks, per root:
 1. The mapped path exists and is a readable directory.
 2. Of a sample of up to 100 of that root's own tracked files, at least 90%
    actually exist on disk.
-3. If the root tracks any files at all, the walk finds *at least one* video
+3. If the root tracks any movie/series folders at all, it also tracks at
+   least one FILE under it. This is the mirror image of check 2 — an
+   unreadable or misnamed `movieFile.path`/`episodeFile.path` across an
+   entire root would otherwise empty the tracked-file set while the tracked
+   folders stayed populated, and every real file in those folders would then
+   match its folder but no tracked file, misreporting the whole library as
+   duplicates. A root nothing here manages at all (zero tracked folders too)
+   is unaffected — that's a legitimate empty or unmanaged root, not a mount
+   problem.
+4. If the root tracks any files at all, the walk finds *at least one* video
    file somewhere under it.
 
 Any one of these failing aborts **that root's** report with a `WARN` naming

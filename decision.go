@@ -700,7 +700,7 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// this phase, and logFileReportSummary's off-state debug demotion can
 	// only do that from its own call, not as an attr on an always-INFO line.
 	if fileReport.enabled {
-		logFileReportSummary(logger, inst, runRadarrFileReport(ctx, logger, scope.itemLevel, inst, movies))
+		logFileReportSummary(logger, inst, runRadarrFileReport(ctx, logger, scope.itemLevel, inst, movies, exclusionTagID, tagActive))
 	}
 
 	attrs := []any{"instance", inst.Name, "type", inst.Type}
@@ -2457,7 +2457,7 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// controller resolution 5).
 	if fileReport.enabled {
 		mismatched := buildMismatchedSeasonsIndex(allDecisions)
-		logFileReportSummary(logger, inst, runSonarrFileReport(ctx, logger, scope.itemLevel, client, inst, series, mismatched))
+		logFileReportSummary(logger, inst, runSonarrFileReport(ctx, logger, scope.itemLevel, client, inst, series, mismatched, exclusionTagID, tagActive))
 	}
 
 	attrs := []any{"instance", inst.Name, "type", inst.Type}
