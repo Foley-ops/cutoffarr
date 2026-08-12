@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -341,6 +343,85 @@ func startDaemonWithArgs(t *testing.T, args []string) *daemonHarness {
 		}
 	})
 	return h
+}
+
+// startDaemonWithContext runs runDaemon on a context THE TEST already holds,
+// rather than run()'s context.Background() plus a signal.
+//
+// The seam exists for exactly one class of assertion: what a cycle logs when
+// shutdown lands INSIDE it. Going through the signal channel cannot express
+// that. installShutdownHandler receives the signal on its own goroutine and
+// cancels from there, so "the signal was delivered" and "the cycle's context is
+// cancelled" are two events with a gap between them, and a test that fires a
+// signal partway through a scan is really asserting that the gap was short
+// enough — which is a race, not a property. Cancelling the context directly
+// from the fake's onRequest hook makes the instant exact, the same way the two
+// engines' own mid-evaluation shutdown tests do it.
+//
+// The context is the CALLER's, and that is what makes those hooks safe to
+// install: the cancel func has to exist before fake.onRequest is assigned, and
+// the assignment has to happen before this function starts the goroutine that
+// serves requests (the fake reads the hook from the serving goroutine, so the
+// `go` statement below is the happens-before edge the write needs).
+//
+// Everything else is startDaemon's wiring: the ephemeral listener, the virtual
+// clock, the ready signal. Signals are still wired up so the harness's stop()
+// works for a test that wants both.
+func startDaemonWithContext(t *testing.T, ctx context.Context, configPath string) *daemonHarness {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("taking an ephemeral port: %v", err)
+	}
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("loading the daemon test config: %v", err)
+	}
+	h := &daemonHarness{
+		t:        t,
+		url:      "http://" + listener.Addr().String(),
+		clock:    newFakeClock(),
+		signals:  make(chan os.Signal, 2),
+		exitCode: make(chan int, 1),
+		out:      &syncBuffer{},
+		ready:    make(chan struct{}),
+	}
+	logger := slog.New(slog.NewTextHandler(h.out, &slog.HandlerOptions{Level: slogLevel(cfg.LogLevel)}))
+	go func() {
+		h.exitCode <- runDaemon(ctx, logger, *cfg, daemonOptions{
+			clock:             h.clock,
+			listener:          listener,
+			signals:           h.signals,
+			forceExit:         func(int) { panic("forceExit must not be reached in this test") },
+			onStartupScanDone: func() { close(h.ready) },
+		})
+	}()
+	t.Cleanup(func() {
+		if h.exited {
+			return
+		}
+		h.exited = true
+		select {
+		case <-h.exitCode:
+		case <-time.After(10 * time.Second):
+			t.Errorf("the daemon did not exit within 10s of the test's context being cancelled:\n%s", h.out.String())
+		}
+	})
+	return h
+}
+
+// awaitExit waits for the daemon started by startDaemonWithCancel to return,
+// for a test whose shutdown came from the context rather than from stop().
+func (h *daemonHarness) awaitExit() int {
+	h.t.Helper()
+	h.exited = true
+	select {
+	case code := <-h.exitCode:
+		return code
+	case <-time.After(10 * time.Second):
+		h.t.Fatalf("the daemon did not exit within 10s:\n%s", h.out.String())
+		return -1
+	}
 }
 
 // mark records the current length of the captured log, so a later since(mark)
@@ -942,6 +1023,111 @@ func TestDaemon_ShutdownDuringAnEvaluation_FinishesTheItemDrainsNothingElseExits
 	// The listener really is closed: a webhook after shutdown fails to connect.
 	if _, err := http.Post(h.url+"/webhook/sonarr-main", "application/json", strings.NewReader(`{}`)); err == nil {
 		t.Error("the webhook server must be closed after shutdown")
+	}
+}
+
+// --- the bookends of an abandoned cycle -------------------------------------
+//
+// These two pin the same rule at the two places a full-library cycle can be cut
+// short: a pass that STOPPED EARLY must never print the line a pass that
+// finished prints.
+//
+// The failure is small to describe and bad to meet. SIGTERM lands mid-scan, the
+// engine correctly abandons the cycle and says so — "abandoning this instance's
+// cycle mid-evaluation" — and the very next line is "startup scan complete", or
+// "reconciliation sweep complete, nextSweep=...". An operator reading a log at
+// the exact moment they are most likely to be reading one (they just stopped
+// the thing) sees a completion claim over a cycle that covered part of the
+// library, immediately after the line that says it did not. The sweep's version
+// also re-armed the schedule and announced a next sweep, from a daemon that was
+// on its way out and would never run one.
+
+// TestDaemon_StartupScanAbandonedOnShutdown_DoesNotClaimToHaveCompleted
+// cancels partway through the FIRST series' evaluation, so the startup scan
+// really does return having seen part of the library.
+func TestDaemon_StartupScanAbandonedOnShutdown_DoesNotClaimToHaveCompleted(t *testing.T) {
+	fake := twoSeriesShutdownSonarrFake(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var once sync.Once
+	fake.onRequest = func(method, path string) {
+		if method == http.MethodGet && path == "/api/v3/episode" {
+			once.Do(cancel) // partway through the FIRST series' evaluation
+		}
+	}
+	h := startDaemonWithContext(t, ctx, writeDaemonConfig(t, "sonarr", fake.srv.URL, false, "info", "1h", "45s"))
+
+	if code := h.awaitExit(); code != 0 {
+		t.Fatalf("exit code = %d, want 0: an abandoned cycle is a clean stop, not a failure:\n%s", code, h.out.String())
+	}
+	out := h.out.String()
+
+	if !strings.Contains(out, "abandoning this instance's cycle mid-evaluation") {
+		t.Fatalf("this test is only meaningful if the scan really was cut short:\n%s", out)
+	}
+	if strings.Contains(out, "startup scan complete") {
+		t.Errorf("a scan that stopped partway through the library claimed to have completed:\n%s", out)
+	}
+	if !strings.Contains(out, "startup scan abandoned on shutdown") {
+		t.Errorf("it must say what happened instead; silence after the abandonment line reads as a scan that never ended:\n%s", out)
+	}
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Errorf("an abandoned cycle writes nothing, got %+v", writes)
+	}
+}
+
+// TestDaemon_ReconciliationSweepAbandonedOnShutdown_DoesNotCompleteOrRearm is
+// the same rule on the sweep, plus the half only the sweep has: the completion
+// line re-arms nextReconcile and announces the next sweep. A daemon shutting
+// down must not schedule anything.
+func TestDaemon_ReconciliationSweepAbandonedOnShutdown_DoesNotCompleteOrRearm(t *testing.T) {
+	fake := twoSeriesShutdownSonarrFake(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The hook is installed before the daemon exists (see
+	// startDaemonWithContext) and armed only once the startup scan is done: the
+	// scan hits the same endpoint, and this test is about the SWEEP.
+	var armed atomic.Bool
+	var once sync.Once
+	fake.onRequest = func(method, path string) {
+		if armed.Load() && method == http.MethodGet && path == "/api/v3/episode" {
+			once.Do(cancel)
+		}
+	}
+	// dry_run: the startup scan must complete normally, so nothing may be
+	// written before the sweep this test is about.
+	h := startDaemonWithContext(t, ctx, writeDaemonConfig(t, "sonarr", fake.srv.URL, true, "info", "1h", "45s"))
+	h.waitReady()
+	eventually(t, "the reconciliation schedule to be announced", func() bool {
+		return strings.Contains(h.out.String(), "reconciliation sweep scheduled")
+	})
+	if !strings.Contains(h.out.String(), "startup scan complete") {
+		t.Fatalf("the startup scan ran to completion and must say so:\n%s", h.out.String())
+	}
+
+	mark := h.mark()
+	armed.Store(true)
+	h.clock.Advance(time.Hour)
+
+	if code := h.awaitExit(); code != 0 {
+		t.Fatalf("exit code = %d, want 0:\n%s", code, h.out.String())
+	}
+	sweep := h.since(mark)
+
+	if !strings.Contains(sweep, "reconciliation sweep beginning") {
+		t.Fatalf("the sweep must have started for this test to mean anything:\n%s", sweep)
+	}
+	if !strings.Contains(sweep, "abandoning this instance's cycle mid-evaluation") {
+		t.Fatalf("this test is only meaningful if the sweep really was cut short:\n%s", sweep)
+	}
+	if strings.Contains(sweep, "reconciliation sweep complete") {
+		t.Errorf("a sweep that stopped partway through the library claimed to have completed:\n%s", sweep)
+	}
+	if !strings.Contains(sweep, "reconciliation sweep abandoned on shutdown") {
+		t.Errorf("it must say what happened instead:\n%s", sweep)
+	}
+	if strings.Contains(sweep, "nextSweep=") {
+		t.Errorf("an exiting daemon re-armed the schedule and announced a sweep it will never run:\n%s", sweep)
 	}
 }
 

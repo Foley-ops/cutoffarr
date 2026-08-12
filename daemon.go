@@ -295,7 +295,19 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 	// is read against.
 	logger.Info("startup scan beginning", "instances", len(cfg.Instances), "dryRun", cfg.DryRun)
 	runScanCycle(ctx, logger, cfg, scanCycle{scope: fullLibraryScope(slog.LevelInfo), dryRun: cfg.DryRun})
-	logger.Info("startup scan complete")
+	// A pass that stopped early must never print the line a pass that finished
+	// prints. runScanCycle returns the same way whether it covered every
+	// instance or abandoned the cycle on shutdown (its own between-instances
+	// check, and the engines' between-items ones), so the only thing that can
+	// tell them apart here is the context — and getting this wrong put
+	// "startup scan complete" immediately after "abandoning this instance's
+	// cycle mid-evaluation", at the exact moment a human is reading the log
+	// because they just stopped the process.
+	if ctx.Err() != nil {
+		logger.Info("startup scan abandoned on shutdown: it stopped between items and did not cover every instance, so nothing above describes the whole library; the next start begins with a full scan")
+	} else {
+		logger.Info("startup scan complete")
+	}
 	if opts.onStartupScanDone != nil {
 		opts.onStartupScanDone()
 	}
@@ -390,6 +402,16 @@ func (d *daemon) loop(ctx context.Context) {
 			// this cycle repeats forever and its per-item lines are repetition
 			// rather than news (binding controller note 6).
 			runScanCycle(ctx, d.logger, d.cfg, scanCycle{scope: fullLibraryScope(slog.LevelDebug), dryRun: d.cfg.DryRun})
+			if ctx.Err() != nil {
+				// The startup scan's rule (see runDaemon) plus the half only the
+				// sweep has: the completion line RE-ARMS the schedule and
+				// announces the next sweep. A daemon on its way out must not
+				// schedule anything — the loop returns on the next iteration —
+				// and announcing a sweep that will never run is worse than
+				// saying nothing.
+				d.logger.Info("reconciliation sweep abandoned on shutdown: it stopped between items and did not cover every instance, so nothing above describes the whole library; the schedule is not re-armed because this daemon is exiting")
+				continue
+			}
 			nextReconcile = d.clock.Now().Add(d.cfg.PollInterval)
 			d.logger.Info("reconciliation sweep complete", "nextSweep", nextReconcile)
 			continue
