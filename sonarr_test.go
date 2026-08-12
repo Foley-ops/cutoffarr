@@ -1208,6 +1208,25 @@ func (f *statefulSonarrFake) wantedCutoffJSON() string {
 	return fmt.Sprintf(`{"page":1,"pageSize":100,"totalRecords":%d,"records":[%s]}`, len(recs), strings.Join(recs, ","))
 }
 
+// setEpisodeWanted moves an episode in or out of the fake's /wanted/cutoff set
+// (and its episode file's qualityCutoffNotMet, which the cross-check compares
+// against it) while the fake is serving. It models what a Download webhook
+// actually announces — a file landed and this episode is no longer below its
+// cutoff — so a daemon test can observe a write the STARTUP scan would not
+// already have made. Mirrors statefulRadarrFake.setWanted.
+func (f *statefulSonarrFake) setEpisodeWanted(episodeID int, wanted bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	e, found := f.episodes[episodeID]
+	if !found {
+		return
+	}
+	e.inWantedSet = wanted
+	if file, ok := f.files[e.episodeFileID]; ok {
+		file.qualityCutoffNotMet = wanted
+	}
+}
+
 // all returns a copy of every request the fake received, under the mutex the
 // handler goroutines append with. Reading f.requests directly from a test is a
 // data race — one the suite really carried, in the allowlist test that bounds

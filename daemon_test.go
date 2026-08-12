@@ -910,3 +910,61 @@ func TestDaemon_WebhookPortAlreadyBound_IsFatalRatherThanASilentPollOnlyDaemon(t
 		t.Errorf("the refusal must name its cause:\n%s", log)
 	}
 }
+
+// TestDaemon_Sonarr_WebhookTriggeredSeasonWrite_HappensAndIsScoped is the
+// Sonarr half of the webhook write path — the brief asks for both apps, and the
+// two are not the same code: a season write is TWO calls, gated separately, and
+// it is the one this project's shutdown boundary exists to protect.
+//
+// The startup scan deliberately writes nothing (the season's episode is below
+// its cutoff); the import then completes and the webhook names the series.
+func TestDaemon_Sonarr_WebhookTriggeredSeasonWrite_HappensAndIsScoped(t *testing.T) {
+	fake := writableSonarrFake(t)
+	fake.setEpisodeWanted(100, true) // below cutoff: nothing to write at startup
+	h := startDaemon(t, writeDaemonConfig(t, "sonarr", fake.srv.URL, false, "debug", "0", "45s"))
+	h.waitReady()
+
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("the startup scan should have had nothing to write, got %+v", writes)
+	}
+
+	fake.setEpisodeWanted(100, false) // the import completed
+	h.post("sonarr-main", `{"eventType":"Download","series":{"id":1,"title":"Write Me"},"episodes":[{"seasonNumber":1}]}`)
+	h.clock.Advance(45 * time.Second)
+	h.awaitLogCount("webhook debounce expired; evaluating", 1)
+	eventually(t, "both halves of the season write to land", func() bool { return len(fake.writes()) == 2 })
+	h.stop()
+
+	if fake.seasonMonitored(1, 1) {
+		t.Error("the season the webhook named must be unmonitored")
+	}
+	if fake.episodeMonitored(100) {
+		t.Error("and so must its episode: a season write is two calls, and both must have landed")
+	}
+	out := h.out.String()
+	if !strings.Contains(out, "unmonitored=1") || !strings.Contains(out, "onlyId=1") {
+		t.Errorf("the write must be counted and the cycle must say it was scoped:\n%s", out)
+	}
+}
+
+// TestDaemon_Sonarr_DryRun_ZeroWritesAcrossStartupAndAWebhookCycle is §2.1 on
+// the Sonarr side, over the catch-all writes() accessor: every non-GET request
+// to any path, stubbed or not.
+func TestDaemon_Sonarr_DryRun_ZeroWritesAcrossStartupAndAWebhookCycle(t *testing.T) {
+	fake := writableSonarrFake(t)
+	h := startDaemon(t, writeDaemonConfig(t, "sonarr", fake.srv.URL, true, "debug", "0", "45s"))
+	h.waitReady()
+
+	h.post("sonarr-main", `{"eventType":"Download","series":{"id":1},"episodes":[{"seasonNumber":1}]}`)
+	h.clock.Advance(45 * time.Second)
+	h.awaitLogCount("webhook debounce expired; evaluating", 1)
+	h.stop()
+
+	if writes := fake.writes(); len(writes) != 0 {
+		t.Fatalf("dry-run made %d write request(s) across startup and a webhook cycle, want ZERO: %+v", len(writes), writes)
+	}
+	out := h.out.String()
+	if !strings.Contains(out, "wouldUnmonitor=1") || !strings.Contains(out, "withheldWrites=1") {
+		t.Errorf("the rehearsal must still report and account for what it would have done:\n%s", out)
+	}
+}
