@@ -129,7 +129,7 @@ func TestEvaluateSeries_SeriesLevelTagExcluded_AllMonitoredSeasonsSkipped(t *tes
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Excluded Show", true, 1, []int{9}, testSeason(1, true, 10, 10), testSeason(2, true, 5, 5))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, true, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, true, map[seasonKey]bool{}, directionForward)
 
 	// The binding evaluation-order resolution's whole point: a series-level
 	// failure costs ZERO per-series fetches. The /episodefile half was already
@@ -163,7 +163,7 @@ func TestEvaluateSeries_SeriesLevelTagsAbsent_TagActive_SkippedWithReason(t *tes
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Untagged Show", true, 1, nil, testSeason(1, true, 10, 10))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, true, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, true, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonTagsUnknown {
 		t.Fatalf("decisions = %+v, want one with reason %q", eval.decisions, ReasonTagsUnknown)
@@ -182,7 +182,7 @@ func TestEvaluateSeries_TagsAbsent_TagNotActive_ProceedsNormally(t *testing.T) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Untagged Show", true, 1, nil, testSeason(1, true, 1, 1))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 || !eval.decisions[0].wouldUnmonitor {
 		t.Fatalf("decisions = %+v, want a single would-unmonitor decision (tag inactive, so absent tags is vacuous)", eval.decisions)
@@ -197,7 +197,7 @@ func TestEvaluateSeries_UnknownProfile_SkippedWithReason(t *testing.T) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Unknown Profile Show", true, 999, []int{}, testSeason(1, true, 10, 10))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonUnknownProfile || eval.decisions[0].profileName != "unknown" {
 		t.Fatalf("decisions = %+v, want reason %q profileName \"unknown\"", eval.decisions, ReasonUnknownProfile)
@@ -212,7 +212,7 @@ func TestEvaluateSeries_UpgradesDisabled_SkippedWithReason(t *testing.T) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Locked Show", true, 2, []int{}, testSeason(1, true, 10, 10))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonUpgradesDisabled {
 		t.Fatalf("decisions = %+v, want reason %q", eval.decisions, ReasonUpgradesDisabled)
@@ -231,7 +231,7 @@ func TestEvaluateSeries_TagAndProfileFail_ExcludedByTagWinsOverProfile(t *testin
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Both Fail Show", true, 999, []int{9}, testSeason(1, true, 10, 10))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, true, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, true, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonExcludedByTag {
 		t.Fatalf("decisions = %+v, want reason %q (tags checked before profile)", eval.decisions, ReasonExcludedByTag)
@@ -251,10 +251,10 @@ func TestEvaluateSeries_SeasonMonitoredFalse_ExcludedAndCounted(t *testing.T) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Mixed Show", true, 1, []int{}, testSeason(1, true, 1, 1), testSeason(2, false, 0, 10))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
-	if eval.alreadyUnmonitored != 1 {
-		t.Errorf("alreadyUnmonitored = %d, want 1", eval.alreadyUnmonitored)
+	if eval.offDirection != 1 {
+		t.Errorf("alreadyUnmonitored = %d, want 1", eval.offDirection)
 	}
 	if len(eval.decisions) != 1 {
 		t.Fatalf("expected 1 season decision (season 2 excluded), got %d: %+v", len(eval.decisions), eval.decisions)
@@ -273,10 +273,10 @@ func TestEvaluateSeries_SeasonMonitoredAbsent_ExcludedNotCountedWarns(t *testing
 
 	untrusted := seriesSeasonElement{SeasonNumber: intPtr(1), Statistics: &seasonStatisticsElement{EpisodeFileCount: intPtr(1), TotalEpisodeCount: intPtr(1)}} // Monitored absent
 	s := testSeries(1, "Untrusted Season Show", true, 1, []int{}, untrusted)
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
-	if eval.alreadyUnmonitored != 0 {
-		t.Errorf("alreadyUnmonitored = %d, want 0 (absent is untrusted, not a counted state)", eval.alreadyUnmonitored)
+	if eval.offDirection != 0 {
+		t.Errorf("alreadyUnmonitored = %d, want 0 (absent is untrusted, not a counted state)", eval.offDirection)
 	}
 	if len(eval.decisions) != 0 {
 		t.Errorf("expected zero decisions (series has no monitored seasons), got %+v", eval.decisions)
@@ -298,10 +298,10 @@ func TestEvaluateSeries_ZeroMonitoredSeasons_SingleDebugLineNoPerSeasonSpam(t *t
 
 	s := testSeries(1, "Fully Unmonitored Show", true, 1, []int{},
 		testSeason(1, false, 10, 10), testSeason(2, false, 10, 10), testSeason(3, false, 10, 10))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
-	if eval.alreadyUnmonitored != 3 {
-		t.Errorf("alreadyUnmonitored = %d, want 3 (still counted even though not individually logged)", eval.alreadyUnmonitored)
+	if eval.offDirection != 3 {
+		t.Errorf("alreadyUnmonitored = %d, want 3 (still counted even though not individually logged)", eval.offDirection)
 	}
 	if len(eval.decisions) != 0 {
 		t.Errorf("expected zero decisions, got %+v", eval.decisions)
@@ -339,13 +339,13 @@ func TestEvaluateSeries_SeasonsFieldAbsent_WarnsAndProducesNoDecisions(t *testin
 		QualityProfileID: intPtr(1), Tags: &[]int{},
 		// Seasons deliberately left nil: the "seasons" key never decoded.
 	}
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 0 {
 		t.Errorf("expected zero decisions, got %+v", eval.decisions)
 	}
-	if eval.alreadyUnmonitored != 0 {
-		t.Errorf("alreadyUnmonitored = %d, want 0", eval.alreadyUnmonitored)
+	if eval.offDirection != 0 {
+		t.Errorf("alreadyUnmonitored = %d, want 0", eval.offDirection)
 	}
 	out := buf.String()
 	if !strings.Contains(out, "level=WARN") {
@@ -369,7 +369,7 @@ func TestEvaluateSeries_IncompleteOnDisk_SkippedWithReason(t *testing.T) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Incomplete Show", true, 1, []int{}, testSeason(1, true, 5, 10))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonSeasonIncomplete {
 		t.Fatalf("decisions = %+v, want reason %q", eval.decisions, ReasonSeasonIncomplete)
@@ -389,7 +389,7 @@ func TestEvaluateSeries_ZeroTotalEpisodeCount_SkippedIncomplete(t *testing.T) {
 	// 0 == 0 would satisfy a naive equality check; rule 2 also requires
 	// totalEpisodeCount > 0.
 	s := testSeries(1, "Empty Show", true, 1, []int{}, testSeason(1, true, 0, 0))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonSeasonIncomplete {
 		t.Fatalf("decisions = %+v, want reason %q (totalEpisodeCount must be > 0)", eval.decisions, ReasonSeasonIncomplete)
@@ -405,7 +405,7 @@ func TestEvaluateSeries_StatisticsMissing_SkippedAsInconsistent(t *testing.T) {
 
 	noStats := seriesSeasonElement{SeasonNumber: intPtr(1), Monitored: boolPtr(true)} // Statistics absent
 	s := testSeries(1, "No Stats Show", true, 1, []int{}, noStats)
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonSeasonEpisodeDataInconsistent {
 		t.Fatalf("decisions = %+v, want reason %q", eval.decisions, ReasonSeasonEpisodeDataInconsistent)
@@ -424,7 +424,7 @@ func TestEvaluateSeries_StatsClaimCompleteButNoEpisodesReturned_SkippedAsInconsi
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Inconsistent Show", true, 1, []int{}, testSeason(1, true, 10, 10))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonSeasonEpisodeDataInconsistent {
 		t.Fatalf("decisions = %+v, want reason %q", eval.decisions, ReasonSeasonEpisodeDataInconsistent)
@@ -454,7 +454,7 @@ func TestEvaluateSeries_PartialEpisodeList_ShortOfStatistics_SkippedAsInconsiste
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Partial Episode List Show", true, 1, []int{}, testSeason(1, true, 3, 3))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 {
 		t.Fatalf("expected 1 decision, got %d: %+v", len(eval.decisions), eval.decisions)
@@ -499,7 +499,7 @@ func TestEvaluateSeries_UnairedEpisodeDroppedForMissingSeasonNumber_SkippedAsInc
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Dropped Episode Show", true, 1, []int{}, testSeason(1, true, 2, 2))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 {
 		t.Fatalf("expected 1 decision, got %d: %+v", len(eval.decisions), eval.decisions)
@@ -534,7 +534,7 @@ func TestEvaluateSeries_AiringSeason_NeverWouldUnmonitor_EvenWhenCompleteAndCuto
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Airing Show", true, 1, []int{}, testSeason(1, true, 2, 2))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 {
 		t.Fatalf("expected 1 decision, got %d", len(eval.decisions))
@@ -562,7 +562,7 @@ func TestEvaluateSeries_AbsentAirDateUtc_TreatedAsNotAired(t *testing.T) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Undated Show", true, 1, []int{}, testSeason(1, true, 1, 1))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonSeasonNotFullyAired {
 		t.Fatalf("decisions = %+v, want reason %q for an absent airDateUtc", eval.decisions, ReasonSeasonNotFullyAired)
@@ -584,7 +584,7 @@ func TestEvaluateSeries_UnparseableAirDateUtc_TreatedAsNotAired(t *testing.T) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Malformed Date Show", true, 1, []int{}, testSeason(1, true, 1, 1))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonSeasonNotFullyAired {
 		t.Fatalf("decisions = %+v, want reason %q for an unparseable airDateUtc (fail safe)", eval.decisions, ReasonSeasonNotFullyAired)
@@ -608,7 +608,7 @@ func TestEvaluateSeries_AiringSeason_ValidFutureDate_NoWarnLogged(t *testing.T) 
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Genuinely Airing Show", true, 1, []int{}, testSeason(1, true, 1, 1))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonSeasonNotFullyAired {
 		t.Fatalf("decisions = %+v, want reason %q for a future-dated episode", eval.decisions, ReasonSeasonNotFullyAired)
@@ -630,7 +630,7 @@ func TestEvaluateSeries_InWantedSet_SkippedWithReason(t *testing.T) {
 
 	s := testSeries(1, "Wanted Show", true, 1, []int{}, testSeason(1, true, 1, 1))
 	wantedSeasons := map[seasonKey]bool{{seriesID: 1, seasonNumber: 1}: true}
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, wantedSeasons)
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, wantedSeasons, directionForward)
 
 	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonQualityCutoffNotMet {
 		t.Fatalf("decisions = %+v, want reason %q", eval.decisions, ReasonQualityCutoffNotMet)
@@ -654,7 +654,7 @@ func TestEvaluateSeries_AiringAndInWantedSet_AiringReasonWins(t *testing.T) {
 
 	s := testSeries(1, "Airing And Wanted Show", true, 1, []int{}, testSeason(1, true, 1, 1))
 	wantedSeasons := map[seasonKey]bool{{seriesID: 1, seasonNumber: 1}: true}
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, wantedSeasons)
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, wantedSeasons, directionForward)
 
 	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonSeasonNotFullyAired {
 		t.Fatalf("decisions = %+v, want reason %q (airing checked before wanted-set)", eval.decisions, ReasonSeasonNotFullyAired)
@@ -675,7 +675,7 @@ func TestEvaluateSeries_EpisodeFetchFailure_AllMonitoredSeasonsSkipped(t *testin
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Broken Episode Fetch Show", true, 1, []int{}, testSeason(1, true, 10, 10), testSeason(2, true, 5, 5))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 2 {
 		t.Fatalf("expected 2 decisions (per-series failure, not instance-fatal), got %d", len(eval.decisions))
@@ -702,7 +702,7 @@ func TestEvaluateSeries_AllRulesPass_WouldUnmonitor(t *testing.T) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Complete Show", true, 1, []int{}, testSeason(1, true, 1, 1))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 {
 		t.Fatalf("expected 1 decision, got %d", len(eval.decisions))
@@ -729,7 +729,7 @@ func TestEvaluateSeries_CFBelowThreshold_SkippedWithReason(t *testing.T) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Low Score Show", true, 1, []int{}, testSeason(1, true, 1, 1))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonCFCutoffNotMet {
 		t.Fatalf("decisions = %+v, want reason %q", eval.decisions, ReasonCFCutoffNotMet)
@@ -746,7 +746,7 @@ func TestEvaluateSeries_CFScoreEqualToThreshold_Passes(t *testing.T) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Exact Score Show", true, 1, []int{}, testSeason(1, true, 1, 1))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 || !eval.decisions[0].wouldUnmonitor {
 		t.Fatalf("decisions = %+v, want wouldUnmonitor=true (score equal to threshold passes)", eval.decisions)
@@ -763,7 +763,7 @@ func TestEvaluateSeries_MultiEpisodeSeason_OneLowScoringEpisode_SkipsWholeSeason
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Mixed Score Show", true, 1, []int{}, testSeason(1, true, 2, 2))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonCFCutoffNotMet {
 		t.Fatalf("decisions = %+v, want reason %q: ANY episode below threshold fails the whole season", eval.decisions, ReasonCFCutoffNotMet)
@@ -780,7 +780,7 @@ func TestEvaluateSeries_MissingCustomFormatScore_SkippedWithReason(t *testing.T)
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "No Score Show", true, 1, []int{}, testSeason(1, true, 1, 1))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonCouldNotFetchCFScore {
 		t.Fatalf("decisions = %+v, want reason %q", eval.decisions, ReasonCouldNotFetchCFScore)
@@ -806,7 +806,7 @@ func TestEvaluateSeries_EpisodeFileFetchFailure_CandidatesSkippedWithReason(t *t
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Broken Episodefile Show", true, 1, []int{}, testSeason(1, true, 1, 1))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonCouldNotFetchCFScore {
 		t.Fatalf("decisions = %+v, want reason %q", eval.decisions, ReasonCouldNotFetchCFScore)
@@ -824,7 +824,7 @@ func TestEvaluateSeries_FileCountMismatch_SkippedWithReason(t *testing.T) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "File Count Mismatch Show", true, 1, []int{}, testSeason(1, true, 2, 2))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonSeasonFileCountMismatch {
 		t.Fatalf("decisions = %+v, want reason %q", eval.decisions, ReasonSeasonFileCountMismatch)
@@ -847,7 +847,7 @@ func TestEvaluateSeries_EpisodefileLaziness_NotFetchedForSeriesFailingRulesOneTo
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Incomplete Show", true, 1, []int{}, testSeason(1, true, 5, 10))
-	evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(gotEpisodefileRequests) != 0 {
 		t.Errorf("expected zero /episodefile requests for a series with no rule-1-6-passing season, got %d", len(gotEpisodefileRequests))
@@ -869,7 +869,7 @@ func TestEvaluateSeries_MultipleCandidateSeasons_SingleEpisodefileFetchCoversAll
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Two Season Show", true, 1, []int{}, testSeason(1, true, 1, 1), testSeason(2, true, 1, 1))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(gotEp) != 1 {
 		t.Errorf("expected exactly 1 /episode request, got %d", len(gotEp))
@@ -900,7 +900,7 @@ func TestEvaluateSeries_SeasonZeroSpecials_NoSpecialCasing(t *testing.T) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Show With Specials", true, 1, []int{}, testSeason(0, true, 1, 1))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 || !eval.decisions[0].wouldUnmonitor || eval.decisions[0].season != 0 {
 		t.Fatalf("decisions = %+v, want season 0 evaluated normally and would-unmonitor", eval.decisions)
@@ -1783,7 +1783,7 @@ func TestEvaluateSeries_EpisodeFileMissingSeasonNumber_WarnsNamingTheFile(t *tes
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Dropped File Show", true, 1, []int{}, testSeason(1, true, 1, 1))
-	evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	out := buf.String()
 	if !strings.Contains(out, "episode file missing seasonNumber") {
@@ -1813,7 +1813,7 @@ func TestEvaluateSeries_DuplicateSeasonNumber_WarnsAndExcludesTheDuplicate(t *te
 
 	// Two monitored seasons both claiming to be season 1.
 	s := testSeries(1, "Duplicate Season Show", true, 1, []int{}, testSeason(1, true, 1, 1), testSeason(1, true, 1, 1))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 {
 		t.Fatalf("expected exactly 1 decision (the duplicate excluded), got %d: %+v", len(eval.decisions), eval.decisions)
@@ -1844,7 +1844,7 @@ func TestEvaluateSeries_EpisodeCountMismatch_NotSkipPoolEligible(t *testing.T) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Inconsistent Show", true, 1, []int{}, testSeason(1, true, 3, 3))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 {
 		t.Fatalf("expected 1 decision, got %d", len(eval.decisions))
@@ -1885,7 +1885,7 @@ func TestEvaluateSeries_EpisodefileFetchFailure_NotSkipPoolEligible(t *testing.T
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Broken Episodefile Show", true, 1, []int{}, testSeason(1, true, 1, 1))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 {
 		t.Fatalf("expected 1 decision, got %d", len(eval.decisions))
@@ -1950,7 +1950,7 @@ func TestEvaluateSeries_FileCountMismatch_StillCarriesCrossCheckEpisodes(t *test
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "File Count Mismatch Show", true, 1, []int{}, testSeason(1, true, 2, 2))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 {
 		t.Fatalf("expected 1 decision, got %d", len(eval.decisions))
@@ -1982,7 +1982,7 @@ func TestEvaluateSeries_UntrustedAirDateAfterAFutureOne_StillWarns(t *testing.T)
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
 	s := testSeries(1, "Mixed Airing Show", true, 1, []int{}, testSeason(1, true, 2, 2))
-	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonSeasonNotFullyAired {
 		t.Fatalf("decisions = %+v, want one airing skip", eval.decisions)
@@ -2093,7 +2093,7 @@ func TestEvaluateSeries_SeasonMonitoredAbsent_WarnNamesTheSeries(t *testing.T) {
 
 	s := testSeries(1, "Untraceable Warn Show", true, 1, []int{},
 		seriesSeasonElement{SeasonNumber: intPtr(1), Statistics: &seasonStatisticsElement{EpisodeFileCount: intPtr(1), TotalEpisodeCount: intPtr(1)}})
-	evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{})
+	evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
 
 	// Isolate the season-monitored warn itself. The buffer also carries the
 	// "monitored series produced no season decisions" warn, which DOES name
@@ -2515,5 +2515,153 @@ func TestRunSonarrDecisionEngine_ShutdownMidEvaluation_CountsSeriesEvaluatedNotS
 	}
 	if !strings.Contains(out, "seriesEvaluated=1") {
 		t.Errorf("seriesEvaluated must count the series the loop actually got through (1 of 2), not the ones the scope names — a cycle that evaluated the whole library before a shutdown must not report 0:\n%s", out)
+	}
+}
+
+// --- evaluateSeries: the reverse direction (Phase 10) -----------------------
+//
+// The reverse scan runs the SAME evaluation over the OPPOSITE population. The
+// only thing the direction changes is which seasons a pass is about — the
+// monitored ones going forward, the unmonitored ones coming back — and which
+// wanted set rule 4 consults. Every rule, every guard, every reason string and
+// the whole evaluation order are the existing ones, unchanged: no quality,
+// airing or tag logic exists twice in this program, so there is nothing for the
+// two directions to drift apart on.
+
+// TestEvaluateSeries_ReverseDirection_EvaluatesUnmonitoredSeasonsOnly is the
+// direction switch itself. A series with one monitored and one unmonitored
+// season yields exactly one decision in each direction, and they are different
+// seasons.
+func TestEvaluateSeries_ReverseDirection_EvaluatesUnmonitoredSeasonsOnly(t *testing.T) {
+	episodes := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "," + episodeJSON(200, 2, 1, pastAirDate, 600) + "]"
+	files := "[" + episodeFileJSON(500, 1, 200, false) + "," + episodeFileJSON(600, 2, 200, false) + "]"
+	srv := sonarrEpisodeFileServer(t, stampSeriesID(t, episodes, 1), files, nil, nil)
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	s := testSeries(1, "Mixed Show", true, 1, []int{}, testSeason(1, true, 1, 1), testSeason(2, false, 1, 1))
+
+	forward := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionForward)
+	if len(forward.decisions) != 1 || forward.decisions[0].season != 1 {
+		t.Fatalf("forward decisions = %+v, want exactly season 1 (the monitored one)", forward.decisions)
+	}
+
+	reverse := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionReverse)
+	if len(reverse.decisions) != 1 || reverse.decisions[0].season != 2 {
+		t.Fatalf("reverse decisions = %+v, want exactly season 2 (the unmonitored one)", reverse.decisions)
+	}
+}
+
+// TestEvaluateSeries_ReverseDirection_BelowCutoffSeasonKeepsTheExistingReason
+// pins that a reverse evaluation produces the project's EXISTING reason
+// constants — the reverse scan reports "this unmonitored season is still below
+// cutoff" in the same vocabulary the forward scan skips with, because it is the
+// same finding read from the other side.
+func TestEvaluateSeries_ReverseDirection_BelowCutoffSeasonKeepsTheExistingReason(t *testing.T) {
+	episodes := "[" + episodeJSON(200, 2, 1, pastAirDate, 600) + "]"
+	files := "[" + episodeFileJSON(600, 2, 200, true) + "]"
+	srv := sonarrEpisodeFileServer(t, stampSeriesID(t, episodes, 1), files, nil, nil)
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	s := testSeries(1, "Below Cutoff Show", true, 1, []int{}, testSeason(2, false, 1, 1))
+	// The UNMONITORED wanted set: this season's episode is in it, so rule 4
+	// fails and the season is still below its quality cutoff.
+	wanted := map[seasonKey]bool{{seriesID: 1, seasonNumber: 2}: true}
+
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, wanted, directionReverse)
+	if len(eval.decisions) != 1 {
+		t.Fatalf("decisions = %+v, want one", eval.decisions)
+	}
+	if eval.decisions[0].reason != ReasonQualityCutoffNotMet || eval.decisions[0].wouldUnmonitor {
+		t.Fatalf("decision = %+v, want reason %q and wouldUnmonitor=false", eval.decisions[0], ReasonQualityCutoffNotMet)
+	}
+}
+
+// TestEvaluateSeries_ReverseDirection_CFBelowThresholdKeepsTheExistingReason is
+// the same point for the custom-format half of the criteria: rule 7 is reached
+// (the season is complete, aired and absent from the unmonitored wanted set)
+// and its file scores below the profile's cutoff.
+func TestEvaluateSeries_ReverseDirection_CFBelowThresholdKeepsTheExistingReason(t *testing.T) {
+	episodes := "[" + episodeJSON(200, 2, 1, pastAirDate, 600) + "]"
+	files := "[" + episodeFileJSON(600, 2, 10, false) + "]" // 10 < the profile's 100
+	srv := sonarrEpisodeFileServer(t, stampSeriesID(t, episodes, 1), files, nil, nil)
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	s := testSeries(1, "Low Score Show", true, 1, []int{}, testSeason(2, false, 1, 1))
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionReverse)
+	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonCFCutoffNotMet {
+		t.Fatalf("decisions = %+v, want one with reason %q", eval.decisions, ReasonCFCutoffNotMet)
+	}
+}
+
+// TestEvaluateSeries_ReverseDirection_AiringGuardStillApplies pins that the
+// single most important Sonarr guard is not weakened by running backwards. An
+// unmonitored season with an unaired episode is not "unmonitored but finished
+// and below cutoff" — it is a season nobody should be told anything about.
+func TestEvaluateSeries_ReverseDirection_AiringGuardStillApplies(t *testing.T) {
+	episodes := "[" + episodeJSON(200, 2, 1, pastAirDate, 600) + "," + episodeJSON(201, 2, 2, futureAirDate, 601) + "]"
+	files := "[" + episodeFileJSON(600, 2, 10, false) + "," + episodeFileJSON(601, 2, 10, false) + "]"
+	srv := sonarrEpisodeFileServer(t, stampSeriesID(t, episodes, 1), files, nil, nil)
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	s := testSeries(1, "Still Airing Show", true, 1, []int{}, testSeason(2, false, 2, 2))
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionReverse)
+	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonSeasonNotFullyAired {
+		t.Fatalf("decisions = %+v, want one with reason %q", eval.decisions, ReasonSeasonNotFullyAired)
+	}
+}
+
+// TestEvaluateSeries_ReverseDirection_ExclusionTagStillWins pins §2.5 in the
+// new direction. An excluded series must not even be REPORTED by the reverse
+// scan, and the series-level check that makes that true is the existing one.
+func TestEvaluateSeries_ReverseDirection_ExclusionTagStillWins(t *testing.T) {
+	var gotEp []string
+	srv := sonarrEpisodeFileServer(t, `[]`, `[]`, &gotEp, nil)
+	defer srv.Close()
+	logger, _ := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	s := testSeries(1, "Excluded Show", true, 1, []int{9}, testSeason(2, false, 1, 1))
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, true, map[seasonKey]bool{}, directionReverse)
+	if len(eval.decisions) != 1 || eval.decisions[0].reason != ReasonExcludedByTag {
+		t.Fatalf("decisions = %+v, want one with reason %q", eval.decisions, ReasonExcludedByTag)
+	}
+	if len(gotEp) != 0 {
+		t.Errorf("an excluded series must cost zero fetches in the reverse direction too, got %v", gotEp)
+	}
+}
+
+// TestEvaluateSeries_ReverseDirection_NoUnmonitoredSeasons_IsQuiet pins the one
+// piece of messaging the direction really does change. Forward, a monitored
+// series with no evaluable season is odd enough to warn about; in reverse, a
+// series with no unmonitored season is the ordinary, healthy state of most of
+// a library, and warning about it would put one line per series into every
+// cycle forever.
+func TestEvaluateSeries_ReverseDirection_NoUnmonitoredSeasons_IsQuiet(t *testing.T) {
+	srv := sonarrEpisodeFileServer(t, `[]`, `[]`, nil, nil)
+	defer srv.Close()
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	s := testSeries(1, "All Monitored Show", true, 1, []int{}, testSeason(1, true, 1, 1))
+	eval := evaluateSeries(context.Background(), logger, client, inst, s, sonarrDecisionTestProfiles, 9, false, map[seasonKey]bool{}, directionReverse)
+	if len(eval.decisions) != 0 {
+		t.Fatalf("decisions = %+v, want none", eval.decisions)
+	}
+	if strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("a series with nothing to reverse-scan must not warn:\n%s", buf.String())
 	}
 }
