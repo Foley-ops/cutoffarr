@@ -574,7 +574,16 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 			// and a targeted run against a large library would additionally
 			// emit one debug line per already-unmonitored movie in the
 			// entire library, not just the target.
-			if m.ID != nil && scope.contains(*m.ID) {
+			// !scope.active() first, and not merely scope.contains(*m.ID):
+			// an INACTIVE scope contains everything including a movie whose id
+			// was never observed, while a scoped run cannot show an
+			// unidentifiable movie to be the one it names. Folding the two into
+			// `m.ID != nil && scope.contains(...)` silently stopped counting a
+			// monitored:false movie with no id on UNSCOPED runs — the summary's
+			// alreadyUnmonitored is one of the numbers a human reads to decide a
+			// no-op cycle really was a no-op, so nothing may drop out of it
+			// unannounced.
+			if !scope.active() || (m.ID != nil && scope.contains(*m.ID)) {
 				alreadyUnmonitoredCount++
 				logger.Debug("already unmonitored",
 					"id", derefOrAbsent(m.ID), "title", titleOrAbsent(m.Title), "instance", inst.Name)

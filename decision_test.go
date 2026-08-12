@@ -3493,3 +3493,50 @@ func TestRunRadarrDecisionEngine_ShutdownMidEvaluation_AbandonsTheCycleWithoutWr
 		t.Errorf("the abandonment must be stated, or the silence reads as a clean no-op cycle:\n%s", out)
 	}
 }
+
+// TestRunRadarrDecisionEngine_AlreadyUnmonitoredMovieWithoutAnID_IsStillCounted
+// is a self-review regression pin from the Phase 8 scope refactor. The
+// already-unmonitored branch used to read `onlyID == 0 || (m.ID != nil && *m.ID
+// == onlyID)`, and became `m.ID != nil && scope.contains(*m.ID)` — which is the
+// same thing for a scoped run and NOT the same thing for an unscoped one: a
+// movie with monitored:false and no id silently stopped being counted at all.
+//
+// It is a corner (real Radarr always sends id) but it is exactly the corner
+// this project refuses to let vanish: the summary's alreadyUnmonitored is one
+// of the numbers a human reads to decide a no-op cycle really was a no-op.
+func TestRunRadarrDecisionEngine_AlreadyUnmonitoredMovieWithoutAnID_IsStillCounted(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{})
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+	movies := []movieListElement{
+		{Title: strPtr("No Id, Not Monitored"), Monitored: boolPtr(false), HasFile: boolPtr(true), QualityProfileID: intPtr(1), Tags: &noTags},
+	}
+
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true)
+
+	out := buf.String()
+	if !strings.Contains(out, "alreadyUnmonitored=1") {
+		t.Errorf("an unscoped run counts every already-unmonitored movie, id or no id:\n%s", out)
+	}
+	if !strings.Contains(out, `msg="already unmonitored"`) || !strings.Contains(out, "id=absent") {
+		t.Errorf("and says so at debug, naming what it could not name:\n%s", out)
+	}
+}
+
+// TestRunRadarrDecisionEngine_ScopedRun_AlreadyUnmonitoredMovieWithoutAnID_IsNotCounted
+// is the other side: a movie whose id was never observed cannot be shown to be
+// the one the scope names, so a scoped run must not count it. Together the two
+// tests pin the exact expression, which is what makes it safe to simplify later.
+func TestRunRadarrDecisionEngine_ScopedRun_AlreadyUnmonitoredMovieWithoutAnID_IsNotCounted(t *testing.T) {
+	fake := newRadarrFake(t, "", map[int]string{2: monitoredMovieDetail(2, "Target")})
+	logger, buf := newDecisionTestLogger(slog.LevelDebug)
+	movies := []movieListElement{
+		{Title: strPtr("No Id, Not Monitored"), Monitored: boolPtr(false), HasFile: boolPtr(true), QualityProfileID: intPtr(1), Tags: &noTags},
+		wouldUnmonitorMovie(2, "Target"),
+	}
+
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude", onlyIDScope(2), true)
+
+	if out := buf.String(); !strings.Contains(out, "alreadyUnmonitored=0") {
+		t.Errorf("a scoped run counts only the named movie; an unidentifiable one is not it:\n%s", out)
+	}
+}

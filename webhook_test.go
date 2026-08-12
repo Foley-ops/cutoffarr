@@ -374,3 +374,32 @@ func TestDebounceQueue_SeasonNumbersAccumulateAcrossEventsForOneKey(t *testing.T
 		t.Errorf("accumulated seasons = %q, want %q", got, "2,3")
 	}
 }
+
+// TestWebhookHandler_PathNamingNoSingleInstance_IsStill200AndWarns closes a
+// silent hole found in self-review. {instance} matches exactly one non-empty
+// segment, so "/webhook/" and "/webhook/radarr/main" — the latter being what an
+// *arr posts to when a configured instance NAME contains a slash, which the
+// config permits — fell through to ServeMux's 404 and this program never knew
+// an event had been aimed at it.
+func TestWebhookHandler_PathNamingNoSingleInstance_IsStill200AndWarns(t *testing.T) {
+	for _, path := range []string{"/webhook/", "/webhook/radarr/main"} {
+		t.Run(path, func(t *testing.T) {
+			handler, queue, buf, _ := newWebhookTestServer(t, map[string]string{"radarr-main": "radarr"}, 45*time.Second, slog.LevelInfo)
+
+			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"eventType":"Download","movie":{"id":1}}`))
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Errorf("status = %d, want 200", rec.Code)
+			}
+			if queue.size() != 0 {
+				t.Errorf("nothing may be queued from a path that names no instance, got %d", queue.size())
+			}
+			out := buf.String()
+			if !strings.Contains(out, "level=WARN") || !strings.Contains(out, path) {
+				t.Errorf("the warning must quote the path so the misconfiguration is fixable:\n%s", out)
+			}
+		})
+	}
+}

@@ -269,7 +269,24 @@ type webhookServer struct {
 func newWebhookHandler(s *webhookServer) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /webhook/{instance}", s.handleWebhook)
+	// The catch-all under the same prefix. {instance} matches exactly one
+	// non-empty path segment, so a POST to "/webhook/" or to
+	// "/webhook/radarr/main" (an instance NAME containing a slash — legal in
+	// the config, and silently un-routable without this) would otherwise fall
+	// through to ServeMux's own 404 and this program would never know an event
+	// had been aimed at it. The more specific pattern above still wins for
+	// every well-formed request.
+	mux.HandleFunc("POST /webhook/", s.handleUnroutable)
 	return mux
+}
+
+// handleUnroutable answers a POST under /webhook/ that names no single
+// instance segment. 200, like every other exit, with the path quoted so the
+// misconfiguration is fixable from the one line.
+func (s *webhookServer) handleUnroutable(w http.ResponseWriter, r *http.Request) {
+	s.logger.Warn("webhook received on a path that names no single instance; ignoring it (the endpoint is POST /webhook/{instance-name}, and an instance name containing a slash can never be routed to)",
+		"path", r.URL.Path, "configured", strings.Join(sortedKeys(s.instances), ", "))
+	writeWebhookAccepted(w)
 }
 
 // handleWebhook is the whole request path: resolve the instance, read a bounded
