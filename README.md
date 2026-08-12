@@ -32,13 +32,25 @@ that setup — copy them, don't retype them:
 - [`docker-compose.example.yml`](docker-compose.example.yml)
 - [`config.example.yml`](config.example.yml)
 
-1. On the host that runs your `*arr` stack, copy both example files and drop
-   the `.example` from their names:
+1. On the host that runs your `*arr` stack, copy `docker-compose.example.yml`
+   to `docker-compose.yml` wherever you keep your compose files, and copy
+   `config.example.yml` to `config.yml` **inside the directory
+   `docker-compose.example.yml` mounts as `/config`** — by default
+   `/mnt/user/appdata/cutoffarr` (Unraid's usual appdata layout):
 
    ```sh
    cp docker-compose.example.yml docker-compose.yml
-   cp config.example.yml config.yml
+   mkdir -p /mnt/user/appdata/cutoffarr
+   cp config.example.yml /mnt/user/appdata/cutoffarr/config.yml
    ```
+
+   If you keep configs somewhere else, edit the host side of the `volumes:`
+   line in `docker-compose.yml` to point there instead — whatever that path
+   is, it's what the `/config` path in the
+   [Configuration reference](#configuration-reference) below refers to
+   inside the container. The volume is mounted read-only, so an empty or
+   missing host directory produces an empty, unwritable `/config` and the
+   container exits at startup rather than silently running with no config.
 
 2. Edit `config.yml`: list each Radarr/Sonarr instance under `instances:`
    with its real `url`, and reference its API key as `${SOME_ENV_VAR}` —
