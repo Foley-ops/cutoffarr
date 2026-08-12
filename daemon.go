@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -83,7 +84,39 @@ type scanCycle struct {
 	// answers is "yes or no". Per-instance opt-in (media_root_map) is read
 	// fresh from cfg.Instances by the engines themselves, not carried here.
 	fileReport fileReportOptions
+
+	// kind and now are Phase 12's addition, both purely for the stats
+	// snapshot (stats.go): kind is this cycle's slot in the API contract's
+	// lastCycleKind vocabulary (startup|sweep|webhook|once) and now is the
+	// clock reading runScanCycle stamps every captured instance's LastRun
+	// and every one of its actions' Time with — the daemon's own injected
+	// clock (see daemonClock) for every daemon-driven cycle, and time.Now
+	// for main.go's --once path, so a test driving the daemon's virtual
+	// clock sees stats timestamps move with it exactly the way every other
+	// timestamp in this file already does.
+	//
+	// A manual "Scan now" cycle (POST /api/scan, webui.go) reports itself as
+	// kind "sweep": the API contract's own lastCycleKind enum names exactly
+	// four values, and a manual scan IS mechanically a full sweep — the
+	// plan's own words for what /api/scan enqueues ("enqueue one full
+	// sweep") — run early, on demand, rather than on the poll_interval;
+	// nothing about what it evaluates, reports, or writes differs from an
+	// ordinary reconciliation sweep, so there is nothing for a fifth value
+	// to distinguish.
+	kind string
+	now  func() time.Time
 }
+
+// cycleKind is scanCycle.kind's own vocabulary — see that field's doc
+// comment. Named constants rather than repeated string literals so
+// daemon.go, stats.go and their tests cannot let one of the four values drift
+// from the API contract's own spelling.
+const (
+	cycleKindStartup = "startup"
+	cycleKindSweep   = "sweep"
+	cycleKindWebhook = "webhook"
+	cycleKindOnce    = "once"
+)
 
 // runScanCycle performs one full pass: for every in-scope instance, the
 // read-only connectivity check, then (if that succeeded) the library read and
@@ -96,7 +129,15 @@ type scanCycle struct {
 // ctx carries the daemon's shutdown. It is checked BETWEEN INSTANCES here, and
 // again between items inside the engines; the write paths detach their own
 // requests from it so an in-flight item completes (binding controller note 4).
-func runScanCycle(ctx context.Context, logger *slog.Logger, cfg Config, cycle scanCycle) {
+//
+// stats is Phase 12's in-memory capture (nil-safe: main.go's --once path
+// passes nil, since --once never starts a server for anything to serve a
+// snapshot to). When non-nil, it is updated once per in-scope instance whose
+// read succeeded (dataOK), from the cycleInstanceStats each decision engine
+// now returns — never for an instance whose connectivity check or library
+// read failed, so a bad cycle leaves the store's last-known-good state alone
+// rather than clobbering it with zeroes.
+func runScanCycle(ctx context.Context, logger *slog.Logger, cfg Config, cycle scanCycle, stats *statsStore) {
 	for _, inst := range cfg.Instances {
 		// An instance the caller did not name is not merely left unwritten: it
 		// is not contacted at all. "--instance radarr-4k" has to mean the run
@@ -127,13 +168,19 @@ func runScanCycle(ctx context.Context, logger *slog.Logger, cfg Config, cycle sc
 		if ok && inst.Type == "radarr" {
 			movies, wantedIDs, dataOK := inspectRadarrLibrary(ctx, readLogger, inst, cycle.samples)
 			if dataOK {
-				runRadarrDecisionEngine(ctx, logger, inst, movies, wantedIDs, cfg.ExclusionTag, cycle.scope, cycle.dryRun, cycle.reverse, cycle.fileReport)
+				result := runRadarrDecisionEngine(ctx, logger, inst, movies, wantedIDs, cfg.ExclusionTag, cycle.scope, cycle.dryRun, cycle.reverse, cycle.fileReport)
+				if stats != nil {
+					stats.recordInstance(cycle.kind, cycle.now(), inst.Name, inst.Type, result)
+				}
 			}
 		}
 		if ok && inst.Type == "sonarr" {
 			series, wantedEpisodeIDs, wantedSeasons, dataOK := inspectSonarrLibrary(ctx, readLogger, inst)
 			if dataOK {
-				runSonarrDecisionEngine(ctx, logger, inst, series, wantedEpisodeIDs, wantedSeasons, cfg.ExclusionTag, cycle.scope, cycle.dryRun, cycle.reverse, cycle.fileReport)
+				result := runSonarrDecisionEngine(ctx, logger, inst, series, wantedEpisodeIDs, wantedSeasons, cfg.ExclusionTag, cycle.scope, cycle.dryRun, cycle.reverse, cycle.fileReport)
+				if stats != nil {
+					stats.recordInstance(cycle.kind, cycle.now(), inst.Name, inst.Type, result)
+				}
 			}
 		}
 	}
@@ -223,6 +270,94 @@ type daemon struct {
 	cfg    Config
 	clock  daemonClock
 	queue  *debounceQueue
+
+	// stats and scan are Phase 12's additions. stats is the in-memory
+	// snapshot GET /api/stats serves from, updated at the end of every cycle
+	// this daemon runs (see runScanCycle's own stats parameter). scan is the
+	// single-flight coordinator POST /api/scan and the loop below share: the
+	// HTTP handler only ever calls requestScan/its own read of running, and
+	// only the loop's own goroutine ever calls begin/end/takePending — see
+	// scanCoordinator's own doc comment for why that split is what makes "no
+	// interleaving" true without an extra lock anywhere else.
+	stats *statsStore
+	scan  *scanCoordinator
+}
+
+// scanCoordinator answers POST /api/scan's whole question — "is a full cycle
+// already running or queued?" — and lets the daemon loop pick up a queued
+// manual scan on its own turn, without ever running two cycles at once.
+//
+// It does NOT itself enforce mutual exclusion between cycles: that is
+// already structural, for free, because every cycle this daemon runs (the
+// startup scan, a reconciliation sweep, a webhook cycle, a manual scan) is
+// invoked from the SAME single loop goroutine (see (*daemon).loop's own
+// comment: "everything that evaluates anything runs here"), which can only
+// ever be inside one runScanCycle call at a time. What scanCoordinator adds
+// is visibility of that fact to the HTTP handler's goroutine (running) and a
+// place for a request that arrived while something else was in flight to
+// wait its turn (pending) — a bool pair a mutex protects, plus a channel
+// that wakes the loop out of an indefinite wait the moment a request lands.
+type scanCoordinator struct {
+	mu      sync.Mutex
+	running bool
+	pending bool
+
+	// notify mirrors debounceQueue.notify exactly (webhook.go): buffered for
+	// one, sent to non-blockingly, so the loop only ever needs to know THAT a
+	// scan was requested, not how many times.
+	notify chan struct{}
+}
+
+func newScanCoordinator() *scanCoordinator {
+	return &scanCoordinator{notify: make(chan struct{}, 1)}
+}
+
+// requestScan is POST /api/scan's entire job. It returns true if this call is
+// the one that queued a scan; false if a cycle is already running OR one is
+// already queued — the API contract's single-flight idempotency ("never two
+// queued"), and the reason a second rapid POST while a scan is in flight
+// cannot stack a second one behind it.
+func (s *scanCoordinator) requestScan() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running || s.pending {
+		return false
+	}
+	s.pending = true
+	select {
+	case s.notify <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+// takePending reports whether a manual scan is waiting to start, clearing the
+// flag if so. Called only from the loop's own goroutine, at the point it is
+// about to honor the request.
+func (s *scanCoordinator) takePending() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.pending {
+		return false
+	}
+	s.pending = false
+	return true
+}
+
+// begin/end bracket EVERY cycle this daemon runs, not only manual ones — the
+// startup scan, an ordinary reconciliation sweep, and each webhook cycle all
+// call these too, which is what makes "already running" in the API contract
+// true for any of them, not only a previous manual scan.
+func (s *scanCoordinator) begin() {
+	s.mu.Lock()
+	s.running = true
+	s.mu.Unlock()
+}
+
+func (s *scanCoordinator) end() {
+	s.mu.Lock()
+	s.running = false
+	s.mu.Unlock()
 }
 
 // runDaemon is the default run mode: a full scan on startup, then the webhook
@@ -257,7 +392,10 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 		forceExit = os.Exit
 	}
 
-	d := &daemon{logger: logger, cfg: cfg, clock: clk, queue: newDebounceQueue(webhookQueueLimit)}
+	d := &daemon{
+		logger: logger, cfg: cfg, clock: clk, queue: newDebounceQueue(webhookQueueLimit),
+		stats: newStatsStore(cfg.DryRun), scan: newScanCoordinator(),
+	}
 
 	instanceTypes := make(map[string]string, len(cfg.Instances))
 	for _, inst := range cfg.Instances {
@@ -275,6 +413,31 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 		}
 	}
 
+	// Phase 12 (v2c): the same listener and the same *http.Server now also
+	// serve the embedded GUI and its two JSON endpoints, mounted alongside the
+	// webhook endpoint on one top-level mux rather than a second port — the
+	// binding "http://[IP]:[PORT:9898]/" WebUI label (docker-compose.
+	// example.yml, templates/cutoffarr.xml) names this SAME port. Mounting
+	// "/webhook/" at a subtree pattern hands webhookHandler the request
+	// UNCHANGED (net/http does not rewrite r.URL.Path for a subtree mount,
+	// unlike http.StripPrefix), so its own "POST /webhook/{instance}" pattern
+	// keeps matching exactly as it did on its own dedicated mux — nothing
+	// about the webhook endpoint's routing, method handling, or 404/405
+	// behavior changes. "/" is the catch-all default and therefore also what
+	// answers every path neither mux recognizes, which is what keeps "404 for
+	// other paths unchanged" true without this file naming every dead path
+	// itself.
+	topMux := http.NewServeMux()
+	topMux.Handle("/webhook/", newWebhookHandler(&webhookServer{
+		logger:       logger,
+		queue:        d.queue,
+		debounce:     cfg.WebhookDebounce,
+		now:          clk.Now,
+		instances:    instanceTypes,
+		pollInterval: cfg.PollInterval,
+	}))
+	topMux.Handle("/", newWebUIHandler(&webUIServer{stats: d.stats, scan: d.scan, logger: logger}))
+
 	srv := &http.Server{
 		// Timeouts, because this listener is reachable by whatever can route to
 		// the container and net/http has none by default: without them a single
@@ -286,14 +449,7 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
-		Handler: newWebhookHandler(&webhookServer{
-			logger:       logger,
-			queue:        d.queue,
-			debounce:     cfg.WebhookDebounce,
-			now:          clk.Now,
-			instances:    instanceTypes,
-			pollInterval: cfg.PollInterval,
-		}),
+		Handler:           topMux,
 	}
 
 	// The shutdown handler is installed BEFORE anything long-running starts, so
@@ -324,7 +480,9 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 	// equivalent of a --once run, and the baseline every later cycle's silence
 	// is read against.
 	logger.Info("startup scan beginning", "instances", len(cfg.Instances), "dryRun", cfg.DryRun)
-	runScanCycle(ctx, logger, cfg, scanCycle{scope: fullLibraryScope(slog.LevelInfo), dryRun: cfg.DryRun, reverse: fullScanReverseOptions(cfg), fileReport: fullScanFileReportOptions()})
+	d.scan.begin()
+	runScanCycle(ctx, logger, cfg, scanCycle{kind: cycleKindStartup, now: d.clock.Now, scope: fullLibraryScope(slog.LevelInfo), dryRun: cfg.DryRun, reverse: fullScanReverseOptions(cfg), fileReport: fullScanFileReportOptions()}, d.stats)
+	d.scan.end()
 	// A pass that stopped early must never print the line a pass that finished
 	// prints. runScanCycle returns the same way whether it covered every
 	// instance or abandoned the cycle on shutdown (its own between-instances
@@ -425,13 +583,34 @@ func (d *daemon) loop(ctx context.Context) {
 			continue
 		}
 
+		// A manual "Scan now" (POST /api/scan, webui.go) checked second,
+		// ahead of the SCHEDULED reconciliation sweep: a human is watching for
+		// this one, while the reconciliation sweep runs unattended whenever it
+		// is due. It never preempts an already-due webhook cycle above, and it
+		// never runs concurrently with anything else — see scanCoordinator's
+		// own doc comment for why that is already structural here.
+		if d.scan.takePending() {
+			d.logger.Info("manual scan beginning", "trigger", "POST /api/scan", "instances", len(d.cfg.Instances), "dryRun", d.cfg.DryRun)
+			d.scan.begin()
+			runScanCycle(ctx, d.logger, d.cfg, scanCycle{kind: cycleKindSweep, now: d.clock.Now, scope: fullLibraryScope(slog.LevelDebug), dryRun: d.cfg.DryRun, reverse: fullScanReverseOptions(d.cfg), fileReport: fullScanFileReportOptions()}, d.stats)
+			d.scan.end()
+			if ctx.Err() != nil {
+				d.logger.Info("manual scan abandoned on shutdown: it stopped between items and did not cover every instance, so nothing above describes the whole library")
+				continue
+			}
+			d.logger.Info("manual scan complete")
+			continue
+		}
+
 		if !nextReconcile.IsZero() && !now.Before(nextReconcile) {
 			d.logger.Info("reconciliation sweep beginning", "instances", len(d.cfg.Instances), "dryRun", d.cfg.DryRun)
 			// The SAME function the startup scan and --once call, with the
 			// same full-library scope — only the report level differs, because
 			// this cycle repeats forever and its per-item lines are repetition
 			// rather than news (binding controller note 6).
-			runScanCycle(ctx, d.logger, d.cfg, scanCycle{scope: fullLibraryScope(slog.LevelDebug), dryRun: d.cfg.DryRun, reverse: fullScanReverseOptions(d.cfg), fileReport: fullScanFileReportOptions()})
+			d.scan.begin()
+			runScanCycle(ctx, d.logger, d.cfg, scanCycle{kind: cycleKindSweep, now: d.clock.Now, scope: fullLibraryScope(slog.LevelDebug), dryRun: d.cfg.DryRun, reverse: fullScanReverseOptions(d.cfg), fileReport: fullScanFileReportOptions()}, d.stats)
+			d.scan.end()
 			if ctx.Err() != nil {
 				// The startup scan's rule (see runDaemon) plus the half only the
 				// sweep has: the completion line RE-ARMS the schedule and
@@ -450,12 +629,13 @@ func (d *daemon) loop(ctx context.Context) {
 		wait, scheduled := d.nextWait(now, nextReconcile)
 		if !scheduled {
 			// Nothing is scheduled at all (poll_interval 0 and an empty
-			// queue): wait for a webhook or for shutdown, indefinitely and
-			// without burning a timer.
+			// queue): wait for a webhook, a manual scan request, or shutdown,
+			// indefinitely and without burning a timer.
 			select {
 			case <-ctx.Done():
 				return
 			case <-d.queue.notify:
+			case <-d.scan.notify:
 			}
 			continue
 		}
@@ -468,6 +648,12 @@ func (d *daemon) loop(ctx context.Context) {
 		case <-timer.C():
 		case <-d.queue.notify:
 			// A new event moved (or added) a deadline; recompute the wait.
+			timer.Stop()
+		case <-d.scan.notify:
+			// A manual scan was requested; recompute nothing — the top of the
+			// loop's takePending check picks it up on the next iteration —
+			// but stop the armed timer the same way a webhook notify does, so
+			// it cannot fire later into an iteration that has moved on.
 			timer.Stop()
 		}
 	}
@@ -547,10 +733,14 @@ func (d *daemon) runWebhookCycles(ctx context.Context, due []queueKey, seasons m
 			}
 		}
 		d.logger.Info("webhook debounce expired; evaluating", attrs...)
+		d.scan.begin()
 		runScanCycle(ctx, d.logger, d.cfg, scanCycle{
 			instanceName: name,
 			scope:        webhookScope(ids, scopeSeasons),
 			dryRun:       d.cfg.DryRun,
-		})
+			kind:         cycleKindWebhook,
+			now:          d.clock.Now,
+		}, d.stats)
+		d.scan.end()
 	}
 }

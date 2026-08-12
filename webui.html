@@ -1,0 +1,617 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'">
+<title>cutoffarr</title>
+<style>
+  /* Tokens. Every other color in this file is derived from these five —
+     bg/panel/ink for structure and text, rest/hunt/alert for state — never
+     introduced fresh. This is a deliberately fixed, single-mode page (a
+     homelab operator glancing at one LAN dashboard), not a light/dark
+     adaptive one. */
+  :root {
+    --bg: #0F1517;
+    --panel: #1A2427;
+    --ink: #D8E2E0;
+    --ink-dim: rgb(216 226 224 / 62%);
+    --ink-faint: rgb(216 226 224 / 38%);
+    --border: rgb(216 226 224 / 12%);
+    --border-strong: rgb(216 226 224 / 22%);
+    --rest: #6FA08C;
+    --rest-dim: rgb(111 160 140 / 22%);
+    --hunt: #D9A05B;
+    --hunt-dim: rgb(217 160 91 / 22%);
+    --alert: #C46A5A;
+    --alert-dim: rgb(196 106 90 / 22%);
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--ink);
+  }
+
+  body {
+    font-family: var(--sans);
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 40px 24px 80px;
+  }
+
+  /* --- header ---------------------------------------------------------- */
+
+  .topbar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin-bottom: 48px;
+  }
+
+  .brand {
+    font-family: var(--mono);
+    font-size: 20px;
+    letter-spacing: -0.01em;
+    color: var(--ink);
+  }
+
+  .brand .tick {
+    color: var(--rest);
+  }
+
+  .status-group {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-left: auto;
+    flex-wrap: wrap;
+  }
+
+  .badge {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 4px 9px;
+    border-radius: 999px;
+    border: 1px solid var(--border-strong);
+    white-space: nowrap;
+  }
+
+  .badge-rest { color: var(--rest); background: var(--rest-dim); border-color: rgb(111 160 140 / 40%); }
+  .badge-hunt { color: var(--hunt); background: var(--hunt-dim); border-color: rgb(217 160 91 / 40%); }
+
+  .last-swept {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-dim);
+    white-space: nowrap;
+  }
+
+  button#scanBtn {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.03em;
+    color: var(--bg);
+    background: var(--rest);
+    border: 1px solid var(--rest);
+    border-radius: 6px;
+    padding: 8px 14px;
+    cursor: pointer;
+  }
+
+  button#scanBtn:hover:not(:disabled) { background: #7FAE9B; }
+
+  button#scanBtn:disabled {
+    cursor: default;
+    color: var(--ink-dim);
+    background: transparent;
+    border-color: var(--border-strong);
+  }
+
+  button:focus-visible, summary:focus-visible, a:focus-visible {
+    outline: 2px solid var(--rest);
+    outline-offset: 2px;
+  }
+
+  /* --- the cutoff shelf: the one bold, signature element ---------------- */
+
+  #instances {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    margin-bottom: 40px;
+  }
+
+  .empty {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--ink-dim);
+  }
+
+  .shelf {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 22px;
+  }
+
+  .shelf-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 14px;
+  }
+
+  .shelf-name {
+    font-family: var(--mono);
+    font-size: 15px;
+    color: var(--ink);
+  }
+
+  .shelf-type {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+
+  .shelf-bar-wrap {
+    position: relative;
+    padding-top: 1.8em;
+  }
+
+  .shelf-count {
+    position: absolute;
+    top: 0;
+    left: 0;
+    transform: translateX(-50%);
+    white-space: nowrap;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--ink);
+  }
+
+  .shelf-count .unit {
+    color: var(--ink-dim);
+    font-size: 11px;
+  }
+
+  .shelf-bar {
+    position: relative;
+    height: 30px;
+    border-radius: 5px;
+    background: var(--hunt-dim);
+    border: 1px solid rgb(217 160 91 / 30%);
+    overflow: hidden;
+  }
+
+  .shelf-rest {
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 0%;
+    background: var(--rest);
+    transition: width 0.3s ease-out;
+  }
+
+  .shelf-marker {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0%;
+    width: 2px;
+    margin-left: -1px;
+    background: var(--ink);
+    transition: left 0.3s ease-out;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .shelf-rest, .shelf-marker { transition: none; }
+  }
+
+  .shelf-sub {
+    margin: 12px 0 0;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--hunt);
+  }
+
+  /* Narrow viewports: the label stops trying to float over the cutoff
+     marker (it can run out of room to center itself near either edge) and
+     stacks as its own line above the bar instead. */
+  @media (max-width: 420px) {
+    .shelf-bar-wrap { padding-top: 0; }
+    .shelf-count {
+      position: static;
+      display: block;
+      transform: none;
+      margin-bottom: 6px;
+    }
+  }
+
+  /* --- reverse-scan / file-clutter panels -------------------------------- */
+
+  details.panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 16px;
+  }
+
+  details.panel summary {
+    cursor: pointer;
+    list-style: none;
+    padding: 16px 22px;
+    font-size: 13px;
+    color: var(--ink);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  details.panel summary::-webkit-details-marker { display: none; }
+
+  details.panel summary::before {
+    content: "▸";
+    color: var(--ink-faint);
+    font-size: 11px;
+    transition: transform 0.15s ease-out;
+  }
+
+  details.panel[open] summary::before { transform: rotate(90deg); }
+
+  .panel-body {
+    padding: 0 22px 20px;
+    border-top: 1px solid var(--border);
+    padding-top: 16px;
+  }
+
+  table.findings {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+
+  table.findings th {
+    text-align: left;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    font-weight: 400;
+    padding: 0 10px 8px 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  table.findings td {
+    padding: 7px 10px 7px 0;
+    border-bottom: 1px solid var(--border);
+    color: var(--ink-dim);
+    vertical-align: top;
+    word-break: break-word;
+  }
+
+  table.findings tr:last-child td { border-bottom: none; }
+
+  table.findings td.path { color: var(--ink-faint); }
+
+  .findings-scroll { overflow-x: auto; }
+
+  footer {
+    margin-top: 48px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--ink-faint);
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="topbar">
+    <div class="brand">cutoffarr<span class="tick">_</span></div>
+    <div class="status-group">
+      <span id="dryRunBadge" class="badge">…</span>
+      <span id="lastSwept" class="last-swept">last swept —</span>
+      <button id="scanBtn" type="button">Scan now</button>
+    </div>
+  </header>
+
+  <!-- signature element: the cutoff shelf. One horizontal shelf bar per
+       instance — sage (rest) meets amber (hunt) at a 2px vertical marker
+       carrying the "N / total at rest" count above it. -->
+  <main id="instances" data-cutoff-shelf>
+    <p class="empty">No cycle has completed yet. The first sweep is still working.</p>
+  </main>
+
+  <details class="panel">
+    <summary>Needs your eyes — reverse scan (<span id="reverseCount">0</span>)</summary>
+    <div class="panel-body findings-scroll" id="reverseBody">
+      <p class="empty">Nothing wrongly unmonitored. The shelves are in order.</p>
+    </div>
+  </details>
+
+  <details class="panel">
+    <summary>File clutter — duplicates &amp; orphans (<span id="fileCount">0</span>)</summary>
+    <div class="panel-body findings-scroll" id="fileBody">
+      <p class="empty">No clutter found. Every tracked file is exactly where it should be.</p>
+    </div>
+  </details>
+
+  <footer>cutoffarr <span id="versionLabel">· dev</span></footer>
+
+</div>
+<script>
+(function () {
+  "use strict";
+
+  var POLL_MS = 30000;
+  var scanBtn = document.getElementById("scanBtn");
+  var pollHandle = null;
+
+  function text(el, s) { el.textContent = s; }
+
+  function el(tag, cls) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    return e;
+  }
+
+  // fmtRelative renders an RFC3339 timestamp (or null) as "just now" / "3m
+  // ago" / "2h ago" / "5d ago" — the operator glances at this, so relative
+  // and coarse beats exact and precise.
+  function fmtRelative(iso) {
+    if (!iso) return "never";
+    var then = new Date(iso).getTime();
+    if (isNaN(then)) return "never";
+    var diffSec = Math.max(0, Math.round((Date.now() - then) / 1000));
+    if (diffSec < 5) return "just now";
+    if (diffSec < 60) return diffSec + "s ago";
+    var m = Math.round(diffSec / 60);
+    if (m < 60) return m + "m ago";
+    var h = Math.round(m / 60);
+    if (h < 24) return h + "h ago";
+    var d = Math.round(h / 24);
+    return d + "d ago";
+  }
+
+  function clampPct(n) {
+    if (!isFinite(n)) return 0;
+    return Math.max(0, Math.min(100, n));
+  }
+
+  function renderShelf(inst) {
+    var total = inst.total || 0;
+    var atRest = inst.unmonitored || 0;
+    var pct = total > 0 ? clampPct((atRest / total) * 100) : 0;
+    var pctStr = pct.toFixed(1) + "%";
+
+    var card = el("section", "shelf");
+    card.setAttribute("data-instance", inst.name);
+
+    var head = el("div", "shelf-head");
+    var name = el("span", "shelf-name"); text(name, inst.name);
+    var kind = el("span", "shelf-type"); text(kind, inst.type);
+    head.appendChild(name);
+    head.appendChild(kind);
+    card.appendChild(head);
+
+    var barWrap = el("div", "shelf-bar-wrap");
+
+    var count = el("span", "shelf-count");
+    count.style.left = pctStr;
+    var unit = el("span", "unit");
+    text(unit, " at rest");
+    count.textContent = atRest + " / " + total;
+    count.appendChild(unit);
+    barWrap.appendChild(count);
+
+    var bar = el("div", "shelf-bar");
+    var rest = el("div", "shelf-rest");
+    rest.style.width = pctStr;
+    var marker = el("div", "shelf-marker");
+    marker.style.left = pctStr;
+    bar.appendChild(rest);
+    bar.appendChild(marker);
+    barWrap.appendChild(bar);
+
+    card.appendChild(barWrap);
+
+    if (inst.wouldUnmonitor > 0) {
+      var sub = el("p", "shelf-sub");
+      text(sub, inst.wouldUnmonitor + " more ready to rest this sweep");
+      card.appendChild(sub);
+    }
+
+    return card;
+  }
+
+  function renderInstances(instances) {
+    var root = document.getElementById("instances");
+    root.textContent = "";
+    if (!instances || instances.length === 0) {
+      var p = el("p", "empty");
+      text(p, "No cycle has completed yet. The first sweep is still working.");
+      root.appendChild(p);
+      return;
+    }
+    for (var i = 0; i < instances.length; i++) {
+      root.appendChild(renderShelf(instances[i]));
+    }
+  }
+
+  function findingsTable(headers, rows, rowFn) {
+    var table = el("table", "findings");
+    var thead = el("thead");
+    var htr = el("tr");
+    for (var h = 0; h < headers.length; h++) {
+      var th = el("th"); text(th, headers[h]);
+      htr.appendChild(th);
+    }
+    thead.appendChild(htr);
+    table.appendChild(thead);
+    var tbody = el("tbody");
+    for (var i = 0; i < rows.length; i++) {
+      tbody.appendChild(rowFn(rows[i]));
+    }
+    table.appendChild(tbody);
+    return table;
+  }
+
+  function renderReverse(instances) {
+    var body = document.getElementById("reverseBody");
+    var rows = [];
+    for (var i = 0; i < instances.length; i++) {
+      var inst = instances[i];
+      var findings = inst.reverseFindings || [];
+      for (var j = 0; j < findings.length; j++) {
+        rows.push({ instance: inst.name, f: findings[j] });
+      }
+    }
+    text(document.getElementById("reverseCount"), String(rows.length));
+    body.textContent = "";
+    if (rows.length === 0) {
+      var p = el("p", "empty");
+      text(p, "Nothing wrongly unmonitored. The shelves are in order.");
+      body.appendChild(p);
+      return;
+    }
+    body.appendChild(findingsTable(
+      ["instance", "item", "season", "reason"],
+      rows,
+      function (r) {
+        var tr = el("tr");
+        var item = r.f.title || r.f.series || "";
+        var season = (r.f.season === undefined || r.f.season === null) ? "—" : String(r.f.season);
+        var cells = [r.instance, item, season, r.f.reason || ""];
+        for (var c = 0; c < cells.length; c++) {
+          var td = el("td"); text(td, cells[c]);
+          tr.appendChild(td);
+        }
+        return tr;
+      }
+    ));
+  }
+
+  function renderFileReport(instances) {
+    var body = document.getElementById("fileBody");
+    var rows = [];
+    for (var i = 0; i < instances.length; i++) {
+      var inst = instances[i];
+      var fr = inst.fileReport || {};
+      var findings = fr.findings || [];
+      for (var j = 0; j < findings.length; j++) {
+        rows.push({ instance: inst.name, f: findings[j] });
+      }
+    }
+    text(document.getElementById("fileCount"), String(rows.length));
+    body.textContent = "";
+    if (rows.length === 0) {
+      var p = el("p", "empty");
+      text(p, "No clutter found. Every tracked file is exactly where it should be.");
+      body.appendChild(p);
+      return;
+    }
+    body.appendChild(findingsTable(
+      ["instance", "kind", "group", "path", "count"],
+      rows,
+      function (r) {
+        var tr = el("tr");
+        var group = r.f.group || "—";
+        var count = r.f.count ? String(r.f.count) : "—";
+        var td;
+        td = el("td"); text(td, r.instance); tr.appendChild(td);
+        td = el("td"); text(td, r.f.kind || ""); tr.appendChild(td);
+        td = el("td"); text(td, group); tr.appendChild(td);
+        td = el("td", "path"); text(td, r.f.path || ""); tr.appendChild(td);
+        td = el("td"); text(td, count); tr.appendChild(td);
+        return tr;
+      }
+    ));
+  }
+
+  function render(data) {
+    var badge = document.getElementById("dryRunBadge");
+    if (data.dryRun) {
+      badge.className = "badge badge-hunt";
+      text(badge, "rehearsing");
+    } else {
+      badge.className = "badge badge-rest";
+      text(badge, "live");
+    }
+
+    var instances = data.instances || [];
+    var latest = null;
+    for (var i = 0; i < instances.length; i++) {
+      var lr = instances[i].lastRun;
+      if (lr && (!latest || new Date(lr) > new Date(latest))) latest = lr;
+    }
+    text(document.getElementById("lastSwept"), "last swept " + fmtRelative(latest));
+    text(document.getElementById("versionLabel"), "· " + (data.version || "dev"));
+
+    renderInstances(instances);
+    renderReverse(instances);
+    renderFileReport(instances);
+  }
+
+  function refresh() {
+    return fetch("/api/stats", { headers: { "Accept": "application/json" } })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        render(data);
+        scanBtn.disabled = false;
+        text(scanBtn, "Scan now");
+      })
+      .catch(function () {
+        // A transient network hiccup talking to our own server is not worth
+        // alarming over; the next poll (or the next click) tries again.
+      });
+  }
+
+  function schedulePoll() {
+    if (pollHandle) clearTimeout(pollHandle);
+    if (document.hidden) return;
+    pollHandle = setTimeout(function () {
+      refresh().then(schedulePoll);
+    }, POLL_MS);
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) {
+      if (pollHandle) clearTimeout(pollHandle);
+      pollHandle = null;
+    } else {
+      refresh().then(schedulePoll);
+    }
+  });
+
+  scanBtn.addEventListener("click", function () {
+    scanBtn.disabled = true;
+    text(scanBtn, "Queued…");
+    fetch("/api/scan", { method: "POST" })
+      .then(function () { return refresh(); })
+      .catch(function () {
+        scanBtn.disabled = false;
+        text(scanBtn, "Scan now");
+      });
+  });
+
+  refresh().then(schedulePoll);
+})();
+</script>
+</body>
+</html>

@@ -1523,7 +1523,7 @@ func TestRunSonarrWritePass_RecoveryUnderPassedGate_IsCountedSeparately(t *testi
 	// An explicit pass with would-unmonitor evidence: the ordinary gate is OPEN.
 	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 2, writeVerified: 2}
 	unmonitored, recovered, writeErrors, echoUnverified, refused, withheld := runSonarrWritePass(
-		context.Background(), logger, fake.client(), fake.instance(), sonarrRecoveryDecisions(), cc, 0, false, false)
+		context.Background(), logger, fake.client(), fake.instance(), sonarrRecoveryDecisions(), cc, 0, false, false, nil)
 
 	out := buf.String()
 	if unmonitored != 1 || recovered != 1 {
@@ -1595,7 +1595,7 @@ func TestRunSonarrWritePass_RecoveryUnderInconclusiveGate_CompletesWhileTheRestI
 	// The shape an instance recovering from a partial write really produces.
 	cc := crossCheckResult{status: crossCheckStatusInconclusive, unverifiable: 1, writeUnverifiable: 1}
 	unmonitored, recovered, writeErrors, echoUnverified, refused, withheld := runSonarrWritePass(
-		context.Background(), logger, fake.client(), fake.instance(), sonarrRecoveryDecisions(), cc, 0, false, false)
+		context.Background(), logger, fake.client(), fake.instance(), sonarrRecoveryDecisions(), cc, 0, false, false, nil)
 
 	out := buf.String()
 	if unmonitored != 0 || recovered != 1 || withheld != 1 {
@@ -1680,7 +1680,7 @@ func TestRunSonarrWritePass_RecoveryUnderFailedOrUnrecognizedCrossCheck_IsBlocke
 
 			cc := crossCheckResult{status: status, unverifiable: 1, writeUnverifiable: 1}
 			unmonitored, recovered, _, _, _, withheld := runSonarrWritePass(
-				context.Background(), logger, fake.client(), fake.instance(), sonarrRecoveryDecisions(), cc, 0, false, false)
+				context.Background(), logger, fake.client(), fake.instance(), sonarrRecoveryDecisions(), cc, 0, false, false, nil)
 
 			out := buf.String()
 			if unmonitored != 0 || recovered != 0 || withheld != 2 {
@@ -1713,7 +1713,7 @@ func TestRunSonarrWritePass_NonRecoverySeasonUnderInconclusiveGate_IsWithheldUnf
 	ordinaryOnly := sonarrRecoveryDecisions()[1:]
 	cc := crossCheckResult{status: crossCheckStatusInconclusive, unverifiable: 1, writeUnverifiable: 1}
 	unmonitored, recovered, writeErrors, echoUnverified, refused, withheld := runSonarrWritePass(
-		context.Background(), logger, fake.client(), fake.instance(), ordinaryOnly, cc, 0, false, false)
+		context.Background(), logger, fake.client(), fake.instance(), ordinaryOnly, cc, 0, false, false, nil)
 
 	out := buf.String()
 	if unmonitored != 0 || recovered != 0 || withheld != 1 {
@@ -1752,7 +1752,7 @@ func TestRunSonarrWritePass_DryRun_GateBlocked_RecoveryIsRehearsedNotWritten(t *
 	// Byte-identical to the write-mode test above except for the last argument.
 	cc := crossCheckResult{status: crossCheckStatusInconclusive, unverifiable: 1, writeUnverifiable: 1}
 	unmonitored, recovered, writeErrors, echoUnverified, refused, withheld := runSonarrWritePass(
-		context.Background(), logger, fake.client(), fake.instance(), sonarrRecoveryDecisions(), cc, 0, false, true)
+		context.Background(), logger, fake.client(), fake.instance(), sonarrRecoveryDecisions(), cc, 0, false, true, nil)
 
 	out := buf.String()
 	if writes := fake.writes(); len(writes) != 0 {
@@ -1888,7 +1888,7 @@ func TestRunSonarrWritePass_GateBlocked_NonCandidateRefusesAtWriteTime_IsCounted
 
 	cc := crossCheckResult{status: crossCheckStatusInconclusive, unverifiable: 1, writeUnverifiable: 1}
 	unmonitored, recovered, writeErrors, echoUnverified, refused, withheld := runSonarrWritePass(
-		context.Background(), logger, fake.client(), fake.instance(), sonarrRecoveryDecisions()[:1], cc, 0, false, false)
+		context.Background(), logger, fake.client(), fake.instance(), sonarrRecoveryDecisions()[:1], cc, 0, false, false, nil)
 
 	out := buf.String()
 	if refused != 1 {
@@ -3491,7 +3491,7 @@ func TestRunSonarrWritePass_ShutdownDuringAnInFlightSeason_FinishesBothCallsThen
 	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 2, writeVerified: 2}
 
 	unmonitored, recovered, writeErrors, echoUnverified, refused, withheld := runSonarrWritePass(
-		ctx, logger, NewAPIClient(fake.srv.URL, "key"), fake.instance(), sonarrTwoSeasonDecisions(), cc, 0, false, false)
+		ctx, logger, NewAPIClient(fake.srv.URL, "key"), fake.instance(), sonarrTwoSeasonDecisions(), cc, 0, false, false, nil)
 
 	out := buf.String()
 	// The invariant. A season whose episodes were written but whose season flag
@@ -3544,7 +3544,7 @@ func TestRunWritePass_ShutdownBetweenMovies_WithholdsTheRestAndSaysSo(t *testing
 	}
 
 	unmonitored, writeErrors, echoUnverified, refused, withheld := runWritePass(
-		ctx, logger, NewAPIClient(fake.srv.URL, "key"), fake.instance(), decisions, cc, 0, false, false)
+		ctx, logger, NewAPIClient(fake.srv.URL, "key"), fake.instance(), decisions, cc, 0, false, false, nil)
 
 	out := buf.String()
 	if unmonitored != 1 || withheld != 1 {

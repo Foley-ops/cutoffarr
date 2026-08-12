@@ -1065,6 +1065,12 @@ type fileReportCounts struct {
 	duplicates  int
 	orphans     int
 	skipReasons map[string]int
+
+	// findings is Phase 12's addition: the SAME findings duplicates/orphans
+	// already tally, kept as data. Appended alongside the existing counting
+	// in mergeFileReportOutcome, never in place of it, so the frozen "file
+	// report" summary line (logFileReportSummary) is untouched.
+	findings []fileReportFinding
 }
 
 // state renders the three-way distinction the binding resolution requires to
@@ -1223,6 +1229,9 @@ func mergeFileReportOutcome(c *fileReportCounts, outcome fileReportRootOutcome) 
 			c.orphans++
 		}
 	}
+	// Phase 12: the findings themselves, carried alongside the counts above
+	// — see fileReportCounts.findings' own doc comment.
+	c.findings = append(c.findings, outcome.findings...)
 	for reason, n := range outcome.skipReasons {
 		c.skipReasons[reason] += n
 	}

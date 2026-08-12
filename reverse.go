@@ -224,6 +224,26 @@ type reverseCounts struct {
 	writeErrors    int
 	echoUnverified int
 	withheld       int
+
+	// movieFindings and seasonFindings are Phase 12's addition: the SAME
+	// findings the counters above already tally, kept as data rather than
+	// only as a count. Nothing here changes what runRadarr/runSonarr decide,
+	// log, or write — these are appended alongside the existing counting and
+	// logging, never in place of it, so the reverse scan's frozen log lines
+	// (binding controller resolution 7) are untouched. Exactly one of the two
+	// is ever populated by a given cycle (Radarr fills movieFindings, Sonarr
+	// fills seasonFindings); the stats layer (stats.go) reads whichever one
+	// its caller's instance type produced.
+	movieFindings  []movieDecision
+	seasonFindings []reverseSeasonFinding
+
+	// actions is Phase 12's record of every WRITE this pass actually made
+	// (report-only cycles and dry-run cycles never populate it — see
+	// writeMovieMonitored/writeSeasonMonitored, both of which return
+	// written=false in dry-run, so record's default/success case is never
+	// reached there). It exists purely for the stats snapshot's lastActions;
+	// nothing in this file ever reads it back.
+	actions []actionRecord
 }
 
 // summaryAttrs renders this cycle's reverse-scan accounting for the engine's
@@ -440,6 +460,10 @@ func (p reversePass) runRadarr(ctx context.Context, movies []movieListElement) r
 			"instance", p.inst.Name, "type", p.inst.Type, "reverseNoFile", c.noFile)
 	}
 
+	// Phase 12: carried out alongside the count, never in place of it — see
+	// reverseCounts.movieFindings' own doc comment.
+	c.movieFindings = findings
+
 	// THE REPORT-ONLY DEFAULT, structurally. With the flag off there is no
 	// write pass to gate, no fresh pre-write fetch, no payload assembled and no
 	// dry-run branch to get wrong — the reverse scan simply ends here, and the
@@ -553,6 +577,10 @@ func (p reversePass) runSonarr(ctx context.Context, series []seriesElement) reve
 				"reason", d.reason, "profile", d.profileName, "seriesMonitored", *s.Monitored)
 		}
 	}
+
+	// Phase 12: carried out alongside the count, never in place of it — see
+	// reverseCounts.seasonFindings' own doc comment.
+	c.seasonFindings = findings
 
 	// The report-only default, structurally: with the flag off there is no write
 	// pass to gate — see the Radarr twin.
@@ -732,7 +760,10 @@ func reverseWriteGateBlockReason(cc crossCheckResult) string {
 //
 // attrs names the item; the caller owns that vocabulary, since a movie line and
 // a season line identify their subject differently.
-func (c *reverseCounts) record(logger *slog.Logger, attrs []any, written bool, err error, dryRun bool) {
+// action is what this write, if it succeeds, is recorded as (Phase 12's
+// lastActions) — built by the caller from the same finding attrs is logging,
+// so it is only ever consulted on the success branch below.
+func (c *reverseCounts) record(logger *slog.Logger, attrs []any, written bool, err error, dryRun bool, action actionRecord) {
 	withAttrs := func(extra ...any) []any {
 		return append(append([]any(nil), attrs...), extra...)
 	}
@@ -772,6 +803,9 @@ func (c *reverseCounts) record(logger *slog.Logger, attrs []any, written bool, e
 	default:
 		c.remonitored++
 		logger.Info("remonitor", attrs...)
+		// Phase 12: recorded alongside the log line above, never in place of
+		// it — see reverseCounts.actions' own doc comment.
+		c.actions = append(c.actions, action)
 	}
 }
 
@@ -811,7 +845,8 @@ func (p reversePass) remonitorMovies(ctx context.Context, findings []movieDecisi
 		}
 
 		written, err := remonitorMovie(ctx, p.logger, p.client, p.inst, d.id, p.exclusionTagID, p.tagActive, p.dryRun, rev)
-		c.record(p.logger, []any{"id", d.id, "title", d.title, "reason", d.reason, "profile", d.profileName, "instance", p.inst.Name}, written, err, p.dryRun)
+		c.record(p.logger, []any{"id", d.id, "title", d.title, "reason", d.reason, "profile", d.profileName, "instance", p.inst.Name}, written, err, p.dryRun,
+			actionRecord{Action: ActionRemonitor, ID: d.id, Title: d.title, Reason: d.reason})
 	}
 }
 
@@ -921,6 +956,8 @@ func (p reversePass) remonitorSeasons(ctx context.Context, findings []reverseSea
 		}
 
 		written, err := remonitorSeason(ctx, p.logger, p.client, p.inst, d.seriesID, d.season, p.exclusionTagID, p.tagActive, p.dryRun, rev)
-		c.record(p.logger, attrs, written, err, p.dryRun)
+		season := d.season
+		c.record(p.logger, attrs, written, err, p.dryRun,
+			actionRecord{Action: ActionRemonitor, ID: d.seriesID, Title: d.series, Season: &season, Reason: d.reason})
 	}
 }

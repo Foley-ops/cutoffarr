@@ -1376,7 +1376,11 @@ func recoveryGateBlockReason(cc crossCheckResult) string {
 //
 //	wouldUnmonitor == unmonitored + recoveredWrites + echoUnverified
 //	                  + writeErrors + writesRefused + withheld
-func runSonarrWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, decisions []seasonDecision, cc crossCheckResult, exclusionTagID int, tagActive bool, dryRun bool) (unmonitored, recovered, writeErrors, echoUnverified, writesRefused, withheld int) {
+//
+// actions is the Radarr write pass's own optional sink (see runWritePass's
+// doc comment, decision.go) — nil everywhere except the decision engine's
+// stats capture.
+func runSonarrWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, decisions []seasonDecision, cc crossCheckResult, exclusionTagID int, tagActive bool, dryRun bool, actions *[]actionRecord) (unmonitored, recovered, writeErrors, echoUnverified, writesRefused, withheld int) {
 	pending := 0
 	for _, d := range decisions {
 		if d.wouldUnmonitor {
@@ -1499,12 +1503,20 @@ func runSonarrWritePass(ctx context.Context, logger *slog.Logger, client *APICli
 					"recoveryReason", "the ordinary write gate was shut; every episode of this season was already unmonitored, so only the season flag remained to write and it cannot strand anything")
 			}
 			logger.Warn("completing a previously partial season unmonitor", recoveryAttrs...)
+			if actions != nil {
+				season := d.season
+				*actions = append(*actions, actionRecord{Action: ActionUnmonitor, ID: d.seriesID, Title: d.series, Season: &season, Reason: d.reason})
+			}
 			continue
 		}
 
 		unmonitored++
 		logger.Info("unmonitor",
 			"instance", inst.Name, "seriesId", d.seriesID, "series", d.series, "season", d.season, "reason", d.reason, "profile", d.profileName)
+		if actions != nil {
+			season := d.season
+			*actions = append(*actions, actionRecord{Action: ActionUnmonitor, ID: d.seriesID, Title: d.series, Season: &season, Reason: d.reason})
+		}
 	}
 
 	// The gate line comes AFTER the pass, not before it, so every number on it

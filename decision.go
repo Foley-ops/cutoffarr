@@ -470,8 +470,32 @@ func evaluateMovie(ctx context.Context, logger *slog.Logger, client *APIClient, 
 // — when its own write switch is on — the cross-check verdict it answers to is
 // the one this cycle already produced. It is silent and free on any cycle that
 // did not ask for it.
-func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, movies []movieListElement, wantedIDs map[int]bool, exclusionTagLabel string, scope evalScope, dryRun bool, reverse reverseOptions, fileReport fileReportOptions) {
+// The named return, stats, is Phase 12's addition (see cycleInstanceStats'
+// own doc comment for why this needed no change to any existing call site).
+// It is filled in progressively as data becomes available and returned
+// however far the function got: total/monitored/unmonitored are set
+// immediately below, before any early return, because they come from movies
+// — already a complete, trustworthy read by the time this function is ever
+// called (daemon.go only calls it after inspectRadarrLibrary's own dataOK
+// gate). wouldUnmonitor, actions, reverseFindings and the file report are
+// each set at the point in the existing control flow where the data they
+// come from is already, itself, complete — never from a partial loop cut
+// short by shutdown, in keeping with this function's own rule that a partial
+// evaluation is never reported as if it covered the whole library.
+func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, movies []movieListElement, wantedIDs map[int]bool, exclusionTagLabel string, scope evalScope, dryRun bool, reverse reverseOptions, fileReport fileReportOptions) (stats cycleInstanceStats) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	// See this function's own doc comment: valid the moment movies is in
+	// hand, so every return path below — including every early one — reports
+	// real library totals rather than zeroes that would read as "library is
+	// suddenly empty".
+	stats.total = len(movies)
+	for _, m := range movies {
+		if m.Monitored != nil && *m.Monitored {
+			stats.monitored++
+		}
+	}
+	stats.unmonitored = stats.total - stats.monitored
 
 	// The per-cycle-repetition logger (see demoteInfoTo): the profile fetch,
 	// the exclusion-tag resolution and the cross-check's per-sample lines are
@@ -538,6 +562,7 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	totalMonitored := 0
 	wouldUnmonitorCount := 0
 	alreadyUnmonitoredCount := 0
+	libraryWouldUnmonitor := 0 // Phase 12: see the loop's own comment
 	skipCounts := make(map[string]int)
 
 	for _, m := range movies {
@@ -636,6 +661,17 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		}
 		d := evaluateMovie(ctx, logger, client, inst, m, profiles, exclusionTagID, tagActive, wantedIDs)
 		decisions = append(decisions, d)
+		// Phase 12: library-wide, unlike wouldUnmonitorCount below — see
+		// cycleInstanceStats' own doc comment for why this is deliberately
+		// NOT scope-filtered. Accumulated in a local, not directly into the
+		// named return, so a shutdown abandoning this loop early (the ctx.Err
+		// branch above, which returns bare) reports nothing here rather than a
+		// partial count — the same "a partial evaluation is never reported as
+		// if it covered the whole library" rule this function already applies
+		// to the cross-check and the write pass.
+		if d.wouldUnmonitor {
+			libraryWouldUnmonitor++
+		}
 
 		// --only-id scoping happens here and nowhere else: every movie is
 		// still evaluated above (the cross-check needs the full candidate
@@ -674,10 +710,15 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 			append([]any{"instance", inst.Name, "type", inst.Type}, scope.summaryAttrs()...)...)
 	}
 
+	// The loop ran to completion (a shutdown-abandoned one already returned
+	// above, without reaching here) — see libraryWouldUnmonitor's own comment.
+	stats.wouldUnmonitor = libraryWouldUnmonitor
+
 	cc := runCrossCheck(cycleLogger, inst, decisions, wantedIDs)
 	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
 
-	unmonitoredCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount := runWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun)
+	var forwardActions []actionRecord
+	unmonitoredCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount := runWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun, &forwardActions)
 
 	var rev reverseCounts
 	if reverse.enabled {
@@ -686,7 +727,17 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 			profiles: profiles, exclusionTagID: exclusionTagID, tagActive: tagActive,
 			cc: cc, scope: scope, itemLevel: scope.itemLevel, dryRun: dryRun, opts: reverse,
 		}.runRadarr(ctx, movies)
+		// Phase 12: captured only when this cycle actually ran the pass — see
+		// cycleInstanceStats.reverseRan's own comment on why a cycle that
+		// skipped it must leave the store's previous findings untouched
+		// rather than overwrite them here with an empty slice.
+		stats.reverseRan = true
+		stats.reverseFindings = radarrReverseFindings(rev.movieFindings)
 	}
+	// Combined here, once, regardless of which passes ran: forwardActions is
+	// always a real (possibly empty) slice, and rev.actions is the reverse
+	// pass's zero value (nil) whenever reverse.enabled was false above.
+	stats.actions = append(forwardActions, rev.actions...)
 
 	// Phase 11, the fifth and last pass: the duplicate & orphan file report.
 	// Runs after the forward AND reverse passes (binding controller
@@ -700,7 +751,12 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// this phase, and logFileReportSummary's off-state debug demotion can
 	// only do that from its own call, not as an attr on an always-INFO line.
 	if fileReport.enabled {
-		logFileReportSummary(logger, inst, runRadarrFileReport(ctx, logger, scope.itemLevel, inst, movies, exclusionTagID, tagActive))
+		frc := runRadarrFileReport(ctx, logger, scope.itemLevel, inst, movies, exclusionTagID, tagActive)
+		logFileReportSummary(logger, inst, frc)
+		// Phase 12: see stats.reverseRan above — the same "only overwrite
+		// when this cycle actually ran it" rule.
+		stats.fileReportRan = true
+		stats.fileReport = fileReportSnapshotFrom(frc)
 	}
 
 	attrs := []any{"instance", inst.Name, "type", inst.Type}
@@ -763,6 +819,7 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 
 	attrs = append(attrs, "skipReasons", formatSkipCounts(skipCounts), "crossCheck", crossCheckSummary)
 	logger.Info("radarr decision summary", attrs...)
+	return stats
 }
 
 // libraryContainsID reports whether any movie in the library carries id.
@@ -864,7 +921,16 @@ func libraryContainsID(movies []movieListElement, id int) bool {
 // and §2.5 says the exclusion tag always wins, in every mode — including a
 // tag added to a movie after it was evaluated but before the write pass
 // reached it.
-func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, decisions []movieDecision, cc crossCheckResult, exclusionTagID int, tagActive bool, dryRun bool) (unmonitored, writeErrors, echoUnverified, writesRefused, withheld int) {
+// actions is Phase 12's optional sink for every confirmed unmonitor this pass
+// makes: nil (every existing call site) means "don't record", the same
+// zero-value-off convention reverse/fileReport options already use, so a
+// caller uninterested in the stats snapshot pays nothing beyond a nil check.
+// It is a pointer to a slice, not a channel or callback, because this is a
+// same-goroutine, in-order accumulation exactly like a return value would be
+// — the only reason it isn't one is that runWritePass's five-int return
+// shape is a tested public contract (decision_test.go, sonarr_writer_test.go)
+// this phase must not disturb.
+func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, decisions []movieDecision, cc crossCheckResult, exclusionTagID int, tagActive bool, dryRun bool, actions *[]actionRecord) (unmonitored, writeErrors, echoUnverified, writesRefused, withheld int) {
 	// The count is what makes the warnings below actionable: "the gate
 	// blocked 12 writes" and "the gate blocked, but there was nothing to
 	// write anyway" are very different situations, and without a number they
@@ -1024,6 +1090,9 @@ func runWritePass(ctx context.Context, logger *slog.Logger, client *APIClient, i
 		unmonitored++
 		logger.Info("unmonitor",
 			"id", d.id, "title", d.title, "reason", d.reason, "profile", d.profileName, "instance", inst.Name)
+		if actions != nil {
+			*actions = append(*actions, actionRecord{Action: ActionUnmonitor, ID: d.id, Title: d.title, Reason: d.reason})
+		}
 	}
 
 	return unmonitored, writeErrors, echoUnverified, writesRefused, withheld
@@ -2238,8 +2307,34 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 // reasons the Radarr engine runs it there: it is a separate question about the
 // same library, its findings must never enter the forward cross-check's pools,
 // and its own write gate reads the verdict this cycle already produced.
-func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, series []seriesElement, wantedEpisodeIDs map[int]bool, wantedSeasons map[seasonKey]bool, exclusionTagLabel string, scope evalScope, dryRun bool, reverse reverseOptions, fileReport fileReportOptions) {
+// The named return, stats, is Phase 12's addition — see runRadarrDecisionEngine's
+// own doc comment for the shared reasoning (no existing call site needed to
+// change) and cycleInstanceStats' for the field-by-field contract. Here,
+// total/monitored/unmonitored are SEASON counts (Sonarr's decision unit is a
+// season, never a series — see runWritePass's sibling comment on
+// runSonarrWritePass, "unmonitored counts SEASONS"), computed straight from
+// each series' own Seasons list independent of the series' own monitored
+// flag or any decision rule, the same simple, rule-independent count the
+// Radarr twin takes from movies.Monitored.
+func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, series []seriesElement, wantedEpisodeIDs map[int]bool, wantedSeasons map[seasonKey]bool, exclusionTagLabel string, scope evalScope, dryRun bool, reverse reverseOptions, fileReport fileReportOptions) (stats cycleInstanceStats) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	// See runRadarrDecisionEngine's own doc comment: valid the moment series
+	// is in hand (already a complete, trustworthy read — daemon.go only calls
+	// this after inspectSonarrLibrary's own dataOK gate), so every return path
+	// below, early ones included, reports real totals.
+	for _, s := range series {
+		if s.Seasons == nil {
+			continue
+		}
+		for _, season := range *s.Seasons {
+			stats.total++
+			if season.Monitored != nil && *season.Monitored {
+				stats.monitored++
+			}
+		}
+	}
+	stats.unmonitored = stats.total - stats.monitored
 
 	// See the Radarr twin: the once-per-cycle informational reads log through
 	// a logger that demotes INFO to this cycle's report level.
@@ -2434,10 +2529,24 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 			append([]any{"instance", inst.Name, "type", inst.Type}, scope.summaryAttrs()...)...)
 	}
 
+	// allDecisions covers every eligible season of every monitored series this
+	// cycle evaluated, regardless of scope — see the Radarr twin's
+	// libraryWouldUnmonitor for why this is deliberately computed from the
+	// unscoped pool rather than from wouldUnmonitorCount below, and why it is
+	// safe to read here unconditionally: the loop that built allDecisions has
+	// already run to completion by this point (a shutdown abandoning it
+	// returns earlier, before this line, exactly like the Radarr engine).
+	for _, d := range allDecisions {
+		if d.wouldUnmonitor {
+			stats.wouldUnmonitor++
+		}
+	}
+
 	cc := runSonarrCrossCheck(ctx, cycleLogger, client, inst, allDecisions, wantedEpisodeIDs)
 	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
 
-	unmonitoredCount, recoveredWriteCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount := runSonarrWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun)
+	var forwardActions []actionRecord
+	unmonitoredCount, recoveredWriteCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount := runSonarrWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun, &forwardActions)
 
 	var rev reverseCounts
 	if reverse.enabled {
@@ -2446,7 +2555,11 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 			profiles: profiles, exclusionTagID: exclusionTagID, tagActive: tagActive,
 			cc: cc, scope: scope, itemLevel: scope.itemLevel, dryRun: dryRun, opts: reverse,
 		}.runSonarr(ctx, series)
+		// Phase 12: see the Radarr twin's identical comment.
+		stats.reverseRan = true
+		stats.reverseFindings = sonarrReverseFindings(rev.seasonFindings)
 	}
+	stats.actions = append(forwardActions, rev.actions...)
 
 	// Phase 11, the fifth and last pass — see the Radarr twin for the shape
 	// and the reasoning. Unlike Radarr, Sonarr's tracked set costs its own
@@ -2457,7 +2570,11 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// controller resolution 5).
 	if fileReport.enabled {
 		mismatched := buildMismatchedSeasonsIndex(allDecisions)
-		logFileReportSummary(logger, inst, runSonarrFileReport(ctx, logger, scope.itemLevel, client, inst, series, mismatched, exclusionTagID, tagActive))
+		frc := runSonarrFileReport(ctx, logger, scope.itemLevel, client, inst, series, mismatched, exclusionTagID, tagActive)
+		logFileReportSummary(logger, inst, frc)
+		// Phase 12: see the Radarr twin's identical comment.
+		stats.fileReportRan = true
+		stats.fileReport = fileReportSnapshotFrom(frc)
 	}
 
 	attrs := []any{"instance", inst.Name, "type", inst.Type}
@@ -2506,6 +2623,7 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 
 	attrs = append(attrs, "skipReasons", formatSkipCounts(skipCounts), "crossCheck", crossCheckSummary)
 	logger.Info("sonarr decision summary", attrs...)
+	return stats
 }
 
 // seasonKeySpread encodes a season decision's (seriesId, season) pair into
