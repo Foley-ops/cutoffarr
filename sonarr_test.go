@@ -275,6 +275,40 @@ func TestFetchEpisodes_MalformedJSON_ReturnsNotOK(t *testing.T) {
 	}
 }
 
+// TestFetchEpisodes_ResponseLargerThan4MB_StillSucceeds pins F2 (Phase 6
+// final review round): fetchEpisodes must route through the 512 MB
+// large-body path (fetchLargeBody), not connectivity.go's fetchBody and its
+// 4 MB cap — the cap every OTHER bulk Sonarr/Radarr read already avoids
+// (/series here, /movie and /wanted/cutoff in radarr.go). A large real-world
+// library's /episode response (the live deploy this project targets is an
+// anime library with 1000+ episode series) can plausibly exceed 4 MB; before
+// this fix such a series would be skipped on every cycle forever, reported
+// as a transport failure rather than a size ceiling. The "padding" field
+// below is not part of episodeElement, so json.Unmarshal silently ignores
+// it — it inflates the body past the 4 MB cap without changing what
+// actually gets decoded.
+func TestFetchEpisodes_ResponseLargerThan4MB_StillSucceeds(t *testing.T) {
+	padding := strings.Repeat("a", maxResponseBodyBytes+1024)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/episode", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `[{"id": 100, "seasonNumber": 1, "episodeNumber": 1, "monitored": true, "hasFile": true, "airDateUtc": "2020-01-01T00:00:00Z", "episodeFileId": 500, "padding": %q}]`, padding)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	episodes, ok := fetchEpisodes(context.Background(), logger, client, inst, 7)
+	if !ok {
+		t.Fatalf("fetchEpisodes returned ok=false for a response over the 4MB connectivity cap but well under the 512MB large-body limit; want true (fetchEpisodes must use fetchLargeBody):\n%s", buf.String())
+	}
+	if len(episodes) != 1 || episodes[0].ID == nil || *episodes[0].ID != 100 {
+		t.Errorf("episodes = %+v, want one element with id=100", episodes)
+	}
+}
+
 // --- fetchEpisodeFiles ---------------------------------------------------
 
 func TestFetchEpisodeFiles_HappyPath_PassesSeriesIdAsQueryParam(t *testing.T) {
@@ -345,6 +379,34 @@ func TestFetchEpisodeFiles_MalformedJSON_ReturnsNotOK(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "level=WARN") {
 		t.Errorf("expected a warning:\n%s", buf.String())
+	}
+}
+
+// TestFetchEpisodeFiles_ResponseLargerThan4MB_StillSucceeds is
+// TestFetchEpisodes_ResponseLargerThan4MB_StillSucceeds's sibling for
+// fetchEpisodeFiles — the second of the two endpoints F2 flags (sonarr.go's
+// /episodefile fetch has the identical bug for the identical reason: a
+// large series's episode-file list is at least as likely to cross 4 MB as
+// its episode list).
+func TestFetchEpisodeFiles_ResponseLargerThan4MB_StillSucceeds(t *testing.T) {
+	padding := strings.Repeat("a", maxResponseBodyBytes+1024)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/episodefile", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `[{"id": 500, "seasonNumber": 1, "customFormatScore": 2000, "qualityCutoffNotMet": false, "padding": %q}]`, padding)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	client := NewAPIClient(inst.URL, inst.APIKey)
+
+	files, ok := fetchEpisodeFiles(context.Background(), logger, client, inst, 7)
+	if !ok {
+		t.Fatalf("fetchEpisodeFiles returned ok=false for a response over the 4MB connectivity cap but well under the 512MB large-body limit; want true (fetchEpisodeFiles must use fetchLargeBody):\n%s", buf.String())
+	}
+	if len(files) != 1 || files[0].ID == nil || *files[0].ID != 500 {
+		t.Errorf("files = %+v, want one element with id=500", files)
 	}
 }
 

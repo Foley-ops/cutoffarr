@@ -186,8 +186,17 @@ type episodeElement struct {
 // skips just this series's monitored seasons, continuing to the rest of the
 // library.
 func fetchEpisodes(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, seriesID int) ([]episodeElement, bool) {
+	// REVIEW FIX (Phase 6 final round, F2): fetchLargeBody (radarr.go), not
+	// connectivity.go's fetchBody, which caps at 4 MB — a limit meant for
+	// small, fixed-shape endpoints like /system/status and /qualityprofile,
+	// not a per-series episode list. A large real-world library (this
+	// deploy's live anime library has 1000+-episode series) can plausibly
+	// exceed 4 MB here, at which point that series would be skipped on
+	// every cycle forever, reported as a transport failure rather than a
+	// size ceiling it never actually needed to hit. Matches the existing
+	// Radarr precedent: /movie and /wanted/cutoff both use the 512 MB limit.
 	query := url.Values{"seriesId": {strconv.Itoa(seriesID)}}
-	body, err := fetchBody(ctx, client, "/api/v3/episode", query)
+	body, err := fetchLargeBody(ctx, client, "/api/v3/episode", query)
 	if err != nil {
 		logger.Warn("episode request failed",
 			"instance", inst.Name, "type", inst.Type, "seriesId", seriesID, "error", err)
@@ -228,8 +237,12 @@ type episodeFileElement struct {
 // all, so their skip reason can still be independently verified. A request
 // or decode failure is per-series, not instance-fatal (§2.6).
 func fetchEpisodeFiles(ctx context.Context, logger *slog.Logger, client *APIClient, inst Instance, seriesID int) ([]episodeFileElement, bool) {
+	// REVIEW FIX (Phase 6 final round, F2): same fetchLargeBody swap as
+	// fetchEpisodes above, for the same reason — a large series's episode
+	// file list is at least as likely to cross the 4 MB fetchBody cap as
+	// its episode list.
 	query := url.Values{"seriesId": {strconv.Itoa(seriesID)}}
-	body, err := fetchBody(ctx, client, "/api/v3/episodefile", query)
+	body, err := fetchLargeBody(ctx, client, "/api/v3/episodefile", query)
 	if err != nil {
 		logger.Warn("episodefile request failed",
 			"instance", inst.Name, "type", inst.Type, "seriesId", seriesID, "error", err)
