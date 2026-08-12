@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // newFileReportTestLogger mirrors newDecisionTestLogger (decision_test.go):
@@ -1069,5 +1070,264 @@ func TestRunSonarrFileReport_TrackedSetBuildFailureIsSkipped(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "level=WARN") {
 		t.Errorf("expected a WARN about the failed tracked-set build:\n%s", buf.String())
+	}
+}
+
+// --- scheduling (binding controller resolution 8) ---------------------------
+//
+// "Reconciliation sweeps and --once full runs only; never webhook-scoped,
+// never --only-id." Pinned with the mirrored no-pass tests reverse.go's own
+// scheduling rule uses (TestDaemon_WebhookCycle_RunsNoReversePass,
+// TestRun_OnlyID_FlagOff_RunsNoReversePass), plus the positive half proving a
+// full cycle really does run it.
+
+// assertNoFileReport fails if cycle shows any sign of the file report having
+// run. Mirrors assertNoReversePass (reverse_test.go) exactly: matches the
+// pass's own frozen tokens, not a bare substring that could also appear
+// elsewhere (e.g. in a config dump or an unrelated log line).
+func assertNoFileReport(t *testing.T, cycle string) {
+	t.Helper()
+	for _, token := range []string{`msg="file report"`, `msg="file-report finding"`, "fileReport=", "duplicates=", "orphans=", "fileSkipReasons="} {
+		if strings.Contains(cycle, token) {
+			t.Errorf("this cycle must run no file report, but its log carries %q:\n%s", token, cycle)
+		}
+	}
+}
+
+// writeFileReportDaemonConfig is writeReverseDaemonConfig's twin: a radarr
+// daemon config with media_root_map configured so the file report is
+// eligible to run whenever a cycle schedules it at all.
+func writeFileReportDaemonConfig(t *testing.T, url, mediaRoot, pollInterval, logLevel string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yml")
+	content := fmt.Sprintf(`
+dry_run: true
+log_level: %s
+poll_interval: %s
+webhook_debounce: 45s
+instances:
+  - name: radarr-main
+    type: radarr
+    url: %s
+    api_key: key1
+    media_root_map:
+      /movies: %s
+`, logLevel, pollInterval, url, mediaRoot)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing the daemon test config: %v", err)
+	}
+	return path
+}
+
+// writeFileReportOnceTestConfig is the --once twin, for the scoped-run tests
+// below.
+func writeFileReportOnceTestConfig(t *testing.T, url, mediaRoot string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yml")
+	content := fmt.Sprintf(`
+dry_run: true
+instances:
+  - name: radarr-main
+    type: radarr
+    url: %s
+    api_key: key1
+    media_root_map:
+      /movies: %s
+`, url, mediaRoot)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+	return path
+}
+
+func TestDaemon_StartupScanAndReconciliationSweep_BothRunTheFileReport(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{wouldUnmonitorStatefulMovie(1, "Movie")})
+	h := startDaemon(t, writeFileReportDaemonConfig(t, fake.srv.URL, t.TempDir(), "1h", "info"))
+	h.waitReady()
+	if !strings.Contains(h.out.String(), `msg="file report"`) {
+		t.Fatalf("the startup scan must run the file report for a configured instance:\n%s", h.out.String())
+	}
+
+	mark := h.mark()
+	h.clock.Advance(time.Hour)
+	h.awaitLogCount("reconciliation sweep complete", 1)
+	h.stop()
+
+	if !strings.Contains(h.since(mark), `msg="file report"`) {
+		t.Errorf("the reconciliation sweep must run the file report too:\n%s", h.since(mark))
+	}
+}
+
+func TestDaemon_WebhookCycle_RunsNoFileReport(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{wouldUnmonitorStatefulMovie(1, "Imported")})
+	h := startDaemon(t, writeFileReportDaemonConfig(t, fake.srv.URL, t.TempDir(), "0", "debug"))
+	h.waitReady()
+	if !strings.Contains(h.out.String(), `msg="file report"`) {
+		t.Fatalf("this test proves nothing unless the startup scan really did run the file report:\n%s", h.out.String())
+	}
+
+	mark := h.mark()
+	h.post("radarr-main", downloadMoviePayload)
+	eventually(t, "the event to be queued", func() bool {
+		return strings.Contains(h.out.String(), "webhook queued")
+	})
+	h.clock.Advance(45 * time.Second)
+	h.awaitLogCount("webhook debounce expired; evaluating", 1)
+	eventually(t, "the webhook cycle to finish", func() bool {
+		return strings.Contains(h.since(mark), "radarr decision summary")
+	})
+	h.stop()
+
+	cycle := h.since(mark)
+	if !strings.Contains(cycle, "radarr decision summary") {
+		t.Fatalf("the webhook cycle must have run at all:\n%s", cycle)
+	}
+	assertNoFileReport(t, cycle)
+}
+
+func TestRun_OnlyID_RunsNoFileReport(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{wouldUnmonitorStatefulMovie(1, "Named")})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeFileReportOnceTestConfig(t, fake.srv.URL, t.TempDir()), "--once", "--only-id", "1"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d; stderr=%s", code, stderr.String())
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "onlyId=1") {
+		t.Fatalf("this test proves nothing unless the run really was scoped:\n%s", out)
+	}
+	assertNoFileReport(t, out)
+}
+
+func TestRun_FullOnceRun_RunsTheFileReport(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{wouldUnmonitorStatefulMovie(1, "Movie")})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", writeFileReportOnceTestConfig(t, fake.srv.URL, t.TempDir()), "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d; stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, `msg="file report"`) || !strings.Contains(out, "fileReport=ran") {
+		t.Errorf("a full --once run against a configured instance must run the file report:\n%s", out)
+	}
+}
+
+// TestRunSonarrDecisionEngine_FileReportWiring is the Sonarr twin proving the
+// engine-level wiring end to end (scanCycle's gating itself is engine-
+// agnostic and already proven above via Radarr); it exercises
+// runSonarrDecisionEngine directly rather than the full daemon harness.
+func TestRunSonarrDecisionEngine_FileReportWiring(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[{"id":1,"name":"HD","upgradeAllowed":true,"cutoffFormatScore":100}]`))
+	})
+	mux.HandleFunc("/api/v3/tag", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`[]`)) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key",
+		MediaRootMap: map[string]string{"/tv_shows": t.TempDir()}}
+	var series []seriesElement
+
+	t.Run("disabled: no file report log at all", func(t *testing.T) {
+		logger, buf := newFileReportTestLogger(slog.LevelDebug)
+		runSonarrDecisionEngine(context.Background(), logger, inst, series, map[int]bool{}, map[seasonKey]bool{},
+			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseOptions{}, fileReportOptions{})
+		assertNoFileReport(t, buf.String())
+	})
+
+	t.Run("enabled: file report runs and reports ran", func(t *testing.T) {
+		logger, buf := newFileReportTestLogger(slog.LevelDebug)
+		runSonarrDecisionEngine(context.Background(), logger, inst, series, map[int]bool{}, map[seasonKey]bool{},
+			"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseOptions{}, fullScanFileReportOptions())
+		out := buf.String()
+		if !strings.Contains(out, `msg="file report"`) || !strings.Contains(out, "fileReport=ran") {
+			t.Errorf("expected the file report to have run for a configured sonarr instance:\n%s", out)
+		}
+	})
+}
+
+// --- noise budget: the two-cycle idle test, extended (binding controller
+// resolution 7) --------------------------------------------------------------
+
+// newFileReportOnlyRadarrFake serves the minimum Radarr API this test needs,
+// with one movie whose path and movieFile.path are set — unlike
+// statefulRadarrFake (writer_test.go), which never emits either field. The
+// movie is unmonitored so no forward decision, cross-check sample, or write
+// pass has anything to do: this test's only subject is the file-report
+// summary's own noise-budget compliance across repeated idle sweeps.
+func newFileReportOnlyRadarrFake(t *testing.T) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/system/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"appName":"Radarr","version":"5.14.0.9383"}`))
+	})
+	mux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[{"id":1,"name":"HD","upgradeAllowed":true,"cutoff":7,"cutoffFormatScore":100}]`))
+	})
+	mux.HandleFunc("/api/v3/tag", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`[]`)) })
+	mux.HandleFunc("/api/v3/wanted/cutoff", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"page":1,"totalRecords":0,"records":[]}`))
+	})
+	mux.HandleFunc("/api/v3/movie", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[{"id":1,"title":"Movie A","monitored":false,"hasFile":true,"qualityProfileId":1,"tags":[],
+			"path":"/movies/Movie A","movieFile":{"id":1,"path":"/movies/Movie A/Movie A.mkv"}}]`))
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestDaemon_IdleCycleWithFileReportFindings_StaysWithinTheNoiseBudget(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureFiles(t, dir, "Movie A/Movie A.mkv", "Movie A/Movie A (2).mkv", "Stray/orphan.mkv")
+	srv := newFileReportOnlyRadarrFake(t)
+
+	h := startDaemon(t, writeFileReportDaemonConfig(t, srv.URL, dir, "1h", "info"))
+	h.waitReady()
+
+	startup := h.out.String()
+	if !strings.Contains(startup, `msg="file-report finding"`) {
+		t.Fatalf("the startup scan must report the findings in full:\n%s", startup)
+	}
+	if n := strings.Count(startup, `msg="file-report finding"`); n != 2 {
+		t.Fatalf("want exactly 2 file-report findings (1 duplicate + 1 orphan) at startup, got %d:\n%s", n, startup)
+	}
+	eventually(t, "the reconciliation schedule to be announced", func() bool {
+		return strings.Contains(h.out.String(), "reconciliation sweep scheduled")
+	})
+
+	mark := h.mark()
+	h.clock.Advance(time.Hour)
+	h.awaitLogCount("reconciliation sweep complete", 1)
+	cycle2 := h.since(mark)
+
+	mark3 := h.mark()
+	h.clock.Advance(time.Hour)
+	h.awaitLogCount("reconciliation sweep complete", 2)
+	cycle3 := h.since(mark3)
+	h.stop()
+
+	for i, cycle := range []string{cycle2, cycle3} {
+		if !assertIdleCycleInfoIsWithinTheBudget(t, cycle) {
+			t.Errorf("cycle %d printed no per-instance decision summary:\n%s", i+2, cycle)
+		}
+		// Per-finding lines are demoted to debug on a sweep (scope.itemLevel),
+		// so they must NOT appear at all with log_level: info — only the
+		// summary's counts stay visible, exactly like the reverse scan's own
+		// idle-cycle pin.
+		if strings.Contains(cycle, `msg="file-report finding"`) {
+			t.Errorf("cycle %d: per-finding lines must be demoted to debug on a repeating sweep:\n%s", i+2, cycle)
+		}
+		if !strings.Contains(cycle, "duplicates=1") || !strings.Contains(cycle, "orphans=1") {
+			t.Errorf("cycle %d must still COUNT the findings on its summary:\n%s", i+2, cycle)
+		}
+	}
+	if strip2, strip3 := withoutTimestamps(dropNextSweep(cycle2)), withoutTimestamps(dropNextSweep(cycle3)); strip2 != strip3 {
+		t.Errorf("two idle cycles with nothing changed must say the same thing:\ncycle2:\n%s\ncycle3:\n%s", strip2, strip3)
 	}
 }
