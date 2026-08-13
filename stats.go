@@ -165,6 +165,18 @@ type cycleInstanceStats struct {
 	reverseRan      bool
 	reverseFindings []reverseFinding
 
+	// reverseSkipped mirrors reverseRan's sibling half: true when this cycle
+	// DID attempt the reverse pass (reverse.enabled) but the pass itself
+	// could not be trusted (reverseCounts.skipped — an incomplete
+	// unmonitored wanted/cutoff set, or a shutdown mid-evaluation), so
+	// reverseFindings above was never populated. reverseRan and
+	// reverseSkipped are never both true; a cycle that never scheduled the
+	// reverse pass at all (a webhook cycle, or the feature globally off)
+	// leaves both false, which recordInstance reads as "say nothing new" —
+	// see instanceStatsView.ReverseStatus's own comment for why this third
+	// case matters as much as the other two.
+	reverseSkipped bool
+
 	fileReportRan bool
 	fileReport    fileReportSnapshot
 
@@ -203,10 +215,51 @@ type instanceStatsView struct {
 	LastRun       *time.Time `json:"lastRun"`
 	LastCycleKind *string    `json:"lastCycleKind"`
 
+	// ReverseStatus is the reverse pass's own ran|skipped|off vocabulary —
+	// fileReport.Status's exact twin, added for the same reason (Phase 12
+	// review round 3): reverseFindings being empty means three different
+	// things ("never ran", "ran but could not be trusted", "ran and found
+	// nothing"), and only this field lets a client (the GUI, a script) tell
+	// them apart instead of rendering a pass that never completed as a clean
+	// all-clear. "off" is the default at instance creation and stays that
+	// way until the first full cycle actually attempts the pass — a webhook
+	// cycle (which never schedules reverse at all) leaves it exactly as the
+	// last full cycle set it, never reverting to "off" in between, mirroring
+	// FileReport.Status's own persistence rule below.
+	ReverseStatus string `json:"reverseStatus"`
+
 	ReverseFindings []reverseFinding   `json:"reverseFindings"`
 	FileReport      fileReportSnapshot `json:"fileReport"`
 	LastActions     []actionRecord     `json:"lastActions"`
+
+	// LastCycleStatus is this instance's outcome on the MOST RECENT cycle
+	// that named it at all — including a cycle that never reached the
+	// decision engine because §2.6's connectivity-gate or library-read
+	// warn-and-skip path fired. Unlike every other field on this struct, it
+	// is NOT gated on decisionsRan/reverseRan/fileReportRan and is NOT
+	// carried forward from a previous cycle when this one fails: a daemon
+	// that has been unable to reach an *arr for a week must show that fact
+	// on THIS cycle, not silently keep repeating "ok" from the last time it
+	// could. See statsStore.recordUnreachable and recordInstance's own
+	// unconditional write to this field.
+	LastCycleStatus cycleStatusView `json:"lastCycleStatus"`
 }
+
+// cycleStatusView is LastCycleStatus's shape: whether the most recent cycle
+// that named this instance actually reached its decision engine at all.
+// Status is "ok" (checkInstanceConnectivity and the library read both
+// succeeded — this cycle got as far as the engine, whatever the engine
+// itself then did) or "skipped" (one of those two gates failed; Reason
+// names which). Reason is empty for "ok".
+type cycleStatusView struct {
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+}
+
+const (
+	cycleStatusOK      = "ok"
+	cycleStatusSkipped = "skipped"
+)
 
 // statsResponse is GET /api/stats's whole body.
 type statsResponse struct {
@@ -264,6 +317,7 @@ func (s *statsStore) recordInstance(kind string, at time.Time, name, typ string,
 		v = &instanceStatsView{
 			Name:            name,
 			Type:            typ,
+			ReverseStatus:   "off",
 			ReverseFindings: []reverseFinding{},
 			FileReport:      fileReportSnapshot{Status: "off", Findings: []fileReportFindingRecord{}},
 			LastActions:     []actionRecord{},
@@ -276,6 +330,14 @@ func (s *statsStore) recordInstance(kind string, at time.Time, name, typ string,
 	v.Total = cs.total
 	v.Monitored = cs.monitored
 	v.Unmonitored = cs.unmonitored
+
+	// This cycle reached the decision engine at all (runScanCycle only calls
+	// recordInstance from inside its dataOK branch) — whatever the engine
+	// then did with it, that is a strictly stronger statement than the
+	// connectivity/library-read gates recordUnreachable exists for, so it
+	// always overwrites whatever LastCycleStatus previously said, unlike
+	// every other field below.
+	v.LastCycleStatus = cycleStatusView{Status: cycleStatusOK}
 
 	// decisionsRan gates WouldUnmonitor and LastRun/LastCycleKind together
 	// (see cycleInstanceStats.decisionsRan's own comment): a cycle that
@@ -299,9 +361,16 @@ func (s *statsStore) recordInstance(kind string, at time.Time, name, typ string,
 	// untouched rather than overwriting them with an empty slice, which would
 	// misreport "did not look" as "looked, found nothing".
 	if cs.reverseRan {
+		v.ReverseStatus = "ran"
 		findings := make([]reverseFinding, len(cs.reverseFindings))
 		copy(findings, cs.reverseFindings)
 		v.ReverseFindings = findings
+	} else if cs.reverseSkipped {
+		// The pass ran but could not be trusted this cycle: say so, but —
+		// same three-state fidelity rule as the findings themselves — leave
+		// the PREVIOUS trustworthy findings in place rather than clearing
+		// them, since this cycle produced no new evidence either way.
+		v.ReverseStatus = "skipped"
 	}
 	if cs.fileReportRan {
 		findings := make([]fileReportFindingRecord, len(cs.fileReport.Findings))
@@ -329,6 +398,51 @@ func (s *statsStore) recordInstance(kind string, at time.Time, name, typ string,
 		}
 		v.LastActions = merged
 	}
+}
+
+// recordUnreachable folds in the OTHER outcome runScanCycle's per-instance
+// loop can have: this cycle never even reached the decision engine for name,
+// because checkInstanceConnectivity or the library read (inspectRadarrLibrary
+// / inspectSonarrLibrary) hit one of §2.6's warn-and-skip paths — a
+// quality-profile fetch failure, an unreachable *arr mid-restart, a malformed
+// response, and so on.
+//
+// It creates name's entry if this is the very first cycle that has ever
+// named it, which is the whole point: before this method existed, an
+// instance that had NEVER once been reached was simply absent from
+// `instances` — indistinguishable from "not configured in this daemon at
+// all" — and an instance that had been reached before just kept showing
+// last cycle's numbers with no marker that anything was wrong. Either way
+// the log's own WARN was the only place the failure was visible, and the
+// GUI's entire job is "glance and trust these numbers" without reading the
+// log.
+//
+// It touches ONLY LastCycleStatus — never Total/Monitored/Unmonitored/
+// WouldUnmonitor/LastRun/LastCycleKind/ReverseFindings/FileReport/
+// LastActions, all of which stay exactly what the last cycle that actually
+// reached the engine left them as (or their zero value, if none ever has):
+// this cycle produced no new evidence about any of those, and overwriting a
+// trusted number with a guess would be worse than leaving it stale and
+// flagged.
+func (s *statsStore) recordUnreachable(name, typ, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	v, ok := s.byName[name]
+	if !ok {
+		v = &instanceStatsView{
+			Name:            name,
+			Type:            typ,
+			ReverseStatus:   "off",
+			ReverseFindings: []reverseFinding{},
+			FileReport:      fileReportSnapshot{Status: "off", Findings: []fileReportFindingRecord{}},
+			LastActions:     []actionRecord{},
+		}
+		s.byName[name] = v
+		s.order = append(s.order, name)
+	}
+	v.Type = typ
+	v.LastCycleStatus = cycleStatusView{Status: cycleStatusSkipped, Reason: reason}
 }
 
 // snapshot copies out the current state for JSON serialization. It is safe to

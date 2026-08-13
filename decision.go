@@ -743,6 +743,14 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		if !rev.skipped {
 			stats.reverseRan = true
 			stats.reverseFindings = radarrReverseFindings(rev.movieFindings)
+		} else {
+			// Round-3 review fix: this cycle DID attempt the pass but could not
+			// trust it — instanceStatsView.ReverseStatus's own comment explains
+			// why this third state (distinct from both "ran" above and "never
+			// scheduled" — reverseSkipped left false when reverse.enabled is
+			// false) has to be captured at all: reverseFindings alone cannot
+			// tell "never ran" apart from "ran but untrustworthy".
+			stats.reverseSkipped = true
 		}
 	}
 	// Combined here, once, regardless of which passes ran: forwardActions is
@@ -2574,6 +2582,9 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		if !rev.skipped {
 			stats.reverseRan = true
 			stats.reverseFindings = sonarrReverseFindings(rev.seasonFindings)
+		} else {
+			// Round-3 review fix: see the Radarr twin's identical comment.
+			stats.reverseSkipped = true
 		}
 	}
 	// Combined here, once, regardless of which passes ran — see the Radarr

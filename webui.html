@@ -178,6 +178,16 @@
     color: var(--ink-faint);
   }
 
+  /* The UNREACHABLE badge (controller addition N2): an instance whose most
+     recent cycle never reached the decision engine at all. Reuses the same
+     .badge/.badge-alert tokens the header's disconnected state uses — ALERT
+     clay, the "needs review" color — rather than inventing a new visual
+     language for what is the same underlying fact (numbers on screen that
+     may no longer be current). margin-left:auto pushes it to the far edge
+     of the shelf-head row, away from the name/type it must never be
+     confused with. */
+  .shelf-unreachable { margin-left: auto; }
+
   .shelf-bar-wrap {
     position: relative;
     /* Reserves room above the bar for .shelf-count's own line height
@@ -232,7 +242,13 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .shelf-rest, .shelf-marker { transition: none; }
+    /* The design plan is explicit: "No other animation." The disclosure
+       caret's own rotate transition (details.panel summary::before, below)
+       is exactly that other animation, so it is disabled here alongside the
+       shelf bar/marker — round-3 review fix; this selector list is the
+       ENTIRE set of animated properties in this page, and must stay that
+       way as the single place motion is turned off. */
+    .shelf-rest, .shelf-marker, details.panel summary::before { transition: none; }
   }
 
   .shelf-sub {
@@ -364,7 +380,7 @@
        instance — sage (rest) meets amber (hunt) at a 2px vertical marker
        carrying the "N / total at rest" count above it. -->
   <main id="instances" data-cutoff-shelf>
-    <p class="empty">No cycle has completed yet. The first sweep is still working.</p>
+    <p class="empty">First sweep in progress — the shelves fill in when it finishes.</p>
   </main>
 
   <details class="panel">
@@ -446,8 +462,16 @@
     var head = el("div", "shelf-head");
     var name = el("span", "shelf-name");
     var kind = el("span", "shelf-type");
+    // unreachable is the round-3 UNREACHABLE badge (controller addition N2):
+    // built once, hidden by default, and only shown by updateShelfCard when
+    // this instance's most recent cycle never reached the decision engine
+    // (lastCycleStatus.status === "skipped") — see that function for why it
+    // must never be silently indistinguishable from a healthy card.
+    var unreachable = el("span", "badge badge-alert shelf-unreachable");
+    unreachable.hidden = true;
     head.appendChild(name);
     head.appendChild(kind);
+    head.appendChild(unreachable);
     card.appendChild(head);
 
     var barWrap = el("div", "shelf-bar-wrap");
@@ -469,7 +493,7 @@
 
     card.appendChild(barWrap);
 
-    card._els = { name: name, kind: kind, count: count, countNum: countNum, rest: rest, marker: marker, sub: null };
+    card._els = { name: name, kind: kind, count: count, countNum: countNum, rest: rest, marker: marker, unreachable: unreachable, sub: null };
     return card;
   }
 
@@ -493,6 +517,23 @@
     els.rest.style.width = pctStr;
     els.marker.style.left = pctStr;
 
+    // The totals above are always the last-known-good numbers (see
+    // statsStore.recordUnreachable's own doc comment: they are never
+    // clobbered by a cycle that could not reach this instance) — so the
+    // shelf bar itself stays exactly as it was. The badge is the ONLY
+    // signal that those numbers may now be stale, which is the point: a
+    // week-unreachable *arr must never look identical to one swept a
+    // moment ago.
+    var status = inst.lastCycleStatus;
+    if (status && status.status === "skipped") {
+      var msg = "couldn't reach " + inst.name + " last sweep";
+      if (status.reason) msg += " — " + status.reason;
+      text(els.unreachable, msg);
+      els.unreachable.hidden = false;
+    } else {
+      els.unreachable.hidden = true;
+    }
+
     if (inst.wouldUnmonitor > 0) {
       if (!els.sub) {
         els.sub = el("p", "shelf-sub");
@@ -511,7 +552,7 @@
       root.textContent = "";
       shelfCards = {};
       var p = el("p", "empty");
-      text(p, "No cycle has completed yet. The first sweep is still working.");
+      text(p, "First sweep in progress — the shelves fill in when it finishes.");
       root.appendChild(p);
       return;
     }
@@ -564,22 +605,61 @@
     return table;
   }
 
+  // renderReverse is reverseStatus-aware — round-3 review fix, the reverse
+  // scan's own twin of renderFileReport's three-state fidelity above: only
+  // an instance whose reverseStatus is "ran" can make an empty
+  // reverseFindings mean "checked, found nothing". Before this field
+  // existed, "never ran" and "ran but could not be trusted" (an incomplete
+  // unmonitored wanted/cutoff set, or a shutdown mid-evaluation —
+  // reverse.go's reverseCounts.skipped) both looked EXACTLY like "ran and
+  // found nothing", printing the same "Nothing wrongly unmonitored"
+  // all-clear over a pass that never actually completed.
   function renderReverse(instances) {
     var body = document.getElementById("reverseBody");
     var rows = [];
+    var notices = [];
+    var anyRan = false;
     for (var i = 0; i < instances.length; i++) {
       var inst = instances[i];
-      var findings = inst.reverseFindings || [];
-      for (var j = 0; j < findings.length; j++) {
-        rows.push({ instance: inst.name, f: findings[j] });
+      var status = inst.reverseStatus;
+      if (status === "ran") {
+        anyRan = true;
+        var findings = inst.reverseFindings || [];
+        for (var j = 0; j < findings.length; j++) {
+          rows.push({ instance: inst.name, f: findings[j] });
+        }
+      } else if (status === "skipped") {
+        notices.push({ instance: inst.name, status: "skipped" });
       }
+      // "off" (or absent — an instance no full cycle has reached yet): the
+      // reverse scan is either globally disabled or has simply never had a
+      // chance to run for this instance, which is not itself alarming the
+      // way a SKIPPED full sweep is, so no notice is printed for it —
+      // mirroring how a webhook-only instance's reverseStatus quietly stays
+      // whatever the last full cycle left it as (statsStore.recordInstance).
     }
     text(document.getElementById("reverseCount"), String(rows.length));
     body.textContent = "";
+
+    if (notices.length > 0) {
+      var list = el("ul", "status-notices");
+      for (var n = 0; n < notices.length; n++) {
+        var li = el("li", "status-notice status-skipped");
+        text(li, notices[n].instance + " — reverse scan could not be trusted this sweep");
+        list.appendChild(li);
+      }
+      body.appendChild(list);
+    }
+
     if (rows.length === 0) {
-      var p = el("p", "empty");
-      text(p, "Nothing wrongly unmonitored. The shelves are in order.");
-      body.appendChild(p);
+      // Same gate as renderFileReport's own: only claim "clean" when at
+      // least one instance actually completed a trustworthy pass (or none
+      // have reported in at all yet).
+      if (anyRan || instances.length === 0) {
+        var p = el("p", "empty");
+        text(p, "Nothing wrongly unmonitored. The shelves are in order.");
+        body.appendChild(p);
+      }
       return;
     }
     body.appendChild(findingsTable(
@@ -612,6 +692,7 @@
     var rows = [];
     var notices = [];
     var anyRan = false;
+    var offCount = 0, skippedCount = 0;
     for (var i = 0; i < instances.length; i++) {
       var inst = instances[i];
       var fr = inst.fileReport || {};
@@ -624,12 +705,27 @@
         }
       } else if (status === "skipped") {
         notices.push({ instance: inst.name, status: "skipped" });
+        skippedCount++;
       } else {
         // "off", or absent entirely — both mean not configured.
         notices.push({ instance: inst.name, status: "off" });
+        offCount++;
       }
     }
-    text(document.getElementById("fileCount"), String(rows.length));
+    // Round-3 review fix: the SUMMARY text is what a collapsed <details> —
+    // the state the glancing operator actually sees — shows, and a bare
+    // row count made "(0)" mean either "every root was clean" or "nothing
+    // was ever looked at", indistinguishably. Once any instance is off or
+    // skipped, the count is qualified right there in the summary, not only
+    // in the body the operator has to expand to see.
+    var fileCountText = String(rows.length);
+    if (offCount > 0 || skippedCount > 0) {
+      var qualifiers = [];
+      if (offCount > 0) qualifiers.push(offCount + " not configured");
+      if (skippedCount > 0) qualifiers.push(skippedCount + " not checked");
+      fileCountText = rows.length + " · " + qualifiers.join(", ");
+    }
+    text(document.getElementById("fileCount"), fileCountText);
     body.textContent = "";
 
     if (notices.length > 0) {
@@ -708,14 +804,34 @@
   // showDisconnected flips the header badge to the ALERT clay token: a
   // dashboard whose backend has died, restarted, or is answering 5xx/HTML
   // through a proxy must never stay pixel-identical to a healthy one — this
-  // page's entire job is "glance and trust these numbers". The numbers
+  // page's entire job is "glance and trust these numbers". Once real data
+  // has been shown at least once (lastSuccessAt is set), the numbers
   // themselves (instances, findings) are left exactly as they were; only
   // the badge changes, and polling keeps retrying on the next tick.
+  //
+  // Round-3 review fix (controller addition N1): when lastSuccessAt is
+  // STILL null — this page has never once heard back from a daemon, which
+  // is exactly the "page served without its daemon" case (a stale browser
+  // tab, a crashed container, a proxy) — #instances is still showing its
+  // static "first sweep in progress" placeholder, and that placeholder
+  // reads as a fact: a sweep IS in progress. It is not; nothing here knows
+  // whether ANY daemon exists to run one. That placeholder is replaced with
+  // an explicit "can't reach the daemon at all" message, which the design
+  // note is explicit must NEVER be confused with "a sweep is running".
   function showDisconnected() {
     var badge = document.getElementById("dryRunBadge");
     badge.className = "badge badge-alert";
     var since = lastSuccessAt ? fmtRelative(lastSuccessAt.toISOString()) : null;
     text(badge, since ? ("disconnected — showing data from " + since) : "disconnected — no data yet");
+
+    if (!lastSuccessAt) {
+      var root = document.getElementById("instances");
+      root.textContent = "";
+      shelfCards = {};
+      var p = el("p", "empty");
+      text(p, "Can't reach cutoffarr. The page is being served without its daemon — start cutoffarr and reload.");
+      root.appendChild(p);
+    }
   }
 
   function refresh() {
@@ -758,12 +874,39 @@
     }
   });
 
+  // Round-3 review fix: this used to ignore the POST's response entirely
+  // (neither its status nor its body), so a refused or failed scan
+  // (404/405/500 — fetch only REJECTS on a network failure, never on a non-
+  // 2xx status) was indistinguishable from a queued one: refresh() still
+  // ran, still repainted a healthy badge, still re-enabled the button with
+  // "Scan now". Now: !r.ok is checked exactly like refresh()'s own GET
+  // /api/stats does, the {"status": "queued"|"already-pending"} body is
+  // actually read and shown on the button, and a genuine failure (network
+  // error or non-2xx) routes through the SAME showDisconnected() signal a
+  // failed poll does, rather than a bare silent button reset.
   scanBtn.addEventListener("click", function () {
     scanBtn.disabled = true;
     text(scanBtn, "Queued…");
     fetch("/api/scan", { method: "POST" })
-      .then(function () { return refresh(); })
+      .then(function (r) {
+        if (!r.ok) throw new Error("POST /api/scan: " + r.status);
+        return r.json();
+      })
+      .then(function (body) {
+        return refresh().then(function () {
+          // refresh()'s own success path already re-enabled the button and
+          // reset it to "Scan now"; only override that when THIS click did
+          // not actually queue anything (a cycle was already running or one
+          // was already queued), so the operator learns their click landed
+          // on an in-progress scan rather than believing it started a new
+          // one.
+          if (body && body.status === "already-pending") {
+            text(scanBtn, "Already scanning…");
+          }
+        });
+      })
       .catch(function () {
+        showDisconnected();
         scanBtn.disabled = false;
         text(scanBtn, "Scan now");
       });

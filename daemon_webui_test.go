@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -303,5 +304,199 @@ func TestDaemon_ScanNow_NeverInterleavesWithAWebhookCycle(t *testing.T) {
 	out := h.out.String()
 	if got := strings.Count(out, "radarr decision summary"); got != 3 {
 		t.Fatalf("summaries = %d, want 3 (startup + webhook cycle + manual scan):\n%s", got, out)
+	}
+}
+
+// --- the composed top-level mux ---------------------------------------------
+
+// TestDaemon_ComposedMux_RouteTable is round-3's regression test for a
+// defect nothing else in the suite could catch: webhook_test.go exercises
+// newWebhookHandler in ISOLATION (its own dedicated mux), and every other
+// daemon test only ever POSTs to a real "/webhook/{instance}" path — nothing
+// exercised the REAL route table runDaemon actually serves once the webhook
+// mux and the webui mux are composed onto one *http.ServeMux (daemon.go).
+//
+// That composition silently changed one thing: mounting "/webhook/" as a
+// SUBTREE pattern makes net/http auto-register a 301 redirect from the bare
+// "/webhook" (no trailing slash) to "/webhook/" — a route this daemon never
+// had before (it used to be an ordinary 404, same as any other unmatched
+// path). This table was captured by running the exact composition daemon.go
+// builds and recording every cell's real status code BEFORE the fix ("/webhook"
+// GET/POST were both 301, not 404 — reproduced and confirmed empirically),
+// then again after adding the explicit "/webhook" -> http.NotFound
+// registration; every other cell is unchanged by that fix, which is the
+// point — the fix touches exactly the one route it needs to and nothing
+// else moves.
+func TestDaemon_ComposedMux_RouteTable(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{wouldUnmonitorStatefulMovie(1, "Movie")})
+	h := startDaemon(t, writeDaemonConfig(t, "radarr", fake.srv.URL, true, "info", "0", "45s"))
+	h.waitReady()
+
+	// Redirects are never followed: a 301 must show up AS a 301 in this
+	// table, not be silently resolved into whatever it redirects to.
+	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
+
+	cases := []struct {
+		method, path string
+		want         int
+	}{
+		// The regression itself: "/webhook" (no trailing slash, no instance)
+		// must still be a plain 404 for both methods, never the subtree's
+		// auto-redirect.
+		{http.MethodGet, "/webhook", http.StatusNotFound},
+		{http.MethodPost, "/webhook", http.StatusNotFound},
+		{http.MethodPut, "/webhook", http.StatusNotFound},
+
+		// "/webhook/" itself (empty instance name): the inner mux's own
+		// "POST /webhook/" catch-all (handleUnroutable) matches only POST;
+		// a GET/PUT to the SAME path, which the inner mux DOES have a
+		// pattern for (just the wrong method), is 405 rather than 404 —
+		// unchanged by this fix, asserted here so a future change to this
+		// composition cannot silently flip it either.
+		{http.MethodGet, "/webhook/", http.StatusMethodNotAllowed},
+		{http.MethodPost, "/webhook/", http.StatusOK},
+		{http.MethodPut, "/webhook/", http.StatusMethodNotAllowed},
+
+		// A real, named instance's webhook endpoint: untouched by this
+		// change either way.
+		{http.MethodGet, "/webhook/radarr-main", http.StatusMethodNotAllowed},
+		{http.MethodPost, "/webhook/radarr-main", http.StatusOK},
+		{http.MethodPut, "/webhook/radarr-main", http.StatusMethodNotAllowed},
+
+		// The webui/stats/scan routes this daemon added THIS phase — proof
+		// the fix's extra "/webhook" registration does not somehow shadow
+		// or interfere with any of them.
+		{http.MethodGet, "/", http.StatusOK},
+		{http.MethodPost, "/", http.StatusMethodNotAllowed},
+		{http.MethodGet, "/api/stats", http.StatusOK},
+		{http.MethodPost, "/api/stats", http.StatusMethodNotAllowed},
+		{http.MethodPost, "/api/scan", http.StatusAccepted},
+		{http.MethodGet, "/api/scan", http.StatusMethodNotAllowed},
+
+		// A path nothing recognizes: the catch-all "/" webui mux's own 404,
+		// unaffected by any of the above.
+		{http.MethodGet, "/nope", http.StatusNotFound},
+		{http.MethodPost, "/nope", http.StatusNotFound},
+	}
+
+	for _, c := range cases {
+		req, err := http.NewRequest(c.method, h.url+c.path, nil)
+		if err != nil {
+			t.Fatalf("building %s %s: %v", c.method, c.path, err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", c.method, c.path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != c.want {
+			t.Errorf("%s %s = %d, want %d", c.method, c.path, resp.StatusCode, c.want)
+		}
+	}
+}
+
+// --- the API surface during the startup scan --------------------------------
+
+// TestDaemon_APIDuringTheStartupScan_StatsAvailableAndScanAlreadyPending is
+// round-3's regression test for round-1 fix #2, which had none: moving
+// d.scan.begin() to before srv.Serve starts accepting (daemon.go) closes a
+// narrow race where a POST /api/scan landing between the listener accepting
+// a connection and the startup scan's own begin() call would see
+// running=false and wrongly report "queued". Before this test, reverting
+// that line back to its original call site (just before the startup scan's
+// own runScanCycle) left the ENTIRE suite green — nothing exercised the API
+// surface while the startup scan was still in flight at all.
+//
+// This also exercises two other binding, previously-untested guarantees for
+// that same window: GET /api/stats answers promptly with instances: [] (not
+// an error, and not blocked on the running cycle) while the startup scan is
+// still blocked mid-read, and the manual scan POST/api/scan queues here
+// actually runs — exactly once — once the startup scan finishes.
+func TestDaemon_APIDuringTheStartupScan_StatsAvailableAndScanAlreadyPending(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{wouldUnmonitorStatefulMovie(1, "First")})
+	fake.onRequest = func(method, path string) {
+		if path == "/api/v3/movie" {
+			<-release // hold the startup scan open
+		}
+	}
+	h := startDaemon(t, writeDaemonConfig(t, "radarr", fake.srv.URL, true, "debug", "0", "45s"))
+
+	eventually(t, "the startup scan to reach the blocked library read", func() bool {
+		return strings.Contains(h.out.String(), "system status")
+	})
+	if strings.Contains(h.out.String(), "startup scan complete") {
+		t.Fatal("the scan should still be blocked at this point")
+	}
+
+	// GET /api/stats must answer promptly (never blocks on the running
+	// cycle) with an empty instances array (the startup scan has not
+	// recorded anything for this instance yet).
+	stats := getStats(t, h)
+	if len(stats.Instances) != 0 {
+		t.Errorf("Instances = %+v, want empty while the startup scan is still running", stats.Instances)
+	}
+
+	// This is the assertion round-1 fix #2 exists for: a POST landing here,
+	// strictly before the startup scan's own runScanCycle call, must still
+	// see running=true (begin() was called before srv.Serve started
+	// accepting, i.e. before this request could even have been received)
+	// and report already-pending, not queued.
+	got := postScanTo(t, h.url)
+	if got.status != http.StatusAccepted || got.body["status"] != "already-pending" {
+		t.Fatalf("POST /api/scan while the startup scan is running = %+v, want 202 {status: already-pending}", got)
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	h.waitReady()
+
+	// The request queued above must actually run, exactly once, once the
+	// startup scan finishes.
+	h.awaitLogCount("manual scan complete", 1)
+	if got := strings.Count(h.out.String(), "radarr decision summary"); got != 2 {
+		t.Errorf("summaries = %d, want 2 (startup + exactly one queued follow-up scan):\n%s", got, h.out.String())
+	}
+}
+
+// --- unreachable instances --------------------------------------------------
+
+// TestDaemon_UnreachableInstance_VisibleInStatsWithSkippedStatus is
+// controller addition N2's end-to-end pin, through the REAL daemon and its
+// REAL startup scan: an instance whose connectivity check fails on every
+// cycle (a 500 from /api/v3/system/status — an *arr mid-restart is the
+// ordinary real-world cause) must still show up in GET /api/stats, not be
+// silently absent, carrying an explicit skipped LastCycleStatus and never a
+// claim to have swept it.
+func TestDaemon_UnreachableInstance_VisibleInStatsWithSkippedStatus(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/system/status", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	h := startDaemon(t, writeDaemonConfig(t, "radarr", srv.URL, true, "info", "0", "45s"))
+	h.waitReady()
+
+	stats := getStats(t, h)
+	if len(stats.Instances) != 1 {
+		t.Fatalf("Instances = %+v, want exactly 1: an instance that has NEVER been reached must still be VISIBLE, not absent", stats.Instances)
+	}
+	inst := stats.Instances[0]
+	if inst.Name != "radarr-main" || inst.Type != "radarr" {
+		t.Errorf("instance = %+v, want name=radarr-main type=radarr", inst)
+	}
+	if inst.LastCycleStatus.Status != cycleStatusSkipped {
+		t.Errorf("LastCycleStatus.Status = %q, want %q", inst.LastCycleStatus.Status, cycleStatusSkipped)
+	}
+	if inst.LastCycleStatus.Reason == "" {
+		t.Error("LastCycleStatus.Reason is empty; the operator has no idea why this instance is unreachable")
+	}
+	if inst.LastRun != nil {
+		t.Errorf("LastRun = %v, want nil: this instance has never once completed a cycle", inst.LastRun)
+	}
+	if inst.Total != 0 {
+		t.Errorf("Total = %d, want 0: no library read has ever succeeded for this instance", inst.Total)
 	}
 }

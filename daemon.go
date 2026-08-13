@@ -118,6 +118,16 @@ const (
 	cycleKindOnce    = "once"
 )
 
+// unreachableReason{Connectivity,LibraryRead} name statsStore.recordUnreachable's
+// two call sites in runScanCycle — the §2.6 gate that failed. Named
+// constants rather than inline strings so the two call sites and their tests
+// cannot drift on the exact wording the GUI badge (webui.html) matches
+// against.
+const (
+	unreachableReasonConnectivity = "could not reach the instance (connectivity check failed)"
+	unreachableReasonLibraryRead  = "connected, but the library read failed"
+)
+
 // runScanCycle performs one full pass: for every in-scope instance, the
 // read-only connectivity check, then (if that succeeded) the library read and
 // the decision engine for that instance's type.
@@ -132,11 +142,18 @@ const (
 //
 // stats is Phase 12's in-memory capture (nil-safe: main.go's --once path
 // passes nil, since --once never starts a server for anything to serve a
-// snapshot to). When non-nil, it is updated once per in-scope instance whose
-// read succeeded (dataOK), from the cycleInstanceStats each decision engine
-// now returns — never for an instance whose connectivity check or library
-// read failed, so a bad cycle leaves the store's last-known-good state alone
-// rather than clobbering it with zeroes.
+// snapshot to). For an in-scope instance whose read succeeded (dataOK), it
+// is updated from the cycleInstanceStats the decision engine returns —
+// Total/Monitored/Unmonitored/WouldUnmonitor/findings/actions all come from
+// there, and the store's last-known-good state for any of them is left
+// alone if the engine itself could not compute a fresh value (see
+// cycleInstanceStats' own gating fields). For an instance whose connectivity
+// check or library read failed instead — §2.6's warn-and-skip paths — the
+// store is still updated, but ONLY with the fact that this cycle could not
+// reach it (statsStore.recordUnreachable): round-3 review fix, closing what
+// used to make such an instance either invisible (if never once reached) or
+// silently stale-looking (if it had been before) on the one surface whose
+// whole job is "glance and trust these numbers".
 func runScanCycle(ctx context.Context, logger *slog.Logger, cfg Config, cycle scanCycle, stats *statsStore) {
 	for _, inst := range cfg.Instances {
 		// An instance the caller did not name is not merely left unwritten: it
@@ -165,22 +182,38 @@ func runScanCycle(ctx context.Context, logger *slog.Logger, cfg Config, cycle sc
 		readLogger := demoteInfoTo(logger, cycle.scope.itemLevel)
 
 		ok := checkInstanceConnectivity(ctx, readLogger, inst)
-		if ok && inst.Type == "radarr" {
+		if !ok {
+			// checkInstanceConnectivity has already WARNed the specific cause
+			// (system/status or qualityprofile unreachable / unparseable); this
+			// is deliberately one coarse reason rather than threading that
+			// string four call stacks deep — the log already has the detail,
+			// and the GUI badge only needs "reachable or not" plus enough to
+			// tell a reader where to look.
+			if stats != nil {
+				stats.recordUnreachable(inst.Name, inst.Type, unreachableReasonConnectivity)
+			}
+			continue
+		}
+		if inst.Type == "radarr" {
 			movies, wantedIDs, dataOK := inspectRadarrLibrary(ctx, readLogger, inst, cycle.samples)
 			if dataOK {
 				result := runRadarrDecisionEngine(ctx, logger, inst, movies, wantedIDs, cfg.ExclusionTag, cycle.scope, cycle.dryRun, cycle.reverse, cycle.fileReport)
 				if stats != nil {
 					stats.recordInstance(cycle.kind, cycle.now(), inst.Name, inst.Type, result)
 				}
+			} else if stats != nil {
+				stats.recordUnreachable(inst.Name, inst.Type, unreachableReasonLibraryRead)
 			}
 		}
-		if ok && inst.Type == "sonarr" {
+		if inst.Type == "sonarr" {
 			series, wantedEpisodeIDs, wantedSeasons, dataOK := inspectSonarrLibrary(ctx, readLogger, inst)
 			if dataOK {
 				result := runSonarrDecisionEngine(ctx, logger, inst, series, wantedEpisodeIDs, wantedSeasons, cfg.ExclusionTag, cycle.scope, cycle.dryRun, cycle.reverse, cycle.fileReport)
 				if stats != nil {
 					stats.recordInstance(cycle.kind, cycle.now(), inst.Name, inst.Type, result)
 				}
+			} else if stats != nil {
+				stats.recordUnreachable(inst.Name, inst.Type, unreachableReasonLibraryRead)
 			}
 		}
 	}
@@ -442,12 +475,20 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 	// "/webhook/" at a subtree pattern hands webhookHandler the request
 	// UNCHANGED (net/http does not rewrite r.URL.Path for a subtree mount,
 	// unlike http.StripPrefix), so its own "POST /webhook/{instance}" pattern
-	// keeps matching exactly as it did on its own dedicated mux — nothing
-	// about the webhook endpoint's routing, method handling, or 404/405
-	// behavior changes. "/" is the catch-all default and therefore also what
-	// answers every path neither mux recognizes, which is what keeps "404 for
-	// other paths unchanged" true without this file naming every dead path
-	// itself.
+	// keeps matching exactly as it did on its own dedicated mux. "/" is the
+	// catch-all default and therefore also what answers every path neither
+	// mux recognizes, which is what keeps "404 for other paths unchanged"
+	// true without this file naming every dead path itself.
+	//
+	// ONE path is NOT free from that: mounting "/webhook/" as a subtree also
+	// makes net/http auto-register its own 301 redirect from the bare
+	// "/webhook" (no trailing slash) to "/webhook/" — a route this daemon
+	// never had before (it used to be an ordinary unmatched path, 404, same
+	// as "/webhook/anything-not-a-real-instance" still is). The explicit
+	// "/webhook" registration a few lines down restores that 404; see its
+	// own comment for why an exact-match registration is what is required
+	// (round-3 review fix — TestDaemon_ComposedMux_RouteTable pins the whole
+	// table, not just this one path).
 	topMux := http.NewServeMux()
 	topMux.Handle("/webhook/", newWebhookHandler(&webhookServer{
 		logger:       logger,
@@ -457,6 +498,19 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 		instances:    instanceTypes,
 		pollInterval: cfg.PollInterval,
 	}))
+	// Round-3 review fix: registering "/webhook/" above as a SUBTREE pattern
+	// makes net/http's ServeMux auto-register its own redirect from the
+	// subtree root without its trailing slash ("/webhook") to the subtree
+	// root WITH it ("/webhook/") — 301, not the 404 every other unmatched
+	// path gets and the 404 "/webhook" itself answered before this mux
+	// existed (a bare newWebhookHandler mux, with no plain "/webhook/"
+	// subtree registered on it at all). This exact-match registration for
+	// "/webhook" takes priority over the subtree's implicit redirect (Go's
+	// ServeMux always prefers a longer/exact match over a subtree one) and
+	// restores the original 404 for both GET and POST — verified by
+	// TestDaemon_ComposedMux_RouteTable, which failed with 301 before this
+	// line existed and passes with it.
+	topMux.HandleFunc("/webhook", http.NotFound)
 	topMux.Handle("/", newWebUIHandler(&webUIServer{stats: d.stats, scan: d.scan, logger: logger}))
 
 	srv := &http.Server{

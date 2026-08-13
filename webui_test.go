@@ -179,6 +179,90 @@ func TestWebUIHandler_Stats_FileReportThreeStatesSurviveDistinctlyToTheClient(t 
 	}
 }
 
+// TestWebUIHandler_Stats_ReverseStatusThreeStatesSurviveDistinctlyToTheClient
+// is round-3's reverse-scan twin of the file-report test above: ran/skipped/
+// off must all reach the client as pairwise distinct ReverseStatus values,
+// through the real HTTP handler's JSON encoding.
+func TestWebUIHandler_Stats_ReverseStatusThreeStatesSurviveDistinctlyToTheClient(t *testing.T) {
+	s := newStatsStore(false)
+	s.recordInstance(cycleKindStartup, time.Now(), "radarr-ran", "radarr", cycleInstanceStats{
+		total: 5, decisionsRan: true, reverseRan: true,
+		reverseFindings: []reverseFinding{{ID: 1, Title: "Finding", Reason: ReasonQualityCutoffNotMet}},
+	})
+	s.recordInstance(cycleKindStartup, time.Now(), "radarr-skipped", "radarr", cycleInstanceStats{
+		total: 5, decisionsRan: true, reverseSkipped: true,
+	})
+	// radarr-off records neither reverseRan nor reverseSkipped — exactly how
+	// a webhook cycle (or the reverse scan globally disabled) behaves.
+	s.recordInstance(cycleKindStartup, time.Now(), "radarr-off", "radarr", cycleInstanceStats{
+		total: 5, decisionsRan: true,
+	})
+
+	ts, _ := newTestWebUIServer(t, s)
+	resp, err := http.Get(ts.URL + "/api/stats")
+	if err != nil {
+		t.Fatalf("GET /api/stats: %v", err)
+	}
+	defer resp.Body.Close()
+	var body statsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
+
+	byName := map[string]instanceStatsView{}
+	for _, inst := range body.Instances {
+		byName[inst.Name] = inst
+	}
+	if got := byName["radarr-ran"].ReverseStatus; got != "ran" {
+		t.Errorf("radarr-ran ReverseStatus = %q, want %q", got, "ran")
+	}
+	if got := byName["radarr-skipped"].ReverseStatus; got != "skipped" {
+		t.Errorf("radarr-skipped ReverseStatus = %q, want %q", got, "skipped")
+	}
+	if got := byName["radarr-off"].ReverseStatus; got != "off" {
+		t.Errorf("radarr-off ReverseStatus = %q, want %q", got, "off")
+	}
+	statuses := map[string]bool{
+		byName["radarr-ran"].ReverseStatus:     true,
+		byName["radarr-skipped"].ReverseStatus: true,
+		byName["radarr-off"].ReverseStatus:     true,
+	}
+	if len(statuses) != 3 {
+		t.Errorf("expected 3 PAIRWISE DISTINCT ReverseStatus values across ran/skipped/off on one response, got %v", statuses)
+	}
+}
+
+// TestWebUIHandler_Stats_UnreachableInstance_VisibleWithSkippedStatusAndNoTotals
+// is controller addition N2's handler-level pin: an instance that has NEVER
+// been reached at all must still appear in `instances` (never simply
+// absent), carrying LastCycleStatus={status: skipped, reason: ...} and
+// zero-value totals — through the real HTTP handler's JSON encoding.
+func TestWebUIHandler_Stats_UnreachableInstance_VisibleWithSkippedStatusAndNoTotals(t *testing.T) {
+	s := newStatsStore(false)
+	s.recordUnreachable("radarr-main", "radarr", unreachableReasonConnectivity)
+
+	ts, _ := newTestWebUIServer(t, s)
+	resp, err := http.Get(ts.URL + "/api/stats")
+	if err != nil {
+		t.Fatalf("GET /api/stats: %v", err)
+	}
+	defer resp.Body.Close()
+	var body statsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
+	if len(body.Instances) != 1 {
+		t.Fatalf("Instances = %+v, want exactly 1: a never-reached instance must be VISIBLE, not absent", body.Instances)
+	}
+	inst := body.Instances[0]
+	if inst.LastCycleStatus.Status != cycleStatusSkipped || inst.LastCycleStatus.Reason != unreachableReasonConnectivity {
+		t.Errorf("LastCycleStatus = %+v, want {status: %q, reason: %q}", inst.LastCycleStatus, cycleStatusSkipped, unreachableReasonConnectivity)
+	}
+	if inst.Total != 0 || inst.LastRun != nil {
+		t.Errorf("a never-reached instance must show zero-value totals and a nil LastRun, got Total=%d LastRun=%v", inst.Total, inst.LastRun)
+	}
+}
+
 // --- POST /api/scan ------------------------------------------------------
 
 func TestWebUIHandler_Scan_FirstPostQueuesSecondReportsAlreadyPending(t *testing.T) {
@@ -376,6 +460,107 @@ func TestWebUIPage_PollsStatsAndPausesWhenHidden(t *testing.T) {
 	}
 }
 
+// TestWebUIPage_ReducedMotionDisablesEveryAnimatedProperty is round-3's
+// regression test for a gap TestWebUIPage_PollsStatsAndPausesWhenHidden's
+// bare substring check couldn't see: the design plan says "No other
+// animation" under prefers-reduced-motion, but the disclosure caret
+// (details.panel summary::before) had its OWN 0.15s rotate transition that
+// the reduced-motion media query never touched.
+//
+// This test parses the <style> block into individual CSS rules by hand
+// (splitting on brace nesting depth — a real selector like "details.panel
+// summary::before" contains a space and two colons, which is exactly why an
+// earlier version of this test using a selector-charset regex silently
+// matched nothing for that rule and could not have caught the bug it was
+// written for; verified by reverting the fix and confirming THIS version
+// fails while a charset-based regex version did not), finds every rule
+// whose body sets a real `transition:` (not `transition: none`), and
+// asserts every one of those selectors appears in the
+// prefers-reduced-motion block's own selector list — so a THIRD animated
+// property added later without updating that block fails here too, not
+// only the two/three known today.
+func TestWebUIPage_ReducedMotionDisablesEveryAnimatedProperty(t *testing.T) {
+	page := string(webUIPage)
+
+	styleStart := strings.Index(page, "<style>")
+	styleEnd := strings.Index(page, "</style>")
+	if styleStart == -1 || styleEnd == -1 || styleEnd < styleStart {
+		t.Fatal("page has no <style>...</style> block")
+	}
+	// Comments are stripped BEFORE parsing: this test's own doc comment
+	// above (and the source CSS's) mentions the literal selector text
+	// "details.panel summary::before" in prose, which — left in — would
+	// make the @media rule's parsed body contain that substring merely
+	// because a COMMENT says it, regardless of whether the actual selector
+	// list does. That false-positive is exactly what let an earlier version
+	// of this test pass against the unfixed CSS; verified by reproducing it.
+	css := regexp.MustCompile(`(?s)/\*.*?\*/`).ReplaceAllString(page[styleStart+len("<style>"):styleEnd], "")
+
+	type rule struct{ selector, body string }
+	var rules []rule
+	depth := 0
+	var selBuf, bodyBuf strings.Builder
+	for _, r := range css {
+		switch {
+		case r == '{':
+			depth++
+			if depth == 1 {
+				bodyBuf.Reset()
+				continue
+			}
+		case r == '}':
+			depth--
+			if depth == 0 {
+				rules = append(rules, rule{selector: strings.TrimSpace(selBuf.String()), body: bodyBuf.String()})
+				selBuf.Reset()
+				continue
+			}
+		}
+		if depth == 0 {
+			selBuf.WriteRune(r)
+		} else if depth >= 1 {
+			bodyBuf.WriteRune(r)
+		}
+	}
+	if len(rules) == 0 {
+		t.Fatal("test instrument parsed zero CSS rules; the page's <style> shape changed enough that this parser needs updating")
+	}
+
+	var reducedMotionBody string
+	for _, ru := range rules {
+		if strings.Contains(ru.selector, "prefers-reduced-motion: reduce") {
+			reducedMotionBody = ru.body
+		}
+	}
+	if reducedMotionBody == "" {
+		t.Fatal("page has no @media (prefers-reduced-motion: reduce) rule")
+	}
+
+	animatedSelectors := 0
+	for _, ru := range rules {
+		if strings.HasPrefix(strings.TrimSpace(ru.selector), "@media") {
+			continue
+		}
+		if !strings.Contains(ru.body, "transition:") || strings.Contains(ru.body, "transition: none") {
+			continue
+		}
+		animatedSelectors++
+		for _, one := range strings.Split(ru.selector, ",") {
+			one = strings.TrimSpace(one)
+			if one == "" {
+				continue
+			}
+			if !strings.Contains(reducedMotionBody, one) {
+				t.Errorf("selector %q sets a real transition (%q) but is not listed in the prefers-reduced-motion block %q",
+					one, strings.TrimSpace(ru.body), reducedMotionBody)
+			}
+		}
+	}
+	if animatedSelectors == 0 {
+		t.Fatal("test instrument found zero animated (transition, not none) rules; the page's CSS shape changed enough that this parser needs updating")
+	}
+}
+
 // TestWebUIPage_ShelfCountHeroSizeIsInTheMandatedBand pins the GUI design
 // plan's type spec: "hero numbers large (28-36px) mono with small unit
 // words". The shelf count ("456 / 996 at rest") is the page's one hero
@@ -459,5 +644,139 @@ func TestWebUIPage_RefreshSurfacesAFailedPollExplicitly(t *testing.T) {
 	}
 	if !strings.Contains(page, "disconnected") {
 		t.Error("a failed poll never surfaces an explicit \"disconnected\" state")
+	}
+}
+
+// TestWebUIPage_DisconnectedStateNeverClaimsASweepIsRunning is round-3's
+// regression test for controller addition N1: a page that has NEVER once
+// heard back from a daemon (a stale tab, a crashed container, a proxy
+// serving the static page without the backend behind it) must say so
+// explicitly, and must never leave the static "a sweep is in progress"
+// placeholder on screen as though it were still true.
+func TestWebUIPage_DisconnectedStateNeverClaimsASweepIsRunning(t *testing.T) {
+	page := string(webUIPage)
+	const cantReach = "Can't reach cutoffarr. The page is being served without its daemon — start cutoffarr and reload."
+	const firstSweep = "First sweep in progress — the shelves fill in when it finishes."
+
+	if !strings.Contains(page, cantReach) {
+		t.Errorf("page is missing the unreachable-daemon copy %q", cantReach)
+	}
+	if !strings.Contains(page, firstSweep) {
+		t.Errorf("page is missing the daemon-up-no-cycle-yet copy %q", firstSweep)
+	}
+	if strings.Contains(page, "still working") {
+		t.Error("page still contains the old ambiguous placeholder copy, which could be read as \"a sweep is in progress\" even when the daemon cannot be reached at all")
+	}
+
+	// The unreachable copy must be reachable ONLY from a path gated on
+	// lastSuccessAt being unset — i.e. from inside showDisconnected, not
+	// from render()'s own empty-instances branch (which is state (b), a
+	// live daemon that simply has no cycle yet, and must keep the OTHER
+	// copy). Extract showDisconnected's own function body and check both
+	// properties hold there.
+	start := strings.Index(page, "function showDisconnected()")
+	if start == -1 {
+		t.Fatal("page has no showDisconnected function")
+	}
+	end := strings.Index(page[start:], "\n  function refresh()")
+	if end == -1 {
+		t.Fatal("could not find the end of showDisconnected (refresh() must follow it)")
+	}
+	body := page[start : start+end]
+	if !strings.Contains(body, "lastSuccessAt") {
+		t.Error("showDisconnected never checks lastSuccessAt: it cannot tell \"never once connected\" apart from \"was connected, now isn't\"")
+	}
+	if !strings.Contains(body, cantReach) {
+		t.Error("showDisconnected's own body never contains the unreachable-daemon copy")
+	}
+}
+
+// TestWebUIPage_FileClutterHeaderDistinguishesCleanFromNotChecked is
+// round-3's regression test: the <summary> row's own fileCount text — what
+// a COLLAPSED panel actually shows the glancing operator — used to be a
+// bare row count, making "(0)" mean either "every root was clean" or
+// "nothing was ever looked at" identically. The fix must qualify the count
+// right there in the summary, not only in the (collapsed, unseen) body.
+func TestWebUIPage_FileClutterHeaderDistinguishesCleanFromNotChecked(t *testing.T) {
+	page := string(webUIPage)
+	if strings.Contains(page, `text(document.getElementById("fileCount"), String(rows.length));`) {
+		t.Error("fileCount summary is still a bare row count; an all-off/all-skipped deployment renders the exact same \"(0)\" as an all-clean one")
+	}
+	if !strings.Contains(page, "not configured") || !strings.Contains(page, "not checked") {
+		t.Error("fileCount summary text never distinguishes not-configured/not-checked instances from a genuine 0")
+	}
+}
+
+// TestWebUIPage_ScanNowChecksResponseOkAndSurfacesStatus is round-3's
+// regression test for the Scan-now click handler's sibling bug to the one
+// round 2 fixed on refresh(): the POST's response was never checked for
+// r.ok NOR decoded, so a refused/failed scan (404/405/500, or a network
+// failure) was indistinguishable from a queued one — refresh() still ran
+// unconditionally, still repainted a healthy badge, and the ONLY thing that
+// says whether the click did anything (the response body) was discarded.
+func TestWebUIPage_ScanNowChecksResponseOkAndSurfacesStatus(t *testing.T) {
+	page := string(webUIPage)
+	start := strings.Index(page, `scanBtn.addEventListener("click"`)
+	if start == -1 {
+		t.Fatal("page has no scanBtn click handler")
+	}
+	handler := page[start:]
+	if idx := strings.Index(handler, "\n  refresh().then(schedulePoll);"); idx != -1 {
+		handler = handler[:idx]
+	}
+
+	if !strings.Contains(handler, "r.ok") {
+		t.Error("Scan-now click handler never checks the POST response's ok status")
+	}
+	if !strings.Contains(handler, "already-pending") {
+		t.Error("Scan-now click handler never reads the returned {status} body")
+	}
+	if !strings.Contains(handler, "showDisconnected()") {
+		t.Error("Scan-now click handler's failure path never routes through showDisconnected(); a refused/failed scan is left as a silent, unsignaled button reset")
+	}
+}
+
+// TestWebUIPage_ReverseStatusThreeStateFidelity is renderFileReport's
+// three-state test (TestWebUIPage_FileReportRendersThreeStateStatus),
+// mirrored for the reverse scan: the page's JS must read reverseStatus and
+// gate the "Nothing wrongly unmonitored" invitation on at least one
+// instance actually having a TRUSTED pass, never printing it as a stand-in
+// for "never ran" or "ran but could not be trusted".
+func TestWebUIPage_ReverseStatusThreeStateFidelity(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, "inst.reverseStatus") && !strings.Contains(page, ".reverseStatus") {
+		t.Error("renderReverse never reads reverseStatus")
+	}
+	if !strings.Contains(page, "anyRan") {
+		t.Error(`renderReverse never gates its empty-state invitation on "at least one instance actually ran a trustworthy pass" (anyRan)`)
+	}
+	if !strings.Contains(page, "could not be trusted this sweep") {
+		t.Error("page is missing skipped-reverse-scan notice copy")
+	}
+}
+
+// TestWebUIPage_UnreachableInstanceBadge pins controller addition N2's GUI
+// half: an instance whose most recent cycle could not even reach the
+// decision engine must carry a visible, distinctly-colored (ALERT clay)
+// badge on its shelf card — never silently show stale numbers with no
+// marker that anything is wrong.
+func TestWebUIPage_UnreachableInstanceBadge(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, "lastCycleStatus") {
+		t.Error("page never reads lastCycleStatus")
+	}
+	if !strings.Contains(page, "shelf-unreachable") {
+		t.Error("page never defines a shelf-unreachable badge element/class")
+	}
+	if !strings.Contains(page, "couldn't reach ") {
+		t.Error("page is missing the unreachable-instance badge copy")
+	}
+	// The badge must use the ALERT clay token, not invent a new color.
+	badgeRuleStart := strings.Index(page, ".shelf-unreachable")
+	if badgeRuleStart == -1 {
+		t.Fatal("no .shelf-unreachable CSS rule found")
+	}
+	if !strings.Contains(page, `el("span", "badge badge-alert shelf-unreachable")`) {
+		t.Error("the unreachable badge element is not built with the badge-alert (ALERT clay) class")
 	}
 }

@@ -678,9 +678,11 @@ script, a status-page widget, whatever) without ever loading the HTML:
         "wouldUnmonitor": 3,
         "lastRun": "2026-03-01T12:00:00Z",
         "lastCycleKind": "sweep",
+        "reverseStatus": "ran",
         "reverseFindings": [],
         "fileReport": { "status": "ran", "duplicates": 0, "orphans": 1, "findings": [] },
-        "lastActions": []
+        "lastActions": [],
+        "lastCycleStatus": { "status": "ok" }
       }
     ],
     "dryRun": true,
@@ -688,18 +690,46 @@ script, a status-page widget, whatever) without ever loading the HTML:
   }
   ```
 
-  `lastCycleKind` is `startup`, `sweep`, `webhook`, or `once` (the shape's
-  own `null` covers a case this response never actually shows: an instance
-  with no completed cycle yet is simply absent from `instances`, rather than
-  present with null fields). A manual scan (below) reports itself as
-  `sweep`, since it's mechanically the same full-library pass, just run on
-  demand instead of on the timer. `fileReport.status` is
-  the same three-way `ran`/`skipped`/`off` the log's own `msg="file report"`
-  line uses: `off` means that instance never set `media_root_map` at all, so
-  `duplicates`/`orphans` being `0` there is "not configured", not "clean" —
-  never conflate the two. `lastActions` holds up to the last 50 confirmed
-  `unmonitor`/`remonitor` writes across both directions; it's always empty
-  in dry-run, because a rehearsal is never reported as an action taken.
+  `lastCycleKind` is `startup`, `sweep`, `webhook`, or `once`. `lastRun`/
+  `lastCycleKind` are `null` when this instance has never once completed a
+  full evaluation — either because its only cycle(s) so far each aborted
+  before finishing one (a profile-fetch failure, say — a `total`/`monitored`/
+  `unmonitored` shown alongside a `null` `lastRun` is a real library read
+  from a cycle that didn't get further), or because the daemon has never
+  once been able to reach it at all (see `lastCycleStatus` below, where
+  `total` and friends stay at `0`). An instance is absent from `instances`
+  entirely only before its very first cycle has been ATTEMPTED — the brief
+  window before the startup scan reaches it. A manual scan (below) reports
+  itself as `sweep`, since it's mechanically the same full-library pass,
+  just run on demand instead of on the timer.
+
+  `fileReport.status` and `reverseStatus` are each the same three-way
+  `ran`/`skipped`/`off` vocabulary the log's own `msg="file report"` line
+  and `reverseScan` attr use: `off` means that pass has never run a
+  complete, trustworthy cycle for this instance yet (`media_root_map` never
+  set, for the file report; the reverse scan globally disabled, or no full
+  sweep has reached it yet); `skipped` means it ran this cycle but could not
+  be trusted (a tracked root read failed; an incomplete unmonitored
+  wanted/cutoff set); `ran` means a clean, trustworthy pass. `duplicates`/
+  `orphans`/`reverseFindings` being empty means "clean" ONLY when the
+  matching status is `ran` — never conflate `off` or `skipped` with "clean".
+
+  `lastCycleStatus` is this instance's outcome on the single MOST RECENT
+  cycle that named it, independent of everything else in this object:
+  `{"status": "ok"}` once that cycle actually reached the decision engine
+  (whatever the engine itself then did), or `{"status": "skipped", "reason":
+  "..."}` when the connectivity check or the library read itself failed —
+  the daemon's own warn-and-skip path, most often an `*arr` mid-restart.
+  Unlike every other field here, it is never carried forward from an
+  earlier cycle: an instance unreachable for a week reports `skipped` on
+  every poll, not a stale `ok` from the last time it was reachable. The
+  dashboard shows this as a clay "couldn't reach … last sweep" badge on
+  that instance's shelf card; every other number on the card is left
+  exactly as it last was.
+
+  `lastActions` holds up to the last 50 confirmed `unmonitor`/`remonitor`
+  writes across both directions; it's always empty in dry-run, because a
+  rehearsal is never reported as an action taken.
 
 - **`POST /api/scan`** — queues one full-library sweep (the same
   `fullLibraryScope`/reverse/file-report shape the reconciliation sweep and

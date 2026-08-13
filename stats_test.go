@@ -153,6 +153,137 @@ func TestStatsStore_RecordInstance_NewInstanceDefaultsFileReportToOff(t *testing
 	if got.ReverseFindings == nil || len(got.ReverseFindings) != 0 {
 		t.Errorf("ReverseFindings = %+v, want a non-nil empty slice", got.ReverseFindings)
 	}
+	if got.ReverseStatus != "off" {
+		t.Errorf("ReverseStatus = %q, want %q before any full cycle has run it for this instance", got.ReverseStatus, "off")
+	}
+}
+
+// TestStatsStore_RecordInstance_ReverseStatusTracksRanVsSkipped is round-3's
+// reverse-scan twin of the file-report three-state coverage above: a cycle
+// that ran the pass and trusted it reports "ran"; a LATER cycle that
+// attempted the pass but could not trust it (reverseSkipped, e.g. an
+// incomplete unmonitored wanted set) must report "skipped" — never silently
+// keep reporting "ran" from the earlier cycle — while still preserving the
+// earlier cycle's actual findings rather than clearing them (the existing
+// three-state fidelity rule for ReverseFindings itself, unchanged here).
+func TestStatsStore_RecordInstance_ReverseStatusTracksRanVsSkipped(t *testing.T) {
+	s := newStatsStore(false)
+	s.recordInstance(cycleKindStartup, time.Now(), "radarr-main", "radarr", cycleInstanceStats{
+		total: 5, decisionsRan: true, reverseRan: true,
+		reverseFindings: []reverseFinding{{ID: 7, Title: "Real finding", Reason: ReasonQualityCutoffNotMet}},
+	})
+	if got := s.snapshot().Instances[0].ReverseStatus; got != "ran" {
+		t.Fatalf("ReverseStatus after a trustworthy reverse pass = %q, want %q", got, "ran")
+	}
+
+	s.recordInstance(cycleKindSweep, time.Now(), "radarr-main", "radarr", cycleInstanceStats{
+		total: 5, decisionsRan: true, reverseSkipped: true,
+	})
+	got := s.snapshot().Instances[0]
+	if got.ReverseStatus != "skipped" {
+		t.Errorf("ReverseStatus after a cycle that attempted but could not trust the reverse pass = %q, want %q", got.ReverseStatus, "skipped")
+	}
+	if len(got.ReverseFindings) != 1 || got.ReverseFindings[0].ID != 7 {
+		t.Errorf("ReverseFindings after a skipped reverse pass = %+v, want the PREVIOUS trustworthy finding preserved", got.ReverseFindings)
+	}
+
+	// A webhook cycle (neither reverseRan nor reverseSkipped — the pass was
+	// never even scheduled) must leave the "skipped" status exactly as it
+	// was, never silently reverting to "off" or back to "ran".
+	s.recordInstance(cycleKindWebhook, time.Now(), "radarr-main", "radarr", cycleInstanceStats{total: 5, decisionsRan: true})
+	if got := s.snapshot().Instances[0].ReverseStatus; got != "skipped" {
+		t.Errorf("ReverseStatus after an unrelated webhook cycle = %q, want the previous %q preserved", got, "skipped")
+	}
+}
+
+// TestStatsStore_RecordInstance_SetsLastCycleStatusOK pins that any cycle
+// which reaches recordInstance at all (i.e. actually got as far as the
+// decision engine — see runScanCycle's own dataOK gate) is unconditionally
+// marked ok, overwriting whatever a PREVIOUS failed cycle may have left,
+// unlike every other field on instanceStatsView.
+func TestStatsStore_RecordInstance_SetsLastCycleStatusOK(t *testing.T) {
+	s := newStatsStore(false)
+	s.recordUnreachable("radarr-main", "radarr", unreachableReasonConnectivity)
+	if got := s.snapshot().Instances[0].LastCycleStatus; got.Status != cycleStatusSkipped {
+		t.Fatalf("LastCycleStatus after recordUnreachable = %+v, want status=%q", got, cycleStatusSkipped)
+	}
+
+	s.recordInstance(cycleKindSweep, time.Now(), "radarr-main", "radarr", cycleInstanceStats{total: 5, decisionsRan: true})
+	got := s.snapshot().Instances[0].LastCycleStatus
+	if got.Status != cycleStatusOK || got.Reason != "" {
+		t.Errorf("LastCycleStatus after a cycle that reached the engine = %+v, want {status: %q, reason: \"\"}, overwriting the previous skipped status", got, cycleStatusOK)
+	}
+}
+
+// TestStatsStore_RecordUnreachable_NeverReachedInstance_CreatesAVisibleEntry
+// is the fix's whole point: before it, an instance that had NEVER once been
+// reached was simply absent from `instances`, indistinguishable from "not
+// configured in this daemon at all". Now such an instance appears with its
+// zero-value totals and an explicit skipped LastCycleStatus.
+func TestStatsStore_RecordUnreachable_NeverReachedInstance_CreatesAVisibleEntry(t *testing.T) {
+	s := newStatsStore(false)
+	s.recordUnreachable("radarr-main", "radarr", unreachableReasonLibraryRead)
+
+	snap := s.snapshot()
+	if len(snap.Instances) != 1 {
+		t.Fatalf("Instances = %+v, want exactly 1 (the unreachable instance must be visible, not absent)", snap.Instances)
+	}
+	got := snap.Instances[0]
+	if got.Name != "radarr-main" || got.Type != "radarr" {
+		t.Errorf("instance = %+v, want name=radarr-main type=radarr", got)
+	}
+	if got.LastCycleStatus.Status != cycleStatusSkipped || got.LastCycleStatus.Reason != unreachableReasonLibraryRead {
+		t.Errorf("LastCycleStatus = %+v, want {status: %q, reason: %q}", got.LastCycleStatus, cycleStatusSkipped, unreachableReasonLibraryRead)
+	}
+	if got.Total != 0 || got.Monitored != 0 || got.Unmonitored != 0 || got.WouldUnmonitor != 0 {
+		t.Errorf("an instance that has NEVER been reached must show zero-value totals, got %+v", got)
+	}
+	if got.LastRun != nil {
+		t.Errorf("LastRun = %v, want nil: this cycle never reached the decision engine, so it never produced a run to timestamp", got.LastRun)
+	}
+	if got.FileReport.Status != "off" || got.ReverseStatus != "off" {
+		t.Errorf("FileReport.Status/ReverseStatus = %q/%q, want off/off for a never-reached instance", got.FileReport.Status, got.ReverseStatus)
+	}
+}
+
+// TestStatsStore_RecordUnreachable_PreviouslyGoodInstance_LeavesTrustedFieldsAlone
+// is the OTHER half: an instance the daemon has reached before, going
+// unreachable on a LATER cycle, must keep showing its last-known-good
+// totals/findings/actions (never clobbered with zeroes or an empty slice)
+// while LastCycleStatus alone reports the new failure.
+func TestStatsStore_RecordUnreachable_PreviouslyGoodInstance_LeavesTrustedFieldsAlone(t *testing.T) {
+	s := newStatsStore(false)
+	s.recordInstance(cycleKindStartup, time.Now(), "radarr-main", "radarr", cycleInstanceStats{
+		total: 100, monitored: 40, unmonitored: 60, wouldUnmonitor: 3, decisionsRan: true,
+		reverseRan:      true,
+		reverseFindings: []reverseFinding{{ID: 7, Title: "Real finding", Reason: ReasonQualityCutoffNotMet}},
+		fileReportRan:   true,
+		fileReport:      fileReportSnapshot{Status: "ran", Duplicates: 1, Orphans: 2, Findings: []fileReportFindingRecord{{Kind: "duplicate", Path: "/x"}}},
+		actions:         []actionRecord{{Action: ActionUnmonitor, ID: 1, Title: "Movie", Reason: ReasonCutoffMet}},
+	})
+	before := s.snapshot().Instances[0]
+
+	s.recordUnreachable("radarr-main", "radarr", unreachableReasonConnectivity)
+
+	got := s.snapshot().Instances[0]
+	if got.Total != before.Total || got.Monitored != before.Monitored || got.Unmonitored != before.Unmonitored || got.WouldUnmonitor != before.WouldUnmonitor {
+		t.Errorf("totals changed after recordUnreachable: before=%+v after=%+v", before, got)
+	}
+	if len(got.ReverseFindings) != 1 || got.ReverseFindings[0].ID != 7 {
+		t.Errorf("ReverseFindings changed after recordUnreachable: got %+v", got.ReverseFindings)
+	}
+	if got.FileReport.Status != "ran" || got.FileReport.Duplicates != 1 {
+		t.Errorf("FileReport changed after recordUnreachable: got %+v", got.FileReport)
+	}
+	if len(got.LastActions) != 1 {
+		t.Errorf("LastActions changed after recordUnreachable: got %+v", got.LastActions)
+	}
+	if got.LastRun == nil || !got.LastRun.Equal(*before.LastRun) {
+		t.Errorf("LastRun changed after recordUnreachable: before=%v after=%v", before.LastRun, got.LastRun)
+	}
+	if got.LastCycleStatus.Status != cycleStatusSkipped || got.LastCycleStatus.Reason != unreachableReasonConnectivity {
+		t.Errorf("LastCycleStatus = %+v, want {status: %q, reason: %q}", got.LastCycleStatus, cycleStatusSkipped, unreachableReasonConnectivity)
+	}
 }
 
 // TestStatsStore_LastActions_CapsAt50AndOrdersNewestFirst pins the plan's own
@@ -429,6 +560,44 @@ func TestRunRadarrDecisionEngine_Stats_ReverseFindingsAndRemonitorAction(t *test
 	}
 }
 
+// TestRunRadarrDecisionEngine_Stats_DryRun_ReverseFindingsButNoRemonitorAction
+// is TestRunRadarrDecisionEngine_Stats_ReverseFindingsAndRemonitorAction's
+// dry-run twin — the SAME fixture, dryRun=true instead of false — proving the
+// REVERSE direction honors "a rehearsal is never reported as an action
+// taken" exactly like the forward direction already does above:
+// reverseFindings must still report the finding (the pass ran and is
+// trustworthy regardless of dry-run), but actions must stay empty, since
+// writeMovieMonitored never confirms a write in dry-run (the §2.1 gate). Round-3
+// review fix: before this test, only the FORWARD direction's dry-run
+// guarantee was pinned by any test; the reverse direction's was true in the
+// code (decision.go, reverse.go's record()) but unverified.
+func TestRunRadarrDecisionEngine_Stats_DryRun_ReverseFindingsButNoRemonitorAction(t *testing.T) {
+	const findingID = 1
+	reverseWanted := `{"page":1,"pageSize":100,"totalRecords":1,"records":[{"id":1,"title":"Accounted Movie"}]}`
+	unmonitoredDetail := `{"id": 1, "title": "Accounted Movie", "monitored": false, "hasFile": true, "qualityProfileId": 1, "tags": []}`
+
+	fake := newRadarrFake(t, "", map[int]string{findingID: unmonitoredDetail})
+	fake.reverseWantedJSON = reverseWanted
+	movies := []movieListElement{crossCheckWitnessMovie(5, "Ordinary Monitored"), unmonitoredBelowCutoffMovie(findingID, "Accounted Movie")}
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	result := runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{5: true}, "cutoffarr-exclude",
+		fullLibraryScope(slog.LevelInfo), true, reverseOptions{enabled: true, remonitor: true}, fileReportOptions{})
+
+	if !result.reverseRan {
+		t.Fatalf("reverseRan = false, want true: a trustworthy reverse pass still ran in dry-run:\n%s", buf.String())
+	}
+	if len(result.reverseFindings) != 1 || result.reverseFindings[0].ID != findingID {
+		t.Fatalf("reverseFindings = %+v, want exactly the one finding, dry-run or not:\n%s", result.reverseFindings, buf.String())
+	}
+	if len(result.actions) != 0 {
+		t.Fatalf("actions = %+v, want empty: dry-run must never record a confirmed remonitor action:\n%s", result.actions, buf.String())
+	}
+	if len(fake.puts()) != 0 {
+		t.Fatalf("the fake must have received ZERO PUTs in dry-run for this test to prove anything, got %d", len(fake.puts()))
+	}
+}
+
 // TestRunRadarrDecisionEngine_Stats_FileReportCapturesRealDuplicateAndOrphan
 // exercises the file report half through the real filesystem walk
 // (runRadarrFileReport, unchanged) and fileReportSnapshotFrom together,
@@ -541,8 +710,19 @@ func TestRunRadarrDecisionEngine_Stats_ReverseScanSkipped_ReverseRanStaysFalse(t
 	if result.reverseRan {
 		t.Fatalf("reverseRan = true, want false: the reverse pass was skipped (an incomplete unmonitored wanted set), so it must not be captured as a pass that ran and found nothing:\n%s", buf.String())
 	}
+	if !result.reverseSkipped {
+		t.Errorf("reverseSkipped = false, want true: the pass DID attempt to run this cycle (reverse.enabled) but could not be trusted, which is a distinct state from \"never scheduled\" — see instanceStatsView.ReverseStatus's own comment")
+	}
 	if len(result.reverseFindings) != 0 {
 		t.Errorf("reverseFindings = %+v, want empty/unset alongside reverseRan=false", result.reverseFindings)
+	}
+	// This fixture drives the engine with dryRun=true: a rehearsal must never
+	// report a confirmed action, forward or reverse — round-3 review fix,
+	// pinned here because this fixture already produces a forward
+	// would-unmonitor candidate ("Forward Candidate") that a regression
+	// recording INTENDED rather than CONFIRMED writes would surface.
+	if len(result.actions) != 0 {
+		t.Fatalf("actions = %+v, want empty: dry-run must never record a confirmed action:\n%s", result.actions, buf.String())
 	}
 
 	// Store-level consequence: a previous cycle's real finding must survive
@@ -579,8 +759,17 @@ func TestRunSonarrDecisionEngine_Stats_ReverseScanSkipped_ReverseRanStaysFalse(t
 	if result.reverseRan {
 		t.Fatalf("reverseRan = true, want false: the reverse pass was skipped:\n%s", buf.String())
 	}
+	if !result.reverseSkipped {
+		t.Errorf("reverseSkipped = false, want true: the pass DID attempt to run this cycle but could not be trusted")
+	}
 	if len(result.reverseFindings) != 0 {
 		t.Errorf("reverseFindings = %+v, want empty/unset alongside reverseRan=false", result.reverseFindings)
+	}
+	// dryRun=true here too (see the Radarr twin's identical assertion) — this
+	// fixture's "Mixed Show" already produces a forward would-unmonitor
+	// candidate (season 1).
+	if len(result.actions) != 0 {
+		t.Fatalf("actions = %+v, want empty: dry-run must never record a confirmed action:\n%s", result.actions, buf.String())
 	}
 
 	s := newStatsStore(false)
