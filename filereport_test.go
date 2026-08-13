@@ -5,6 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -14,6 +17,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -3239,13 +3243,51 @@ func TestDaemon_IdleCycleWithFileReportFindings_StaysWithinTheNoiseBudget(t *tes
 // substring ban is exactly as effective at stopping that as an allowlist that
 // starts empty and has to be argued into non-empty.
 
-// fsMutationAllowlist names files permitted to call a filesystem-mutation API
-// outside a test file. It is empty: nothing in this project needs to create,
-// delete, rename, or truncate anything on disk, and this phase's own
-// filereport.go — the one file with any reason to go near the media
-// filesystem at all — is walk-and-stat only, appearing here would be exactly
-// the drift the binding Phase 10 branch review ordered this test to prevent.
-var fsMutationAllowlist = map[string]bool{}
+// fsMutationAllowlist names the files permitted to call a filesystem-mutation
+// API outside a test file, and — this is the part that keeps it an allowlist
+// rather than a hole — WHICH calls each of them may make. Everything not
+// named here stays banned for every file in the tree, including these.
+//
+// [v2.2 AMENDMENT, made deliberately and argued for rather than slipped in.]
+// This map was empty for Phase 11 and its emptiness was itself the point.
+// What changed is not the rule but who the rule is about. The owner ruled
+// (plan §7, Phase 11, 2026-08-13) that the no-file-writes rule binds the
+// AUTOMATION — "forbidden for the automation to do, not for the human" — and
+// that a human clicking a per-finding button that states its exact operation
+// is the human acting, with cutoffarr as the hand. actions.go is that hand
+// and nothing else: every function in it is reachable only from the action
+// endpoint handler (TestTree_ExecutorsAreReachableOnlyFromTheActionEndpoint,
+// actions_test.go), so no sweep, webhook, reconciliation or startup path can
+// reach a single one of these calls no matter what the config says.
+//
+// Exactly ONE file joins, and it may make exactly TWO calls:
+//
+//   - os.Rename — the trash move and the merge move. A rename never destroys
+//     a file's contents and never leaves a half-written copy behind.
+//   - os.MkdirAll — the trash directory (which is also the read-only-mount
+//     probe, rule 8) and a merge destination's parents.
+//
+// os.Remove and os.RemoveAll are NOT here and never will be: they stay banned
+// tree-wide, in this file too (fsMutationAlwaysBanned below enforces that
+// against the allowlist itself). True deletion does not exist in this
+// codebase — every removal is a move into .cutoffarr-trash, and emptying that
+// is a human's job with their own shell.
+var fsMutationAllowlist = map[string]map[string]bool{
+	"actions.go": {
+		"os.Rename(":   true,
+		"os.MkdirAll(": true,
+	},
+}
+
+// fsMutationAlwaysBanned are the calls no file may make, allowlisted or not.
+// They are the destructive ones — the two that can make a file cease to
+// exist — and the allowlist deliberately cannot grant them: v2.2 added the
+// ability to MOVE a file, not the ability to destroy one, and the difference
+// is the whole safety argument the owner's ruling rests on.
+var fsMutationAlwaysBanned = map[string]bool{
+	"os.Remove(":    true,
+	"os.RemoveAll(": true,
+}
 
 // fsMutationAPIs are the calls that mutate the filesystem: create, delete,
 // rename, truncate, or open for writing. Named individually (not a single
@@ -3329,8 +3371,15 @@ func TestTree_BansFilesystemMutationAPIsEverywhere(t *testing.T) {
 		body := string(src)
 
 		for _, api := range fsMutationAPIs {
-			if strings.Contains(body, api) && !fsMutationAllowlist[name] {
-				t.Errorf("%s calls %s: this project's filesystem access must stay read-only outside the (empty) allowlist — the permanent no-file-writes rule extends from the *arr APIs to the disk itself", name, api)
+			if !strings.Contains(body, api) {
+				continue
+			}
+			if fsMutationAlwaysBanned[api] {
+				t.Errorf("%s calls %s: this call is banned in EVERY file including the v2.2 action allowlist — cutoffarr moves files into %s, it never destroys one", name, api, trashDirName)
+				continue
+			}
+			if !fsMutationAllowlist[name][api] {
+				t.Errorf("%s calls %s: this project's filesystem access must stay read-only outside the narrow v2.2 action allowlist — the permanent no-file-writes rule extends from the *arr APIs to the disk itself, and binds every autonomous code path forever", name, api)
 			}
 		}
 		return nil
@@ -3350,6 +3399,88 @@ func TestTree_BansFilesystemMutationAPIsEverywhere(t *testing.T) {
 	if scanned < minScannedNonTestGoFiles {
 		t.Fatalf("scanned only %d non-test .go file(s), want at least %d: this audit is vacuous unless the walk is actually finding the project's source", scanned, minScannedNonTestGoFiles)
 	}
+}
+
+// fsMutationApprovedFunctions is the v2.2 amendment's second half, and the
+// reason the allowlist above is a narrow grant rather than a blanket one:
+// naming a FILE that may rename and mkdir says nothing about WHAT it renames.
+// This names the only functions in that file whose bodies may contain such a
+// call, and each of them is a trash-move or a merge-move by construction:
+//
+//	probeRootWritable  — rule 8's read-only-mount probe, which IS the
+//	                     trash-directory create (os.MkdirAll only).
+//	moveToTrash        — rule 4's rename-move into .cutoffarr-trash.
+//	mergeCaseTwinDir   — rule 5's per-file rename-moves of the untracked
+//	                     spelling's contents into the tracked spelling, whose
+//	                     every collision routes back through moveToTrash.
+//
+// A future "cleanupOldTrash" or "renameToMatchTheArr" would compile, would
+// sit in an allowlisted file, and would be caught here — which is the point.
+var fsMutationApprovedFunctions = map[string]bool{
+	"probeRootWritable": true,
+	"moveToTrash":       true,
+	"mergeCaseTwinDir":  true,
+}
+
+// TestActionsFile_EveryMutationIsATrashMoveOrAMergeMove is the pin the v2.2
+// amendment owes the audit it just widened. It parses the allowlisted file
+// (go/ast, not a substring scan, so it can tell WHICH function a call is
+// inside) and requires every os.Rename/os.MkdirAll call site to sit in one of
+// the three approved functions above.
+//
+// It also carries its own vacuity guard, for the same reason
+// minScannedNonTestGoFiles exists one test up: an audit that finds no call
+// sites at all has verified nothing while still reporting green, and a
+// renamed file or a broken parse is exactly how that happens.
+func TestActionsFile_EveryMutationIsATrashMoveOrAMergeMove(t *testing.T) {
+	const file = "actions.go"
+	fset := token.NewFileSet()
+	parsed, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		t.Fatalf("parsing %s: %v", file, err)
+	}
+
+	watched := map[string]bool{"Rename": true, "MkdirAll": true}
+	sites := 0
+	for _, decl := range parsed.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			pkg, ok := sel.X.(*ast.Ident)
+			if !ok || pkg.Name != "os" || !watched[sel.Sel.Name] {
+				return true
+			}
+			sites++
+			if !fsMutationApprovedFunctions[fn.Name.Name] {
+				t.Errorf("%s: os.%s is called inside %s, which is not one of the approved trash-move/merge-move functions %v — the v2.2 allowlist grants this file the ability to MOVE a file into the trash and to merge a case-twin, nothing else",
+					file, sel.Sel.Name, fn.Name.Name, sortedApprovedFunctionNames())
+			}
+			return true
+		})
+	}
+
+	if sites < 3 {
+		t.Fatalf("found only %d os.Rename/os.MkdirAll call site(s) in %s, want at least 3 (the probe's mkdir, the trash move's rename, the merge's rename): this audit is vacuous unless it is actually finding them", sites, file)
+	}
+}
+
+func sortedApprovedFunctionNames() []string {
+	names := make([]string, 0, len(fsMutationApprovedFunctions))
+	for n := range fsMutationApprovedFunctions {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // --- the plan's verbatim acceptance scenario (Phase 11, HUMAN GATE) --------
