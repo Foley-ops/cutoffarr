@@ -1046,8 +1046,14 @@ func TestWebUIPage_FileReportShowsRootRelativeDisplayPathWithFullPathAsTitle(t *
 // breaks mid-word (dupli-cate) in its narrow column" fix: the kind cell must
 // opt out of table.findings td's page-wide word-break: break-word (below)
 // via its own class, and that class must reserve enough width to hold
-// "case-collision" — [v2.1] now the longest of the three kind values (14
-// characters, surpassing "duplicate"'s 9) — on one line.
+// "duplicate" — [ROUND, inline-display fix] once again the longest kind
+// value this column ever renders, now that case-collision findings are
+// rendered exclusively by buildCaseCollisionBlock (see
+// TestWebUIPage_FileReportTableExcludesCaseCollisionRowsButHeaderCount
+// IncludesThem) and never reach table.findings at all — deliberately
+// shrunk back down from [v2.1]'s 14ch (sized for "case-collision", which
+// briefly passed through this same cell) rather than left oversized for a
+// value that can no longer appear here.
 func TestWebUIPage_FileReportKindCellDoesNotWrapMidWord(t *testing.T) {
 	page := string(webUIPage)
 
@@ -1065,10 +1071,10 @@ func TestWebUIPage_FileReportKindCellDoesNotWrapMidWord(t *testing.T) {
 	}
 	rule := page[start : start+end]
 	if !strings.Contains(rule, "white-space: nowrap") {
-		t.Error("table.findings td.kind does not set white-space: nowrap — \"case-collision\" can still wrap (and break) mid-word")
+		t.Error("table.findings td.kind does not set white-space: nowrap — \"duplicate\" can still wrap (and break) mid-word")
 	}
-	if !strings.Contains(rule, "min-width: 14ch") {
-		t.Error("table.findings td.kind does not reserve 14ch — the auto-sized column can still come out narrower than \"case-collision\" itself")
+	if !strings.Contains(rule, "min-width: 9ch") {
+		t.Error("table.findings td.kind does not reserve 9ch — the auto-sized column can still come out narrower than \"duplicate\" itself")
 	}
 }
 
@@ -1105,12 +1111,15 @@ func TestWebUIPage_FileReportKindCellUsesClayChipStyling(t *testing.T) {
 }
 
 // TestWebUIPage_FileReportCaseCollisionNoticeExplainsActionability pins
-// [v2.1]'s "pluralized copy in the panel's operator voice explaining the
-// actionability" requirement: when the file-clutter panel is showing any
-// case-collision rows, it must say what a case-twin IS and what to DO about
-// it (merge or rename), in the same plain, second-person-free "operator
-// voice" the panel's other copy ("No clutter found...", "not configured")
-// already uses — matching PLURALIZED to the count, the same way the
+// [ROUND, inline-display fix]'s shortened notice copy: the user-reported bug
+// was that the OLD notice ("N case-twin name collisions found — two names
+// differing only by case; ...") pointed at rows buried in a multi-thousand-
+// row table, so the collisions themselves (buildCaseCollisionBlock, rendered
+// immediately below this notice — see
+// TestWebUIPage_CaseCollisionBlockRendersEveryCollisionsNamesAndTracked) now
+// speak for themselves; the notice's own copy shortens to actionability
+// alone ("merge or rename"), still in the panel's plain, second-person-free
+// operator voice, still PLURALIZED to the collision count the same way the
 // reverse-scan panel's own notice pluralizes "item"/"items".
 func TestWebUIPage_FileReportCaseCollisionNoticeExplainsActionability(t *testing.T) {
 	page := string(webUIPage)
@@ -1125,8 +1134,8 @@ func TestWebUIPage_FileReportCaseCollisionNoticeExplainsActionability(t *testing
 	}
 	body := page[start : start+end]
 
-	if !strings.Contains(body, "differing only by case") {
-		t.Error("renderFileReport never explains what a case-collision finding IS (\"differing only by case\")")
+	if !strings.Contains(body, "case-twin name") {
+		t.Error(`renderFileReport's case-collision notice no longer identifies the finding as a "case-twin name[s]"`)
 	}
 	if !strings.Contains(body, "merge or rename") {
 		t.Error("renderFileReport never explains the actionability of a case-collision finding (\"merge or rename\")")
@@ -1134,19 +1143,27 @@ func TestWebUIPage_FileReportCaseCollisionNoticeExplainsActionability(t *testing
 	if !strings.Contains(body, `=== 1 ? "" : "s"`) && !strings.Contains(body, `== 1 ? "" : "s"`) {
 		t.Error("renderFileReport's case-collision notice does not pluralize its copy to the count, unlike the rest of this page's own notices")
 	}
+	if !strings.Contains(body, "buildCaseCollisionBlock(collisions)") {
+		t.Error("renderFileReport's case-collision notice is no longer followed by buildCaseCollisionBlock — the collisions it announces are not actually rendered")
+	}
 }
 
-// TestWebUIPage_FileReportRowsAreNeverFilteredByKind pins that [v2.1]'s new
-// case-collision kind flows through renderFileReport's row-building loop
-// exactly like duplicate/orphan already do: rows.push is the loop's very
-// FIRST statement, unconditional, never gated behind a kind check that
-// could silently drop a kind (e.g. case-collision) from pagination —
-// paginateRows (shared with the reverse-scan panel) sees and pages every
-// finding pushed here like any other row, per the binding requirement
-// ("Pagination covers them like any row"). Any per-kind counting the loop
-// also does (e.g. tallying case-collisions for the notice below) must come
-// AFTER the push, never instead of it.
-func TestWebUIPage_FileReportRowsAreNeverFilteredByKind(t *testing.T) {
+// TestWebUIPage_FileReportTableExcludesCaseCollisionRowsButHeaderCount
+// IncludesThem pins [ROUND, inline-display fix]'s controller ruling head-on:
+// a case-twin collision used to be just as easy to lose inside a
+// multi-thousand-row paginated table as any other row — the user-reported
+// bug this whole round exists to fix — so case-collision findings are now
+// routed to `collisions` (buildCaseCollisionBlock's own display, never
+// table.findings) instead of `rows` (table.findings' data), UNCONDITIONALLY
+// by kind, deliberately reversing the PRIOR round's
+// "rows.push is never kind-filtered" pin now that collisions have
+// their own, better home. The header count is a DIFFERENT promise, made
+// separately and explicitly kept: "3412 stays 3412" — fileCountText must
+// still total every finding of every kind (totalFindingCount), not just the
+// rows the table ends up paginating, so dropping collisions from the table
+// must never also drop them from what the collapsed panel's own summary
+// count claims to have found.
+func TestWebUIPage_FileReportTableExcludesCaseCollisionRowsButHeaderCountIncludesThem(t *testing.T) {
 	page := string(webUIPage)
 
 	start := strings.Index(page, "function renderFileReport(")
@@ -1159,48 +1176,99 @@ func TestWebUIPage_FileReportRowsAreNeverFilteredByKind(t *testing.T) {
 	}
 	body := page[start : start+end]
 
-	if !strings.Contains(body, "j++) {\n          rows.push({ instance: inst.name, f: findings[j] });") {
-		t.Error("rows.push is not the row-building loop's own first, unconditional statement — a kind-based filter or reordering may have crept in ahead of it")
+	// totalFindingCount is incremented unconditionally, before the
+	// kind-based routing branch — every finding counts toward the header
+	// regardless of which of the two homes (table row vs. collision block)
+	// it ends up in.
+	if !strings.Contains(body, "j++) {\n          totalFindingCount++;") {
+		t.Error("totalFindingCount++ is not the row-building loop's own first, unconditional statement — the header count could silently drop a kind")
+	}
+	// The routing itself: case-collision goes to collisions, everything
+	// else still goes to rows — table.findings' own data source.
+	if !strings.Contains(body, `if (findings[j].kind === "case-collision") {`) {
+		t.Fatal("renderFileReport's finding loop has no case-collision routing branch")
+	}
+	if !strings.Contains(body, "collisions.push({ instance: inst.name, f: findings[j] });") {
+		t.Error("case-collision findings are never pushed into collisions — buildCaseCollisionBlock would have nothing to render")
+	}
+	if !strings.Contains(body, "rows.push({ instance: inst.name, f: findings[j] });") {
+		t.Error("non-case-collision findings are never pushed into rows — table.findings would have nothing to page")
+	}
+	// The header must total every finding (totalFindingCount), never just
+	// the ones that made it into the now-filtered rows.
+	if !strings.Contains(body, "var fileCountText = String(totalFindingCount);") {
+		t.Error("fileCountText is not derived from totalFindingCount — the header count would undercount once case-collision rows are excluded from `rows`")
+	}
+	if strings.Contains(body, "var fileCountText = String(rows.length);") {
+		t.Error("fileCountText is still derived from rows.length — case-collision findings would silently vanish from the header count now that they are excluded from rows")
 	}
 }
 
-// TestWebUIPage_FileReportCaseCollisionRowRendersNamesAndEntryType pins
-// [FIX, v2.2]: a case-collision finding never sets group/count (duplicate-
-// only fields), so without a dedicated branch every collision row rendered
-// group="—" and count="—" — byte-identical to any other collision found in
-// the same directory, and never showing the colliding NAMES themselves, the
-// only actionable part of the finding (and the one thing the panel's own
-// notice tells the operator to go inspect). The group cell must render
-// entryType plus every colliding name (marking which one is tracked), and
-// the count cell must render the group's own size — both derived from
-// r.f.entryType/r.f.names, never from the duplicate-only r.f.group/r.f.count.
-func TestWebUIPage_FileReportCaseCollisionRowRendersNamesAndEntryType(t *testing.T) {
+// TestWebUIPage_CaseCollisionBlockRendersEveryCollisionsNamesAndTracked pins
+// [ROUND, inline-display fix]'s whole point: the collisions themselves must
+// be the obvious thing on screen, not a fact buried in a 3000+ row table.
+// buildCaseCollisionBlock must loop over EVERY collision passed to it (not
+// just the first — a single hardcoded item would satisfy a test that only
+// ever checks for one) and, within each, over EVERY colliding name (same
+// reasoning) — the two-loop shape is the structural stand-in this project's
+// "no browser" test suite uses for "renders 2+ collisions, and 2+ names
+// within one, not just index 0" (mirrors how
+// TestWebUIPage_ShelfCountLabelClampsAwayFromCardEdges and friends pin
+// per-item loops rather than executing the DOM). It must also read
+// f.entryType to call out the "mixed" case (a folder colliding with a file
+// — the one case genuinely worth a label, unlike a plain dir/dir or
+// file/file twin) and mark each tracked name with the clay [tracked]
+// marker.
+func TestWebUIPage_CaseCollisionBlockRendersEveryCollisionsNamesAndTracked(t *testing.T) {
 	page := string(webUIPage)
 
-	start := strings.Index(page, "function renderFileReport(")
+	start := strings.Index(page, "function buildCaseCollisionBlock(")
 	if start == -1 {
-		t.Fatal("page has no renderFileReport function")
+		t.Fatal("page has no buildCaseCollisionBlock function")
 	}
-	end := strings.Index(page[start:], "\n  function render(data)")
+	end := strings.Index(page[start:], "\n  function renderFileReport(")
 	if end == -1 {
-		t.Fatal("could not find the end of renderFileReport (render(data) must follow it)")
+		t.Fatal("could not find the end of buildCaseCollisionBlock (renderFileReport must follow it)")
 	}
 	body := page[start : start+end]
 
-	if !strings.Contains(body, `r.f.kind === "case-collision"`) {
-		t.Fatal("renderFileReport's row builder has no dedicated case-collision branch")
+	if !strings.Contains(body, "for (var i = 0; i < collisions.length; i++)") {
+		t.Error("buildCaseCollisionBlock does not loop over every collision (collisions.length) — a 2nd+ collision would never render")
 	}
-	if !strings.Contains(body, "r.f.entryType") {
-		t.Error("the case-collision row branch never reads r.f.entryType")
+	if !strings.Contains(body, "for (var j = 0; j < names.length; j++)") {
+		t.Error("buildCaseCollisionBlock does not loop over every colliding name (names.length) — a 2nd+ name in one collision would never render")
 	}
-	if !strings.Contains(body, "r.f.names") {
-		t.Error("the case-collision row branch never reads r.f.names")
+	if !strings.Contains(body, "f.display || f.path") {
+		t.Error("buildCaseCollisionBlock never renders the collision's own root-relative display path")
 	}
-	if !strings.Contains(body, `n.tracked ? " (tracked)" : ""`) {
-		t.Error("the case-collision row branch never marks which colliding name is tracked")
+	if !strings.Contains(body, `f.entryType === "mixed"`) {
+		t.Error(`buildCaseCollisionBlock never checks for the "mixed" entryType (a folder colliding with a file)`)
 	}
-	if !strings.Contains(body, "names.length") {
-		t.Error("the case-collision row branch's count does not come from the group's own size (names.length)")
+	if !strings.Contains(body, "names[j].tracked") {
+		t.Error("buildCaseCollisionBlock never reads a colliding name's own tracked correlation")
+	}
+	if !strings.Contains(body, `"case-collision-tracked"`) {
+		t.Error("buildCaseCollisionBlock never applies the clay case-collision-tracked marker class")
+	}
+	if !strings.Contains(body, "[tracked]") {
+		t.Error(`buildCaseCollisionBlock's tracked marker text is not "[tracked]"`)
+	}
+
+	// The CSS backing the block's prominence/readability split: the notice
+	// and each collision's own directory line stay amber (hunt), the
+	// colliding names render in the page's normal, readable ink, and the
+	// tracked marker is clay (alert) — never a color introduced fresh.
+	for _, want := range []string{
+		".case-collision-dir {",
+		".case-collision-name {",
+		".case-collision-tracked {",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("page is missing the %q CSS rule the case-collision block depends on", want)
+		}
+	}
+	if !strings.Contains(page, "color: var(--alert);") {
+		t.Error("no case-collision styling uses the clay (--alert) token for the [tracked] marker")
 	}
 }
 
@@ -1288,15 +1356,19 @@ func TestWebUIPage_FileClutterHeaderDistinguishesCleanFromNotChecked(t *testing.
 // text a glancing operator sees without expanding anything — still read
 // "File clutter — duplicates & orphans (N)" even after case-collision
 // findings became a THIRD kind this same panel renders. fileCountText (the
-// number inside that summary) is `rows.length` over every finding pushed
-// into `rows`, which now includes every case-collision row alongside
-// duplicates/orphans — so an instance with 0 duplicates, 0 orphans and 3
-// case-twins rendered "duplicates & orphans (3)", a count that contradicts
-// its own label. This is the same "the number means something other than
-// what the label says" failure TestWebUIPage_FileClutterHeaderDistinguishes
-// CleanFromNotChecked (above) exists to prevent for the off/skipped
-// qualifier — here pinning the label itself so it can never again omit a
-// kind renderFileReport's row builder actually emits.
+// number inside that summary) is `totalFindingCount` — [ROUND, inline-
+// display fix] renamed from the original `rows.length` once case-collision
+// findings were routed OUT of `rows` and into their own `collisions` array
+// (buildCaseCollisionBlock's data, never table.findings') — but the
+// controller ruling was explicit that the header must still total every
+// finding of every kind regardless of which of the two homes it ends up in:
+// an instance with 0 duplicates, 0 orphans and 3 case-twins must still
+// render "duplicates & orphans (3)", a count that would otherwise
+// contradict its own label. This is the same "the number means something
+// other than what the label says" failure TestWebUIPage_FileClutterHeader
+// DistinguishesCleanFromNotChecked (above) exists to prevent for the
+// off/skipped qualifier — here pinning the label itself so it can never
+// again omit a kind renderFileReport actually counts.
 func TestWebUIPage_FileClutterHeaderNamesEveryFindingKind(t *testing.T) {
 	page := string(webUIPage)
 	start := strings.Index(page, "<summary>File clutter")
@@ -1309,8 +1381,8 @@ func TestWebUIPage_FileClutterHeaderNamesEveryFindingKind(t *testing.T) {
 	}
 	summary := page[start : start+end]
 	// duplicate, orphan, and case-collision are the only three kinds
-	// renderFileReport's row builder ever pushes into `rows` (see
-	// fileKindDuplicate/fileKindOrphan/fileKindCaseCollision in
+	// renderFileReport's finding loop ever counts into totalFindingCount
+	// (see fileKindDuplicate/fileKindOrphan/fileKindCaseCollision in
 	// filereport.go) — every one of them must be named in the heading that
 	// counts them, in the panel's own established copy for each ("case-twin"
 	// is the operator-facing term used everywhere else on this panel, e.g.
