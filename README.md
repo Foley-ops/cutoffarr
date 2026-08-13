@@ -715,6 +715,16 @@ script, a status-page widget, whatever) without ever loading the HTML:
   `orphans`/`reverseFindings` being empty means "clean" ONLY when the
   matching status is `ran` — never conflate `off` or `skipped` with "clean".
 
+  Each `fileReport.findings` item is `{"kind": "duplicate"|"orphan", "group":
+  "...", "path": "...", "display": "...", "count": N}` (`group`/`count` are
+  present only on a `duplicate`). `path` is the full cutoffarr-side (disk)
+  path — the same one the `msg="file-report finding"` log line carries.
+  `display` is that same file's path relative to its mapped `media_root_map`
+  root: the root's own last path segment, then the remainder underneath it
+  (`Movies/Some Title/file.mkv`, never the full, potentially much longer
+  host-specific mount path `path` carries). The dashboard renders `display`
+  in the row itself and puts `path` only in that row's hover title.
+
   `reverseAsOf` is the timestamp of the reverse pass `reverseFindings` is
   CURRENTLY holding — the last cycle whose pass actually completed
   trustworthily (`reverseStatus: "ran"`), not the most recent cycle. On a

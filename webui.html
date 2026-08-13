@@ -357,6 +357,20 @@
 
   table.findings td.path { color: var(--ink-faint); }
 
+  /* File-clutter panel only (findingsTable's other caller, the reverse-scan
+     panel, has no kind column): td's own word-break: break-word above is
+     right for a long path but was breaking "duplicate" mid-word ("dupli-
+     cate") whenever the auto-sized column came out narrower than the word
+     itself. nowrap stops that outright; min-width reserves enough room for
+     "duplicate" (the longer of the two kind values, 9 characters) at this
+     table's own 12px mono size — 1ch is one monospace glyph's width, so 9ch
+     fits it exactly, with the cell's own right padding (above) as the only
+     breathing room needed after it. */
+  table.findings td.kind {
+    white-space: nowrap;
+    min-width: 9ch;
+  }
+
   .findings-scroll { overflow-x: auto; }
 
   /* Per-instance file-report status notices (off/skipped) — the three-state
@@ -1094,9 +1108,20 @@
         var count = r.f.count ? String(r.f.count) : "—";
         var td;
         td = el("td"); text(td, r.instance); tr.appendChild(td);
-        td = el("td"); text(td, r.f.kind || ""); tr.appendChild(td);
+        td = el("td", "kind"); text(td, r.f.kind || ""); tr.appendChild(td);
         td = el("td"); text(td, group); tr.appendChild(td);
-        td = el("td", "path"); text(td, r.f.path || ""); tr.appendChild(td);
+        // Path-display GUI fix: the cell shows the path relative to its mapped
+        // root (display) — never the full cutoffarr-side disk path (path),
+        // which on a dev checkout or a deeply nested server share can carry
+        // a prefix many segments longer than anything an operator needs to
+        // see. The full path is still one hover away, in the cell's own
+        // title attribute, for whoever actually needs it (a copy/paste onto
+        // the server, say). display falls back to path for a daemon that
+        // predates this field.
+        td = el("td", "path");
+        text(td, r.f.display || r.f.path || "");
+        td.title = r.f.path || "";
+        tr.appendChild(td);
         td = el("td"); text(td, count); tr.appendChild(td);
         return tr;
       }

@@ -129,6 +129,51 @@ func TestEvaluateFileReportRoot_ClassifiesEveryIdentityTerm(t *testing.T) {
 	assertFileReportIdentity(t, 6, outcome)
 }
 
+// TestEvaluateFileReportRoot_FindingsCarryRootRelativeDisplayPath pins that
+// the walk itself (not just fileReportSnapshotFrom downstream) sets
+// displayPath on every finding it produces, using the exact `rel` fs.WalkDir
+// already computed rather than re-deriving it a second time from diskPath.
+func TestEvaluateFileReportRoot_FindingsCarryRootRelativeDisplayPath(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureFiles(t, dir,
+		"Movie A (2020)/Movie A (2020).mkv",     // tracked
+		"Movie A (2020)/Movie A (2020) (2).mkv", // duplicate
+		"Stray Folder/Something.mkv",            // orphan
+	)
+	trackedFile := filepath.Join(dir, "Movie A (2020)/Movie A (2020).mkv")
+
+	root := mediaRoot{arrPath: "/movies", diskPath: dir}
+	set := instanceTrackedSet{
+		files:   map[string]bool{trackedFile: true},
+		folders: map[string]string{filepath.Join(dir, "Movie A (2020)"): "Movie A (2020)"},
+	}
+
+	logger, _ := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "radarr-main", Type: "radarr"}, root, set)
+	if outcome.skipped {
+		t.Fatalf("outcome unexpectedly skipped: %+v", outcome)
+	}
+
+	rootName := filepath.Base(dir)
+	wantDupDisplay := filepath.Join(rootName, "Movie A (2020)", "Movie A (2020) (2).mkv")
+	wantOrphanDisplay := filepath.Join(rootName, "Stray Folder", "Something.mkv")
+	for _, f := range outcome.findings {
+		var want string
+		switch f.kind {
+		case fileKindDuplicate:
+			want = wantDupDisplay
+		case fileKindOrphan:
+			want = wantOrphanDisplay
+		}
+		if f.displayPath != want {
+			t.Errorf("finding kind=%s displayPath = %q, want %q", f.kind, f.displayPath, want)
+		}
+		if f.displayPath == f.diskPath {
+			t.Errorf("finding kind=%s displayPath equals the full diskPath (%q) — it must be root-relative", f.kind, f.diskPath)
+		}
+	}
+}
+
 func TestEvaluateFileReportRoot_CleanRootProducesNoFindings(t *testing.T) {
 	dir := t.TempDir()
 	writeFixtureFiles(t, dir, "Movie A (2020)/Movie A (2020).mkv")
@@ -930,6 +975,48 @@ func TestMapArrPathToAnyRoot_NoMatch(t *testing.T) {
 	roots := []mediaRoot{{arrPath: "/movies", diskPath: "/data/media/Movies"}}
 	if _, ok := mapArrPathToAnyRoot("/tv_shows/Show/S01E01.mkv", roots); ok {
 		t.Error("a path outside every configured root must not map")
+	}
+}
+
+// TestRootRelativeDisplayPath_LastRootSegmentPlusRel pins the GUI fix's whole
+// contract: a display path is the mapped root's own LAST path segment,
+// joined to rel (the file's path relative to that root) — never the full
+// disk path, which on a real deployment can carry a long, host-specific
+// mount prefix (a scratch directory on a dev laptop, a deeply nested share
+// on the server) that dwarfs anything an operator glancing at the GUI needs
+// to see.
+func TestRootRelativeDisplayPath_LastRootSegmentPlusRel(t *testing.T) {
+	cases := []struct {
+		name string
+		root mediaRoot
+		rel  string
+		want string
+	}{
+		{
+			name: "ordinary nested root",
+			root: mediaRoot{arrPath: "/movies", diskPath: "/data/media/Movies"},
+			rel:  "Harry Potter and the Chamber of Secrets (2002)/Harry.Potter.2002.2160p-ETRG/ETRG.mkv",
+			want: "Movies/Harry Potter and the Chamber of Secrets (2002)/Harry.Potter.2002.2160p-ETRG/ETRG.mkv",
+		},
+		{
+			name: "long host-specific scratch prefix collapses to its own last segment",
+			root: mediaRoot{arrPath: "/movies", diskPath: "/private/tmp/claude/scratchpad/media-mnt/Movies"},
+			rel:  "Some Film (2020)/Some Film (2020) (2).mkv",
+			want: "Movies/Some Film (2020)/Some Film (2020) (2).mkv",
+		},
+		{
+			name: "file directly at the root",
+			root: mediaRoot{arrPath: "/movies", diskPath: "/data/media/Movies"},
+			rel:  "loose.mkv",
+			want: "Movies/loose.mkv",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := rootRelativeDisplayPath(tc.root, tc.rel); got != tc.want {
+				t.Errorf("rootRelativeDisplayPath(%+v, %q) = %q, want %q", tc.root, tc.rel, got, tc.want)
+			}
+		})
 	}
 }
 

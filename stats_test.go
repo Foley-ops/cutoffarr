@@ -521,8 +521,8 @@ func TestFileReportSnapshotFrom_ConvertsCountsAndFindings(t *testing.T) {
 	c := fileReportCounts{
 		configured: true, duplicates: 1, orphans: 1,
 		findings: []fileReportFinding{
-			{kind: fileKindDuplicate, diskPath: "/movies/A/A (2).mkv", group: "A", groupCount: 2},
-			{kind: fileKindOrphan, diskPath: "/movies/Untracked/stray.mkv"},
+			{kind: fileKindDuplicate, diskPath: "/movies/A/A (2).mkv", displayPath: "Movies/A/A (2).mkv", group: "A", groupCount: 2},
+			{kind: fileKindOrphan, diskPath: "/movies/Untracked/stray.mkv", displayPath: "Movies/Untracked/stray.mkv"},
 		},
 	}
 	snap := fileReportSnapshotFrom(c)
@@ -539,9 +539,15 @@ func TestFileReportSnapshotFrom_ConvertsCountsAndFindings(t *testing.T) {
 	if dup.Kind != "duplicate" || dup.Group != "A" || dup.Count != 2 || dup.Path != "/movies/A/A (2).mkv" {
 		t.Errorf("duplicate finding = %+v, fields do not match the source fileReportFinding", dup)
 	}
+	if dup.Display != "Movies/A/A (2).mkv" {
+		t.Errorf("duplicate finding Display = %q, want the source fileReportFinding.displayPath carried through verbatim", dup.Display)
+	}
 	orphan := snap.Findings[1]
 	if orphan.Kind != "orphan" || orphan.Group != "" || orphan.Count != 0 || orphan.Path != "/movies/Untracked/stray.mkv" {
 		t.Errorf("orphan finding = %+v, want an empty group and zero count (omitted in JSON via omitempty)", orphan)
+	}
+	if orphan.Display != "Movies/Untracked/stray.mkv" {
+		t.Errorf("orphan finding Display = %q, want the source fileReportFinding.displayPath carried through verbatim", orphan.Display)
 	}
 }
 
@@ -794,6 +800,31 @@ func TestRunRadarrDecisionEngine_Stats_FileReportCapturesRealDuplicateAndOrphan(
 	}
 	if len(result.fileReport.Findings) != 2 {
 		t.Fatalf("Findings = %+v, want 2 entries", result.fileReport.Findings)
+	}
+
+	// Path-display GUI fix: each finding's Display must be the root-relative
+	// path (the mapped root's own last segment, then the remainder under
+	// it) — never the full disk path, which on a real deployment can carry
+	// a long, host-specific mount prefix (dir's own t.TempDir() value
+	// stands in for that here).
+	wantDupDisplay := filepath.Join(filepath.Base(dir), "Movie A", "Movie A (2).mkv")
+	wantOrphanDisplay := filepath.Join(filepath.Base(dir), "Untracked", "stray.mkv")
+	for _, f := range result.fileReport.Findings {
+		var want string
+		switch f.Kind {
+		case "duplicate":
+			want = wantDupDisplay
+		case "orphan":
+			want = wantOrphanDisplay
+		default:
+			t.Fatalf("finding has unexpected kind %q", f.Kind)
+		}
+		if f.Display != want {
+			t.Errorf("%s finding Display = %q, want %q", f.Kind, f.Display, want)
+		}
+		if f.Display == f.Path {
+			t.Errorf("%s finding Display equals the full disk Path (%q) — Display must be root-relative, not the long host-specific path this field exists to shorten", f.Kind, f.Path)
+		}
 	}
 }
 
