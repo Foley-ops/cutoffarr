@@ -845,6 +845,11 @@ func TestLogFileReportFinding_EmitsTheFrozenVocabulary(t *testing.T) {
 			},
 		},
 		{
+			// [final review round fix] The per-name tracked correlation must
+			// render IN the log line, not just be discardable struct data:
+			// the tracked spelling gets a `[tracked]` suffix, the other
+			// spelling stays bare, so an operator reading docker logs alone
+			// (no GUI, no API) still sees which of the two to keep.
 			name: "case-collision dir",
 			inst: Instance{Name: "radarr-main", Type: "radarr"},
 			f: fileReportFinding{
@@ -858,7 +863,7 @@ func TestLogFileReportFinding_EmitsTheFrozenVocabulary(t *testing.T) {
 			want: []string{
 				`msg="file-report finding"`, "kind=case-collision", "instance=radarr-main", "type=radarr",
 				"root=/data/Movies", "path=/data/Movies", "entryType=dir",
-				`names="My Name Is Earl, my name is earl"`,
+				`names="My Name Is Earl [tracked], my name is earl"`,
 			},
 		},
 		{
@@ -876,6 +881,27 @@ func TestLogFileReportFinding_EmitsTheFrozenVocabulary(t *testing.T) {
 				`msg="file-report finding"`, "kind=case-collision", "instance=radarr-main", "type=radarr",
 				"root=/data/Movies", `path="/data/Movies/Movie A"`, "entryType=file",
 				`names="poster.jpg, Poster.jpg"`,
+			},
+		},
+		{
+			// [final review round] a cross-type twin (binding controller
+			// ruling F5): a directory and a file colliding on the same
+			// casefold name gets entryType=mixed, and the log line's own
+			// controller-cited example — `names="Show [tracked], show"`.
+			name: "case-collision mixed dir/file",
+			inst: Instance{Name: "sonarr-main", Type: "sonarr"},
+			f: fileReportFinding{
+				kind: fileKindCaseCollision, diskPath: "/data/TV",
+				entryType: fileReportEntryTypeMixed,
+				names: []caseCollisionEntry{
+					{name: "Show", tracked: true},
+					{name: "show", tracked: false},
+				},
+			},
+			want: []string{
+				`msg="file-report finding"`, "kind=case-collision", "instance=sonarr-main", "type=sonarr",
+				"root=/data/Movies", "path=/data/TV", "entryType=mixed",
+				`names="Show [tracked], show"`,
 			},
 		},
 	}
@@ -3791,6 +3817,54 @@ func TestCaseCollisionsInDir_ListerErrorPropagates(t *testing.T) {
 	}
 }
 
+// TestCaseCollisionsInDir_DetectsCrossTypeCollisionBetweenDirAndFile is the
+// [final review round] regression test for controller ruling F5: a
+// directory `Show` beside a file `show` is a real case-twin exactly like two
+// same-type twins are — the *arr still tracks at most one of the two, and a
+// case-insensitive view still cannot address both unambiguously — so it
+// must be DETECTED, not silently allowed through because the two names sat
+// in different entry-type buckets. Before this fix, dirNames and fileNames
+// were each run through detectCaseCollisions independently, so this exact
+// shape produced zero findings and both names still descended/classified
+// normally, hitting the ambiguous ReadDir this whole feature exists to
+// route around.
+func TestCaseCollisionsInDir_DetectsCrossTypeCollisionBetweenDirAndFile(t *testing.T) {
+	root := mediaRoot{arrPath: "/tv", diskPath: "/data/media/TV"}
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		root.diskPath: {fakeDir("Show"), fakeFile("show"), fakeDir("Other Show")},
+	})
+	set := instanceTrackedSet{files: map[string]bool{}, folders: map[string]string{}}
+
+	findings, excludeDirs, excludeFiles, excluded, err := caseCollisionsInDir(root.diskPath, ".", root, set)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %+v, want exactly 1 cross-type collision", findings)
+	}
+	f := findings[0]
+	if f.entryType != fileReportEntryTypeMixed {
+		t.Errorf("entryType = %q, want %q for a dir/file cross-type collision", f.entryType, fileReportEntryTypeMixed)
+	}
+	if len(f.names) != 2 || f.names[0].name != "Show" || f.names[1].name != "show" {
+		t.Errorf("names = %+v, want [Show, show] in listing order", f.names)
+	}
+	dirEntry := path.Join(root.diskPath, "Show")
+	fileEntry := path.Join(root.diskPath, "show")
+	if !excludeDirs[dirEntry] {
+		t.Errorf("excludeDirs = %+v, want the dir half %q excluded", excludeDirs, dirEntry)
+	}
+	if !excludeFiles[fileEntry] {
+		t.Errorf("excludeFiles = %+v, want the file half %q excluded", excludeFiles, fileEntry)
+	}
+	if excluded != 2 {
+		t.Errorf("excludedCount = %d, want 2", excluded)
+	}
+	if other := path.Join(root.diskPath, "Other Show"); excludeDirs[other] {
+		t.Errorf("excludeDirs unexpectedly excludes the non-colliding sibling %q", other)
+	}
+}
+
 // --- caseCollisionsInDir: tracked-set correlation (binding controller
 // resolution 2: "whether each name contains/IS a tracked path") -----------
 
@@ -3978,6 +4052,60 @@ func TestEvaluateFileReportRoot_CaseCollisionFileExcludedFromClassification(t *t
 	// phantom name injected at the listing layer and is never visited by
 	// the real walk at all, so it is not one of totalFilesOnDisk here).
 	assertFileReportIdentity(t, 2, outcome)
+}
+
+// TestEvaluateFileReportRoot_CaseCollisionCrossTypeDirVsFileExcludesBoth is
+// the [final review round] end-to-end twin of
+// TestCaseCollisionsInDir_DetectsCrossTypeCollisionBetweenDirAndFile: a
+// directory `Show` beside a file `show` must exclude BOTH from the real
+// walk (the dir from descent, the file from classification) and complete
+// as fileReport=ran with one entryType=mixed finding, same as the two
+// same-type cross-exclusion tests above.
+func TestEvaluateFileReportRoot_CaseCollisionCrossTypeDirVsFileExcludesBoth(t *testing.T) {
+	dir := t.TempDir()
+	// The REAL half of the twin: a tracked directory "Show" with its own
+	// tracked file inside.
+	writeFixtureFiles(t, dir, "Show/Show.mkv")
+	trackedFile := filepath.Join(dir, "Show", "Show.mkv")
+	trackedFolder := filepath.Join(dir, "Show")
+
+	root := mediaRoot{arrPath: "/tv", diskPath: dir}
+	// The PHANTOM half — a FILE named "show" — is injected only at the
+	// listing layer: a case-insensitive dev filesystem cannot hold a
+	// directory "Show" and a file "show" side by side any more than it can
+	// hold two same-type twins (see this section's own header comment).
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		dir: {fakeDir("Show"), fakeFile("show")},
+	})
+	set := instanceTrackedSet{
+		files:   map[string]bool{trackedFile: true},
+		folders: map[string]string{trackedFolder: "Show"},
+	}
+	logger, _ := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "sonarr-main", Type: "sonarr"}, root, set)
+
+	if outcome.skipped {
+		t.Fatalf("a cross-type case collision must never abort the root: %+v", outcome)
+	}
+	var collisions []fileReportFinding
+	for _, f := range outcome.findings {
+		if f.kind == fileKindCaseCollision {
+			collisions = append(collisions, f)
+		}
+	}
+	if len(collisions) != 1 {
+		t.Fatalf("case-collision findings = %+v, want exactly 1", outcome.findings)
+	}
+	if collisions[0].entryType != fileReportEntryTypeMixed {
+		t.Errorf("entryType = %q, want %q: one colliding name is a dir, the other a file", collisions[0].entryType, fileReportEntryTypeMixed)
+	}
+	if outcome.seenTracked != 0 {
+		t.Errorf("seenTracked = %d, want 0: the tracked file lives inside the excluded (colliding) folder and is never visited this cycle", outcome.seenTracked)
+	}
+	if got := outcome.skipReasons[FileSkipReasonCaseTwin]; got != 2 {
+		t.Errorf("skipReasons[case-twin names excluded] = %d, want 2", got)
+	}
+	assertFileReportIdentity(t, 0, outcome) // the excluded folder's file was never visited
 }
 
 // TestEvaluateFileReportRoot_CaseCollisionDetectedAtEveryLevelOfTheWalk pins

@@ -104,11 +104,12 @@ type caseCollisionNameRecord struct {
 // always present and always shorter, for a client that wants something
 // screen-sized instead of a possibly long, host-specific mount prefix.
 //
-// EntryType ("dir"|"file") and Names are case-collision-only (binding
-// controller resolution 2: "all colliding names, whether each name
-// contains/IS a tracked path ..., and entry type"), both omitted for a
-// duplicate or orphan the same way Group/Count are omitted for anything
-// that isn't a duplicate.
+// EntryType ("dir"|"file", or "mixed" for a [final review round] cross-type
+// twin — a directory colliding with a file, e.g. Show/show) and Names are
+// case-collision-only (binding controller resolution 2: "all colliding
+// names, whether each name contains/IS a tracked path ..., and entry
+// type"), both omitted for a duplicate or orphan the same way Group/Count
+// are omitted for anything that isn't a duplicate.
 type fileReportFindingRecord struct {
 	Kind      string                    `json:"kind"`
 	Group     string                    `json:"group,omitempty"`

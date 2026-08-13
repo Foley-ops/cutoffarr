@@ -135,15 +135,20 @@ const (
 // reason.
 const fileKindCaseCollision = "case-collision"
 
-// fileReportEntryTypeDir/fileReportEntryTypeFile are the two shapes a
-// case-collision finding's own entryType field can take (binding controller
-// resolution 2: "entry type (dir/file)") — a single finding's colliding
-// names are always all the same type, since detectCaseCollisions is applied
-// separately to a directory's subdirectory names and its file names (binding
-// controller resolution 1), never to the two mixed together.
+// fileReportEntryTypeDir/fileReportEntryTypeFile/fileReportEntryTypeMixed are
+// the three shapes a case-collision finding's own entryType field can take
+// (binding controller resolution 2: "entry type (dir/file)", extended by the
+// [final review round] cross-type ruling below). fileReportEntryTypeDir/File
+// mean every colliding name in the group is that one type; fileReportEntryTypeMixed
+// means the group spans both — e.g. a directory `Show` beside a file `show`,
+// which is exactly as real a case-twin (and exactly as disruptive to a
+// case-insensitive view's directory addressing) as two same-type twins, so
+// caseCollisionsInDir detects it rather than only documenting it as an
+// exclusion.
 const (
-	fileReportEntryTypeDir  = "dir"
-	fileReportEntryTypeFile = "file"
+	fileReportEntryTypeDir   = "dir"
+	fileReportEntryTypeFile  = "file"
+	fileReportEntryTypeMixed = "mixed"
 )
 
 // --- path mapping (binding controller resolution 2) -------------------------
@@ -694,21 +699,34 @@ func pathIsOrContainsTracked(p string, set instanceTrackedSet) bool {
 
 // caseCollisionsInDir lists dirPath's own entries (fileReportDirLister — see
 // its own doc comment on why this is an injectable seam) and applies
-// detectCaseCollisions separately to its subdirectory names and its file
-// names (binding controller resolution 1: "applies to BOTH ... at every
-// level of the walk") — unfiltered by video extension or any other
-// classification rule, since the collision check runs BEFORE any of that
-// (binding controller resolution 3). For every group found it returns one
-// case-collision finding, carrying the containing directory (diskPath/
-// displayPath, root-relative per the existing convention) plus every
-// colliding name and its tracked correlation, and records every colliding
-// entry's own full disk path in excludeDirs/excludeFiles so
-// evaluateFileReportRoot's walk can exclude it from descent (a directory)
-// or classification (a file) entirely — see that function's own walkFn
-// closure for how the two maps are consumed. excludedCount is the total
-// number of colliding NAMES across every group found here, both entry
-// types combined — the new skip reason's own tally, FileSkipReasonCaseTwin
-// ("case-twin names excluded=N", binding controller resolution 3).
+// detectCaseCollisions to the UNION of its subdirectory names and its file
+// names together (binding controller resolution 1: "applies to BOTH ... at
+// every level of the walk", extended by the [final review round] cross-type
+// ruling: a directory `Show` beside a file `show` is a real case-twin too —
+// the *arr still tracks at most one of them, and a case-insensitive view
+// still cannot address both — so it must be DETECTED, not silently allowed
+// to fall through to the ambiguous ReadDir that used to abort the whole
+// root). detectCaseCollisions itself stays a pure function over plain
+// names — it does not need to know which type a name is, only whether two
+// names fold together — so entry type is tracked separately, per name, by
+// this function, purely so each group's colliding names can be routed to
+// the right exclude map below. The collision check runs unfiltered by video
+// extension or any other classification rule, since it runs BEFORE any of
+// that (binding controller resolution 3). For every group found it returns
+// one case-collision finding, carrying the containing directory (diskPath/
+// displayPath, root-relative per the existing convention), every colliding
+// name and its tracked correlation, and an entryType that is "dir"/"file"
+// when every name in the group is that one type, or "mixed" when the group
+// spans both — and records every colliding entry's own full disk path in
+// excludeDirs/excludeFiles (a dir-typed name into excludeDirs, a file-typed
+// name into excludeFiles, regardless of whether its own finding's entryType
+// is single-type or mixed) so evaluateFileReportRoot's walk can exclude it
+// from descent (a directory) or classification (a file) entirely — see that
+// function's own walkFn closure for how the two maps are consumed.
+// excludedCount is the total number of colliding NAMES across every group
+// found here, both entry types combined — the new skip reason's own tally,
+// FileSkipReasonCaseTwin ("case-twin names excluded=N", binding controller
+// resolution 3).
 //
 // [Known simplicity/perf tradeoff, documented rather than engineered
 // around] This is a SECOND, independent read of dirPath's own entries:
@@ -726,12 +744,21 @@ func caseCollisionsInDir(dirPath, rel string, root mediaRoot, set instanceTracke
 	if err != nil {
 		return nil, nil, nil, 0, err
 	}
-	var dirNames, fileNames []string
+	// allNames feeds detectCaseCollisions as a single unioned listing so a
+	// dir/file cross-type pair folds into the same group; entryTypeOf is the
+	// per-name side-table detectCaseCollisions' own name-only signature has
+	// no room for, consulted below once a group is known. Two entries can
+	// never share the exact same spelling here regardless of type — a
+	// directory and a file cannot occupy the identical name in one real
+	// directory listing — so a plain map keyed by name is unambiguous.
+	var allNames []string
+	entryTypeOf := map[string]string{}
 	for _, e := range entries {
+		allNames = append(allNames, e.Name())
 		if e.IsDir() {
-			dirNames = append(dirNames, e.Name())
+			entryTypeOf[e.Name()] = fileReportEntryTypeDir
 		} else {
-			fileNames = append(fileNames, e.Name())
+			entryTypeOf[e.Name()] = fileReportEntryTypeFile
 		}
 	}
 
@@ -739,23 +766,34 @@ func caseCollisionsInDir(dirPath, rel string, root mediaRoot, set instanceTracke
 	excludeFiles = map[string]bool{}
 	display := rootRelativeDisplayPath(root, rel)
 
-	addFindingsFor := func(groups [][]string, entryType string, exclude map[string]bool) {
-		for _, group := range groups {
-			names := make([]caseCollisionEntry, len(group))
-			for i, n := range group {
-				full := cleanArrPath(path.Join(dirPath, n))
-				exclude[full] = true
-				names[i] = caseCollisionEntry{name: n, tracked: pathIsOrContainsTracked(full, set)}
+	for _, group := range detectCaseCollisions(allNames) {
+		names := make([]caseCollisionEntry, len(group))
+		sawDir, sawFile := false, false
+		for i, n := range group {
+			full := cleanArrPath(path.Join(dirPath, n))
+			switch entryTypeOf[n] {
+			case fileReportEntryTypeDir:
+				excludeDirs[full] = true
+				sawDir = true
+			default:
+				excludeFiles[full] = true
+				sawFile = true
 			}
-			excludedCount += len(group)
-			findings = append(findings, fileReportFinding{
-				kind: fileKindCaseCollision, diskPath: dirPath, displayPath: display,
-				entryType: entryType, names: names,
-			})
+			names[i] = caseCollisionEntry{name: n, tracked: pathIsOrContainsTracked(full, set)}
 		}
+		excludedCount += len(group)
+		entryType := fileReportEntryTypeMixed
+		switch {
+		case sawDir && !sawFile:
+			entryType = fileReportEntryTypeDir
+		case sawFile && !sawDir:
+			entryType = fileReportEntryTypeFile
+		}
+		findings = append(findings, fileReportFinding{
+			kind: fileKindCaseCollision, diskPath: dirPath, displayPath: display,
+			entryType: entryType, names: names,
+		})
 	}
-	addFindingsFor(detectCaseCollisions(dirNames), fileReportEntryTypeDir, excludeDirs)
-	addFindingsFor(detectCaseCollisions(fileNames), fileReportEntryTypeFile, excludeFiles)
 
 	return findings, excludeDirs, excludeFiles, excludedCount, nil
 }
@@ -798,12 +836,13 @@ type fileReportFinding struct {
 	groupCount int
 
 	// entryType/names are [v2.1] case-collision-only: which kind of entry
-	// collided (fileReportEntryTypeDir/fileReportEntryTypeFile) and every
-	// colliding name plus its tracked-set correlation (binding controller
-	// resolution 2). For this kind, diskPath/displayPath name the
-	// CONTAINING DIRECTORY the collision was found in, not any one of the
-	// colliding entries themselves — see caseCollisionsInDir's own doc
-	// comment.
+	// collided (fileReportEntryTypeDir/fileReportEntryTypeFile, or
+	// fileReportEntryTypeMixed for a cross-type twin — a directory beside a
+	// file, e.g. `Show`/`show`) and every colliding name plus its
+	// tracked-set correlation (binding controller resolution 2). For this
+	// kind, diskPath/displayPath name the CONTAINING DIRECTORY the collision
+	// was found in, not any one of the colliding entries themselves — see
+	// caseCollisionsInDir's own doc comment.
 	entryType string
 	names     []caseCollisionEntry
 }
@@ -1256,6 +1295,13 @@ func groupKey(f fileReportFinding) string {
 // entryType/names attrs. Logged at itemLevel — the same demotion the
 // forward and reverse passes give their own per-item lines (full at
 // startup/--once, debug on repeating sweeps) — never at a level of its own.
+//
+// [final review round fix] The names attr marks each tracked spelling
+// inline (`Show [tracked], show`) rather than joining bare names — docker
+// logs are this daemon's primary surface, and README/the GUI both promise
+// the tracked correlation ("so you know which spelling to keep"); without
+// this an operator reading the log sees two spellings and not the one
+// actionable bit the API/GUI already carry correctly.
 func logFileReportFinding(ctx context.Context, logger *slog.Logger, itemLevel slog.Level, inst Instance, root mediaRoot, f fileReportFinding) {
 	attrs := []any{"kind", f.kind, "instance", inst.Name, "type", inst.Type, "root", root.diskPath, "path", f.diskPath}
 	switch f.kind {
@@ -1269,7 +1315,11 @@ func logFileReportFinding(ctx context.Context, logger *slog.Logger, itemLevel sl
 	case fileKindCaseCollision:
 		names := make([]string, len(f.names))
 		for i, n := range f.names {
-			names[i] = n.name
+			if n.tracked {
+				names[i] = n.name + " [tracked]"
+			} else {
+				names[i] = n.name
+			}
 		}
 		attrs = append(attrs, "entryType", f.entryType, "names", strings.Join(names, ", "))
 	}

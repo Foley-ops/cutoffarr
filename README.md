@@ -523,8 +523,13 @@ identically on every platform, case-sensitive or not — before anything
 else happens with that directory: every level of the walk, both the
 subdirectory names and the file names in it, are checked against each
 other for a case-only difference *before* any of them is descended into or
-classified as tracked/duplicate/orphan. A colliding pair (or larger group)
-is reported as its own finding, `kind=case-collision`, naming the
+classified as tracked/duplicate/orphan. That check is not scoped to one
+entry type at a time either: a **directory** named `Show` colliding with a
+**file** named `show` in the same parent is just as real a case-twin, and
+just as ambiguous to address on a case-insensitive view, as two folders or
+two files would be — it is caught the same way, reported with
+`entryType=mixed` rather than `dir`/`file`. A colliding pair (or larger
+group) is reported as its own finding, `kind=case-collision`, naming the
 containing directory and every colliding name — and, wherever cutoffarr
 can tell, whether each name IS or CONTAINS something the `*arr` actually
 tracks, so you know which spelling to keep. The colliding entries
@@ -535,9 +540,15 @@ whose only irregularity is a detected case-twin still completes with
 `fileReport=ran`: a collision is a **finding**, not a reason to abort.
 
 ```
-level=INFO msg="file-report finding" kind=case-collision instance=radarr-main root=/data/media/Movies path=/data/media/Movies entryType=dir names="My Name Is Earl, My Name is Earl"
+level=INFO msg="file-report finding" kind=case-collision instance=radarr-main root=/data/media/Movies path=/data/media/Movies entryType=dir names="My Name Is Earl [tracked], My Name is Earl"
 level=INFO msg="file report" instance=radarr-main type=radarr fileReport=ran duplicates=0 orphans=0 caseCollisions=1 fileSkipReasons="case-twin names excluded=2"
 ```
+
+The tracked spelling — whichever of the colliding names IS or CONTAINS
+something the `*arr` actually tracks — is marked inline in the log line
+itself with a `[tracked]` suffix, the same correlation the API's
+`names[].tracked` and the dashboard's own row carry, so the one actionable
+bit ("keep this spelling") is visible from `docker logs` alone.
 
 As with every other finding here, resolving it — merging the two folders,
 renaming the stray one — is always a decision you make by hand, outside
@@ -758,9 +769,13 @@ script, a status-page widget, whatever) without ever loading the HTML:
 
   Each `fileReport.findings` item is `{"kind": "duplicate"|"orphan"|
   "case-collision", "group": "...", "path": "...", "display": "...", "count":
-  N, "entryType": "dir"|"file", "names": [...]}`. `group`/`count` are present
-  only on a `duplicate`; `entryType`/`names` are present only on a
-  `case-collision` — `names` is `[{"name": "...", "tracked": bool}, ...]`,
+  N, "entryType": "dir"|"file"|"mixed", "names": [...]}`. `group`/`count` are
+  present only on a `duplicate`; `entryType`/`names` are present only on a
+  `case-collision`. `entryType` is `"dir"`/`"file"` when every colliding name
+  in the group is that one type, or `"mixed"` when the group spans both — a
+  directory and a file colliding on the same name, e.g. `Show`/`show` (see
+  [Case-twin names](#case-twin-names)). `names` is
+  `[{"name": "...", "tracked": bool}, ...]`,
   every colliding name found in that directory plus, wherever cutoffarr
   could tell, whether that exact name is or contains something the `*arr`
   actually tracks (see [Case-twin names](#case-twin-names)). `path` is the

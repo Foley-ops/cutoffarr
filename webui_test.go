@@ -117,6 +117,85 @@ func TestWebUIHandler_Stats_ReflectsARecordedCycle(t *testing.T) {
 	}
 }
 
+// TestWebUIHandler_Stats_CaseCollisionWireFieldsRawJSONSpelling is the
+// [final review round] regression test for a gap every other case-collision
+// test shared: every one of them decodes the response back into the SAME Go
+// structs (fileReportSnapshot/fileReportFindingRecord/
+// caseCollisionNameRecord) it was encoded from, so a typo'd or accidentally
+// `,omitempty`'d struct tag on CaseCollisions/EntryType/Names would break
+// webui.html's literal r.f.entryType/r.f.names/n.tracked reads AND README's
+// "caseCollisions is always present (including 0)" contract with a fully
+// green suite — decode/re-encode round-trips through Go field names, not
+// wire spelling. This asserts the RAW bytes instead, the same pattern
+// TestWebUIHandler_Stats_ReflectsARecordedCycle already uses for `"group":
+// ""`: caseCollisions is present at the top level even though it is 1 (a
+// non-zero case is not what would silently break under omitempty — this
+// pins the KEY spelling, which the existing count-based tests never do),
+// and entryType/names (with name/tracked) are present on the collision
+// finding's own JSON object and ABSENT on the duplicate's, exactly as the
+// API contract promises (`entryType`/`names` are case-collision-only).
+func TestWebUIHandler_Stats_CaseCollisionWireFieldsRawJSONSpelling(t *testing.T) {
+	s := newStatsStore(false)
+	s.recordInstance(cycleKindSweep, time.Now(), "sonarr-main", "sonarr", cycleInstanceStats{
+		total: 10, decisionsRan: true, fileReportRan: true,
+		fileReport: fileReportSnapshot{
+			Status: "ran", Duplicates: 1, Orphans: 0, CaseCollisions: 1,
+			Findings: []fileReportFindingRecord{
+				{Kind: "duplicate", Group: "S01E01", Path: "/tv/Show/dup.mkv", Display: "Show/dup.mkv", Count: 2},
+				{Kind: "case-collision", Path: "/tv/Show", Display: "Show", EntryType: "dir",
+					Names: []caseCollisionNameRecord{{Name: "Show", Tracked: true}, {Name: "show", Tracked: false}}},
+			},
+		},
+	})
+	ts, _ := newTestWebUIServer(t, s)
+
+	resp, err := http.Get(ts.URL + "/api/stats")
+	if err != nil {
+		t.Fatalf("GET /api/stats: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	body := string(raw)
+
+	if !strings.Contains(body, `"caseCollisions":1`) {
+		t.Errorf(`raw JSON missing "caseCollisions":1 (wire-spelled key) — a typo'd or omitempty'd struct tag would still round-trip through the Go struct decode every other test uses:\n%s`, raw)
+	}
+
+	// Pull each finding's OWN raw JSON object apart so presence/absence can
+	// be checked per-object, not just "somewhere in the response" (the
+	// collision finding's own entryType/names would otherwise make a
+	// substring search pass even if the duplicate wrongly carried them too,
+	// or mask a duplicate that wrongly omitted display/path).
+	var generic struct {
+		Instances []struct {
+			FileReport struct {
+				Findings []json.RawMessage `json:"findings"`
+			} `json:"fileReport"`
+		} `json:"instances"`
+	}
+	if err := json.Unmarshal(raw, &generic); err != nil {
+		t.Fatalf("response is not valid JSON: %v\n%s", err, raw)
+	}
+	if len(generic.Instances) != 1 || len(generic.Instances[0].FileReport.Findings) != 2 {
+		t.Fatalf("expected exactly 1 instance with 2 findings, got %+v", generic)
+	}
+	dup := string(generic.Instances[0].FileReport.Findings[0])
+	collision := string(generic.Instances[0].FileReport.Findings[1])
+
+	if strings.Contains(dup, `"entryType"`) || strings.Contains(dup, `"names"`) {
+		t.Errorf("the duplicate finding's own JSON object must never carry entryType/names (case-collision-only per the API contract):\n%s", dup)
+	}
+	if !strings.Contains(collision, `"entryType":"dir"`) {
+		t.Errorf(`collision finding missing "entryType":"dir":%s`, collision)
+	}
+	if !strings.Contains(collision, `"names":[{"name":"Show","tracked":true},{"name":"show","tracked":false}]`) {
+		t.Errorf(`collision finding's names array does not wire-spell {"name","tracked"} as promised:%s`, collision)
+	}
+	if strings.Contains(collision, `"group"`) || strings.Contains(collision, `"count"`) {
+		t.Errorf("the case-collision finding's own JSON object must never carry group/count (duplicate-only per the API contract):\n%s", collision)
+	}
+}
+
 // TestWebUIHandler_Stats_FileReportThreeStatesSurviveDistinctlyToTheClient
 // is the binding Phase 11 carry-forward, exercised end to end through the
 // REAL HTTP handler's JSON encoding rather than only statsStore's own Go
@@ -1014,6 +1093,14 @@ func TestWebUIPage_FileReportKindCellUsesClayChipStyling(t *testing.T) {
 
 	if !strings.Contains(body, `"badge badge-hunt"`) {
 		t.Error("renderFileReport's kind cell does not reuse the existing badge/badge-hunt (clay) chip styling")
+	}
+	// [final review round fix] The prior version of this test was relaxed to
+	// pin only the chip's creation/class, losing the assertion that the
+	// chip's own TEXT is the finding's kind — dropping
+	// `text(kindChip, r.f.kind || "")` (webui.html) would ship an empty clay
+	// pill in every findings row with the rest of this test still green.
+	if !strings.Contains(body, `text(kindChip, r.f.kind`) {
+		t.Error("renderFileReport's kind chip never sets its own text to r.f.kind — the chip would render empty")
 	}
 }
 
