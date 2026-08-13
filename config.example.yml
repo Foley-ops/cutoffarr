@@ -52,6 +52,34 @@ reverse_scan_remonitor: false
                          # one a human made by hand, so it is reported every
                          # cycle and never written either way.
 
+# gui_actions (v2.2): the master switch for the dashboard's per-finding
+# BUTTONS — trash a duplicate/orphan, merge a case-twin folder, re-monitor one
+# item. Default false, which is what an absent key means, so every config
+# written before v2.2 keeps behaving exactly as it did.
+#
+# Read this before turning it on. The permanent no-file-writes rule has NOT
+# been weakened: it binds the AUTOMATION. No sweep, webhook, reconciliation or
+# startup path can reach a file operation with this true or false — the
+# executors are reachable only from the action endpoint, which only a human's
+# confirmed POST arrives at. What this flag decides is whether cutoffarr will
+# act as YOUR hand when you click a button that states its exact operation.
+#
+# Three things are true whatever you set it to:
+#   - Nothing is ever deleted. Every removal is a rename-move into
+#     <media-root>/.cutoffarr-trash/<timestamp>/<original path>, which is never
+#     auto-pruned and never walked by the file report. You empty it yourself.
+#   - Every action re-derives its finding from live data first and refuses if
+#     the world has moved on (file gone, size changed, twin already merged,
+#     item already monitored).
+#   - dry_run still wins. With dry_run: true every button REHEARSES: full
+#     verification, then a "here is what I would have done" answer.
+#
+# It also needs the media volume mounted :rw — the deploy default is :ro on
+# purpose. See docker-compose.example.yml's ACTIONS-ENABLED VARIANT block and
+# the README's "Acting on findings" section.
+#
+# gui_actions: false
+
 instances:
   - name: radarr-main    # unique, used in logs
     type: radarr         # radarr | sonarr

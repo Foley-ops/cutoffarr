@@ -25,6 +25,7 @@ enforced and checked.
 - [Known limitations](#known-limitations)
 - [Webhook setup](#webhook-setup)
 - [The web dashboard](#the-web-dashboard)
+- [Acting on findings](#acting-on-findings)
 - [FAQ](#faq)
 - [License](#license)
 
@@ -121,11 +122,12 @@ blank.
 | --- | --- | --- |
 | `dry_run` | **`true`** | **Read this one first.** When true, cutoffarr performs zero write requests — not one — and only logs what it would do. Every write code path checks this flag immediately before its HTTP call, not once at startup, so nothing short of setting it to `false` in the loaded config ever causes a write. `--dry-run` on the command line can force it *on* but can never turn it off. |
 | `poll_interval` | `24h` | How often the reconciliation full sweep runs, as a Go duration string. Minimum `1h` if nonzero; `0` disables the sweep entirely (webhooks and the startup scan are then the only triggers). This is the safety net for events missed while the container was down. |
-| `webhook_port` | `9898` | The port the webhook HTTP listener binds, inside the container. Also serves [the web dashboard](#the-web-dashboard) (`GET /`, `GET /api/stats`, `POST /api/scan`) on the same port. Must be `1`-`65535`. |
+| `webhook_port` | `9898` | The port the webhook HTTP listener binds, inside the container. Also serves [the web dashboard](#the-web-dashboard) (`GET /`, `GET /api/stats`, `POST /api/scan`, and — since v2.2 — `POST /api/action`) on the same port. Unauthenticated: keep it on a LAN you trust. Must be `1`-`65535`. |
 | `webhook_debounce` | `45s` | How long to wait after the *last* event for a given movie/series before evaluating it — so a season-pack import (many episode-import events) becomes one evaluation, not one per episode. `0` evaluates immediately, with no wait. |
 | `log_level` | `info` | One of `debug`, `info`, `warn`, `error`. Logging is always to stdout only, via `log/slog`'s text handler — never to a file. |
 | `exclusion_tag` | `cutoffarr-exclude` | The tag label that opts an item out of everything cutoffarr does, in every mode, including dry-run reporting. Must not be empty or all-whitespace (omit the key entirely to use the default; an explicit empty string is a fatal config error, not a silent "exclude nothing"). |
 | `reverse_scan_remonitor` | **`false`** | Whether the reverse scan may WRITE. The reverse scan itself always runs on full cycles and reports what it finds; this flag alone decides whether it re-monitors it. With `false` no write of any kind is composed by that pass — not gated, not attempted. With `true`, re-monitoring obeys `dry_run` and the exclusion tag exactly like the forward path, and `--once --only-id N` becomes a scoped both-directions run against that single item ([Trying it on one item first](#trying-it-on-one-item-first)). See [The reverse scan](#the-reverse-scan). |
+| `gui_actions` | **`false`** | Whether the dashboard's per-finding **buttons** may act — trash a duplicate/orphan, merge a case-twin folder, re-monitor one item. With `false` (the default, and what an absent key means) the action endpoint answers `403` and every button renders disabled carrying that reason. It does not weaken the permanent no-file-writes rule, which binds every autonomous path forever whatever this is set to; it decides only whether cutoffarr will act as *your* hand on a button you confirmed. Also requires an `:rw` media mount, and `reverse_scan_remonitor` as well for the re-monitor button. See [Acting on findings](#acting-on-findings). |
 | `instances` | *(required, may be empty)* | A list of `*arr` instances to reconcile against. An empty list is valid (cutoffarr just warns and does nothing) but almost certainly not what you want. |
 | `instances[].name` | — | A unique, human-readable name used in every log line and as the webhook path segment (`/webhook/{instance-name}`). |
 | `instances[].type` | — | `radarr` or `sonarr`. |
@@ -222,18 +224,29 @@ deliberately small and independently checked, not just documented:
   timeout, plus a 5-second drain of the webhook listener: 80 seconds
   worst-case, 90 for headroom. **Don't lower `stop_grace_period` below that
   without understanding why it's there.**
-- **The file report never writes, deletes, moves, or renames a file, and it
-  never gains an option to.** It is off by default (opt-in per instance via
-  `media_root_map`) and, unlike the reverse scan, has no write switch at all
-  to turn on: it only reads `/movie`, `/series`, and `/episodefile`, and
-  walks the mapped media directories with `fs.WalkDir` and `os.Stat` —
-  nothing that creates, removes, or renames anything. This is enforced by a
-  test the same way the API write surface is:
+- **No automatic code path ever writes, deletes, moves, or renames a file,
+  and none ever gains an option to.** The file report itself is off by
+  default (opt-in per instance via `media_root_map`) and has no write switch
+  at all: it only reads `/movie`, `/series`, and `/episodefile`, and walks
+  the mapped media directories with `fs.WalkDir` and `os.Stat`. Sweeps,
+  webhooks, reconciliation and the startup scan are filesystem-read-only
+  forever, under any configuration.
+
+  This is enforced by a test rather than promised:
   `TestTree_BansFilesystemMutationAPIsEverywhere` in `filereport_test.go`
-  greps every non-test file in the tree for `os.Remove`, `os.Rename`,
-  `os.Create`, `os.WriteFile`, `os.OpenFile`, `os.Mkdir`/`os.MkdirAll`, and a
-  handful of other filesystem-mutation calls, and fails unless the file is on
-  an allowlist that is empty by design. See
+  greps every non-test file for `os.Remove`, `os.Rename`, `os.Create`,
+  `os.WriteFile`, `os.OpenFile`, `os.Mkdir`/`os.MkdirAll` and a handful of
+  other filesystem-mutation calls.
+
+  Since v2.2 that audit has exactly one entry, and it is worth understanding
+  what it is and is not. `actions.go` may call `os.Rename` and `os.MkdirAll`
+  — and nothing else, in only three named functions, all of them trash-moves
+  or case-twin merges. `os.Remove` and `os.RemoveAll` remain banned in every
+  file **including that one**, so true deletion does not exist in this
+  codebase at all. Those functions are reachable only from the action
+  endpoint, which only a human's confirmed click arrives at (a second test
+  walks the tree to keep it that way). See
+  [Acting on findings](#acting-on-findings) and
   [The file report](#the-file-report).
 
 ## The reverse scan
@@ -383,12 +396,19 @@ in Radarr or Sonarr's own UI will ever mention it. The file report finds
 these by walking your media directories and comparing what's actually there
 against exactly what each `*arr` says it tracks.
 
-**It is read-only, permanently, with no flag to change that.** See the
-[Safety and dry-run](#safety-and-dry-run) bullet above for how that is
-enforced by a test rather than merely documented. Findings are reported;
-nothing is ever deleted, moved, or renamed. Acting on a finding — deleting
-the extra file, investigating the orphan — is always a decision you make by
-hand, outside cutoffarr, after reading the report.
+**The scan itself is read-only, permanently, with no flag to change that.**
+No sweep, webhook, reconciliation pass or startup scan can touch a file,
+under any configuration — see the [Safety and dry-run](#safety-and-dry-run)
+bullet above for how that is enforced by a test rather than merely
+documented.
+
+Acting on a finding is a separate thing, and it is always a decision *you*
+make: since v2.2 each finding carries a button stating its exact operation,
+which does that one thing when you confirm it and nothing otherwise. It is
+off by default (`gui_actions: false`), needs an `:rw` media mount, and never
+deletes — see [Acting on findings](#acting-on-findings). Doing it by hand on
+the server, after reading the report, remains entirely reasonable and is what
+the default deployment expects.
 
 ### Turning it on
 
@@ -825,22 +845,199 @@ script, a status-page widget, whatever) without ever loading the HTML:
   a cycle is already running or one is already queued — idempotent by
   design, so mashing the button never stacks up extra sweeps.
 
-Both endpoints, and the page itself, live on the same listener and port as
-the webhook endpoint (`webhook_port`); nothing about `POST
+- **`POST /api/action`** (v2.2) — the one endpoint that can change anything.
+  A JSON body naming the action kind, the finding's own identifying fields,
+  and `confirm: true`. It answers `200` for a performed or rehearsed action,
+  `409` for a refusal with the reason, `403` when a config switch is off
+  (naming which one), `400` for a malformed or unconfirmed request, and `502`
+  when an operation was attempted and something outside cutoffarr failed.
+  Actions are serialized through a single-flight executor and are never
+  reachable from any autonomous code path. See
+  [Acting on findings](#acting-on-findings).
+
+All three endpoints, and the page itself, live on the same listener and port
+as the webhook endpoint (`webhook_port`); nothing about `POST
 /webhook/{instance-name}`'s own routing, method handling, or response
 changed to make room for them.
+
+There is **no authentication** on any of them. That was already worth
+knowing when the page was read-only; now that one of them can move files, it
+is worth stating flatly: anything that can reach this port can click these
+buttons. See the trust-model note in
+[Acting on findings](#acting-on-findings).
+
+## Acting on findings
+
+Everything above this section is a report. cutoffarr finds things and tells
+you about them, and for two versions that was the whole of it: the
+no-file-writes rule was permanent, structural, and enforced by a test that
+greps the source tree.
+
+That rule has not been weakened. What v2.2 added is a distinction the owner
+ruled on directly (2026-08-13):
+
+> Forbidden for the automation to do, not for the human.
+
+A sweep, a webhook, a reconciliation pass and the startup scan are
+filesystem-read-only forever, with any config, on any flag. A **human** who
+reads a button that states its exact operation, confirms it, and clicks it is
+the one acting — and cutoffarr is allowed to be their hand for that one
+operation.
+
+That is enforced structurally rather than promised. The action executors are
+reachable only from the action endpoint's handler, which only a confirmed
+`POST` arrives at; a test walks the whole source tree and fails if any other
+file so much as names one of them.
+
+### What the buttons can do
+
+Three operations, one per finding kind, each a button on the row it belongs
+to:
+
+| Button | On | What it does |
+| --- | --- | --- |
+| `Move to trash — <path> (<size>)` | a duplicate or orphan row | Renames the file into `<media-root>/.cutoffarr-trash/<timestamp>/<its original path>`. |
+| `Merge "X" into "Y" [tracked]` | a case-twin block | Moves the untracked spelling's contents into the tracked spelling, then trash-moves the emptied folder. |
+| `Re-monitor — <title> (movie N)` | a reverse-scan row | Sets `monitored: true` on that one item, through the same gated write path the reverse scan itself uses. |
+
+There is exactly one bulk action, **Re-monitor all N**, and that is
+deliberate: a re-monitor flips a flag the next sweep would respect anyway,
+where moving many files on one click is a different decision that has not been
+ruled on. File actions stay per-item.
+
+Every button states its **exact operation** — never a bare "Fix" — and the
+confirm dialog re-shows that same sentence before anything happens. The
+response echoes it back, so the row can show you that what happened is what
+the button said would happen.
+
+### Nothing is ever deleted
+
+There is no delete in this codebase. `os.Remove` and `os.RemoveAll` do not
+appear in it, in any file, and the mutation audit fails the build if they ever
+do — including in the one file that is allowed to move things.
+
+Every removal is a **rename-move into the trash**:
+
+```
+<media-root>/.cutoffarr-trash/2026-08-13T09:04:05Z/Movies/Some Movie (2019)/ETRG.Sample.mkv
+```
+
+The path under the timestamp mirrors where the file came from, so restoring is
+`mv` with the two halves you can read off the path. Some properties worth
+knowing:
+
+- **It is never auto-pruned.** Nothing in cutoffarr ever removes anything from
+  it, on any schedule, under any flag. Emptying it is your job, with your own
+  shell, when you have decided you don't want what's in there.
+- **It is never walked by the file report.** Otherwise a file you trashed
+  would come straight back on the next sweep as an orphan, carrying a button
+  offering to trash it again, forever.
+- **It never overwrites.** If something already occupies the destination, the
+  incoming file gets a `(2)`, `(3)` suffix rather than replacing it — in the
+  one directory whose entire purpose is that nothing is lost.
+- **The `*arr`s ignore it**, because it is dot-prefixed.
+
+### Fresh verification, and honest refusals
+
+A dashboard tab can sit open for a week. Every action therefore re-derives its
+finding from **live data** before doing anything — re-running the file report
+against a fresh library read, re-listing the directory, re-fetching the `*arr`
+object — and refuses if the world no longer matches what the button promised.
+Concretely, an action refuses when:
+
+- the path is not something the last completed sweep actually reported as that
+  kind of finding (which is what stops the endpoint from being an arbitrary
+  "move this file" API);
+- a fresh check no longer classifies it as that finding — the `*arr` imported
+  it, or someone already tidied it up;
+- the file's **size** has changed, meaning something replaced it at that path
+  and it is not the file you confirmed;
+- the case-twin has already been merged, or the `*arr` now tracks the other
+  spelling;
+- the item is already monitored, or no longer fails the criteria that made it
+  a finding;
+- the media root is mounted read-only (see below).
+
+Refusals are answers, not silence: the row shows the reason in clay, and the
+log carries a line for it.
+
+### The switches, and what each one means
+
+| State | What a click does |
+| --- | --- |
+| `gui_actions: false` (default) | `403`. Buttons render **disabled**, carrying the reason. |
+| `gui_actions: true`, `dry_run: true` | **Rehearses.** Full re-verification runs, then the answer says what it *would* have done. Nothing is moved and nothing is written. |
+| `gui_actions: true`, `dry_run: false` | Performs the one operation the button named. |
+| Re-monitor, `reverse_scan_remonitor: false` | `403`, naming *that* flag. The re-monitor button needs it as well as `gui_actions`. |
+
+The page never guesses which switch is missing — `/api/stats` reports both,
+and the disabled button's own text names the one that is off.
+
+One honest detail about rehearsals: a rehearsed **file** action does create the
+empty `.cutoffarr-trash` directory, because attempting that create is the only
+way to find out whether the mount is writable, and a rehearsal that answered
+"this would work" on a read-only mount would be a rehearsal that lied. Nothing
+is moved, and the directory is ignored by everything.
+
+### The read-only mount, which is the default
+
+`docker-compose.example.yml` mounts media `:ro`, on purpose, and that is the
+shape this project ships. With it, no bug and no request that reaches the port
+can modify a byte of your media — and every file button refuses with a message
+naming the mount and telling you to remount it or do the job on the server
+yourself.
+
+If you want the buttons to work, the compose example carries a commented
+**ACTIONS-ENABLED VARIANT** block with `:rw` mounts and the trade written out
+next to them. You also need the container's uid (`user: "99:100"` in the
+example) to own the media it would move.
+
+### The trust model, stated plainly
+
+**There is no authentication on this dashboard, and v2.2 does not add any.**
+That was already true of a read-only page (plan §8: it is a LAN homelab tool),
+and it is worth restating now that the page can move files:
+
+> Anything that can reach `webhook_port` can click these buttons.
+
+So: keep that port on a LAN you trust, do not publish it to the internet or
+through a reverse proxy without your own auth in front of it, and leave
+`gui_actions: false` until you have decided the network it sits on is one where
+that sentence is acceptable. The defaults are chosen so that a deployment which
+never thinks about this is safe: `gui_actions` off, media `:ro`, `dry_run` on.
+
+### The audit trail
+
+Every action — performed, rehearsed or refused — writes one line:
+
+```
+level=INFO msg=action source=gui kind=trash outcome=performed instance=radarr-main path=/data/media/Movies/... operation="Move to trash — ..." detail="moved to /data/media/Movies/.cutoffarr-trash/..."
+```
+
+Performed actions also appear in the dashboard's `lastActions` list, alongside
+the writes cutoffarr made on its own — the same table, so "what changed" has
+one place to look.
 
 ## FAQ
 
 **Does it delete anything?**
-No. cutoffarr never sends a delete of any kind, to either `*arr`. The only
-field it ever writes is `monitored`: `false` on the forward path, and `true`
-only when `reverse_scan_remonitor` is enabled (off by default — see
-[Letting it fix them](#letting-it-fix-them)). This isn't just a
-design intent — see
+No — and that is meant literally in both directions.
+
+In the `*arr`s: cutoffarr never sends a delete of any kind. The only field it
+ever writes is `monitored`: `false` on the forward path, and `true` only when
+`reverse_scan_remonitor` is enabled (off by default — see
+[Letting it fix them](#letting-it-fix-them)). See
 [Safety and dry-run](#safety-and-dry-run) for the test that makes it
-checkable: no delete verb (or any write verb outside the two designated
-write-path files) exists anywhere in the tree.
+checkable: no delete verb, or any write verb outside the two designated
+write-path files, exists anywhere in the tree.
+
+On disk: nothing cutoffarr runs on its own can touch a file at all. When
+*you* click a v2.2 action button (off by default), the file is **renamed into
+`<media-root>/.cutoffarr-trash/`**, never deleted — `os.Remove` and
+`os.RemoveAll` are banned in every file in the project by a test, so the
+capability to delete does not exist to be reached. The trash is never
+auto-pruned; emptying it is your call. See
+[Acting on findings](#acting-on-findings).
 
 **Is this the same as unmonitorr or unmonitarr?**
 No — both are real, unrelated projects that happen to have very similar
