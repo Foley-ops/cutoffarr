@@ -27,6 +27,15 @@ const (
 	// writes nothing unless asked" is a safety decision, not an accident of
 	// the language.
 	defaultReverseScanRemonitor = false
+
+	// defaultGUIActions is [v2.2] the same statement for the action system:
+	// a human-clicked per-finding button may perform the one operation it
+	// names (owner's ruling, plan Phase 11 — "forbidden for the AUTOMATION to
+	// do, not for the human"), but ONLY once someone has said so in the
+	// config. Named, not left to the zero value, for the same reason as
+	// above: this is the switch that decides whether this program is allowed
+	// to move a file at all.
+	defaultGUIActions = false
 )
 
 const redactedPlaceholder = "<redacted>"
@@ -53,6 +62,26 @@ type Config struct {
 	// write in the opposite direction from everything this project did before,
 	// so it is opt-in in the strongest sense the config has.
 	ReverseScanRemonitor bool
+
+	// GUIActions is [v2.2] the master switch for the human-clicked action
+	// system (actions.go): per-finding buttons that trash a file, merge a
+	// case-twin directory, or re-monitor one item. Default false.
+	//
+	// It changes nothing about the PERMANENT rule it sits beside: no sweep, no
+	// webhook, no reconciliation, no startup path may ever reach an executor,
+	// with this flag true or false — the executors are reachable only from the
+	// action endpoint handler, which only a human POST can arrive at (see
+	// actions.go's own structural pin). What this flag decides is narrower and
+	// entirely about the human's own authority: whether cutoffarr will act as
+	// their hand at all.
+	//
+	// With it false the endpoint answers 403 with the reason stated, and the
+	// GUI renders every button disabled carrying that same reason — never
+	// silently absent, since a button that vanished would leave a human
+	// believing the finding is not actionable rather than that they have not
+	// yet opted in. dry_run remains independently binding on top of it: see
+	// actionSwitchState (actions.go) for the full matrix.
+	GUIActions bool
 
 	Instances []Instance
 }
@@ -107,6 +136,7 @@ type rawConfig struct {
 	LogLevel             *string       `yaml:"log_level"`
 	ExclusionTag         *string       `yaml:"exclusion_tag"`
 	ReverseScanRemonitor *bool         `yaml:"reverse_scan_remonitor"`
+	GUIActions           *bool         `yaml:"gui_actions"`
 	Instances            []rawInstance `yaml:"instances"`
 }
 
@@ -196,6 +226,7 @@ func (r rawConfig) toConfig() (*Config, error) {
 		LogLevel:             defaultLogLevel,
 		ExclusionTag:         defaultExclusionTag,
 		ReverseScanRemonitor: defaultReverseScanRemonitor,
+		GUIActions:           defaultGUIActions,
 	}
 
 	if r.DryRun != nil {
@@ -204,6 +235,10 @@ func (r rawConfig) toConfig() (*Config, error) {
 
 	if r.ReverseScanRemonitor != nil {
 		cfg.ReverseScanRemonitor = *r.ReverseScanRemonitor
+	}
+
+	if r.GUIActions != nil {
+		cfg.GUIActions = *r.GUIActions
 	}
 
 	if r.PollInterval.Kind != 0 {

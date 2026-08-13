@@ -848,3 +848,77 @@ instances:
 		t.Errorf("error %q does not name the offending relative path", err.Error())
 	}
 }
+
+// --- gui_actions (v2.2) -----------------------------------------------------
+//
+// The GUI action system's master switch, and the reason the owner's ruling
+// ("forbidden for the AUTOMATION to do, not for the human") can be executable
+// without weakening the permanent no-file-writes rule one inch: with this
+// false — which is what an absent key, and therefore every config written
+// before v2.2 existed, means — the action endpoints refuse and the buttons
+// render disabled. It is a *bool in rawConfig for exactly the reason dry_run
+// and reverse_scan_remonitor are: "absent" must be tellable from "explicitly
+// set", even where the default coincides with Go's zero value.
+
+func TestLoadConfig_GUIActionsDefaultsFalseWhenAbsent(t *testing.T) {
+	path := writeConfig(t, `
+instances: []
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	if cfg.GUIActions {
+		t.Errorf("GUIActions = true, want false when gui_actions is absent from config")
+	}
+}
+
+func TestLoadConfig_GUIActionsHonorsExplicitTrue(t *testing.T) {
+	path := writeConfig(t, `
+gui_actions: true
+instances: []
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	if !cfg.GUIActions {
+		t.Errorf("GUIActions = false, want true when gui_actions: true is set explicitly")
+	}
+}
+
+func TestLoadConfig_GUIActionsHonorsExplicitFalse(t *testing.T) {
+	path := writeConfig(t, `
+gui_actions: false
+instances: []
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	if cfg.GUIActions {
+		t.Errorf("GUIActions = true, want false when gui_actions: false is set explicitly")
+	}
+}
+
+// TestLoadConfig_GUIActionsNonBoolean_IsFatal is the present-but-invalid rule
+// every other typed field in this config already obeys, applied to the one
+// switch that authorizes cutoffarr to touch a file at all: "gui_actions: yes
+// please" silently meaning false would be a human believing the buttons are
+// live while the program refuses every click — and, far worse in the other
+// direction, a future typo'd truthy string must never be read as ON.
+func TestLoadConfig_GUIActionsNonBoolean_IsFatal(t *testing.T) {
+	path := writeConfig(t, `
+gui_actions: "yes please"
+instances: []
+`)
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("LoadConfig returned nil error, want a fatal error for a non-boolean gui_actions")
+	}
+	for _, want := range []string{"parsing yaml", "line 2", "bool"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error must locate the offending value (%q missing): %v", want, err)
+		}
+	}
+}
