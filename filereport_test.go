@@ -4143,6 +4143,57 @@ func TestEvaluateFileReportRoot_HeuristicDDoesNotFireOnCollisionOnlyUntrackedRoo
 	}
 }
 
+// TestEvaluateFileReportRoot_HeuristicCCountsVideoExtensionFileCollisionEvidence
+// is the discriminating regression test for the per-FILE half of
+// collisionEvidence (the `for f := range subFiles { if
+// videoExtensions[...] { collisionEvidence++ } }` loop in
+// evaluateFileReportRoot's d.IsDir() branch): a mirror image of
+// TestEvaluateFileReportRoot_HeuristicDDoesNotFireOnCollisionOnlyUntrackedRoot
+// above, but for heuristic (c) rather than (d), and for a TRACKED root
+// rather than an untracked one. "Movie A/Movie A.mkv" is real on disk and
+// genuinely tracked, so heuristic (b) samples it successfully (os.Stat
+// reads the real file directly, never through the excluded walk path) —
+// but the walk itself never classifies it as tracked, because its own name
+// is one half of a case-twin pair and is excluded from classification
+// (binding controller resolution 3). videoFilesSeen therefore stays 0, and
+// only the collisionEvidence contributed by the two colliding .mkv names
+// (there are zero colliding SUBDIRECTORIES anywhere in this fixture, so
+// len(subDirs) contributes nothing) can keep heuristic (c) from firing.
+// Deleting the per-file loop makes this test abort with heuristic (c)'s own
+// "zero video files of any kind" WARN — the same false abort binding
+// controller resolution 3 was written to eliminate — even though this
+// root's only irregularity is a detected case-collision.
+func TestEvaluateFileReportRoot_HeuristicCCountsVideoExtensionFileCollisionEvidence(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureFiles(t, dir, "Movie A/Movie A.mkv")
+	movieDir := filepath.Join(dir, "Movie A")
+	root := mediaRoot{arrPath: "/movies", diskPath: dir}
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		movieDir: {fakeFile("Movie A.mkv"), fakeFile("movie a.mkv")},
+	})
+	set := instanceTrackedSet{
+		files:   map[string]bool{filepath.Join(movieDir, "Movie A.mkv"): true},
+		folders: map[string]string{movieDir: "Movie A"},
+	}
+	logger, buf := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "radarr-main", Type: "radarr"}, root, set)
+	if outcome.skipped {
+		t.Fatalf("a tracked root whose only recognized video content is a case-twin pair must still complete as ran (binding controller resolution 3): %+v\n%s", outcome, buf.String())
+	}
+	if strings.Contains(buf.String(), "zero video files of any kind") {
+		t.Errorf("heuristic (c) must not fire: the collision itself is the root's only video-extension evidence:\n%s", buf.String())
+	}
+	var collisions int
+	for _, f := range outcome.findings {
+		if f.kind == fileKindCaseCollision {
+			collisions++
+		}
+	}
+	if collisions != 1 {
+		t.Errorf("case-collision findings = %d, want 1", collisions)
+	}
+}
+
 // --- real fixtures on a case-sensitive filesystem (CI only) ----------------
 
 func TestEvaluateFileReportRoot_RealCaseTwinDirectoriesEndToEnd(t *testing.T) {

@@ -535,7 +535,7 @@ whose only irregularity is a detected case-twin still completes with
 `fileReport=ran`: a collision is a **finding**, not a reason to abort.
 
 ```
-level=INFO msg="file-report finding" kind=case-collision instance=radarr-main root=/data/media/Movies path="/data/media/Movies/My Name Is Earl" entryType=dir names="My Name Is Earl, My Name is Earl"
+level=INFO msg="file-report finding" kind=case-collision instance=radarr-main root=/data/media/Movies path=/data/media/Movies entryType=dir names="My Name Is Earl, My Name is Earl"
 level=INFO msg="file report" instance=radarr-main type=radarr fileReport=ran duplicates=0 orphans=0 caseCollisions=1 fileSkipReasons="case-twin names excluded=2"
 ```
 
