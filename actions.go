@@ -66,11 +66,27 @@ import (
 // --- the trash --------------------------------------------------------------
 
 // trashDirName is the single directory every trashed file lands under, at the
-// top of the media root it came from. Dot-prefixed for two reasons that are
-// both load-bearing: the *arrs' own scanners ignore dot-directories, and this
-// project's file report already prunes dot-directories from its walk the same
-// way it prunes the Plex extras folders, so trashed files can never come back
-// as a second generation of duplicate/orphan findings.
+// top of the media root it came from.
+//
+// It is dot-prefixed for ONE reason: the *arrs' own scanners ignore
+// dot-directories. That is the whole benefit of the dot, and it is worth
+// stating plainly because an earlier version of this comment claimed a second
+// one that does not exist — that the file report "already prunes
+// dot-directories from its walk the same way it prunes the Plex extras
+// folders". Neither half of that was true, and in the one file whose comments
+// ARE the safety argument it invited deleting the real guard as redundant:
+//
+//   - there is no dot-directory prune anywhere in the file report;
+//   - the extras folders are deliberately NOT pruned from descent at all —
+//     underExtrasDir (filereport.go) classifies them lexically, precisely so
+//     their files can still be COUNTED under FileSkipReasonExtrasDir.
+//
+// What actually keeps trashed files from coming back as a second generation of
+// duplicate/orphan findings is a single explicit check: the trash is the ONE
+// directory pruned from descent, BY NAME, at filereport.go's
+// `d.Name() == trashDirName` guard. Nothing else is. That guard is what
+// TestEvaluateFileReportRoot_TrashIsNeverWalked pins, and removing it breaks
+// rule 4 no matter what this directory is called.
 //
 // It is never auto-pruned. Nothing in this program ever deletes anything from
 // it, on any schedule, under any flag: "restore by hand, empty it by hand" is
@@ -673,13 +689,27 @@ func (a *actionRunner) run(ctx context.Context, req actionRequest) actionRespons
 		return a.refuse(req, actionOutcomeDisabled, "", reason).withStatus(http.StatusForbidden)
 	}
 
+	// EXHAUSTIVE, with a refusing default — round-4 review fix, and the one
+	// place in this system where "never guess" is least affordable.
+	//
+	// actionKinds (validated above) and this switch are two separate lists, and
+	// this used to end in `default: return a.remonitor(...)`. A fourth kind
+	// added to actionKinds — the ordinary way this system grows — would
+	// therefore have passed the validator and then EXECUTED AS A RE-MONITOR: a
+	// button labelled one thing performing another, writing to an *arr, with
+	// every test green. Naming ActionRemonitor explicitly costs one line and
+	// makes the gap between the two lists a 400 instead of a write.
 	switch req.Kind {
 	case ActionTrash:
 		return a.trash(ctx, inst, req)
 	case ActionMergeCaseTwin:
 		return a.mergeTwin(ctx, inst, req)
-	default:
+	case ActionRemonitor:
 		return a.remonitor(ctx, inst, req)
+	default:
+		return a.refuse(req, actionOutcomeRefused, "",
+			fmt.Sprintf("%q is an action kind this cutoffarr recognizes but has no executor wired for, so nothing was done. This is a cutoffarr bug, not a problem with the finding: please report it.", req.Kind)).
+			withStatus(http.StatusBadRequest)
 	}
 }
 
@@ -1008,7 +1038,19 @@ func humanSize(n int64) string {
 	case n < 1024*1024*1024:
 		return fmt.Sprintf("%d MB", int64(math.Round(float64(n)/(1024*1024))))
 	default:
-		return fmt.Sprintf("%.1f GB", float64(n)/(1024*1024*1024))
+		// math.Round here too, for the SAME reason and against the same trap
+		// one unit up (round-4 review fix). The page renders this branch with
+		// toFixed(1), which rounds a tenth-boundary tie AWAY FROM ZERO; %.1f on
+		// its own rounds those ties to EVEN, so an exactly-1.25 GB file read
+		// "1.3 GB" in the confirm dialog and "1.2 GB" in the operation the
+		// response echoes back. Rounding to tenths first makes %.1f a pure
+		// renderer of a number already rounded the page's way.
+		//
+		// The two sides agree exactly, not approximately: n/2^30 is exact in
+		// float64 (a division by a power of two), and so is multiplying it by
+		// ten for any n below ~900 TB, so both sides round the identical value
+		// by the identical rule.
+		return fmt.Sprintf("%.1f GB", math.Round(float64(n)/(1024*1024*1024)*10)/10)
 	}
 }
 
@@ -1045,8 +1087,10 @@ func (a *actionRunner) trash(ctx context.Context, inst Instance, req actionReque
 	// established without attempting it. The one filesystem effect a rehearsal
 	// therefore has is creating an EMPTY .cutoffarr-trash directory: nothing
 	// is moved, nothing is destroyed, and the operator gets a true answer
-	// instead of a hopeful one. (That directory is dot-prefixed, so the file
-	// report's own walk prunes it and it can never become a finding.)
+	// instead of a hopeful one. (That directory can never become a finding,
+	// because the file report prunes it from descent by name — see
+	// trashDirName's own comment for why the dot prefix is NOT what does
+	// that.)
 	//
 	// It runs HERE — after the in-memory authorization gate, before the
 	// expensive live re-derivation — and the order is a deliberate,
@@ -1469,8 +1513,25 @@ func (a *actionRunner) remonitorOutcome(inst Instance, req actionRequest, operat
 		a.audit(req, actionOutcomePerformed, operation, msg)
 		return actionResponse{Outcome: actionOutcomePerformed, Kind: req.Kind, Operation: operation, Message: msg, Reason: msg, status: http.StatusOK}
 
+	// This branch says less than it used to, and that is the round-4 review
+	// fix. It read "Nothing was changed", flatly, which is a claim a failed
+	// write cannot support: writeErrors is one int covering at least three
+	// different endings, and it cannot tell them apart.
+	//
+	//   - the server ANSWERED and refused (a non-2xx): nothing changed, true;
+	//   - the PUT left the client and no answer came back (a timeout mid-write,
+	//     a reset connection): whether it landed is simply not knowable here;
+	//   - on Sonarr, the episode-monitor write COMPLETED and the season write
+	//     then failed — sonarr_writer.go has two sentences for exactly that
+	//     state — which means something DID change, and "Nothing was changed"
+	//     was not merely unknowable, it was FALSE.
+	//
+	// So it names the uncertainty and states the recovery instead, the way the
+	// echoUnverified branch above it already does. The log line — which carries
+	// the actual error, including the Sonarr sentences that DO know — is where
+	// the specifics live, and it is named.
 	case rev.writeErrors > 0:
-		msg := fmt.Sprintf("The re-monitor write to %s failed. Nothing was changed; the log line for this action names the error.", inst.Name)
+		msg := fmt.Sprintf("The re-monitor write to %s failed, and its result could not be confirmed either way — it may have been refused before anything changed, or it may have failed after part of it landed. The log line for this action names the error, and the next sweep reports the item again if it is still unmonitored.", inst.Name)
 		a.audit(req, actionOutcomeFailed, operation, msg)
 		return actionResponse{Outcome: actionOutcomeFailed, Kind: req.Kind, Operation: operation, Message: msg, Reason: msg, status: http.StatusBadGateway}
 

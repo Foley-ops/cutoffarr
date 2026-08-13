@@ -1084,10 +1084,17 @@ func evaluateFileReportRoot(ctx context.Context, logger *slog.Logger, itemLevel 
 		filePath := cleanArrPath(path.Join(root.diskPath, rel))
 
 		if d.IsDir() {
-			// [v2.2] The trash is pruned from descent, exactly like the Plex
-			// extras folders are, and it is pruned FIRST — before the
+			// [v2.2] The trash is the ONE directory this walk prunes from
+			// descent, by name, and it is pruned FIRST — before the
 			// case-collision pre-scan, before any classification — because
 			// nothing inside it is a fact about the library at all.
+			//
+			// "The one" is exact, and the earlier wording here ("exactly like
+			// the Plex extras folders are") was not: the extras folders are
+			// deliberately NOT SkipDir'd, so their files can still be counted
+			// under FileSkipReasonExtrasDir — see underExtrasDir, which says
+			// so at length. Nothing else, dot-prefixed or otherwise, is
+			// skipped from this traversal.
 			//
 			// Without this the action system eats its own tail: a file a human
 			// trashed lands under <root>/.cutoffarr-trash, is by construction

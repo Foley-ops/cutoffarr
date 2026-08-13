@@ -79,8 +79,9 @@ type Config struct {
 	// GUI renders every button disabled carrying that same reason — never
 	// silently absent, since a button that vanished would leave a human
 	// believing the finding is not actionable rather than that they have not
-	// yet opted in. dry_run remains independently binding on top of it: see
-	// actionSwitchState (actions.go) for the full matrix.
+	// yet opted in. dry_run remains independently binding on top of it: the
+	// gate itself is switchRefusal (actions.go), and the full matrix of the
+	// three switches is the README's "Acting on findings" switches table.
 	GUIActions bool
 
 	Instances []Instance

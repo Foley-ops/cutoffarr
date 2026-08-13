@@ -1289,6 +1289,48 @@ func TestActionEndpoint_ValidationAndMethodConventions(t *testing.T) {
 	}
 }
 
+// TestAction_AKnownKindWithNoDispatchCaseIsRefusedNotRunAsARemonitor is the
+// round-4 review finding at the ONE dispatch point in this system.
+//
+// actionKinds (the closed set the endpoint validates against) and run's own
+// switch are two separate lists, and the switch used to end in
+// `default: return a.remonitor(...)`. So a fourth kind added to actionKinds —
+// the ordinary way this system grows — would have been accepted by the
+// validator and then EXECUTED AS A RE-MONITOR: a button labelled one thing
+// performing another, at the one place in the codebase where "never guess" is
+// least affordable. Nothing would have failed; the new kind would simply have
+// written to an *arr.
+//
+// The kind is injected into actionKinds rather than named as a literal,
+// because the point is precisely the gap between the two lists: a test that
+// posted an unknown kind would be stopped by the validator and never reach the
+// switch at all.
+func TestAction_AKnownKindWithNoDispatchCaseIsRefusedNotRunAsARemonitor(t *testing.T) {
+	fake := newArrFake(t)
+	_, _, inst := radarrFileFixture(t, fake)
+	cfg := Config{
+		DryRun: false, GUIActions: true, ReverseScanRemonitor: true,
+		ExclusionTag: "cutoffarr-exclude", Instances: []Instance{inst},
+	}
+	runner := newActionRunner(cfg, nil, newStatsStore(true))
+
+	// A kind this cutoffarr knows about but has wired no executor for — the
+	// state of the tree for exactly as long as it takes someone to add the
+	// constant and forget the case.
+	const future = "rename-folder"
+	actionKinds[future] = true
+	defer delete(actionKinds, future)
+
+	resp := runner.run(context.Background(), actionRequest{Kind: future, Confirm: true, Instance: inst.Name})
+	if resp.Outcome != actionOutcomeRefused || resp.status != http.StatusBadRequest {
+		t.Fatalf("outcome=%q status=%d reason=%q, want a 400 refusal: a kind with no executor must never fall through to the re-monitor executor",
+			resp.Outcome, resp.status, resp.Reason)
+	}
+	if !strings.Contains(resp.Reason, future) {
+		t.Errorf("the refusal must name the kind it could not dispatch; got %q", resp.Reason)
+	}
+}
+
 // postActionWith is postAction with control over the two headers the
 // cross-site guard reads. An empty contentType sends none at all.
 func postActionWith(t *testing.T, ts *httptest.Server, body, contentType, secFetchSite string) (int, actionResponse) {
@@ -2113,6 +2155,15 @@ func TestHumanSize_MatchesThePagesOwnRounding(t *testing.T) {
 		{2560, "3 KB"},         // 2.5 -> away from zero (Go's %.0f gave "2")
 		{2621440, "3 MB"},      // 2.5 MB, same trap one unit up
 		{1610612736, "1.5 GB"}, // GB keeps one decimal, both sides
+		// The SAME trap one more unit up, which the round-3 fix left behind and
+		// the round-4 review found: the page renders GB with toFixed(1), which
+		// rounds halves AWAY FROM ZERO, while fmt's %.1f rounds them to EVEN.
+		// Both of these land exactly on a tenth-boundary tie (1.25 GB, 2.25 GB)
+		// and both used to read one way in the confirm dialog and the other in
+		// the operation the response echoes back — the disagreement the README
+		// tells operators to trust the echo to settle.
+		{1342177280, "1.3 GB"}, // exactly 1.25 GB; %.1f gave "1.2"
+		{2415919104, "2.3 GB"}, // exactly 2.25 GB; %.1f gave "2.2"
 	} {
 		if got := humanSize(tc.n); got != tc.want {
 			t.Errorf("humanSize(%d) = %q, want %q — the server's label must match the page's, or the confirm dialog and the answer disagree about the same file", tc.n, got, tc.want)
@@ -2441,6 +2492,61 @@ func TestAction_Remonitor_SonarrSeasonThatIsNoLongerAFindingIsAnsweredHonestly(t
 	}
 	if !strings.Contains(rec.Reason, "no longer reports") {
 		t.Errorf("lastActions[0].Reason = %q, want the same answer the operator got", rec.Reason)
+	}
+}
+
+// TestAction_RemonitorOutcome_AFailedWriteClaimsOnlyWhatIsKnowable is the
+// round-4 review finding on the one branch of this system that asserted more
+// than it could know.
+//
+// The writeErrors branch used to answer "Nothing was changed", flatly. It is
+// reached by at least three genuinely different endings, and the counter is an
+// int that cannot tell them apart:
+//
+//   - the server ANSWERED and refused (a non-2xx): nothing changed, true;
+//   - the PUT left the client and no answer came back (a timeout mid-write, a
+//     reset connection): whether it landed is simply unknown;
+//   - on Sonarr, the episode-monitor write COMPLETED and the season write then
+//     failed (sonarr_writer.go's own two sentences for exactly that), which
+//     means something DID change — so "Nothing was changed" was not merely
+//     unknowable there, it was false.
+//
+// The one honest answer available from a counter therefore names the
+// uncertainty and states the recovery, the way the echoUnverified branch beside
+// it already does. This is the response an operator reads to decide whether to
+// go looking at their server, and a false certainty is the worst thing it can
+// carry.
+func TestAction_RemonitorOutcome_AFailedWriteClaimsOnlyWhatIsKnowable(t *testing.T) {
+	inst := Instance{Name: "radarr-main", Type: "radarr"}
+	cfg := Config{GUIActions: true, ReverseScanRemonitor: true, Instances: []Instance{inst}}
+	store := newStatsStore(true)
+	runner := newActionRunner(cfg, nil, store)
+	req := actionRequest{Kind: ActionRemonitor, Confirm: true, Instance: inst.Name, ID: 7}
+	const operation = "Re-monitor — Fever Pitch (movie 7)"
+
+	resp := runner.remonitorOutcome(inst, req, operation, cycleInstanceStats{
+		decisionsRan: true,
+		reverse:      reverseCounts{writeErrors: 1},
+	})
+
+	if resp.Outcome != actionOutcomeFailed || resp.status != http.StatusBadGateway {
+		t.Fatalf("outcome=%q status=%d, want failed/502 — a server fault is not a refusal", resp.Outcome, resp.status)
+	}
+	if strings.Contains(resp.Message, "Nothing was changed") {
+		t.Errorf("the failed-write answer still claims %q, which a failed write cannot establish: %q", "Nothing was changed", resp.Message)
+	}
+	// It must name the uncertainty AND the recovery, so the operator is not
+	// left to guess what to do with an answer that promises nothing.
+	for _, want := range []string{"could not be confirmed", "next sweep"} {
+		if !strings.Contains(resp.Message, want) {
+			t.Errorf("the failed-write answer is missing %q; got %q", want, resp.Message)
+		}
+	}
+	// The listed record carries the same sentence the operator was shown: the
+	// list and the response must never say two different things about one click.
+	rec := assertOneListedAction(t, store, ActionRemonitor, actionOutcomeFailed)
+	if rec.Reason != resp.Message {
+		t.Errorf("lastActions[0].Reason = %q, want the same answer the operator got (%q)", rec.Reason, resp.Message)
 	}
 }
 
