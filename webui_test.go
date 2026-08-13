@@ -803,6 +803,115 @@ func TestWebUIPage_ReusesShelfCardsAcrossRefreshesForTransitions(t *testing.T) {
 	}
 }
 
+// TestWebUIPage_FindingsPaginationDefaultsAndSizeTokens pins the reverse-scan
+// / file-clutter pagination's basic contract: a default page size of 25, and
+// the exact four size tokens (10 · 25 · 50 · all) an operator can switch
+// between — a typo or dropped token here would silently remove a size
+// option or change what a fresh page load shows before anyone clicks
+// anything.
+func TestWebUIPage_FindingsPaginationDefaultsAndSizeTokens(t *testing.T) {
+	page := string(webUIPage)
+
+	if !strings.Contains(page, "DEFAULT_PAGE_SIZE = 25") {
+		t.Error("page's default findings page size is not pinned to 25")
+	}
+	if !strings.Contains(page, `PAGE_SIZES = [10, 25, 50, "all"]`) {
+		t.Error(`page does not define the four page-size tokens as [10, 25, 50, "all"]`)
+	}
+	if !strings.Contains(page, "size: DEFAULT_PAGE_SIZE") {
+		t.Error("a pager's initial state does not default to DEFAULT_PAGE_SIZE")
+	}
+}
+
+// TestWebUIPage_FindingsPaginationSlicingIsOneSharedImplementation pins that
+// renderReverse and renderFileReport slice their rows through the SAME
+// paginateRows function — a second, drifted copy of the arithmetic in one
+// section would be exactly the kind of bug that only shows up once a panel
+// has enough rows to page past page 1.
+func TestWebUIPage_FindingsPaginationSlicingIsOneSharedImplementation(t *testing.T) {
+	page := string(webUIPage)
+
+	if n := strings.Count(page, "function paginateRows("); n != 1 {
+		t.Fatalf("expected exactly one paginateRows definition, found %d — the reverse-scan and file-clutter panels must share one slicing implementation, not each carry their own", n)
+	}
+	if n := strings.Count(page, "= paginateRows(rows,"); n != 2 {
+		t.Errorf("expected paginateRows to be called (assigned to a result) from exactly two call sites (renderReverse and renderFileReport), found %d", n)
+	}
+
+	start := strings.Index(page, "function renderReverse(")
+	if start == -1 {
+		t.Fatal("page has no renderReverse function")
+	}
+	end := strings.Index(page[start:], "\n  function renderFileReport(")
+	if end == -1 {
+		t.Fatal("could not find the end of renderReverse (renderFileReport must follow it)")
+	}
+	reverseBody := page[start : start+end]
+	if !strings.Contains(reverseBody, "paginateRows(rows, reversePager)") {
+		t.Error("renderReverse does not call paginateRows against its own reversePager state")
+	}
+
+	fileStart := start + end
+	fileEnd := strings.Index(page[fileStart:], "\n  function render(data)")
+	if fileEnd == -1 {
+		t.Fatal("could not find the end of renderFileReport (render(data) must follow it)")
+	}
+	fileBody := page[fileStart : fileStart+fileEnd]
+	if !strings.Contains(fileBody, "paginateRows(rows, filePager)") {
+		t.Error("renderFileReport does not call paginateRows against its own filePager state")
+	}
+}
+
+// TestWebUIPage_FindingsPaginationPositionLineFormat pins the "a–b of n"
+// position-line format (an en dash, matching the design plan's exact
+// wording) that buildPagerControls renders next to each section's page-size
+// and prev/next controls.
+func TestWebUIPage_FindingsPaginationPositionLineFormat(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, `(page.start + 1) + "–" + page.end + " of " + page.total`) {
+		t.Error(`buildPagerControls does not render the "a–b of n" position line in the expected format`)
+	}
+	if !strings.Contains(page, "pager-position") {
+		t.Error("page has no pager-position element for the position line")
+	}
+}
+
+// TestWebUIPage_FindingsPaginationPreservesPositionAcrossPollsWithSameCount
+// pins the "do not yank the operator back to page 1 every 30s" requirement:
+// a poll refresh must only reset a section's page back to 1 when that
+// section's row COUNT has actually changed since the last render — never
+// unconditionally on every refresh, which would make paging past page 1
+// useless on a page that re-polls every 30 seconds.
+func TestWebUIPage_FindingsPaginationPreservesPositionAcrossPollsWithSameCount(t *testing.T) {
+	page := string(webUIPage)
+
+	if !strings.Contains(page, "function resetPagerIfCountChanged(") {
+		t.Fatal("page has no resetPagerIfCountChanged function guarding page resets by row-count change")
+	}
+	if !strings.Contains(page, "resetPagerIfCountChanged(reversePager, rows.length)") {
+		t.Error("renderReverse never calls resetPagerIfCountChanged — its page could reset on every poll regardless of whether the row count changed")
+	}
+	if !strings.Contains(page, "resetPagerIfCountChanged(filePager, rows.length)") {
+		t.Error("renderFileReport never calls resetPagerIfCountChanged — its page could reset on every poll regardless of whether the row count changed")
+	}
+
+	start := strings.Index(page, "function resetPagerIfCountChanged(")
+	if start == -1 {
+		t.Fatal("page has no resetPagerIfCountChanged function")
+	}
+	end := strings.Index(page[start:], "\n  }")
+	if end == -1 {
+		t.Fatal("could not find the end of resetPagerIfCountChanged")
+	}
+	body := page[start : start+end]
+	if !strings.Contains(body, "pager.lastCount !== count") {
+		t.Error("resetPagerIfCountChanged does not compare against a persisted lastCount before resetting the page — a reset on every call would reintroduce the yank-to-page-1 bug")
+	}
+	if !strings.Contains(body, "pager.page = 1") {
+		t.Error("resetPagerIfCountChanged never resets the page to 1 when the count actually changed")
+	}
+}
+
 // TestWebUIPage_FileReportRendersThreeStateStatus is the page-side half of
 // the binding Phase 11 carry-forward ("a skipped instance must never render
 // as clean … an off instance shows the feature as not configured"): the
