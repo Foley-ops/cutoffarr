@@ -2014,6 +2014,98 @@ func TestWebUIPage_ActionOutcomesSurviveARepaint(t *testing.T) {
 	}
 }
 
+// TestWebUIPage_ASizelessFindingIsDisabledWithTheServersOwnReason closes the
+// one unactionable shape the page still rendered as a live button.
+//
+// actions.go refuses any trash whose last-completed-sweep size is <= 0: without
+// a size there is nothing to compare the file on disk against, so the promise
+// the button made cannot be kept. The page nonetheless built that row's button
+// fully live, labelled "… (size unknown)", and every click on it answered 409.
+// Every OTHER unactionable shape in this GUI — a switch that is off, a
+// case-twin whose shape is report-only — renders disabled with its reason
+// stated, which is the brief's own mandate; this one shape was the exception,
+// and it is the one where the label itself already says something is missing.
+func TestWebUIPage_ASizelessFindingIsDisabledWithTheServersOwnReason(t *testing.T) {
+	page := string(webUIPage)
+	start := strings.Index(page, `kind: "trash", confirm: true,`)
+	if start == -1 {
+		t.Fatal("the trash button builds no request body")
+	}
+	// The whole buildActionButton({...}) call the trash row makes, back from the
+	// body to the opening brace and forward to the close.
+	callAt := strings.LastIndex(page[:start], "buildActionButton({")
+	if callAt == -1 {
+		t.Fatal("the trash row does not build its button through buildActionButton")
+	}
+	end := strings.Index(page[callAt:], "\n        }));")
+	if end == -1 {
+		t.Fatal("could not find the end of the trash row's buildActionButton call")
+	}
+	call := page[callAt : callAt+end]
+
+	if !strings.Contains(call, "ineligible:") {
+		t.Errorf("the trash button never passes an ineligible reason, so a finding the server refuses on every click still renders live:\n%s", call)
+	}
+	if !strings.Contains(call, "r.f.size") {
+		t.Errorf("the ineligible reason is not derived from the finding's own size:\n%s", call)
+	}
+	// It must quote the server's refusal rather than inventing a second
+	// vocabulary for the same rule: the operator reads one of these before the
+	// click and the other after it.
+	for _, want := range []string{"no size", "by hand"} {
+		if !strings.Contains(call, want) {
+			t.Errorf("the sizeless-finding reason does not state the server's own refusal (%q missing):\n%s", want, call)
+		}
+	}
+}
+
+// TestWebUIPage_ADisabledButtonKeepsItsReasonEvenWithARememberedOutcome is the
+// one combination that escaped TestWebUIPage_DisabledButtonsCarryTheirReasonTwice.
+//
+// buildActionButton's remembered-outcome branch returns before the
+// disabled-reason path, and it used to set btn.title = opts.label and let
+// renderActionOutcome own the note outright. So a button disabled by a switch
+// or by its own finding's shape that ALSO had an outcome to show — a daemon
+// restarted with gui_actions flipped off while a tab holding outcomes stays
+// open, or any ineligible twin whose earlier click was refused — came back
+// disabled with the reason in NEITHER the title nor the note: a dead button
+// with no explanation, which is exactly what rule 7 forbids.
+func TestWebUIPage_ADisabledButtonKeepsItsReasonEvenWithARememberedOutcome(t *testing.T) {
+	page := string(webUIPage)
+	build := jsFunctionBody(t, page, "buildActionButton", "attachActionClick")
+
+	remembered := strings.Index(build, "if (remembered) {")
+	if remembered == -1 {
+		t.Fatal("buildActionButton no longer has a remembered-outcome branch")
+	}
+	branch := build[remembered:]
+	if end := strings.Index(branch, "\n    }\n"); end != -1 {
+		branch = branch[:end]
+	}
+
+	if strings.Contains(branch, "btn.title = opts.label;") {
+		t.Errorf("a remembered outcome still overwrites the title with the label unconditionally, so a disabled button's reason is invisible:\n%s", branch)
+	}
+	if !strings.Contains(branch, "btn.title = reason || opts.label") {
+		t.Errorf("the remembered branch must prefer the disabled reason for the title, falling back to the label:\n%s", branch)
+	}
+	// And in the note too, beside the outcome — a title alone is invisible on a
+	// touch screen, which is the whole reason the reason travels twice.
+	if !strings.Contains(branch, "if (reason)") {
+		t.Errorf("the remembered branch never renders the disabled reason inline:\n%s", branch)
+	}
+	if !strings.Contains(branch, "note.insertBefore(") && !strings.Contains(branch, "note.appendChild(") {
+		t.Errorf("the reason is never attached to the note beside the remembered outcome:\n%s", branch)
+	}
+	// renderActionOutcome sets note.textContent, so the reason must be attached
+	// AFTER it or it is wiped in the same tick.
+	renderAt := strings.Index(branch, "renderActionOutcome(note, opts.container, remembered)")
+	attachAt := strings.Index(branch, "var why =")
+	if renderAt == -1 || attachAt == -1 || attachAt < renderAt {
+		t.Errorf("the reason must be attached after renderActionOutcome, which owns the note's text:\n%s", branch)
+	}
+}
+
 // TestWebUIPage_BulkRemonitorSummarySurvivesItsOwnRerender is the same rule for
 // the one bulk action: buildBulkRemonitor wrote its summary into `note` and
 // then called rerender(), whose first act is body.textContent = "" — destroying

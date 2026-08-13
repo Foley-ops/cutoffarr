@@ -553,8 +553,10 @@
   }
 
   /* The reason a button is disabled, and the outcome of one that was
-     clicked, share one element: at any moment a row has at most one thing to
-     say about its action. */
+     clicked, share one element — and can both be present at once, which is
+     what .action-why is for: it sits inside .action-note carrying the
+     disabled reason beside a remembered outcome, dimmed so the outcome (which
+     is coloured by its own .action-note-* class) still reads first. */
   .action-note {
     display: block;
     font-family: var(--mono);
@@ -567,6 +569,7 @@
   .action-note-refused { color: var(--alert); }
   .action-note-rehearsed { color: var(--hunt); }
   .action-note-done { color: var(--rest); }
+  .action-why { color: var(--ink-dim); }
 
   /* A row whose action was performed is struck through and dimmed rather
      than removed: the operator has to be able to see that the thing they
@@ -1352,22 +1355,42 @@
     // refusal or a failure is a thing an operator may legitimately retry once
     // they have fixed its cause — the note tells them what that cause was.
     var remembered = rememberedActionOutcome(opts.body);
+    // An ineligible finding (rule 5's report-only twin shapes) is disabled
+    // for a reason that has nothing to do with the switches, and that reason
+    // wins: it is about THIS finding, not about the deployment.
+    //
+    // Computed HERE, above both branches, because a disabled button and a
+    // remembered outcome can be true at once and used not to be handled
+    // together — see the remembered branch below.
+    var reason = opts.ineligible || actionDisabledReason(opts.kind);
+
     if (remembered) {
-      btn.title = opts.label;
       // Still disabled if the deployment (or this twin's shape) says so: an
       // outcome this page remembers is a fact about the past, never an
       // authorization for a second click.
-      btn.disabled = remembered.outcome === "performed" ||
-        !!(opts.ineligible || actionDisabledReason(opts.kind));
+      btn.disabled = remembered.outcome === "performed" || !!reason;
+      // The reason wins the title when there is one. This branch used to set
+      // the label unconditionally, which meant the one combination of
+      // disabled-with-a-reason AND an outcome to show — a daemon restarted
+      // with a switch flipped while a tab holding outcomes stays open, an
+      // ineligible twin whose earlier click was refused — came back as a dead
+      // button explaining itself nowhere.
+      btn.title = reason || opts.label;
       renderActionOutcome(note, opts.container, remembered);
+      if (reason) {
+        // Beside the outcome, not instead of it: both are true, and a title
+        // alone is invisible on a touch screen. It is a separate node because
+        // renderActionOutcome owns the note's text (textContent), and it goes
+        // in immediately after that text so a merge's itemized collision list
+        // still reads last.
+        var why = el("span", "action-why");
+        text(why, " — " + reason);
+        note.insertBefore(why, note.firstChild && note.firstChild.nextSibling);
+      }
       if (!btn.disabled) attachActionClick(btn, note, opts);
       return wrap;
     }
 
-    // An ineligible finding (rule 5's report-only twin shapes) is disabled
-    // for a reason that has nothing to do with the switches, and that reason
-    // wins: it is about THIS finding, not about the deployment.
-    var reason = opts.ineligible || actionDisabledReason(opts.kind);
     if (reason) {
       btn.disabled = true;
       btn.title = reason;
@@ -1793,11 +1816,20 @@
         // [v2.2] The trash button. Clay, because it moves a file; its label
         // states the exact operation including the size, which is the single
         // most useful fact for telling a stray sample from the real episode.
+        //
+        // A finding the sweep recorded NO size for is ineligible, quoting the
+        // server's own refusal (actions.go's `reported.Size <= 0` gate). This
+        // row used to render fully live, labelled "… (size unknown)", and
+        // answered 409 on every click — the one unactionable shape in this GUI
+        // that did not state its reason up front, and the one where the label
+        // already admits something is missing.
         var actionCell = el("td", "action-cell");
         actionCell.appendChild(buildActionButton({
           kind: "trash",
           tone: "clay",
           label: "Move to trash — " + (r.f.display || r.f.path || "") + " (" + humanSize(r.f.size) + ")",
+          ineligible: r.f.size > 0 ? "" :
+            "the last completed sweep recorded no size for this file (it could not be stat'd, or it is a zero-byte file), so cutoffarr cannot establish that the file there now is the one this button describes. Move it by hand if that is what you want.",
           body: {
             kind: "trash", confirm: true, instance: r.instance,
             path: r.f.path || "", finding: r.f.kind || "", size: r.f.size || 0
