@@ -350,10 +350,24 @@ const (
 )
 
 // statsResponse is GET /api/stats's whole body.
+//
+// GUIActions/ReverseScanRemonitor are [v2.2]'s addition, and they are here for
+// one reason: the page must be able to render an action button DISABLED WITH
+// ITS REASON. The two alternatives are both worse. Hiding the button reads to
+// an operator as "this finding is not actionable"; showing it live and letting
+// the click come back 403 reads as "cutoffarr is broken". Rule 7 requires the
+// page never to lie about which switch is missing, and it cannot tell without
+// being told.
+//
+// They are the CONFIG's values, not a summary of them: dryRun already travels
+// beside them and the three are read independently, because "which switch is
+// off" is exactly the question the disabled button's tooltip answers.
 type statsResponse struct {
-	Instances []instanceStatsView `json:"instances"`
-	DryRun    bool                `json:"dryRun"`
-	Version   string              `json:"version"`
+	Instances            []instanceStatsView `json:"instances"`
+	DryRun               bool                `json:"dryRun"`
+	GUIActions           bool                `json:"guiActions"`
+	ReverseScanRemonitor bool                `json:"reverseScanRemonitor"`
+	Version              string              `json:"version"`
 }
 
 // statsStore is the mutex-guarded in-memory state GET /api/stats serves from.

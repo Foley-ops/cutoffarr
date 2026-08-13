@@ -95,13 +95,23 @@ func (s *webUIServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 // a DEBUG line per request would grow without bound over a long-running
 // daemon for a read that changes nothing.
 func (s *webUIServer) handleStats(w http.ResponseWriter, r *http.Request) {
+	snap := s.stats.snapshot()
+	// [v2.2] The action switches, read from the runner's own config so the
+	// page and the endpoint can never disagree about which button is live. A
+	// server with no runner wired reports both as false — the honest answer,
+	// since every action against it is refused — rather than omitting them and
+	// leaving the page to guess a default.
+	if s.actions != nil {
+		snap.GUIActions = s.actions.cfg.GUIActions
+		snap.ReverseScanRemonitor = s.actions.cfg.ReverseScanRemonitor
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	// The encode error is not checked: by the time Encode could fail, the 200
 	// header is already written and there is nothing left to correct it with
 	// — the same "nothing more to do" the webhook handler's own
 	// fmt.Fprintln(w, "accepted") accepts silently.
-	_ = json.NewEncoder(w).Encode(s.stats.snapshot())
+	_ = json.NewEncoder(w).Encode(snap)
 }
 
 // handleScan is the whole of POST /api/scan: ask the coordinator to queue

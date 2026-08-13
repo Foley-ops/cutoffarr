@@ -1612,3 +1612,227 @@ func TestWebUIPage_UnreachableBadgeWrapsInsteadOfOverflowing(t *testing.T) {
 		t.Error(".shelf-unreachable never overrides .badge's uppercase text-transform; a full sentence in 11px caps is unreadable")
 	}
 }
+
+// --- [v2.2] the action switches on the wire ---------------------------------
+
+// TestWebUIHandler_Stats_CarriesTheActionSwitches is what lets the page render
+// a button DISABLED WITH ITS REASON rather than either hiding it (which reads
+// as "this finding is not actionable") or showing it live and letting the
+// click 403 (which reads as "cutoffarr is broken"). The page cannot know which
+// switch is missing without being told, and rule 7 is explicit that it must
+// never lie about which one it is.
+func TestWebUIHandler_Stats_CarriesTheActionSwitches(t *testing.T) {
+	store := newStatsStore(true)
+	srv := &webUIServer{stats: store, scan: newScanCoordinator(),
+		actions: newActionRunner(Config{GUIActions: true, ReverseScanRemonitor: false}, nil, store)}
+	ts := httptest.NewServer(newWebUIHandler(srv))
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Get(ts.URL + "/api/stats")
+	if err != nil {
+		t.Fatalf("GET /api/stats: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+	if raw["guiActions"] != true {
+		t.Errorf("guiActions = %v, want true", raw["guiActions"])
+	}
+	if raw["reverseScanRemonitor"] != false {
+		t.Errorf("reverseScanRemonitor = %v, want false", raw["reverseScanRemonitor"])
+	}
+}
+
+// TestWebUIHandler_Stats_NoActionRunnerReportsBothSwitchesOff keeps the
+// pre-v2.2 shape honest: a server with no action system wired must report the
+// switches as off rather than omitting them, or the page would fall back to
+// its own default and could render a live-looking button on a deployment where
+// every click is a 403.
+func TestWebUIHandler_Stats_NoActionRunnerReportsBothSwitchesOff(t *testing.T) {
+	ts, _ := newTestWebUIServer(t, newStatsStore(true))
+	resp, err := http.Get(ts.URL + "/api/stats")
+	if err != nil {
+		t.Fatalf("GET /api/stats: %v", err)
+	}
+	defer resp.Body.Close()
+	var raw map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+	for _, key := range []string{"guiActions", "reverseScanRemonitor"} {
+		v, present := raw[key]
+		if !present {
+			t.Errorf("%s is absent from the stats payload; the page must never have to guess a switch state", key)
+		}
+		if v != false {
+			t.Errorf("%s = %v, want false when no action system is wired", key, v)
+		}
+	}
+}
+
+// --- [v2.2] GUI action structural pins --------------------------------------
+
+// TestWebUIPage_ActionButtonsStateTheirExactOperation is rule 2, pinned
+// against the page's own source. A button labelled "Fix" or "Clean up" is the
+// single failure this whole design is built to prevent: the operator has to be
+// able to read what will happen BEFORE they click, in enough detail to catch
+// cutoffarr having identified the wrong thing.
+func TestWebUIPage_ActionButtonsStateTheirExactOperation(t *testing.T) {
+	page := string(webUIPage)
+	// The three operation phrasings, each matching the server's own
+	// operation text word for word (actions.go's trashOperationText,
+	// twinOperationText, remonitorOperationText).
+	for _, want := range []string{`"Move to trash — "`, `"Re-monitor — "`, `Merge \"`} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the page never builds the operation label %s; a button that does not state its exact operation is exactly what rule 2 forbids", want)
+		}
+	}
+	// The trash button must state the SIZE, which is what tells a stray
+	// sample from the real episode.
+	if !strings.Contains(page, "humanSize(r.f.size)") {
+		t.Error("the trash button's label never includes the file's size")
+	}
+	for _, banned := range []string{`text(btn, "Fix")`, `text(btn, "Clean up")`, `text(btn, "Delete")`} {
+		if strings.Contains(page, banned) {
+			t.Errorf("the page contains a bare %s button", banned)
+		}
+	}
+}
+
+// TestWebUIPage_EveryActionGoesThroughAConfirmGate is the second half of rule
+// 2: the confirm step re-shows the full operation before anything fires. It is
+// pinned structurally because the failure mode — a click that acts
+// immediately — is invisible in review and irreversible in use.
+func TestWebUIPage_EveryActionGoesThroughAConfirmGate(t *testing.T) {
+	page := string(webUIPage)
+	start := strings.Index(page, "function buildActionButton(")
+	if start == -1 {
+		t.Fatal("page has no buildActionButton")
+	}
+	end := strings.Index(page[start:], "\n  function reverseActionLabel(")
+	if end == -1 {
+		t.Fatal("could not find the end of buildActionButton")
+	}
+	fn := page[start : start+end]
+
+	confirmAt := strings.Index(fn, "window.confirm(")
+	postAt := strings.Index(fn, "postAction(")
+	if confirmAt == -1 {
+		t.Fatal("buildActionButton never calls window.confirm: an action must never fire on a bare click")
+	}
+	if postAt == -1 {
+		t.Fatal("buildActionButton never posts the action")
+	}
+	if confirmAt > postAt {
+		t.Error("buildActionButton posts the action before confirming it")
+	}
+	if !strings.Contains(fn, "opts.label + ") {
+		t.Error("the confirm dialog must re-show the FULL operation (opts.label), not a generic 'are you sure'")
+	}
+	// The bulk action has its own confirm, listing every item.
+	bulk := page[strings.Index(page, "function buildBulkRemonitor("):]
+	if !strings.Contains(bulk[:strings.Index(bulk, "\n  function ")], "window.confirm(") {
+		t.Error("the bulk re-monitor never confirms")
+	}
+}
+
+// TestWebUIPage_DisabledButtonsCarryTheirReasonTwice is rule 7's GUI half: a
+// switched-off button is disabled with its reason, never hidden — and the
+// reason travels in both the title attribute and an inline note, because a
+// title alone is invisible on a touch screen.
+func TestWebUIPage_DisabledButtonsCarryTheirReasonTwice(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, "function actionDisabledReason(") {
+		t.Fatal("page has no actionDisabledReason")
+	}
+	for _, want := range []string{"gui_actions is false", "reverse_scan_remonitor is false"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the disabled reason never names the switch %q; rule 7 requires the page never lie about which switch is missing", want)
+		}
+	}
+	start := strings.Index(page, "function buildActionButton(")
+	fn := page[start : start+strings.Index(page[start:], "\n  function reverseActionLabel(")]
+	if !strings.Contains(fn, "btn.disabled = true") || !strings.Contains(fn, "btn.title = reason") || !strings.Contains(fn, "text(note, reason)") {
+		t.Errorf("a disabled button must carry its reason as BOTH title and inline text; got:\n%s", fn)
+	}
+}
+
+// TestWebUIPage_RowsUpdateFromTheResponseNotFromTheNextSweep pins that a row
+// reflects what actually happened, from the answer, immediately.
+func TestWebUIPage_RowsUpdateFromTheResponseNotFromTheNextSweep(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, "function renderActionOutcome(") {
+		t.Fatal("page has no renderActionOutcome")
+	}
+	for _, want := range []string{"action-performed", "action-note-refused", "action-note-rehearsed", "resp.items"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("renderActionOutcome never handles %q: performed, refused, rehearsed and the merge's itemized collisions must each be visible on the row", want)
+		}
+	}
+	if !strings.Contains(page, "tr.action-performed td") {
+		t.Error("a performed row is never struck through; the operator has to see that the row they clicked is the one that changed")
+	}
+}
+
+// TestWebUIPage_BulkActionIsRemonitorOnly is the phase's own scope boundary,
+// pinned so a later round cannot quietly add a bulk file action: moving many
+// files on one click is a different decision from moving one, and it has not
+// been ruled on.
+func TestWebUIPage_BulkActionIsRemonitorOnly(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, "Re-monitor all ") {
+		t.Error("the page has no bulk re-monitor")
+	}
+	for _, banned := range []string{"Trash all ", "Merge all ", "Move all "} {
+		if strings.Contains(page, banned) {
+			t.Errorf("the page offers a bulk file action (%q): file actions stay per-item in this phase", banned)
+		}
+	}
+}
+
+// TestWebUIPage_ActionButtonsUseTheEstablishedTokens keeps the buttons inside
+// the page's own five-token palette — clay for anything that moves a file,
+// sage for the re-monitor, which only flips a flag.
+func TestWebUIPage_ActionButtonsUseTheEstablishedTokens(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, ".action-clay { color: var(--alert)") {
+		t.Error("the destructive action tone is not the page's own clay/--alert token")
+	}
+	if !strings.Contains(page, ".action-sage { color: var(--rest)") {
+		t.Error("the re-monitor action tone is not the page's own sage/--rest token")
+	}
+	if !strings.Contains(page, `tone: "clay"`) || !strings.Contains(page, `tone: "sage"`) {
+		t.Error("the two tones are never actually used by the button builders")
+	}
+	// The re-monitor must not be clay: it moves nothing and undoes nothing
+	// the next sweep could not redo.
+	start := strings.Index(page, "kind: \"remonitor\",")
+	if start == -1 {
+		t.Fatal("no re-monitor button is built")
+	}
+	if !strings.Contains(page[start:start+80], `tone: "sage"`) {
+		t.Error("the re-monitor button is not sage; clay is reserved for operations that move a file")
+	}
+}
+
+// TestWebUIPage_TrashButtonSendsTheFindingsIdentifyingFields pins that the
+// request carries what the server needs to re-derive the finding and to check
+// the promise the button made — in particular the size, without which a file
+// REPLACED at the same path passes every check there is.
+func TestWebUIPage_TrashButtonSendsTheFindingsIdentifyingFields(t *testing.T) {
+	page := string(webUIPage)
+	start := strings.Index(page, `kind: "trash", confirm: true,`)
+	if start == -1 {
+		t.Fatal("the trash button builds no request body")
+	}
+	body := page[start : start+240]
+	for _, want := range []string{"instance:", "path:", "finding:", "size:"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the trash request body is missing %s; got %q", want, body)
+		}
+	}
+}
