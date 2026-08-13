@@ -509,6 +509,86 @@
     cursor: default;
   }
 
+  /* --- [v2.2] action buttons -------------------------------------------
+
+     Quiet mono, sized to sit inside a table row without becoming the row.
+     Two tones, and the choice is not decorative: clay (--alert) for anything
+     that MOVES A FILE, sage (--rest) for the re-monitor, which only flips a
+     flag the next sweep would respect anyway. They are outlined rather than
+     filled — button#scanBtn's filled pill is the page's one primary action
+     and stays that way — so a table of twenty rows does not become twenty
+     competing calls to action.
+
+     A disabled button keeps its shape and its full label. It must never
+     vanish: a button that is not there reads as "this finding is not
+     actionable", which is a different and false statement from "you have not
+     switched this on". Its reason travels twice, in the title attribute and
+     in the inline note beside it, because a title alone is invisible on a
+     touch screen and to anyone who does not think to hover. */
+  .action-btn {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.02em;
+    background: transparent;
+    border: 1px solid var(--border-strong);
+    border-radius: 5px;
+    padding: 4px 9px;
+    cursor: pointer;
+    white-space: nowrap;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .action-clay { color: var(--alert); border-color: rgb(196 106 90 / 40%); }
+  .action-sage { color: var(--rest); border-color: rgb(111 160 140 / 40%); }
+
+  .action-clay:hover:not(:disabled) { background: var(--alert-dim); }
+  .action-sage:hover:not(:disabled) { background: var(--rest-dim); }
+
+  .action-btn:disabled {
+    color: var(--ink-faint);
+    border-color: var(--border);
+    cursor: default;
+  }
+
+  /* The reason a button is disabled, and the outcome of one that was
+     clicked, share one element — and can both be present at once, which is
+     what .action-why is for: it sits inside .action-note carrying the
+     disabled reason beside a remembered outcome, dimmed so the outcome (which
+     is coloured by its own .action-note-* class) still reads first. */
+  .action-note {
+    display: block;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--ink-dim);
+    margin-top: 4px;
+    white-space: normal;
+  }
+
+  .action-note-refused { color: var(--alert); }
+  .action-note-rehearsed { color: var(--hunt); }
+  .action-note-done { color: var(--rest); }
+  .action-why { color: var(--ink-dim); }
+
+  /* A row whose action was performed is struck through and dimmed rather
+     than removed: the operator has to be able to see that the thing they
+     clicked is the thing that changed, and a row that vanished would leave
+     them counting rows to work out whether it worked. The next sweep drops
+     it for real. */
+  tr.action-performed td { color: var(--ink-faint); text-decoration: line-through; }
+  tr.action-performed td.action-cell { text-decoration: none; }
+
+  .case-collision-item.action-performed .case-collision-dir,
+  .case-collision-item.action-performed .case-collision-name {
+    color: var(--ink-faint);
+    text-decoration: line-through;
+  }
+
+  .bulk-actions {
+    margin: 0 0 12px;
+  }
+
   footer {
     margin-top: 48px;
     font-family: var(--mono);
@@ -1065,9 +1145,14 @@
       }
       return;
     }
+    // [v2.2] The one bulk action this phase has, above the table so it reads
+    // as being about the whole list rather than about whichever page is
+    // showing — and it acts on every row, not just the visible page, which is
+    // what its own label says.
+    body.appendChild(buildBulkRemonitor(rows, function () { renderReverse(lastInstances); }));
     var page = paginateRows(rows, reversePager);
     body.appendChild(findingsTable(
-      ["instance", "item", "season", "reason"],
+      ["instance", "item", "season", "reason", "action"],
       page.pageRows,
       function (r) {
         var tr = el("tr");
@@ -1078,10 +1163,406 @@
           var td = el("td"); text(td, cells[c]);
           tr.appendChild(td);
         }
+        var actionCell = el("td", "action-cell");
+        actionCell.appendChild(buildActionButton({
+          kind: "remonitor",
+          tone: "sage",
+          label: reverseActionLabel(r.f),
+          body: reverseActionBody(r),
+          container: tr
+        }));
+        tr.appendChild(actionCell);
         return tr;
       }
     ));
     body.appendChild(buildPagerControls(reversePager, page, function () { renderReverse(lastInstances); }));
+  }
+
+  // --- [v2.2] actions -----------------------------------------------------
+  //
+  // Everything below is the human-clicked action system's front end. Three
+  // rules run through all of it, and they are the same three the server
+  // enforces from its side:
+  //
+  //   - A button STATES ITS EXACT OPERATION. Never "Fix", never "Clean up".
+  //     The label is the operation, the confirm dialog re-shows that same
+  //     label verbatim, and the server echoes it back in the response so the
+  //     row can prove the three agree.
+  //   - A button that is switched off is DISABLED WITH ITS REASON, never
+  //     hidden. Hiding it would say "this finding is not actionable", which
+  //     is false and unfixable; disabling it says "you have not turned this
+  //     on", which is true and one config line away.
+  //   - The row updates from the RESPONSE, not from a hopeful assumption and
+  //     not by waiting for the next sweep: performed strikes the row through,
+  //     refused leaves a clay note, rehearsed an amber one — and it KEEPS
+  //     that state across repaints (see actionOutcomes), because the two
+  //     renderers rebuild their tables from scratch on a 30s timer and a
+  //     result that survives for at most one poll has not satisfied "without
+  //     waiting for the next sweep" at all.
+
+  // actionOutcomes is that memory: finding identity -> the last response this
+  // page got for it. It exists because renderReverse and renderFileReport both
+  // begin with body.textContent = "" and refresh() calls render(data) every
+  // POLL_MS, so without it the strike-through, the refusal note and the merge's
+  // itemized collisions were all wiped within 30 seconds — and the row came
+  // back from the STILL-STALE snapshot with a fully live "Move to trash — …"
+  // button for a file that is already in the trash. The second click is safely
+  // refused by the server, so that was misleading rather than dangerous, but
+  // "the action did not work" is exactly the wrong thing for the page to say
+  // about an action that did.
+  //
+  // The identity is what a REBUILT row can be matched on: instance + kind +
+  // path for a file action, instance + id + season for a re-monitor. Entries
+  // live until the finding stops appearing in a snapshot (pruneActionOutcomes),
+  // which is the honest end of their life: while the server still reports the
+  // finding, what this page last heard about it is still the freshest thing
+  // anybody knows.
+  var actionOutcomes = {};
+
+  // actionKey builds that identity from the very body the button would POST,
+  // so the key and the request can never describe different findings.
+  function actionKey(body) {
+    if (!body || !body.kind) return "";
+    if (body.kind === "remonitor") {
+      var season = (body.season === undefined || body.season === null) ? "-" : String(body.season);
+      return body.instance + "|remonitor|" + (body.id || 0) + "|" + season;
+    }
+    if (body.kind === "merge-case-twin") {
+      return body.instance + "|merge-case-twin|" + (body.path || "") + "|" + (body.tracked || "") + "|" + (body.untracked || "");
+    }
+    return body.instance + "|" + body.kind + "|" + (body.path || "");
+  }
+
+  function rememberActionOutcome(body, resp) {
+    var key = actionKey(body);
+    if (key) actionOutcomes[key] = resp;
+  }
+
+  function rememberedActionOutcome(body) {
+    var key = actionKey(body);
+    return key ? actionOutcomes[key] : null;
+  }
+
+  // pruneActionOutcomes drops everything the current snapshot no longer
+  // reports. It is built from the DATA rather than from the buttons that were
+  // rendered, deliberately: both finding tables are paginated, so a run keyed
+  // on "which buttons did we just build" would forget every outcome on a page
+  // the operator happened to be scrolled away from.
+  function pruneActionOutcomes(instances) {
+    var live = {};
+    for (var i = 0; i < instances.length; i++) {
+      var inst = instances[i];
+      var rf = inst.reverseFindings || [];
+      for (var j = 0; j < rf.length; j++) {
+        live[actionKey(reverseActionBody({ instance: inst.name, f: rf[j] }))] = true;
+      }
+      var fr = (inst.fileReport && inst.fileReport.findings) || [];
+      for (var k = 0; k < fr.length; k++) {
+        var f = fr[k];
+        if (f.kind === "case-collision") {
+          var elig = twinEligibility(f);
+          live[actionKey({
+            kind: "merge-case-twin", instance: inst.name, path: f.path || "",
+            tracked: elig.tracked || "", untracked: elig.untracked || ""
+          })] = true;
+        } else {
+          live[actionKey({ kind: "trash", instance: inst.name, path: f.path || "" })] = true;
+        }
+      }
+    }
+    for (var key in actionOutcomes) {
+      if (Object.prototype.hasOwnProperty.call(actionOutcomes, key) && !live[key]) delete actionOutcomes[key];
+    }
+  }
+
+  // actionSwitches mirrors the two config flags GET /api/stats reports, so a
+  // button's disabled state is always the daemon's own answer rather than
+  // this page's guess. Both default to false: a page that has not yet heard
+  // from a daemon must never render a live-looking button.
+  var actionSwitches = { guiActions: false, reverseScanRemonitor: false, dryRun: true };
+
+  // actionDisabledReason returns "" when this kind of action may be clicked,
+  // or the exact reason it may not — naming the switch, because an operator
+  // who has already set one flag needs to be told it is the other one.
+  function actionDisabledReason(kind) {
+    if (!actionSwitches.guiActions) {
+      return "gui_actions is false in this cutoffarr's config, so it will not act on findings for you";
+    }
+    if (kind === "remonitor" && !actionSwitches.reverseScanRemonitor) {
+      return "reverse_scan_remonitor is false, so no re-monitor may be written by any path — set it as well as gui_actions";
+    }
+    return "";
+  }
+
+  // postAction sends one confirmed action and resolves with the parsed body
+  // whatever the status was: a refusal is an ANSWER, not a failure, and the
+  // page renders its reason rather than routing it through the disconnected
+  // signal the way a genuinely broken request goes.
+  function postAction(body) {
+    return fetch("/api/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      return r.json().then(function (parsed) { return { ok: r.ok, body: parsed }; });
+    });
+  }
+
+  // renderActionOutcome puts one response onto one row.
+  function renderActionOutcome(note, container, resp) {
+    var outcome = (resp && resp.outcome) || "refused";
+    note.className = "action-note action-note-" +
+      (outcome === "performed" ? "done" : outcome === "rehearsed" ? "rehearsed" : "refused");
+    text(note, (resp && (resp.message || resp.reason)) || "the action produced no answer");
+    if (outcome === "performed" && container) {
+      container.className = container.className + " action-performed";
+    }
+    if (resp && resp.items && resp.items.length) {
+      // The merge's itemized collisions. Every one of them is a file that
+      // went to the trash instead of overwriting something, and a human who
+      // just moved files needs to see exactly which without going to the log.
+      var list = el("ul", "status-notices");
+      for (var i = 0; i < resp.items.length; i++) {
+        var li = el("li", "status-notice status-skipped");
+        text(li, resp.items[i]);
+        list.appendChild(li);
+      }
+      note.appendChild(list);
+    }
+  }
+
+  // buildActionButton makes one per-finding button: the label IS the
+  // operation, the confirm re-shows it verbatim, and the note element beside
+  // it carries either the disabled reason or the outcome.
+  //
+  // `container` is the element struck through when the action is performed
+  // (the <tr>, or the case-twin item) — passed in rather than derived,
+  // because the three surfaces have three different row shapes.
+  function buildActionButton(opts) {
+    var wrap = el("div", "action-wrap");
+    var btn = el("button", "action-btn action-" + opts.tone);
+    btn.type = "button";
+    text(btn, opts.label);
+    var note = el("span", "action-note");
+    wrap.appendChild(btn);
+    wrap.appendChild(note);
+
+    // A row REBUILT by a poll (or by a pager click) re-applies whatever this
+    // page last heard about this exact finding, before anything else is
+    // decided about the button. A performed action also keeps the button
+    // disabled: the operation is done, and re-arming it would read as "that
+    // did not work". Every other outcome leaves the button live, because a
+    // refusal or a failure is a thing an operator may legitimately retry once
+    // they have fixed its cause — the note tells them what that cause was.
+    var remembered = rememberedActionOutcome(opts.body);
+    // An ineligible finding (rule 5's report-only twin shapes) is disabled
+    // for a reason that has nothing to do with the switches, and that reason
+    // wins: it is about THIS finding, not about the deployment.
+    //
+    // Computed HERE, above both branches, because a disabled button and a
+    // remembered outcome can be true at once and used not to be handled
+    // together — see the remembered branch below.
+    var reason = opts.ineligible || actionDisabledReason(opts.kind);
+
+    if (remembered) {
+      // Still disabled if the deployment (or this twin's shape) says so: an
+      // outcome this page remembers is a fact about the past, never an
+      // authorization for a second click.
+      btn.disabled = remembered.outcome === "performed" || !!reason;
+      // The reason wins the title when there is one. This branch used to set
+      // the label unconditionally, which meant the one combination of
+      // disabled-with-a-reason AND an outcome to show — a daemon restarted
+      // with a switch flipped while a tab holding outcomes stays open, an
+      // ineligible twin whose earlier click was refused — came back as a dead
+      // button explaining itself nowhere.
+      btn.title = reason || opts.label;
+      renderActionOutcome(note, opts.container, remembered);
+      if (reason) {
+        // Beside the outcome, not instead of it: both are true, and a title
+        // alone is invisible on a touch screen. It is a separate node because
+        // renderActionOutcome owns the note's text (textContent), and it goes
+        // in immediately after that text so a merge's itemized collision list
+        // still reads last.
+        var why = el("span", "action-why");
+        text(why, " — " + reason);
+        note.insertBefore(why, note.firstChild && note.firstChild.nextSibling);
+      }
+      if (!btn.disabled) attachActionClick(btn, note, opts);
+      return wrap;
+    }
+
+    if (reason) {
+      btn.disabled = true;
+      btn.title = reason;
+      text(note, reason);
+      return wrap;
+    }
+
+    btn.title = opts.label;
+    attachActionClick(btn, note, opts);
+    return wrap;
+  }
+
+  // attachActionClick is the confirm-then-POST half of buildActionButton,
+  // shared with the remembered-outcome path above so a retryable row's button
+  // behaves identically to a freshly rendered one.
+  function attachActionClick(btn, note, opts) {
+    btn.addEventListener("click", function () {
+      // The confirm gate. It re-shows the FULL operation — the same string
+      // the button carries and the server will echo back — so the last thing
+      // a human reads before anything happens is exactly what will happen.
+      var prompt = opts.label + "\n\n" +
+        (actionSwitches.dryRun
+          ? "dry_run is on, so this will be REHEARSED only: cutoffarr will re-verify everything and then tell you what it would have done."
+          : "This will be performed now. Files are moved to .cutoffarr-trash, never deleted.");
+      if (!window.confirm(prompt)) return;
+
+      btn.disabled = true;
+      text(note, "working…");
+      note.className = "action-note";
+      postAction(opts.body)
+        .then(function (res) {
+          rememberActionOutcome(opts.body, res.body);
+          renderActionOutcome(note, opts.container, res.body);
+          if (!res.body || res.body.outcome !== "performed") btn.disabled = false;
+        })
+        .catch(function () {
+          // Deliberately NOT remembered: a network failure establishes
+          // nothing about whether the action ran, and a memory that survived
+          // repaints would keep asserting that non-answer over whatever the
+          // next poll's data says.
+          note.className = "action-note action-note-refused";
+          text(note, "cutoffarr could not be reached, so nothing is known about whether anything happened — check the log before clicking again");
+          btn.disabled = false;
+        });
+    });
+  }
+
+  // reverseActionLabel is the re-monitor button's exact operation, matching
+  // the server's own remonitorOperationText word for word.
+  function reverseActionLabel(f) {
+    var title = f.title || f.series || "this item";
+    var id = f.id || f.seriesId || 0;
+    var noun = f.seriesId ? "series" : "movie";
+    if (f.season !== undefined && f.season !== null) {
+      return "Re-monitor — " + title + " season " + f.season + " (" + noun + " " + id + ")";
+    }
+    return "Re-monitor — " + title + " (" + noun + " " + id + ")";
+  }
+
+  function reverseActionBody(row) {
+    var f = row.f;
+    var body = { kind: "remonitor", confirm: true, instance: row.instance, id: f.id || f.seriesId || 0 };
+    if (f.season !== undefined && f.season !== null) body.season = f.season;
+    return body;
+  }
+
+  // humanSize mirrors the server's own humanSize: the trash button has to
+  // state how big the file it would move is, and the two must not disagree
+  // about the number a human reads before confirming.
+  function humanSize(n) {
+    if (!n || n <= 0) return "size unknown";
+    if (n < 1024) return n + " B";
+    if (n < 1048576) return Math.round(n / 1024) + " KB";
+    if (n < 1073741824) return Math.round(n / 1048576) + " MB";
+    return (n / 1073741824).toFixed(1) + " GB";
+  }
+
+  // buildBulkRemonitor is the ONE bulk action this phase has. File actions
+  // stay strictly per-item: destroying — or here, moving — many files at once
+  // on one click is a different decision from moving one, and it has not been
+  // ruled on. A bulk re-monitor is safe in a way a bulk file action is not:
+  // every item still goes through its own full re-verification server-side,
+  // the writes are serialized by the same single-flight executor, and the
+  // worst case is a flag flipped on something that will be flipped back by
+  // the next sweep.
+  //
+  // Its summary survives its own rerender through bulkRemonitorSummary, for
+  // the same reason the per-row outcomes survive a poll: the completion used
+  // to write the summary into `note` and then call rerender(), whose first act
+  // is body.textContent = "" — destroying the sentence in the same tick, so
+  // the operator never saw it at all and the repaint came back from the stale
+  // findings looking exactly as it had before the click.
+  var bulkRemonitorSummary = null;
+
+  function buildBulkRemonitor(rows, rerender) {
+    var wrap = el("div", "bulk-actions");
+    var label = "Re-monitor all " + rows.length + " reverse-scan finding" + (rows.length === 1 ? "" : "s");
+    var btn = el("button", "action-btn action-sage");
+    btn.type = "button";
+    text(btn, label);
+    var note = el("span", "action-note");
+    wrap.appendChild(btn);
+    wrap.appendChild(note);
+
+    if (bulkRemonitorSummary) {
+      note.className = "action-note action-note-" + bulkRemonitorSummary.tone;
+      text(note, bulkRemonitorSummary.text);
+    }
+
+    var reason = actionDisabledReason("remonitor");
+    if (reason) {
+      btn.disabled = true;
+      btn.title = reason;
+      text(note, reason);
+      return wrap;
+    }
+
+    btn.title = label;
+    btn.addEventListener("click", function () {
+      var lines = [];
+      for (var i = 0; i < rows.length; i++) lines.push("  " + reverseActionLabel(rows[i].f));
+      if (!window.confirm(label + ":\n\n" + lines.join("\n") + "\n\n" +
+        (actionSwitches.dryRun ? "dry_run is on, so every one of these will be REHEARSED only." : "Each one is re-verified against fresh data before it is written."))) return;
+
+      btn.disabled = true;
+      bulkRemonitorSummary = null;
+      // Three counters, not two. A 502 `failed` and a network error are NOT
+      // refusals: "refused" means cutoffarr decided not to, and one of these
+      // means it tried and something outside it broke — which is the operator's
+      // cue to go and look at their server. Collapsing them asserted a decision
+      // where the outcome is genuinely unknown.
+      var performed = 0, declined = 0, unknown = 0;
+      // Strictly sequential: the server serializes actions anyway, and firing
+      // N requests at a single-flight executor would only queue them inside
+      // its lock while this page had no idea which one it was waiting on.
+      var i = 0;
+      function step() {
+        if (i >= rows.length) {
+          var summary = performed + " answered yes, " + declined + " were refused or rehearsed";
+          if (unknown > 0) summary += ", " + unknown + " failed or unknown — check the log";
+          bulkRemonitorSummary = {
+            tone: (declined || unknown) ? "refused" : "done",
+            text: summary + " — reloading the findings."
+          };
+          // The per-row outcomes were remembered as each answer arrived, so
+          // this repaint brings every row back carrying its own result, and
+          // buildBulkRemonitor re-applies the summary above from the same
+          // memory rather than writing into a note it is about to destroy.
+          rerender();
+          return;
+        }
+        text(note, "working on " + (i + 1) + " of " + rows.length + "…");
+        var body = reverseActionBody(rows[i]);
+        postAction(body)
+          .then(function (res) {
+            var outcome = res.body && res.body.outcome;
+            if (outcome === "performed") performed++;
+            else if (outcome === "refused" || outcome === "rehearsed" || outcome === "disabled") declined++;
+            else unknown++;
+            if (outcome) rememberActionOutcome(body, res.body);
+            i++;
+            step();
+          })
+          .catch(function () {
+            unknown++;
+            i++;
+            step();
+          });
+      }
+      step();
+    });
+    return wrap;
   }
 
   // buildCaseCollisionBlock is [ROUND, inline-display fix]: renders every
@@ -1122,9 +1603,59 @@
         item.appendChild(nameLine);
       }
 
+      // [v2.2] The merge button — or, for a shape rule 5 will not merge, the
+      // same button DISABLED carrying the reason. twinEligibility mirrors the
+      // server's twinMergeEligibility exactly; the server re-decides it
+      // against fresh data before acting either way, so a page whose copy has
+      // drifted can only ever offer a button the server then refuses, never
+      // sneak an ineligible shape past it.
+      var el2 = twinEligibility(f);
+      item.appendChild(buildActionButton({
+        kind: "merge-case-twin",
+        tone: "clay",
+        label: el2.ok
+          ? ("Merge \"" + el2.untracked + "\" into \"" + el2.tracked + "\" [tracked]")
+          : "Merge — not offered for this twin",
+        ineligible: el2.ok ? "" : el2.reason,
+        body: {
+          kind: "merge-case-twin", confirm: true, instance: collisions[i].instance,
+          path: f.path || "", tracked: el2.tracked, untracked: el2.untracked
+        },
+        container: item
+      }));
+
       wrap.appendChild(item);
     }
     return wrap;
+  }
+
+  // twinEligibility is the client-side twin of the server's
+  // twinMergeEligibility (actions.go). It decides only whether to OFFER a
+  // button and what reason to show when it does not; the server re-decides
+  // the same question against freshly re-derived data before moving anything,
+  // so this can never authorize a merge — only decline to suggest one.
+  function twinEligibility(f) {
+    if (f.entryType === "mixed") {
+      return { ok: false, reason: "this twin is a folder and a file sharing one name — there are no folder contents to merge, so the fix is a human's call" };
+    }
+    if (f.entryType === "file") {
+      return { ok: false, reason: "these twins are files, not folders — merging would mean choosing which copy wins, which cutoffarr will not decide for you" };
+    }
+    var names = f.names || [];
+    if (names.length !== 2) {
+      return { ok: false, reason: "this twin has " + names.length + " spellings — the pairwise merge a button could name does not describe what would happen" };
+    }
+    var tracked = [], untracked = [];
+    for (var i = 0; i < names.length; i++) {
+      (names[i].tracked ? tracked : untracked).push(names[i].name);
+    }
+    if (tracked.length === 0) {
+      return { ok: false, reason: "neither spelling is tracked by this instance, so nothing establishes which one is the real folder" };
+    }
+    if (tracked.length === 2) {
+      return { ok: false, reason: "both spellings are tracked by this instance — that is a problem in the *arr's own database rather than on disk" };
+    }
+    return { ok: true, tracked: tracked[0], untracked: untracked[0] };
   }
 
   // renderFileReport is status-aware: fileReport.status is ran|skipped|off
@@ -1247,7 +1778,7 @@
     }
     var page = paginateRows(rows, filePager);
     body.appendChild(findingsTable(
-      ["instance", "kind", "group", "path", "count"],
+      ["instance", "kind", "group", "path", "count", "action"],
       page.pageRows,
       function (r) {
         var tr = el("tr");
@@ -1282,6 +1813,30 @@
         td.title = r.f.path || "";
         tr.appendChild(td);
         td = el("td"); text(td, count); tr.appendChild(td);
+        // [v2.2] The trash button. Clay, because it moves a file; its label
+        // states the exact operation including the size, which is the single
+        // most useful fact for telling a stray sample from the real episode.
+        //
+        // A finding the sweep recorded NO size for is ineligible, quoting the
+        // server's own refusal (actions.go's `reported.Size <= 0` gate). This
+        // row used to render fully live, labelled "… (size unknown)", and
+        // answered 409 on every click — the one unactionable shape in this GUI
+        // that did not state its reason up front, and the one where the label
+        // already admits something is missing.
+        var actionCell = el("td", "action-cell");
+        actionCell.appendChild(buildActionButton({
+          kind: "trash",
+          tone: "clay",
+          label: "Move to trash — " + (r.f.display || r.f.path || "") + " (" + humanSize(r.f.size) + ")",
+          ineligible: r.f.size > 0 ? "" :
+            "the last completed sweep recorded no size for this file (it could not be stat'd, or it is a zero-byte file), so cutoffarr cannot establish that the file there now is the one this button describes. Move it by hand if that is what you want.",
+          body: {
+            kind: "trash", confirm: true, instance: r.instance,
+            path: r.f.path || "", finding: r.f.kind || "", size: r.f.size || 0
+          },
+          container: tr
+        }));
+        tr.appendChild(actionCell);
         return tr;
       }
     ));
@@ -1298,6 +1853,12 @@
       text(badge, "live");
     }
 
+    // [v2.2] The switches are captured BEFORE the three renderers run, since
+    // every button they build reads them to decide disabled-with-reason.
+    actionSwitches.guiActions = !!data.guiActions;
+    actionSwitches.reverseScanRemonitor = !!data.reverseScanRemonitor;
+    actionSwitches.dryRun = !!data.dryRun;
+
     var instances = data.instances || [];
     lastInstances = instances;
     var latest = null;
@@ -1307,6 +1868,12 @@
     }
     text(document.getElementById("lastSwept"), "last swept " + fmtRelative(latest));
     text(document.getElementById("versionLabel"), "· " + (data.version || "dev"));
+
+    // [v2.2] Before the three renderers rebuild their tables from scratch:
+    // forget what this page was told about findings this snapshot no longer
+    // reports (the click worked and the sweep has caught up), and keep
+    // everything else so the rows come back carrying their outcomes.
+    pruneActionOutcomes(instances);
 
     renderInstances(instances);
     renderReverse(instances);

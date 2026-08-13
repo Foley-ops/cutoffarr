@@ -406,3 +406,59 @@ func uncommented(yaml string) string {
 	}
 	return b.String()
 }
+
+// TestComposeExample_MediaStaysReadOnlyByDefaultWithAnActionsVariantExplained
+// is [v2.2]'s deploy-shape pin, and rule 8's half of the deployment artifact.
+//
+// The action system can move files, and it can only move files if the media
+// volume is mounted read-WRITE. The ruling that permits a human to act does
+// not permit the DEFAULT deployment to be one where a bug could. So:
+//
+//   - Every media mount line the example ships must still end in :ro. That is
+//     asserted against the file's real content (comments included), because
+//     these lines are shipped commented-out — an operator uncomments and edits
+//     them, so a commented line carrying :rw would be exactly as harmful as an
+//     uncommented one.
+//   - The rw variant must be present, commented, and adjacent to an
+//     explanation of the trade, so an operator who wants the buttons finds the
+//     one line to change and the reason it is not already changed.
+func TestComposeExample_MediaStaysReadOnlyByDefaultWithAnActionsVariantExplained(t *testing.T) {
+	compose := readRepoFile(t, "docker-compose.example.yml")
+
+	// Every media volume line, commented or not, must be :ro. The rw variant
+	// is deliberately excluded from this sweep by being written as a distinct,
+	// clearly-labelled block the check below looks for on purpose.
+	for _, line := range strings.Split(compose, "\n") {
+		trimmed := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "#"))
+		if !strings.HasPrefix(trimmed, "- /mnt/user/data/media/") {
+			continue
+		}
+		if strings.Contains(trimmed, ":rw") {
+			if !strings.Contains(compose, actionsVariantMarker) {
+				t.Errorf("a :rw media mount appears without the actions-enabled block that explains it: %q", trimmed)
+			}
+			continue
+		}
+		if !strings.HasSuffix(trimmed, ":ro") {
+			t.Errorf("media mount %q does not end in :ro; the read-only mount is the DEFAULT this deployment ships and a bug's blast radius depends on it", trimmed)
+		}
+	}
+
+	if !strings.Contains(compose, actionsVariantMarker) {
+		t.Errorf("the compose example must carry a commented actions-enabled (:rw) variant so an operator who wants the buttons finds the one line to change:\n%s", compose)
+	}
+	// The uncommented file must NOT carry an rw media mount: the variant is an
+	// opt-in an operator makes, never the shipped default.
+	if strings.Contains(uncommented(compose), "/data/media/") {
+		t.Error("the shipped compose example has an ACTIVE media mount; media mounts are commented-out examples an operator edits, and the actions variant especially must never ship live")
+	}
+	for _, want := range []string{"gui_actions", "read-only"} {
+		if !strings.Contains(compose, want) {
+			t.Errorf("the actions-enabled variant must mention %q so the trade is stated where the change is made", want)
+		}
+	}
+}
+
+// actionsVariantMarker is the comment heading the actions-enabled mount block
+// carries. Named here so the test and the file cannot drift on it silently.
+const actionsVariantMarker = "ACTIONS-ENABLED VARIANT"

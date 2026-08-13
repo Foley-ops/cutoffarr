@@ -192,6 +192,19 @@ func scopedReverseOptions(cfg Config) reverseOptions {
 	return reverseOptions{enabled: cfg.ReverseScanRemonitor, remonitor: cfg.ReverseScanRemonitor}
 }
 
+// withheldByDryRunReason is the §2.1 dry-run gate's own withholding reason —
+// the one reason in this file that turning dry_run OFF actually overcomes.
+//
+// It is a named constant because the GUI action path has to tell it apart from
+// every other withholding by identity (reverseCounts.withheldReason ==
+// withheldByDryRunReason), and only that one may be reported to an operator as
+// "rehearsed — with dry_run: false this would re-monitor the item". The others
+// — the cross-check write gate, a Sonarr season whose series is unmonitored, a
+// shutdown — are refusals that dry_run has nothing to do with, and reporting
+// any of them as a successful rehearsal promises a write that would never
+// happen (round-2 review).
+const withheldByDryRunReason = "dry_run is on, so the write was withheld at the §2.1 gate immediately before the PUT"
+
 // reverseCounts is one instance's reverse-scan accounting for one cycle.
 //
 // findings is what the report-only default produces. The five write counters
@@ -224,6 +237,26 @@ type reverseCounts struct {
 	writeErrors    int
 	echoUnverified int
 	withheld       int
+
+	// withheldReason is [v2.2] the reason the most recently withheld item was
+	// withheld, in the words the operator should read. It exists for exactly
+	// one caller — the GUI re-monitor action (actions.go), which drives this
+	// same pass scoped to ONE item and therefore has at most one withheld item
+	// to explain — and it is deliberately not part of any log line or summary:
+	// the whole-library passes already log every withholding at the moment it
+	// happens, with the full per-item attrs, and folding a "last reason" into
+	// a summary line would misrepresent N different withholdings as one.
+	//
+	// A pass that withheld nothing leaves it empty, which is the only state
+	// the action path treats as "there is nothing to explain".
+	//
+	// Round-2 review fix: the action path must also tell the ONE withholding
+	// that turning dry_run off would overcome apart from the several it would
+	// not (a blocked cross-check write gate, a Sonarr season under an
+	// unmonitored series, a shutdown). It does that by comparing this string
+	// against withheldByDryRunReason rather than by consulting cfg.DryRun,
+	// which is why that reason is a shared constant and not a literal.
+	withheldReason string
 
 	// movieFindings and seasonFindings are Phase 12's addition: the SAME
 	// findings the counters above already tally, kept as data rather than
@@ -800,6 +833,7 @@ func (c *reverseCounts) record(logger *slog.Logger, attrs []any, written bool, e
 		// the PUT, and has already been logged at debug. The ONLY remaining
 		// (false, nil) case, exactly as on the forward paths.
 		c.withheld++
+		c.withheldReason = withheldByDryRunReason
 	default:
 		c.remonitored++
 		logger.Info("remonitor", attrs...)
@@ -816,6 +850,7 @@ func (c *reverseCounts) record(logger *slog.Logger, attrs []any, written bool, e
 func (p reversePass) remonitorMovies(ctx context.Context, findings []movieDecision, rev reverseWriteContext, c *reverseCounts) {
 	if reason := reverseWriteGateBlockReason(p.cc); reason != "" {
 		c.withheld += len(findings)
+		c.withheldReason = reason
 		if len(findings) > 0 {
 			// One line per instance per cycle, not per item: "nothing was
 			// written" and "nothing needed writing" must never look the same,
@@ -836,6 +871,7 @@ func (p reversePass) remonitorMovies(ctx context.Context, findings []movieDecisi
 		// finishes.
 		if ctx.Err() != nil {
 			c.withheld++
+			c.withheldReason = "shutdown was requested before this item's write began"
 			if !shutdownNoted {
 				shutdownNoted = true
 				p.logger.Info("shutdown requested: the remaining reverse-scan writes for this instance are withheld and the next cycle will revisit them",
@@ -916,6 +952,7 @@ func verifySeasonStillAReverseFinding(ctx context.Context, logger *slog.Logger, 
 func (p reversePass) remonitorSeasons(ctx context.Context, findings []reverseSeasonFinding, rev reverseWriteContext, c *reverseCounts) {
 	if reason := reverseWriteGateBlockReason(p.cc); reason != "" {
 		c.withheld += len(findings)
+		c.withheldReason = reason
 		if len(findings) > 0 {
 			attrs := []any{"instance", p.inst.Name, "type", p.inst.Type, "crossCheck", p.cc.status}
 			attrs = append(attrs, p.cc.logAttrs()...)
@@ -940,6 +977,7 @@ func (p reversePass) remonitorSeasons(ctx context.Context, findings []reverseSea
 		// series retired between the scan and the write is caught.
 		if !f.seriesMonitored {
 			c.withheld++
+			c.withheldReason = "this season's series is not monitored, so re-monitoring the season would fight a deliberate retirement of the whole show"
 			p.logger.Log(ctx, p.itemLevel, "reverse-scan finding withheld: its series is not monitored, so re-monitoring this season would fight a deliberate retirement of the whole show; reporting it is all this cycle will do",
 				append(append([]any(nil), attrs...), "seriesMonitored", false)...)
 			continue
@@ -947,6 +985,7 @@ func (p reversePass) remonitorSeasons(ctx context.Context, findings []reverseSea
 
 		if ctx.Err() != nil {
 			c.withheld++
+			c.withheldReason = "shutdown was requested before this item's write began"
 			if !shutdownNoted {
 				shutdownNoted = true
 				p.logger.Info("shutdown requested: the remaining reverse-scan writes for this instance are withheld and the next cycle will revisit them",

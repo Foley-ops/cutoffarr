@@ -373,6 +373,16 @@ func TestDaemon_ComposedMux_RouteTable(t *testing.T) {
 		{http.MethodPost, "/api/scan", http.StatusAccepted},
 		{http.MethodGet, "/api/scan", http.StatusMethodNotAllowed},
 
+		// [v2.2] The action endpoint. A GET is 405 from the route pattern
+		// itself, and a POST with no body is a 400 — the endpoint's own
+		// "could not be read as JSON" refusal, which is the correct answer
+		// and proves the route reaches the handler rather than the mux's
+		// catch-all. Nothing here performs an action: the daemon under test
+		// runs with gui_actions absent (false), so even a well-formed body
+		// would be a 403.
+		{http.MethodGet, "/api/action", http.StatusMethodNotAllowed},
+		{http.MethodPost, "/api/action", http.StatusBadRequest},
+
 		// A path nothing recognizes: the catch-all "/" webui mux's own 404,
 		// unaffected by any of the above.
 		{http.MethodGet, "/nope", http.StatusNotFound},

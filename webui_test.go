@@ -1612,3 +1612,595 @@ func TestWebUIPage_UnreachableBadgeWrapsInsteadOfOverflowing(t *testing.T) {
 		t.Error(".shelf-unreachable never overrides .badge's uppercase text-transform; a full sentence in 11px caps is unreadable")
 	}
 }
+
+// --- [v2.2] the action switches on the wire ---------------------------------
+
+// TestWebUIHandler_Stats_CarriesTheActionSwitches is what lets the page render
+// a button DISABLED WITH ITS REASON rather than either hiding it (which reads
+// as "this finding is not actionable") or showing it live and letting the
+// click 403 (which reads as "cutoffarr is broken"). The page cannot know which
+// switch is missing without being told, and rule 7 is explicit that it must
+// never lie about which one it is.
+func TestWebUIHandler_Stats_CarriesTheActionSwitches(t *testing.T) {
+	store := newStatsStore(true)
+	srv := &webUIServer{stats: store, scan: newScanCoordinator(),
+		actions: newActionRunner(Config{GUIActions: true, ReverseScanRemonitor: false}, nil, store)}
+	ts := httptest.NewServer(newWebUIHandler(srv))
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Get(ts.URL + "/api/stats")
+	if err != nil {
+		t.Fatalf("GET /api/stats: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+	if raw["guiActions"] != true {
+		t.Errorf("guiActions = %v, want true", raw["guiActions"])
+	}
+	if raw["reverseScanRemonitor"] != false {
+		t.Errorf("reverseScanRemonitor = %v, want false", raw["reverseScanRemonitor"])
+	}
+}
+
+// TestWebUIHandler_Stats_NoActionRunnerReportsBothSwitchesOff keeps the
+// pre-v2.2 shape honest: a server with no action system wired must report the
+// switches as off rather than omitting them, or the page would fall back to
+// its own default and could render a live-looking button on a deployment where
+// every click is a 403.
+func TestWebUIHandler_Stats_NoActionRunnerReportsBothSwitchesOff(t *testing.T) {
+	ts, _ := newTestWebUIServer(t, newStatsStore(true))
+	resp, err := http.Get(ts.URL + "/api/stats")
+	if err != nil {
+		t.Fatalf("GET /api/stats: %v", err)
+	}
+	defer resp.Body.Close()
+	var raw map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+	for _, key := range []string{"guiActions", "reverseScanRemonitor"} {
+		v, present := raw[key]
+		if !present {
+			t.Errorf("%s is absent from the stats payload; the page must never have to guess a switch state", key)
+		}
+		if v != false {
+			t.Errorf("%s = %v, want false when no action system is wired", key, v)
+		}
+	}
+}
+
+// TestActionEndpoint_TheTwoExitsBeforeTheRunnerAreLogged closes the one hole in
+// rule 9's coverage of this endpoint: handleAction has two exits that answer
+// WITHOUT reaching the runner, and neither used to write a log line at any
+// level, while every exit the runner owns produces a full msg=action line.
+//
+// On the one unauthenticated endpoint in this program that can move files, that
+// silence hid two very different things at once — a burst of malformed probes
+// against the port, and an operator's "I click the button and nothing happens"
+// on a deployment where no action system is wired at all. Both are now one line
+// each, at WARN, carrying the status that was actually returned.
+func TestActionEndpoint_TheTwoExitsBeforeTheRunnerAreLogged(t *testing.T) {
+	const body = `{"kind":"trash","confirm":true,"instance":"radarr-main","path":"/x","finding":"duplicate","size":10}`
+
+	t.Run("no action system wired", func(t *testing.T) {
+		logger, buf := newActionTestLogger()
+		store := newStatsStore(true)
+		ts := httptest.NewServer(newWebUIHandler(&webUIServer{
+			stats: store, scan: newScanCoordinator(), logger: logger,
+		}))
+		t.Cleanup(ts.Close)
+
+		status, out := postAction(t, ts, body)
+		if status != http.StatusForbidden || out.Outcome != actionOutcomeDisabled {
+			t.Fatalf("status=%d outcome=%q, want 403/disabled", status, out.Outcome)
+		}
+		log := buf.String()
+		for _, want := range []string{"level=WARN", "msg=action", "source=gui", "outcome=" + actionOutcomeDisabled, "status=403"} {
+			if !strings.Contains(log, want) {
+				t.Errorf("the no-runner exit's log line is missing %q; an operator whose buttons do nothing must be able to find out why from the log. Log:\n%s", want, log)
+			}
+		}
+	})
+
+	t.Run("a body that cannot be read", func(t *testing.T) {
+		logger, buf := newActionTestLogger()
+		store := newStatsStore(true)
+		ts := httptest.NewServer(newWebUIHandler(&webUIServer{
+			stats: store, scan: newScanCoordinator(), logger: logger,
+			actions: newActionRunner(Config{GUIActions: true}, logger, store),
+		}))
+		t.Cleanup(ts.Close)
+
+		status, out := postAction(t, ts, `{not json`)
+		if status != http.StatusBadRequest || out.Outcome != actionOutcomeRefused {
+			t.Fatalf("status=%d outcome=%q, want 400/refused", status, out.Outcome)
+		}
+		log := buf.String()
+		for _, want := range []string{"level=WARN", "source=gui", "status=400", "error="} {
+			if !strings.Contains(log, want) {
+				t.Errorf("the undecodable-body exit's log line is missing %q; a burst of malformed probes at this endpoint must not be invisible. Log:\n%s", want, log)
+			}
+		}
+	})
+}
+
+// TestWebUIServer_ADeadlineThatCannotBeSetIsNotADebugLine is the second half of
+// the same finding. If SetWriteDeadline fails in production the action silently
+// reverts to the server's 30s WriteTimeout — the exact mid-move connection
+// teardown actionDeadline exists to prevent, on a request that may be renaming
+// files — and at Debug that reverting is invisible on every deployment that
+// does not run with debug logging, which is all of them.
+func TestWebUIServer_ADeadlineThatCannotBeSetIsNotADebugLine(t *testing.T) {
+	src := webUIGoSource(t)
+	call := strings.Index(src, "SetWriteDeadline(")
+	if call == -1 {
+		t.Fatal("webui.go no longer sets a write deadline on the action response")
+	}
+	// The if-block the failure is handled in, whatever length its comment
+	// grows to: from the call to the first line that closes it at one tab.
+	block := src[call:]
+	if end := strings.Index(block, "\n\t}\n"); end != -1 {
+		block = block[:end]
+	}
+	if strings.Contains(block, ".Debug(") || strings.Contains(block, "logDebug(") {
+		t.Errorf("the deadline failure is still logged at Debug, where a production deployment never sees it:\n%s", block)
+	}
+	if !strings.Contains(block, "logWarn(") {
+		t.Errorf("the deadline failure must be logged at Warn; got:\n%s", block)
+	}
+}
+
+// webUIGoSource reads webui.go itself. The two properties above are about the
+// LEVEL a line is emitted at on a path that needs a real ResponseWriter failure
+// to reach, which no httptest recorder can be made to produce reliably; the
+// source is where the level is decided and is therefore what is pinned.
+func webUIGoSource(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile("webui.go")
+	if err != nil {
+		t.Fatalf("reading webui.go: %v", err)
+	}
+	return string(b)
+}
+
+// --- [v2.2] GUI action structural pins --------------------------------------
+
+// TestWebUIPage_ActionButtonsStateTheirExactOperation is rule 2, pinned
+// against the page's own source. A button labelled "Fix" or "Clean up" is the
+// single failure this whole design is built to prevent: the operator has to be
+// able to read what will happen BEFORE they click, in enough detail to catch
+// cutoffarr having identified the wrong thing.
+func TestWebUIPage_ActionButtonsStateTheirExactOperation(t *testing.T) {
+	page := string(webUIPage)
+	// The three operation phrasings, each matching the server's own
+	// operation text word for word (actions.go's trashOperationText,
+	// twinOperationText, remonitorOperationText).
+	for _, want := range []string{`"Move to trash — "`, `"Re-monitor — "`, `Merge \"`} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the page never builds the operation label %s; a button that does not state its exact operation is exactly what rule 2 forbids", want)
+		}
+	}
+	// The trash button must state the SIZE, which is what tells a stray
+	// sample from the real episode.
+	if !strings.Contains(page, "humanSize(r.f.size)") {
+		t.Error("the trash button's label never includes the file's size")
+	}
+	for _, banned := range []string{`text(btn, "Fix")`, `text(btn, "Clean up")`, `text(btn, "Delete")`} {
+		if strings.Contains(page, banned) {
+			t.Errorf("the page contains a bare %s button", banned)
+		}
+	}
+}
+
+// TestWebUIPage_EveryActionGoesThroughAConfirmGate is the second half of rule
+// 2: the confirm step re-shows the full operation before anything fires. It is
+// pinned structurally because the failure mode — a click that acts
+// immediately — is invisible in review and irreversible in use.
+func TestWebUIPage_EveryActionGoesThroughAConfirmGate(t *testing.T) {
+	page := string(webUIPage)
+	start := strings.Index(page, "function buildActionButton(")
+	if start == -1 {
+		t.Fatal("page has no buildActionButton")
+	}
+	end := strings.Index(page[start:], "\n  function reverseActionLabel(")
+	if end == -1 {
+		t.Fatal("could not find the end of buildActionButton")
+	}
+	fn := page[start : start+end]
+
+	confirmAt := strings.Index(fn, "window.confirm(")
+	postAt := strings.Index(fn, "postAction(")
+	if confirmAt == -1 {
+		t.Fatal("buildActionButton never calls window.confirm: an action must never fire on a bare click")
+	}
+	if postAt == -1 {
+		t.Fatal("buildActionButton never posts the action")
+	}
+	if confirmAt > postAt {
+		t.Error("buildActionButton posts the action before confirming it")
+	}
+	if !strings.Contains(fn, "opts.label + ") {
+		t.Error("the confirm dialog must re-show the FULL operation (opts.label), not a generic 'are you sure'")
+	}
+	// The bulk action has its own confirm, listing every item.
+	bulk := page[strings.Index(page, "function buildBulkRemonitor("):]
+	if !strings.Contains(bulk[:strings.Index(bulk, "\n  function ")], "window.confirm(") {
+		t.Error("the bulk re-monitor never confirms")
+	}
+}
+
+// TestWebUIPage_DisabledButtonsCarryTheirReasonTwice is rule 7's GUI half: a
+// switched-off button is disabled with its reason, never hidden — and the
+// reason travels in both the title attribute and an inline note, because a
+// title alone is invisible on a touch screen.
+func TestWebUIPage_DisabledButtonsCarryTheirReasonTwice(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, "function actionDisabledReason(") {
+		t.Fatal("page has no actionDisabledReason")
+	}
+	for _, want := range []string{"gui_actions is false", "reverse_scan_remonitor is false"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the disabled reason never names the switch %q; rule 7 requires the page never lie about which switch is missing", want)
+		}
+	}
+	start := strings.Index(page, "function buildActionButton(")
+	fn := page[start : start+strings.Index(page[start:], "\n  function reverseActionLabel(")]
+	if !strings.Contains(fn, "btn.disabled = true") || !strings.Contains(fn, "btn.title = reason") || !strings.Contains(fn, "text(note, reason)") {
+		t.Errorf("a disabled button must carry its reason as BOTH title and inline text; got:\n%s", fn)
+	}
+}
+
+// TestWebUIPage_RowsUpdateFromTheResponseNotFromTheNextSweep pins that a row
+// reflects what actually happened, from the answer, immediately.
+func TestWebUIPage_RowsUpdateFromTheResponseNotFromTheNextSweep(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, "function renderActionOutcome(") {
+		t.Fatal("page has no renderActionOutcome")
+	}
+	for _, want := range []string{"action-performed", "action-note-refused", "action-note-rehearsed", "resp.items"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("renderActionOutcome never handles %q: performed, refused, rehearsed and the merge's itemized collisions must each be visible on the row", want)
+		}
+	}
+	if !strings.Contains(page, "tr.action-performed td") {
+		t.Error("a performed row is never struck through; the operator has to see that the row they clicked is the one that changed")
+	}
+}
+
+// TestWebUIPage_BulkActionIsRemonitorOnly is the phase's own scope boundary,
+// pinned so a later round cannot quietly add a bulk file action: moving many
+// files on one click is a different decision from moving one, and it has not
+// been ruled on.
+func TestWebUIPage_BulkActionIsRemonitorOnly(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, "Re-monitor all ") {
+		t.Error("the page has no bulk re-monitor")
+	}
+	for _, banned := range []string{"Trash all ", "Merge all ", "Move all "} {
+		if strings.Contains(page, banned) {
+			t.Errorf("the page offers a bulk file action (%q): file actions stay per-item in this phase", banned)
+		}
+	}
+}
+
+// TestWebUIPage_ActionButtonsUseTheEstablishedTokens keeps the buttons inside
+// the page's own five-token palette — clay for anything that moves a file,
+// sage for the re-monitor, which only flips a flag.
+func TestWebUIPage_ActionButtonsUseTheEstablishedTokens(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, ".action-clay { color: var(--alert)") {
+		t.Error("the destructive action tone is not the page's own clay/--alert token")
+	}
+	if !strings.Contains(page, ".action-sage { color: var(--rest)") {
+		t.Error("the re-monitor action tone is not the page's own sage/--rest token")
+	}
+	if !strings.Contains(page, `tone: "clay"`) || !strings.Contains(page, `tone: "sage"`) {
+		t.Error("the two tones are never actually used by the button builders")
+	}
+	// The re-monitor must not be clay: it moves nothing and undoes nothing
+	// the next sweep could not redo.
+	start := strings.Index(page, "kind: \"remonitor\",")
+	if start == -1 {
+		t.Fatal("no re-monitor button is built")
+	}
+	if !strings.Contains(page[start:start+80], `tone: "sage"`) {
+		t.Error("the re-monitor button is not sage; clay is reserved for operations that move a file")
+	}
+}
+
+// TestWebUIPage_TrashButtonSendsTheFindingsIdentifyingFields pins that the
+// request carries what the server needs to re-derive the finding and to check
+// the promise the button made — in particular the size, without which a file
+// REPLACED at the same path passes every check there is.
+func TestWebUIPage_TrashButtonSendsTheFindingsIdentifyingFields(t *testing.T) {
+	page := string(webUIPage)
+	start := strings.Index(page, `kind: "trash", confirm: true,`)
+	if start == -1 {
+		t.Fatal("the trash button builds no request body")
+	}
+	body := page[start : start+240]
+	for _, want := range []string{"instance:", "path:", "finding:", "size:"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the trash request body is missing %s; got %q", want, body)
+		}
+	}
+}
+
+// TestWebUIPage_ActionRequestsAreSentAsSameOriginJSON pins the CLIENT half of
+// the cross-site guard, which was a one-sided contract until this round.
+//
+// crossSiteRefusal (actions.go) makes `Content-Type: application/json` a hard
+// precondition for every action: a request without it is a 400 before any gate
+// runs, because a cross-site form post cannot set that header. The server-side
+// test proves the server ACCEPTS that shape; nothing proved the page PRODUCES
+// it. Deleting or editing the page's one Content-Type line therefore made every
+// action button on every surface answer 400 while `go test ./...`, `-race` and
+// `node --check` all stayed green — a guard that costs the real client nothing
+// only as long as the real client keeps sending it.
+//
+// The assertion is scoped to postAction's body rather than to the page, so it
+// is about the fetch that actually runs (see jsFunctionBody).
+func TestWebUIPage_ActionRequestsAreSentAsSameOriginJSON(t *testing.T) {
+	page := string(webUIPage)
+	post := jsFunctionBody(t, page, "postAction", "renderActionOutcome")
+	for _, want := range []string{`"/api/action"`, `method: "POST"`, `"Content-Type": "application/json"`} {
+		if !strings.Contains(post, want) {
+			t.Errorf("postAction() no longer sends %s, so every action button answers 400 at crossSiteRefusal; the function is:\n%s", want, post)
+		}
+	}
+}
+
+// TestWebUIPage_ActionOutcomesSurviveARepaint is the round-2 IMPORTANT on the
+// front end: renderFileReport and renderReverse each begin by clearing their
+// table (body.textContent = ""), and refresh() calls render(data) on a 30s
+// timer. Every trace of an action's result — the strike-through, the clay
+// refusal note, the merge's itemized collisions — was therefore wiped within
+// one poll, and the row came back from the still-stale snapshot with a fully
+// live "Move to trash — …" button for a file that is already in the trash.
+//
+// The brief requires the row to update from the response "without waiting for
+// the next sweep"; holding that state for at most one poll does not satisfy it,
+// and a re-armed button reads to the operator as "the action did not work".
+// Each assertion below is scoped to the function that has to make the CALL,
+// which is the round-3 review fix: the previous version looked for
+// "rememberedActionOutcome(" anywhere in the page, and the DECLARATION satisfied
+// that. Deleting the one call inside buildActionButton — re-introducing the
+// exact defect this test is named for — left it green, and `node --check` does
+// not notice an uncalled function either.
+func TestWebUIPage_ActionOutcomesSurviveARepaint(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, "var actionOutcomes") {
+		t.Fatal("the page keeps no memory of what a click answered, so every repaint erases it")
+	}
+	if !strings.Contains(page, "function actionKey(") {
+		t.Error("there is no per-finding identity to key an outcome by; instance+kind+path / instance+id+season is what a rebuilt row has to match on")
+	}
+
+	// The read side: a rebuilt row consults the memory, keyed off the very body
+	// it would POST, BEFORE it decides anything about the button.
+	build := jsFunctionBody(t, page, "buildActionButton", "attachActionClick")
+	if !strings.Contains(build, "rememberedActionOutcome(opts.body)") {
+		t.Error("buildActionButton never consults the remembered outcome, so a rebuilt row re-arms its button and loses its note — the poll erases the result of the click")
+	}
+	if !strings.Contains(build, "renderActionOutcome(note, opts.container, remembered)") {
+		t.Error("buildActionButton looks the outcome up and then does not render it")
+	}
+	rememberedAt := strings.Index(build, "rememberedActionOutcome(opts.body)")
+	reasonAt := strings.Index(build, "var reason = opts.ineligible")
+	if rememberedAt == -1 || reasonAt == -1 || rememberedAt > reasonAt {
+		t.Error("the remembered outcome must be applied before the disabled-reason path returns, or a performed action on an ineligible-for-other-reasons row is never shown")
+	}
+
+	// The write side: the memory is written from the answer, not from optimism.
+	click := jsFunctionBody(t, page, "attachActionClick", "reverseActionLabel")
+	if !strings.Contains(click, "rememberActionOutcome(") {
+		t.Error("a click's answer is never remembered, so the next 30s poll erases it")
+	}
+
+	// The expiry side: pruning is driven by the snapshot, from render().
+	render := jsFunctionBody(t, page, "render", "")
+	if !strings.Contains(render, "pruneActionOutcomes(instances)") {
+		t.Error("render never prunes remembered outcomes, so a row keeps its strike-through long after the finding stopped appearing in the snapshot")
+	}
+	pruneAt := strings.Index(render, "pruneActionOutcomes(instances)")
+	renderReverseAt := strings.Index(render, "renderReverse(instances)")
+	if renderReverseAt == -1 || pruneAt > renderReverseAt {
+		t.Error("pruning must happen before the tables are rebuilt, or the rows are rebuilt from a memory this snapshot has already contradicted")
+	}
+}
+
+// TestWebUIPage_ASizelessFindingIsDisabledWithTheServersOwnReason closes the
+// one unactionable shape the page still rendered as a live button.
+//
+// actions.go refuses any trash whose last-completed-sweep size is <= 0: without
+// a size there is nothing to compare the file on disk against, so the promise
+// the button made cannot be kept. The page nonetheless built that row's button
+// fully live, labelled "… (size unknown)", and every click on it answered 409.
+// Every OTHER unactionable shape in this GUI — a switch that is off, a
+// case-twin whose shape is report-only — renders disabled with its reason
+// stated, which is the brief's own mandate; this one shape was the exception,
+// and it is the one where the label itself already says something is missing.
+func TestWebUIPage_ASizelessFindingIsDisabledWithTheServersOwnReason(t *testing.T) {
+	page := string(webUIPage)
+	start := strings.Index(page, `kind: "trash", confirm: true,`)
+	if start == -1 {
+		t.Fatal("the trash button builds no request body")
+	}
+	// The whole buildActionButton({...}) call the trash row makes, back from the
+	// body to the opening brace and forward to the close.
+	callAt := strings.LastIndex(page[:start], "buildActionButton({")
+	if callAt == -1 {
+		t.Fatal("the trash row does not build its button through buildActionButton")
+	}
+	end := strings.Index(page[callAt:], "\n        }));")
+	if end == -1 {
+		t.Fatal("could not find the end of the trash row's buildActionButton call")
+	}
+	call := page[callAt : callAt+end]
+
+	if !strings.Contains(call, "ineligible:") {
+		t.Errorf("the trash button never passes an ineligible reason, so a finding the server refuses on every click still renders live:\n%s", call)
+	}
+	if !strings.Contains(call, "r.f.size") {
+		t.Errorf("the ineligible reason is not derived from the finding's own size:\n%s", call)
+	}
+	// It must quote the server's refusal rather than inventing a second
+	// vocabulary for the same rule: the operator reads one of these before the
+	// click and the other after it.
+	for _, want := range []string{"no size", "by hand"} {
+		if !strings.Contains(call, want) {
+			t.Errorf("the sizeless-finding reason does not state the server's own refusal (%q missing):\n%s", want, call)
+		}
+	}
+}
+
+// TestWebUIPage_ADisabledButtonKeepsItsReasonEvenWithARememberedOutcome is the
+// one combination that escaped TestWebUIPage_DisabledButtonsCarryTheirReasonTwice.
+//
+// buildActionButton's remembered-outcome branch returns before the
+// disabled-reason path, and it used to set btn.title = opts.label and let
+// renderActionOutcome own the note outright. So a button disabled by a switch
+// or by its own finding's shape that ALSO had an outcome to show — a daemon
+// restarted with gui_actions flipped off while a tab holding outcomes stays
+// open, or any ineligible twin whose earlier click was refused — came back
+// disabled with the reason in NEITHER the title nor the note: a dead button
+// with no explanation, which is exactly what rule 7 forbids.
+func TestWebUIPage_ADisabledButtonKeepsItsReasonEvenWithARememberedOutcome(t *testing.T) {
+	page := string(webUIPage)
+	build := jsFunctionBody(t, page, "buildActionButton", "attachActionClick")
+
+	remembered := strings.Index(build, "if (remembered) {")
+	if remembered == -1 {
+		t.Fatal("buildActionButton no longer has a remembered-outcome branch")
+	}
+	branch := build[remembered:]
+	if end := strings.Index(branch, "\n    }\n"); end != -1 {
+		branch = branch[:end]
+	}
+
+	if strings.Contains(branch, "btn.title = opts.label;") {
+		t.Errorf("a remembered outcome still overwrites the title with the label unconditionally, so a disabled button's reason is invisible:\n%s", branch)
+	}
+	if !strings.Contains(branch, "btn.title = reason || opts.label") {
+		t.Errorf("the remembered branch must prefer the disabled reason for the title, falling back to the label:\n%s", branch)
+	}
+	// And in the note too, beside the outcome — a title alone is invisible on a
+	// touch screen, which is the whole reason the reason travels twice.
+	if !strings.Contains(branch, "if (reason)") {
+		t.Errorf("the remembered branch never renders the disabled reason inline:\n%s", branch)
+	}
+	if !strings.Contains(branch, "note.insertBefore(") && !strings.Contains(branch, "note.appendChild(") {
+		t.Errorf("the reason is never attached to the note beside the remembered outcome:\n%s", branch)
+	}
+	// renderActionOutcome sets note.textContent, so the reason must be attached
+	// AFTER it or it is wiped in the same tick.
+	renderAt := strings.Index(branch, "renderActionOutcome(note, opts.container, remembered)")
+	attachAt := strings.Index(branch, "var why =")
+	if renderAt == -1 || attachAt == -1 || attachAt < renderAt {
+		t.Errorf("the reason must be attached after renderActionOutcome, which owns the note's text:\n%s", branch)
+	}
+}
+
+// TestWebUIPage_BulkRemonitorSummarySurvivesItsOwnRerender is the same rule for
+// the one bulk action: buildBulkRemonitor wrote its summary into `note` and
+// then called rerender(), whose first act is body.textContent = "" — destroying
+// the summary in the same tick, so it was never visible at all.
+//
+// Scoped to the call sites for the same reason as the test above: the previous
+// version searched the whole page for "bulkRemonitorSummary", which the
+// `var bulkRemonitorSummary = null;` declaration alone satisfied.
+func TestWebUIPage_BulkRemonitorSummarySurvivesItsOwnRerender(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, "var bulkRemonitorSummary = null;") {
+		t.Fatal("the bulk summary is not kept anywhere, so the rerender that follows it destroys it in the same tick")
+	}
+	bulk := jsFunctionBody(t, page, "buildBulkRemonitor", "buildCaseCollisionBlock")
+
+	applyAt := strings.Index(bulk, "text(note, bulkRemonitorSummary.text)")
+	if applyAt == -1 {
+		t.Fatal("the rebuilt bulk control never re-applies the summary it stored, so the rerender it triggers still destroys it")
+	}
+	// It has to be re-applied BEFORE the disabled-reason early return, or the
+	// summary vanishes the moment a switch is off — which is precisely when an
+	// operator most needs to read what just happened.
+	returnAt := strings.Index(bulk, `var reason = actionDisabledReason("remonitor")`)
+	if returnAt == -1 {
+		t.Fatal("buildBulkRemonitor no longer has its disabled-reason path")
+	}
+	if applyAt > returnAt {
+		t.Error("the summary is re-applied after the disabled-reason early return, so it is never shown when a switch is off")
+	}
+	if !strings.Contains(bulk, "bulkRemonitorSummary = {") {
+		t.Error("the run never stores a summary, so there is nothing for the rerender to bring back")
+	}
+	storeAt := strings.Index(bulk, "bulkRemonitorSummary = {")
+	rerenderAt := strings.Index(bulk[storeAt:], "rerender()")
+	if rerenderAt == -1 {
+		t.Error("the bulk run never triggers the rerender that brings the per-row outcomes back")
+	}
+}
+
+// TestWebUIPage_BulkRemonitorNeverCallsAFailureARefusal is the honesty half of
+// the same finding: the loop counted a 502 `failed` and a network error
+// identically to a refusal ("N answered yes, M were refused or rehearsed"),
+// asserting a decision where the outcome is genuinely unknown.
+//
+// The round-3 fix is that this now checks the COUNTER, not the sentence: the
+// old version only proved the string "failed or unknown" existed somewhere,
+// which stayed true with `unknown` stuck at zero forever and every failure
+// silently counted as a refusal again.
+func TestWebUIPage_BulkRemonitorNeverCallsAFailureARefusal(t *testing.T) {
+	page := string(webUIPage)
+	bulk := jsFunctionBody(t, page, "buildBulkRemonitor", "buildCaseCollisionBlock")
+	if !strings.Contains(bulk, "failed or unknown") {
+		t.Error("a failed or unreachable bulk item is still reported as refused; those are different outcomes and one of them means go and look at the server")
+	}
+	if !strings.Contains(bulk, "var performed = 0, declined = 0, unknown = 0;") {
+		t.Fatal("the bulk loop no longer keeps three separate counters")
+	}
+	// The two paths that must reach `unknown`: an answer whose outcome is
+	// neither performed nor one of the three decided ones (a 502 failed), and a
+	// request that never answered at all.
+	if !strings.Contains(bulk, "else unknown++;") {
+		t.Error("an answer that is not performed/refused/rehearsed/disabled is not counted as unknown, so a 502 `failed` is being reported as a refusal — a decision cutoffarr did not make")
+	}
+	catchAt := strings.Index(bulk, ".catch(function ()")
+	if catchAt == -1 {
+		t.Fatal("the bulk loop has no catch, so one network error stops it mid-run")
+	}
+	if !strings.Contains(bulk[catchAt:], "unknown++") {
+		t.Error("a request that never answered is not counted as unknown; a network error is the definition of an outcome nobody knows")
+	}
+}
+
+// jsFunctionBody slices one function out of webui.html: from `function name(`
+// to the declaration of `until` (or to the next top-level function, when until
+// is empty). Assertions made against a slice are assertions about the code that
+// has to RUN — a whole-page substring search is satisfied by a declaration, and
+// an uncalled function is exactly the defect these tests exist to catch.
+func jsFunctionBody(t *testing.T, page, name, until string) string {
+	t.Helper()
+	start := strings.Index(page, "function "+name+"(")
+	if start == -1 {
+		t.Fatalf("webui.html no longer declares %s(), so this pin is looking at nothing", name)
+	}
+	rest := page[start:]
+	end := -1
+	if until != "" {
+		end = strings.Index(rest, "\n  function "+until+"(")
+		if end == -1 {
+			t.Fatalf("could not find the end of %s(): %s() no longer follows it", name, until)
+		}
+	} else {
+		end = strings.Index(rest, "\n  function ")
+		if end == -1 {
+			t.Fatalf("could not find the end of %s()", name)
+		}
+	}
+	return rest[:end]
+}
