@@ -235,22 +235,28 @@ type instanceStatsView struct {
 	// LastCycleStatus is this instance's outcome on the MOST RECENT cycle
 	// that named it at all — including a cycle that never reached the
 	// decision engine because §2.6's connectivity-gate or library-read
-	// warn-and-skip path fired. Unlike every other field on this struct, it
-	// is NOT gated on decisionsRan/reverseRan/fileReportRan and is NOT
-	// carried forward from a previous cycle when this one fails: a daemon
-	// that has been unable to reach an *arr for a week must show that fact
-	// on THIS cycle, not silently keep repeating "ok" from the last time it
-	// could. See statsStore.recordUnreachable and recordInstance's own
-	// unconditional write to this field.
+	// warn-and-skip path fired (statsStore.recordUnreachable), AND
+	// (round-4 review fix) a cycle that DID reach the engine but aborted
+	// inside it, before the evaluation loop that computes wouldUnmonitor
+	// ever ran to completion (a quality-profile fetch failure, an
+	// exclusion-tag resolution failure — cycleInstanceStats.decisionsRan
+	// stays false on both). Unlike every other field on this struct, it is
+	// NEVER carried forward from a previous cycle when this one fails: a
+	// daemon that has been unable to complete an evaluation for a week must
+	// show that fact on THIS cycle, not silently keep repeating "ok" from
+	// the last time it could — see statsStore.recordUnreachable and
+	// recordInstance's own unconditional write to this field, gated only on
+	// WHICH value to write (ok vs skipped), never on whether to write at
+	// all.
 	LastCycleStatus cycleStatusView `json:"lastCycleStatus"`
 }
 
 // cycleStatusView is LastCycleStatus's shape: whether the most recent cycle
-// that named this instance actually reached its decision engine at all.
-// Status is "ok" (checkInstanceConnectivity and the library read both
-// succeeded — this cycle got as far as the engine, whatever the engine
-// itself then did) or "skipped" (one of those two gates failed; Reason
-// names which). Reason is empty for "ok".
+// that named this instance actually completed an evaluation. Status is "ok"
+// (checkInstanceConnectivity succeeded, the library read succeeded, AND the
+// engine's own evaluation loop ran to completion — cs.decisionsRan) or
+// "skipped" (any one of those three gates failed; Reason names which).
+// Reason is empty for "ok".
 type cycleStatusView struct {
 	Status string `json:"status"`
 	Reason string `json:"reason,omitempty"`
@@ -259,6 +265,16 @@ type cycleStatusView struct {
 const (
 	cycleStatusOK      = "ok"
 	cycleStatusSkipped = "skipped"
+
+	// abortedEvaluationReason is recordInstance's own LastCycleStatus.Reason
+	// (round-4 review fix) for the third gate — distinct from
+	// unreachableReasonConnectivity/unreachableReasonLibraryRead (daemon.go),
+	// which name the two gates BEFORE the engine is ever called: this cycle
+	// DID reach the decision engine (connectivity and the library read both
+	// succeeded), but the engine itself bare-returned from one of §2.6's
+	// warn-and-skip paths (a quality-profile fetch failure, an
+	// exclusion-tag resolution failure) before its evaluation loop finished.
+	abortedEvaluationReason = "the cycle reached this instance but aborted before completing an evaluation"
 )
 
 // statsResponse is GET /api/stats's whole body.
@@ -332,12 +348,25 @@ func (s *statsStore) recordInstance(kind string, at time.Time, name, typ string,
 	v.Unmonitored = cs.unmonitored
 
 	// This cycle reached the decision engine at all (runScanCycle only calls
-	// recordInstance from inside its dataOK branch) — whatever the engine
-	// then did with it, that is a strictly stronger statement than the
-	// connectivity/library-read gates recordUnreachable exists for, so it
-	// always overwrites whatever LastCycleStatus previously said, unlike
-	// every other field below.
-	v.LastCycleStatus = cycleStatusView{Status: cycleStatusOK}
+	// recordInstance from inside its dataOK branch) — a strictly stronger
+	// statement than the connectivity/library-read gates recordUnreachable
+	// exists for — but reaching the engine is not the same as the engine
+	// having actually COMPLETED an evaluation: §2.6's warn-and-skip paths
+	// INSIDE the engine (a quality-profile fetch failure, an exclusion-tag
+	// resolution failure) bare-return before cs.decisionsRan is ever set
+	// (round-4 review fix). Before this gate, such a cycle was recorded as
+	// {status:"ok"} unconditionally — indistinguishable on the dashboard
+	// from a cycle that actually swept the library, with no badge and no
+	// per-card timestamp to betray it, the same false-all-clear class
+	// already closed for reverseRan/fileReportRan/WouldUnmonitor. Either
+	// branch always overwrites whatever LastCycleStatus previously said
+	// (unlike every other field below): this cycle's own outcome, good or
+	// bad, is never stale.
+	if cs.decisionsRan {
+		v.LastCycleStatus = cycleStatusView{Status: cycleStatusOK}
+	} else {
+		v.LastCycleStatus = cycleStatusView{Status: cycleStatusSkipped, Reason: abortedEvaluationReason}
+	}
 
 	// decisionsRan gates WouldUnmonitor and LastRun/LastCycleKind together
 	// (see cycleInstanceStats.decisionsRan's own comment): a cycle that
@@ -384,11 +413,20 @@ func (s *statsStore) recordInstance(kind string, at time.Time, name, typ string,
 	}
 
 	if len(cs.actions) > 0 {
-		// Newest first: prepend this cycle's actions (in the order they were
-		// performed) ahead of whatever was already there, so the GUI table
-		// needs no client-side sort to show the most recent action on top.
+		// Newest first: prepend this cycle's actions ahead of whatever was
+		// already there, so the GUI table needs no client-side sort to show
+		// the most recent action on top. cs.actions is in PERFORMED order
+		// (oldest first) — walking it in REVERSE (round-4 review fix) is
+		// what makes the newest action of THIS cycle land at merged[0], not
+		// just the newest action across cycles. Without the reverse walk, a
+		// single cycle producing more than maxLastActions actions (a live
+		// sweep's first pass over a mature library, unmonitoring hundreds of
+		// movies at once) would have `merged[:maxLastActions]` below keep
+		// that cycle's FIRST maxLastActions actions and silently discard its
+		// most recent ones — the exact opposite of "last 50 action lines".
 		merged := make([]actionRecord, 0, len(cs.actions)+len(v.LastActions))
-		for _, a := range cs.actions {
+		for i := len(cs.actions) - 1; i >= 0; i-- {
+			a := cs.actions[i]
 			a.Time = at
 			merged = append(merged, a)
 		}

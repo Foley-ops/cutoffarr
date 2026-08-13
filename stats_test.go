@@ -196,11 +196,15 @@ func TestStatsStore_RecordInstance_ReverseStatusTracksRanVsSkipped(t *testing.T)
 	}
 }
 
-// TestStatsStore_RecordInstance_SetsLastCycleStatusOK pins that any cycle
-// which reaches recordInstance at all (i.e. actually got as far as the
-// decision engine — see runScanCycle's own dataOK gate) is unconditionally
+// TestStatsStore_RecordInstance_SetsLastCycleStatusOK pins that a cycle
+// which reaches recordInstance AND completes an evaluation (decisionsRan) is
 // marked ok, overwriting whatever a PREVIOUS failed cycle may have left,
-// unlike every other field on instanceStatsView.
+// unlike every other field on instanceStatsView. It also pins the round-4
+// review fix's own case in the same place: recordInstance is called (the
+// connectivity/library-read gates recordUnreachable exists for both
+// succeeded) but decisionsRan is false (an engine-internal warn-and-skip
+// abort) must still land on "skipped", not "ok" — reaching the engine is a
+// weaker statement than completing an evaluation.
 func TestStatsStore_RecordInstance_SetsLastCycleStatusOK(t *testing.T) {
 	s := newStatsStore(false)
 	s.recordUnreachable("radarr-main", "radarr", unreachableReasonConnectivity)
@@ -211,7 +215,19 @@ func TestStatsStore_RecordInstance_SetsLastCycleStatusOK(t *testing.T) {
 	s.recordInstance(cycleKindSweep, time.Now(), "radarr-main", "radarr", cycleInstanceStats{total: 5, decisionsRan: true})
 	got := s.snapshot().Instances[0].LastCycleStatus
 	if got.Status != cycleStatusOK || got.Reason != "" {
-		t.Errorf("LastCycleStatus after a cycle that reached the engine = %+v, want {status: %q, reason: \"\"}, overwriting the previous skipped status", got, cycleStatusOK)
+		t.Errorf("LastCycleStatus after a cycle that reached the engine and completed an evaluation = %+v, want {status: %q, reason: \"\"}, overwriting the previous skipped status", got, cycleStatusOK)
+	}
+
+	// A cycle that reaches recordInstance but never completes an evaluation
+	// (decisionsRan false) must not fall back to "ok" just because it beat
+	// the connectivity/library-read gates.
+	s.recordInstance(cycleKindSweep, time.Now(), "radarr-main", "radarr", cycleInstanceStats{total: 5, decisionsRan: false})
+	got2 := s.snapshot().Instances[0].LastCycleStatus
+	if got2.Status != cycleStatusSkipped {
+		t.Errorf("LastCycleStatus after a cycle that reached the engine but never completed an evaluation = %+v, want status=%q, overwriting the previous ok status", got2, cycleStatusSkipped)
+	}
+	if got2.Reason == "" {
+		t.Error("LastCycleStatus.Reason is empty for a cycle that reached the engine but aborted mid-evaluation")
 	}
 }
 
@@ -314,6 +330,48 @@ func TestStatsStore_LastActions_CapsAt50AndOrdersNewestFirst(t *testing.T) {
 	}
 	if !got[0].Time.Equal(base.Add(54 * time.Minute)) {
 		t.Errorf("LastActions[0].Time = %v, want the recording cycle's own clock reading", got[0].Time)
+	}
+}
+
+// TestStatsStore_LastActions_WithinOneCycleKeepsTheNewestNotTheFirst is
+// round-4 review's finding: the existing cap/order test above only ever
+// records ONE action per cycle across 55 cycles, so it cannot see that
+// WITHIN a single cycle recordInstance used to append cs.actions in
+// PERFORMED order (oldest first) ahead of the previous list — newest-first
+// ACROSS cycles, but oldest-first inside one. A cycle that alone produces
+// more than maxLastActions actions (a live sweep's first pass over a mature
+// library, unmonitoring hundreds of movies at once) then had
+// `merged[:maxLastActions]` keep that cycle's FIRST 50 actions and discard
+// its most recent ones — the opposite of the plan's "last 50 action lines".
+func TestStatsStore_LastActions_WithinOneCycleKeepsTheNewestNotTheFirst(t *testing.T) {
+	s := newStatsStore(false)
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	// One cycle, 60 actions, recorded in the order they were actually
+	// performed (ID 0 first, ID 59 last).
+	actions := make([]actionRecord, 60)
+	for i := 0; i < 60; i++ {
+		actions[i] = actionRecord{Action: ActionUnmonitor, ID: i, Title: "movie", Reason: ReasonCutoffMet}
+	}
+	s.recordInstance(cycleKindSweep, at, "radarr-main", "radarr", cycleInstanceStats{
+		total: 60, actions: actions,
+	})
+
+	got := s.snapshot().Instances[0].LastActions
+	if len(got) != maxLastActions {
+		t.Fatalf("len(LastActions) = %d, want %d", len(got), maxLastActions)
+	}
+	// The LAST action this cycle performed (ID 59) must survive at index 0 —
+	// not the first one it performed (ID 0), which the pre-fix code kept.
+	if got[0].ID != 59 {
+		t.Errorf("LastActions[0].ID = %d, want 59 (the most recently PERFORMED action within this cycle, not the first)", got[0].ID)
+	}
+	// The 50 survivors must be the 50 MOST RECENT of the 60 (IDs 10..59),
+	// newest first, so the oldest surviving one is ID 10 — not ID 49, which
+	// is what "keep the first 50, oldest-first within the cycle" would leave
+	// at the tail.
+	if got[len(got)-1].ID != 10 {
+		t.Errorf("LastActions[last].ID = %d, want 10 (the oldest of the 50 MOST RECENTLY performed actions)", got[len(got)-1].ID)
 	}
 }
 
@@ -844,6 +902,18 @@ func TestRunRadarrDecisionEngine_Stats_AbortedCycle_PreservesPreviousWouldUnmoni
 	if got.Total != 1 {
 		t.Errorf("Total after an aborted cycle = %d, want 1 (this cycle's own library read, trustworthy even though the decision loop aborted)", got.Total)
 	}
+	// Round-4 review fix: an aborted cycle must NOT render as {status:"ok"}
+	// just because it reached the engine — the connectivity/library-read
+	// gates succeeded, but the evaluation loop itself never finished, and
+	// that must be visible on THIS cycle's LastCycleStatus (not a stale "ok"
+	// preserved from the earlier real cycle either — the status field is
+	// never carried forward, unlike WouldUnmonitor/LastRun above).
+	if got.LastCycleStatus.Status != cycleStatusSkipped {
+		t.Errorf("LastCycleStatus.Status after an aborted cycle = %q, want %q (reaching the engine is not the same as completing an evaluation)", got.LastCycleStatus.Status, cycleStatusSkipped)
+	}
+	if got.LastCycleStatus.Reason == "" {
+		t.Error("LastCycleStatus.Reason after an aborted cycle is empty; the operator has no idea the evaluation never completed")
+	}
 }
 
 // TestRunSonarrDecisionEngine_Stats_AbortedCycle_PreservesPreviousWouldUnmonitorAndLastRun
@@ -890,5 +960,13 @@ func TestRunSonarrDecisionEngine_Stats_AbortedCycle_PreservesPreviousWouldUnmoni
 	}
 	if got.LastCycleKind == nil || *got.LastCycleKind != cycleKindStartup {
 		t.Errorf("LastCycleKind after an aborted cycle = %v, want the PREVIOUS real cycle's %q preserved", got.LastCycleKind, cycleKindStartup)
+	}
+	// Round-4 review fix: the Sonarr twin of the same LastCycleStatus
+	// assertion the Radarr test above pins.
+	if got.LastCycleStatus.Status != cycleStatusSkipped {
+		t.Errorf("LastCycleStatus.Status after an aborted cycle = %q, want %q (reaching the engine is not the same as completing an evaluation)", got.LastCycleStatus.Status, cycleStatusSkipped)
+	}
+	if got.LastCycleStatus.Reason == "" {
+		t.Error("LastCycleStatus.Reason after an aborted cycle is empty; the operator has no idea the evaluation never completed")
 	}
 }

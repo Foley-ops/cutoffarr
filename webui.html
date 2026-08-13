@@ -162,6 +162,12 @@
     align-items: baseline;
     gap: 10px;
     margin-bottom: 14px;
+    /* Round-4 review fix: without this, the UNREACHABLE badge (below) is a
+       flex item with no room to shrink OR wrap — its nowrap text sets its
+       min-content width to the whole string, and the row simply overflows
+       the shelf card. Wrapping the row lets a long badge drop to its own
+       line instead. */
+    flex-wrap: wrap;
   }
 
   .shelf-name {
@@ -186,7 +192,20 @@
      may no longer be current). margin-left:auto pushes it to the far edge
      of the shelf-head row, away from the name/type it must never be
      confused with. */
-  .shelf-unreachable { margin-left: auto; }
+  .shelf-unreachable {
+    margin-left: auto;
+    /* Round-4 review fix: .badge's own white-space: nowrap + text-transform:
+       uppercase are right for a short status word ("rehearsing", "live")
+       but wrong for this badge's copy, which carries a full sentence
+       (instance name + a reason drawn from cycleStatusView.Reason, up to
+       ~95 characters) — nowrap uppercase text cannot wrap or shrink and
+       overflowed the shelf card at every width, roughly 2x the mandated
+       360px minimum. Overridden here (later in the cascade than .badge,
+       same specificity, so this wins) rather than on .badge itself, which
+       every OTHER badge on the page still needs nowrap/uppercase for. */
+    white-space: normal;
+    text-transform: none;
+  }
 
   .shelf-bar-wrap {
     position: relative;
@@ -524,9 +543,20 @@
     // signal that those numbers may now be stale, which is the point: a
     // week-unreachable *arr must never look identical to one swept a
     // moment ago.
+    //
+    // Round-4 review fix: the copy used to lead with a claim that this
+    // instance could not be reached at all, which is FALSE for one of the
+    // three cases this same badge now covers — a cycle that DID reach the
+    // instance (connectivity and the library read both succeeded) but
+    // aborted INSIDE the engine before completing an evaluation. "last
+    // sweep incomplete" is accurate for all three of LastCycleStatus's
+    // skipped reasons; the instance name is dropped (redundant — it is
+    // already the card's own .shelf-name) so the reason itself has more
+    // room before wrapping (see .shelf-unreachable's white-space: normal /
+    // .shelf-head's flex-wrap: wrap).
     var status = inst.lastCycleStatus;
     if (status && status.status === "skipped") {
-      var msg = "couldn't reach " + inst.name + " last sweep";
+      var msg = "last sweep incomplete";
       if (status.reason) msg += " — " + status.reason;
       text(els.unreachable, msg);
       els.unreachable.hidden = false;
@@ -614,11 +644,26 @@
   // reverse.go's reverseCounts.skipped) both looked EXACTLY like "ran and
   // found nothing", printing the same "Nothing wrongly unmonitored"
   // all-clear over a pass that never actually completed.
+  //
+  // Round-4 review fix: "off" (or absent — an instance recordUnreachable
+  // just created, or a cycle that aborted before reaching the reverse pass)
+  // used to contribute NOTHING here — no row, no notice — unlike
+  // renderFileReport's own off/skipped handling below, which pushes a
+  // notice AND qualifies its summary count for exactly this case. Two
+  // consequences followed: the collapsed <details> summary (what the
+  // glancing operator actually sees) showed a bare "(0)" indistinguishable
+  // from "every instance is genuinely clean", and — worse — when EVERY
+  // instance was off, the panel body was left with literally nothing
+  // appended (the empty-state invitation below is gated on
+  // anyRan||instances.length===0, which an all-off deployment satisfies
+  // neither), so expanding the panel showed a blank box. Both are fixed the
+  // same way renderFileReport already handles its own off/skipped instances.
   function renderReverse(instances) {
     var body = document.getElementById("reverseBody");
     var rows = [];
     var notices = [];
     var anyRan = false;
+    var offCount = 0, skippedCount = 0;
     for (var i = 0; i < instances.length; i++) {
       var inst = instances[i];
       var status = inst.reverseStatus;
@@ -630,22 +675,39 @@
         }
       } else if (status === "skipped") {
         notices.push({ instance: inst.name, status: "skipped" });
+        skippedCount++;
+      } else {
+        // "off", or absent entirely — both mean the reverse scan has not
+        // completed a trustworthy pass for this instance yet (globally
+        // disabled, never reached by a full cycle, or an instance
+        // recordUnreachable just created).
+        notices.push({ instance: inst.name, status: "off" });
+        offCount++;
       }
-      // "off" (or absent — an instance no full cycle has reached yet): the
-      // reverse scan is either globally disabled or has simply never had a
-      // chance to run for this instance, which is not itself alarming the
-      // way a SKIPPED full sweep is, so no notice is printed for it —
-      // mirroring how a webhook-only instance's reverseStatus quietly stays
-      // whatever the last full cycle left it as (statsStore.recordInstance).
     }
-    text(document.getElementById("reverseCount"), String(rows.length));
+    // The SUMMARY text is what a COLLAPSED <details> — the state the
+    // glancing operator actually sees — shows, and a bare row count made
+    // "(0)" mean either "every instance is clean" or "nothing was ever
+    // trustworthily checked", indistinguishably (renderFileReport's own
+    // fileCount fix, mirrored here).
+    var reverseCountText = String(rows.length);
+    if (offCount > 0 || skippedCount > 0) {
+      var qualifiers = [];
+      if (offCount > 0) qualifiers.push(offCount + " not checked yet");
+      if (skippedCount > 0) qualifiers.push(skippedCount + " not trusted this sweep");
+      reverseCountText = rows.length + " · " + qualifiers.join(", ");
+    }
+    text(document.getElementById("reverseCount"), reverseCountText);
     body.textContent = "";
 
     if (notices.length > 0) {
       var list = el("ul", "status-notices");
       for (var n = 0; n < notices.length; n++) {
-        var li = el("li", "status-notice status-skipped");
-        text(li, notices[n].instance + " — reverse scan could not be trusted this sweep");
+        var li = el("li", "status-notice status-" + notices[n].status);
+        var word = notices[n].status === "off"
+          ? "the reverse scan has not completed a trustworthy pass for this instance yet"
+          : "reverse scan could not be trusted this sweep";
+        text(li, notices[n].instance + " — " + word);
         list.appendChild(li);
       }
       body.appendChild(list);

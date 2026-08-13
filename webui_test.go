@@ -755,6 +755,62 @@ func TestWebUIPage_ReverseStatusThreeStateFidelity(t *testing.T) {
 	}
 }
 
+// TestWebUIPage_ReverseCountHeaderDistinguishesCleanFromNotChecked is
+// renderFileReport's own fix (TestWebUIPage_FileClutterHeaderDistinguishes
+// CleanFromNotChecked), mirrored for the reverse scan: round-4 review
+// finding — the "Needs your eyes — reverse scan (N)" summary is what a
+// COLLAPSED <details> (the state the glancing operator actually sees)
+// shows, and a bare row count made "(0)" mean either "every instance's
+// reverse pass was clean" or "no instance has ever produced a trustworthy
+// pass at all", indistinguishably — exactly the ambiguity round 3 already
+// removed one function down, for file clutter.
+func TestWebUIPage_ReverseCountHeaderDistinguishesCleanFromNotChecked(t *testing.T) {
+	page := string(webUIPage)
+	if strings.Contains(page, `text(document.getElementById("reverseCount"), String(rows.length));`) {
+		t.Error("reverseCount summary is still a bare row count; a deployment where every instance is off/skipped renders the exact same \"(0)\" as an all-clean one")
+	}
+	if !strings.Contains(page, "not checked yet") || !strings.Contains(page, "not trusted this sweep") {
+		t.Error("reverseCount summary text never distinguishes not-checked/not-trusted instances from a genuine 0")
+	}
+}
+
+// TestWebUIPage_ReverseOffInstancesGetANoticeNotABlankBody is round-4
+// review's other reverse-scan finding: an instance whose reverseStatus is
+// "off" (never configured to run reverse at all, OR — made MORE reachable
+// by round 3's own recordUnreachable fix — an instance recordUnreachable
+// just created, or a cycle that aborted before the reverse pass) used to
+// contribute NOTHING to renderReverse: no row, no notice, unlike
+// renderFileReport's off-instance handling one function down. When every
+// instance is "off", the panel body was left with literally nothing
+// appended — no empty-state invitation either, since that is gated on
+// anyRan||instances.length===0 and neither held — so expanding the panel
+// showed a blank box with zero explanation, directly under a collapsed
+// summary already reading the ambiguous bare "(0)".
+func TestWebUIPage_ReverseOffInstancesGetANoticeNotABlankBody(t *testing.T) {
+	page := string(webUIPage)
+	const offNotice = "the reverse scan has not completed a trustworthy pass for this instance yet"
+	if !strings.Contains(page, offNotice) {
+		t.Errorf("page is missing the off/absent reverseStatus notice copy %q; an all-off deployment renders a blank panel body with no explanation", offNotice)
+	}
+
+	start := strings.Index(page, "function renderReverse(")
+	if start == -1 {
+		t.Fatal("page has no renderReverse function")
+	}
+	end := strings.Index(page[start:], "\n  function renderFileReport(")
+	if end == -1 {
+		t.Fatal("could not find the end of renderReverse (renderFileReport must follow it)")
+	}
+	body := page[start : start+end]
+	// Structural proof renderReverse's "off" branch actually pushes a
+	// notice (mirroring its own "skipped" branch and renderFileReport's own
+	// off/skipped branches) rather than silently no-op'ing with a
+	// comment-only else, which is exactly what the pre-fix code did.
+	if strings.Count(body, "notices.push") < 2 {
+		t.Errorf("renderReverse must push a notice for BOTH the skipped case and the off/absent case, so the panel body is never left blank; got function body:\n%s", body)
+	}
+}
+
 // TestWebUIPage_UnreachableInstanceBadge pins controller addition N2's GUI
 // half: an instance whose most recent cycle could not even reach the
 // decision engine must carry a visible, distinctly-colored (ALERT clay)
@@ -768,8 +824,19 @@ func TestWebUIPage_UnreachableInstanceBadge(t *testing.T) {
 	if !strings.Contains(page, "shelf-unreachable") {
 		t.Error("page never defines a shelf-unreachable badge element/class")
 	}
-	if !strings.Contains(page, "couldn't reach ") {
-		t.Error("page is missing the unreachable-instance badge copy")
+	// Round-4 review fix: the badge copy must not claim "couldn't reach"
+	// specifically — LastCycleStatus.Status can now also be "skipped" for a
+	// cycle that DID reach the instance but aborted INSIDE the engine before
+	// completing an evaluation (a quality-profile fetch failure, an
+	// exclusion-tag resolution failure), for which "couldn't reach" would be
+	// a false statement. "last sweep incomplete" is accurate for all of
+	// LastCycleStatus's skipped reasons (connectivity, library read, AND an
+	// aborted evaluation).
+	if !strings.Contains(page, "last sweep incomplete") {
+		t.Error("page is missing the unreachable/incomplete-cycle badge copy")
+	}
+	if strings.Contains(page, "couldn't reach ") {
+		t.Error("page still contains the old badge copy, which falsely claims connectivity failure even for a cycle that reached the instance but aborted mid-evaluation")
 	}
 	// The badge must use the ALERT clay token, not invent a new color.
 	badgeRuleStart := strings.Index(page, ".shelf-unreachable")
@@ -778,5 +845,49 @@ func TestWebUIPage_UnreachableInstanceBadge(t *testing.T) {
 	}
 	if !strings.Contains(page, `el("span", "badge badge-alert shelf-unreachable")`) {
 		t.Error("the unreachable badge element is not built with the badge-alert (ALERT clay) class")
+	}
+}
+
+// TestWebUIPage_UnreachableBadgeWrapsInsteadOfOverflowing is round-4
+// review's fix for the badge's overflow at the mandated 360px-wide minimum:
+// the badge text is up to ~95 characters ("couldn't reach " + a long
+// instance name + " last sweep — " + a full-sentence reason), rendered
+// inside .badge (white-space: nowrap) inside .shelf-head (display: flex,
+// no flex-wrap and no overflow anywhere in the chain) — a flex item's
+// default min-width:auto resolves to its min-content, which for nowrap text
+// is the WHOLE string, so the badge could neither shrink nor wrap and
+// overflowed the shelf card (roughly 2x the 360px viewport). An *arr
+// mid-restart is the ordinary real-world cause of this state, i.e. exactly
+// when the page must stay readable.
+func TestWebUIPage_UnreachableBadgeWrapsInsteadOfOverflowing(t *testing.T) {
+	page := string(webUIPage)
+
+	shelfHeadStart := strings.Index(page, ".shelf-head {")
+	if shelfHeadStart == -1 {
+		t.Fatal("no .shelf-head CSS rule found")
+	}
+	shelfHeadEnd := strings.Index(page[shelfHeadStart:], "}")
+	if shelfHeadEnd == -1 {
+		t.Fatal("could not find the end of the .shelf-head rule")
+	}
+	shelfHeadRule := page[shelfHeadStart : shelfHeadStart+shelfHeadEnd]
+	if !strings.Contains(shelfHeadRule, "flex-wrap: wrap") {
+		t.Error(".shelf-head does not allow its children to wrap onto a new line, so a long badge has nowhere to go but overflow")
+	}
+
+	unreachableStart := strings.Index(page, ".shelf-unreachable {")
+	if unreachableStart == -1 {
+		t.Fatal("no .shelf-unreachable CSS rule found")
+	}
+	unreachableEnd := strings.Index(page[unreachableStart:], "}")
+	if unreachableEnd == -1 {
+		t.Fatal("could not find the end of the .shelf-unreachable rule")
+	}
+	unreachableRule := page[unreachableStart : unreachableStart+unreachableEnd]
+	if !strings.Contains(unreachableRule, "white-space: normal") {
+		t.Error(".shelf-unreachable never overrides .badge's white-space: nowrap, so its text cannot wrap and will overflow at 360px")
+	}
+	if !strings.Contains(unreachableRule, "text-transform: none") {
+		t.Error(".shelf-unreachable never overrides .badge's uppercase text-transform; a full sentence in 11px caps is unreadable")
 	}
 }
