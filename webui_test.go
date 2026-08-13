@@ -117,6 +117,85 @@ func TestWebUIHandler_Stats_ReflectsARecordedCycle(t *testing.T) {
 	}
 }
 
+// TestWebUIHandler_Stats_CaseCollisionWireFieldsRawJSONSpelling is the
+// [final review round] regression test for a gap every other case-collision
+// test shared: every one of them decodes the response back into the SAME Go
+// structs (fileReportSnapshot/fileReportFindingRecord/
+// caseCollisionNameRecord) it was encoded from, so a typo'd or accidentally
+// `,omitempty`'d struct tag on CaseCollisions/EntryType/Names would break
+// webui.html's literal r.f.entryType/r.f.names/n.tracked reads AND README's
+// "caseCollisions is always present (including 0)" contract with a fully
+// green suite — decode/re-encode round-trips through Go field names, not
+// wire spelling. This asserts the RAW bytes instead, the same pattern
+// TestWebUIHandler_Stats_ReflectsARecordedCycle already uses for `"group":
+// ""`: caseCollisions is present at the top level even though it is 1 (a
+// non-zero case is not what would silently break under omitempty — this
+// pins the KEY spelling, which the existing count-based tests never do),
+// and entryType/names (with name/tracked) are present on the collision
+// finding's own JSON object and ABSENT on the duplicate's, exactly as the
+// API contract promises (`entryType`/`names` are case-collision-only).
+func TestWebUIHandler_Stats_CaseCollisionWireFieldsRawJSONSpelling(t *testing.T) {
+	s := newStatsStore(false)
+	s.recordInstance(cycleKindSweep, time.Now(), "sonarr-main", "sonarr", cycleInstanceStats{
+		total: 10, decisionsRan: true, fileReportRan: true,
+		fileReport: fileReportSnapshot{
+			Status: "ran", Duplicates: 1, Orphans: 0, CaseCollisions: 1,
+			Findings: []fileReportFindingRecord{
+				{Kind: "duplicate", Group: "S01E01", Path: "/tv/Show/dup.mkv", Display: "Show/dup.mkv", Count: 2},
+				{Kind: "case-collision", Path: "/tv/Show", Display: "Show", EntryType: "dir",
+					Names: []caseCollisionNameRecord{{Name: "Show", Tracked: true}, {Name: "show", Tracked: false}}},
+			},
+		},
+	})
+	ts, _ := newTestWebUIServer(t, s)
+
+	resp, err := http.Get(ts.URL + "/api/stats")
+	if err != nil {
+		t.Fatalf("GET /api/stats: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	body := string(raw)
+
+	if !strings.Contains(body, `"caseCollisions":1`) {
+		t.Errorf(`raw JSON missing "caseCollisions":1 (wire-spelled key) — a typo'd or omitempty'd struct tag would still round-trip through the Go struct decode every other test uses:\n%s`, raw)
+	}
+
+	// Pull each finding's OWN raw JSON object apart so presence/absence can
+	// be checked per-object, not just "somewhere in the response" (the
+	// collision finding's own entryType/names would otherwise make a
+	// substring search pass even if the duplicate wrongly carried them too,
+	// or mask a duplicate that wrongly omitted display/path).
+	var generic struct {
+		Instances []struct {
+			FileReport struct {
+				Findings []json.RawMessage `json:"findings"`
+			} `json:"fileReport"`
+		} `json:"instances"`
+	}
+	if err := json.Unmarshal(raw, &generic); err != nil {
+		t.Fatalf("response is not valid JSON: %v\n%s", err, raw)
+	}
+	if len(generic.Instances) != 1 || len(generic.Instances[0].FileReport.Findings) != 2 {
+		t.Fatalf("expected exactly 1 instance with 2 findings, got %+v", generic)
+	}
+	dup := string(generic.Instances[0].FileReport.Findings[0])
+	collision := string(generic.Instances[0].FileReport.Findings[1])
+
+	if strings.Contains(dup, `"entryType"`) || strings.Contains(dup, `"names"`) {
+		t.Errorf("the duplicate finding's own JSON object must never carry entryType/names (case-collision-only per the API contract):\n%s", dup)
+	}
+	if !strings.Contains(collision, `"entryType":"dir"`) {
+		t.Errorf(`collision finding missing "entryType":"dir":%s`, collision)
+	}
+	if !strings.Contains(collision, `"names":[{"name":"Show","tracked":true},{"name":"show","tracked":false}]`) {
+		t.Errorf(`collision finding's names array does not wire-spell {"name","tracked"} as promised:%s`, collision)
+	}
+	if strings.Contains(collision, `"group"`) || strings.Contains(collision, `"count"`) {
+		t.Errorf("the case-collision finding's own JSON object must never carry group/count (duplicate-only per the API contract):\n%s", collision)
+	}
+}
+
 // TestWebUIHandler_Stats_FileReportThreeStatesSurviveDistinctlyToTheClient
 // is the binding Phase 11 carry-forward, exercised end to end through the
 // REAL HTTP handler's JSON encoding rather than only statsStore's own Go
@@ -967,11 +1046,12 @@ func TestWebUIPage_FileReportShowsRootRelativeDisplayPathWithFullPathAsTitle(t *
 // breaks mid-word (dupli-cate) in its narrow column" fix: the kind cell must
 // opt out of table.findings td's page-wide word-break: break-word (below)
 // via its own class, and that class must reserve enough width to hold
-// "duplicate" — the longer of the two kind values — on one line.
+// "case-collision" — [v2.1] now the longest of the three kind values (14
+// characters, surpassing "duplicate"'s 9) — on one line.
 func TestWebUIPage_FileReportKindCellDoesNotWrapMidWord(t *testing.T) {
 	page := string(webUIPage)
 
-	if !strings.Contains(page, `td = el("td", "kind"); text(td, r.f.kind || "");`) {
+	if !strings.Contains(page, `td = el("td", "kind");`) {
 		t.Error("renderFileReport's kind cell is not built with the \"kind\" class")
 	}
 
@@ -985,10 +1065,142 @@ func TestWebUIPage_FileReportKindCellDoesNotWrapMidWord(t *testing.T) {
 	}
 	rule := page[start : start+end]
 	if !strings.Contains(rule, "white-space: nowrap") {
-		t.Error("table.findings td.kind does not set white-space: nowrap — \"duplicate\" can still wrap (and break) mid-word")
+		t.Error("table.findings td.kind does not set white-space: nowrap — \"case-collision\" can still wrap (and break) mid-word")
 	}
-	if !strings.Contains(rule, "min-width") {
-		t.Error("table.findings td.kind reserves no min-width — the auto-sized column can still come out narrower than \"duplicate\" itself")
+	if !strings.Contains(rule, "min-width: 14ch") {
+		t.Error("table.findings td.kind does not reserve 14ch — the auto-sized column can still come out narrower than \"case-collision\" itself")
+	}
+}
+
+// TestWebUIPage_FileReportKindCellUsesClayChipStyling pins [v2.1]'s "renders
+// the kind with the existing chip styling (clay)" requirement: the kind
+// cell's text is wrapped in the page's OWN existing badge/badge-hunt chip
+// (the same clay-toned pill .shelf-unreachable and the dry-run/live badge
+// already use), not a bespoke new visual element — see the CSS token
+// comment's own "never introduced fresh" rule.
+func TestWebUIPage_FileReportKindCellUsesClayChipStyling(t *testing.T) {
+	page := string(webUIPage)
+
+	start := strings.Index(page, "function renderFileReport(")
+	if start == -1 {
+		t.Fatal("page has no renderFileReport function")
+	}
+	end := strings.Index(page[start:], "\n  function render(data)")
+	if end == -1 {
+		t.Fatal("could not find the end of renderFileReport (render(data) must follow it)")
+	}
+	body := page[start : start+end]
+
+	if !strings.Contains(body, `"badge badge-hunt"`) {
+		t.Error("renderFileReport's kind cell does not reuse the existing badge/badge-hunt (clay) chip styling")
+	}
+	// [final review round fix] The prior version of this test was relaxed to
+	// pin only the chip's creation/class, losing the assertion that the
+	// chip's own TEXT is the finding's kind — dropping
+	// `text(kindChip, r.f.kind || "")` (webui.html) would ship an empty clay
+	// pill in every findings row with the rest of this test still green.
+	if !strings.Contains(body, `text(kindChip, r.f.kind`) {
+		t.Error("renderFileReport's kind chip never sets its own text to r.f.kind — the chip would render empty")
+	}
+}
+
+// TestWebUIPage_FileReportCaseCollisionNoticeExplainsActionability pins
+// [v2.1]'s "pluralized copy in the panel's operator voice explaining the
+// actionability" requirement: when the file-clutter panel is showing any
+// case-collision rows, it must say what a case-twin IS and what to DO about
+// it (merge or rename), in the same plain, second-person-free "operator
+// voice" the panel's other copy ("No clutter found...", "not configured")
+// already uses — matching PLURALIZED to the count, the same way the
+// reverse-scan panel's own notice pluralizes "item"/"items".
+func TestWebUIPage_FileReportCaseCollisionNoticeExplainsActionability(t *testing.T) {
+	page := string(webUIPage)
+
+	start := strings.Index(page, "function renderFileReport(")
+	if start == -1 {
+		t.Fatal("page has no renderFileReport function")
+	}
+	end := strings.Index(page[start:], "\n  function render(data)")
+	if end == -1 {
+		t.Fatal("could not find the end of renderFileReport (render(data) must follow it)")
+	}
+	body := page[start : start+end]
+
+	if !strings.Contains(body, "differing only by case") {
+		t.Error("renderFileReport never explains what a case-collision finding IS (\"differing only by case\")")
+	}
+	if !strings.Contains(body, "merge or rename") {
+		t.Error("renderFileReport never explains the actionability of a case-collision finding (\"merge or rename\")")
+	}
+	if !strings.Contains(body, `=== 1 ? "" : "s"`) && !strings.Contains(body, `== 1 ? "" : "s"`) {
+		t.Error("renderFileReport's case-collision notice does not pluralize its copy to the count, unlike the rest of this page's own notices")
+	}
+}
+
+// TestWebUIPage_FileReportRowsAreNeverFilteredByKind pins that [v2.1]'s new
+// case-collision kind flows through renderFileReport's row-building loop
+// exactly like duplicate/orphan already do: rows.push is the loop's very
+// FIRST statement, unconditional, never gated behind a kind check that
+// could silently drop a kind (e.g. case-collision) from pagination —
+// paginateRows (shared with the reverse-scan panel) sees and pages every
+// finding pushed here like any other row, per the binding requirement
+// ("Pagination covers them like any row"). Any per-kind counting the loop
+// also does (e.g. tallying case-collisions for the notice below) must come
+// AFTER the push, never instead of it.
+func TestWebUIPage_FileReportRowsAreNeverFilteredByKind(t *testing.T) {
+	page := string(webUIPage)
+
+	start := strings.Index(page, "function renderFileReport(")
+	if start == -1 {
+		t.Fatal("page has no renderFileReport function")
+	}
+	end := strings.Index(page[start:], "\n  function render(data)")
+	if end == -1 {
+		t.Fatal("could not find the end of renderFileReport (render(data) must follow it)")
+	}
+	body := page[start : start+end]
+
+	if !strings.Contains(body, "j++) {\n          rows.push({ instance: inst.name, f: findings[j] });") {
+		t.Error("rows.push is not the row-building loop's own first, unconditional statement — a kind-based filter or reordering may have crept in ahead of it")
+	}
+}
+
+// TestWebUIPage_FileReportCaseCollisionRowRendersNamesAndEntryType pins
+// [FIX, v2.2]: a case-collision finding never sets group/count (duplicate-
+// only fields), so without a dedicated branch every collision row rendered
+// group="—" and count="—" — byte-identical to any other collision found in
+// the same directory, and never showing the colliding NAMES themselves, the
+// only actionable part of the finding (and the one thing the panel's own
+// notice tells the operator to go inspect). The group cell must render
+// entryType plus every colliding name (marking which one is tracked), and
+// the count cell must render the group's own size — both derived from
+// r.f.entryType/r.f.names, never from the duplicate-only r.f.group/r.f.count.
+func TestWebUIPage_FileReportCaseCollisionRowRendersNamesAndEntryType(t *testing.T) {
+	page := string(webUIPage)
+
+	start := strings.Index(page, "function renderFileReport(")
+	if start == -1 {
+		t.Fatal("page has no renderFileReport function")
+	}
+	end := strings.Index(page[start:], "\n  function render(data)")
+	if end == -1 {
+		t.Fatal("could not find the end of renderFileReport (render(data) must follow it)")
+	}
+	body := page[start : start+end]
+
+	if !strings.Contains(body, `r.f.kind === "case-collision"`) {
+		t.Fatal("renderFileReport's row builder has no dedicated case-collision branch")
+	}
+	if !strings.Contains(body, "r.f.entryType") {
+		t.Error("the case-collision row branch never reads r.f.entryType")
+	}
+	if !strings.Contains(body, "r.f.names") {
+		t.Error("the case-collision row branch never reads r.f.names")
+	}
+	if !strings.Contains(body, `n.tracked ? " (tracked)" : ""`) {
+		t.Error("the case-collision row branch never marks which colliding name is tracked")
+	}
+	if !strings.Contains(body, "names.length") {
+		t.Error("the case-collision row branch's count does not come from the group's own size (names.length)")
 	}
 }
 
@@ -1068,6 +1280,45 @@ func TestWebUIPage_FileClutterHeaderDistinguishesCleanFromNotChecked(t *testing.
 	}
 	if !strings.Contains(page, "not configured") || !strings.Contains(page, "not checked") {
 		t.Error("fileCount summary text never distinguishes not-configured/not-checked instances from a genuine 0")
+	}
+}
+
+// TestWebUIPage_FileClutterHeaderNamesEveryFindingKind is round-3's [v2.1
+// review] regression test: the panel's own collapsed <summary> — the exact
+// text a glancing operator sees without expanding anything — still read
+// "File clutter — duplicates & orphans (N)" even after case-collision
+// findings became a THIRD kind this same panel renders. fileCountText (the
+// number inside that summary) is `rows.length` over every finding pushed
+// into `rows`, which now includes every case-collision row alongside
+// duplicates/orphans — so an instance with 0 duplicates, 0 orphans and 3
+// case-twins rendered "duplicates & orphans (3)", a count that contradicts
+// its own label. This is the same "the number means something other than
+// what the label says" failure TestWebUIPage_FileClutterHeaderDistinguishes
+// CleanFromNotChecked (above) exists to prevent for the off/skipped
+// qualifier — here pinning the label itself so it can never again omit a
+// kind renderFileReport's row builder actually emits.
+func TestWebUIPage_FileClutterHeaderNamesEveryFindingKind(t *testing.T) {
+	page := string(webUIPage)
+	start := strings.Index(page, "<summary>File clutter")
+	if start == -1 {
+		t.Fatal("page has no File clutter panel <summary>")
+	}
+	end := strings.Index(page[start:], "</summary>")
+	if end == -1 {
+		t.Fatal("File clutter panel <summary> has no closing tag")
+	}
+	summary := page[start : start+end]
+	// duplicate, orphan, and case-collision are the only three kinds
+	// renderFileReport's row builder ever pushes into `rows` (see
+	// fileKindDuplicate/fileKindOrphan/fileKindCaseCollision in
+	// filereport.go) — every one of them must be named in the heading that
+	// counts them, in the panel's own established copy for each ("case-twin"
+	// is the operator-facing term used everywhere else on this panel, e.g.
+	// the actionability notice below).
+	for _, want := range []string{"duplicates", "orphans", "case-twin"} {
+		if !strings.Contains(summary, want) {
+			t.Errorf("File clutter panel <summary> %q is missing %q; the heading must name every finding kind the panel can display, not just the first two", summary, want)
+		}
 	}
 }
 

@@ -98,6 +98,19 @@ const (
 	FileSkipReasonMismatchedSeason       = "season excluded: episode file count mismatch"
 	FileSkipReasonExcludedByTag          = "movie/series excluded by exclusion_tag"
 	FileSkipReasonOutsideConfiguredRoots = "tracked path outside every configured root"
+
+	// FileSkipReasonCaseTwin is [v2.1] the case-collision skip reason: every
+	// colliding entry NAME (both halves of a directory-name twin, or a
+	// file-name twin) that caseCollisionsInDir excludes from descent/
+	// classification is counted under this one string on the SAME
+	// fileSkipReasons summary attr the other six reasons already share
+	// ("case-twin names excluded=N", binding controller resolution 3) —
+	// even though, unlike the other six, it can cover DIRECTORY entries as
+	// well as file entries, never routed through classifyFileReportPath at
+	// all. See caseCollisionsInDir's own doc comment for why this lives
+	// outside the five-identity-term vocabulary below rather than as a
+	// sixth skipped-by-rule/skipped-untrusted reason.
+	FileSkipReasonCaseTwin = "case-twin names excluded"
 )
 
 // The five identity terms every video file the walk visits resolves into
@@ -109,6 +122,33 @@ const (
 	fileKindOrphan           = "orphan"
 	fileKindSkippedByRule    = "skipped-by-rule"
 	fileKindSkippedUntrusted = "skipped-untrusted"
+)
+
+// fileKindCaseCollision is [v2.1] a SIXTH finding kind, deliberately outside
+// the five-identity-term vocabulary above: a case-collision finding is never
+// the classification of one video FILE the walk visited (classifyFileReportPath
+// never runs against a colliding entry at all — see caseCollisionsInDir's own
+// doc comment), it is a finding about a whole GROUP of same-folded entry
+// NAMES observed at listing time, before any per-file classification could
+// even begin. assertFileReportIdentity (filereport_test.go) recognizes this
+// kind explicitly and excludes it from the five-term sum for exactly that
+// reason.
+const fileKindCaseCollision = "case-collision"
+
+// fileReportEntryTypeDir/fileReportEntryTypeFile/fileReportEntryTypeMixed are
+// the three shapes a case-collision finding's own entryType field can take
+// (binding controller resolution 2: "entry type (dir/file)", extended by the
+// [final review round] cross-type ruling below). fileReportEntryTypeDir/File
+// mean every colliding name in the group is that one type; fileReportEntryTypeMixed
+// means the group spans both — e.g. a directory `Show` beside a file `show`,
+// which is exactly as real a case-twin (and exactly as disruptive to a
+// case-insensitive view's directory addressing) as two same-type twins, so
+// caseCollisionsInDir detects it rather than only documenting it as an
+// exclusion.
+const (
+	fileReportEntryTypeDir   = "dir"
+	fileReportEntryTypeFile  = "file"
+	fileReportEntryTypeMixed = "mixed"
 )
 
 // --- path mapping (binding controller resolution 2) -------------------------
@@ -536,6 +576,228 @@ func classifyFileReportPath(filePath string, root mediaRoot, set instanceTracked
 	return fileReportClassification{kind: fileKindDuplicate, isSeries: isSeries, title: title, group: group, folder: folder}
 }
 
+// --- case-collision detection (v2.1, user-requested) ------------------------
+//
+// Case-twins are real library defects (the *arr tracks at most one
+// spelling; the other is shadow content) AND they break directory
+// addressing on case-insensitive views (macOS SMB), where they previously
+// caused the whole root to abort with "could not be checked". Detection
+// from the LISTING works on every platform — enumeration returns both names
+// even where opening one of them ambiguously is not safe — so this whole
+// feature is built on that: a directory's own entry names, nothing more.
+
+// detectCaseCollisions groups names by Unicode case-folding equality
+// (strings.EqualFold semantics — not a precomputed strings.ToLower key,
+// which can diverge from EqualFold for pairs like the Kelvin sign and
+// ASCII "k") and returns every group of two or more names that fold equal
+// to each other but are not ALL identical byte-for-byte — real case-twins,
+// the library defect this whole feature exists to surface (binding
+// controller resolution 1). A directory's own real entries can never repeat
+// a byte-identical name twice (the filesystem itself forbids it), so the
+// "not all identical" guard only ever matters against a synthesized/test
+// name list — but it costs nothing to keep correct there too: two spellings
+// that already match exactly have nothing to merge or rename.
+//
+// Pure and side-effect free: no I/O, callable directly from a synthesized
+// name list on every platform — see this file's own "case-collision
+// detection" section header, and filereport_test.go's matching header, for
+// why that matters (t.TempDir on macOS/APFS cannot hold two real case-twin
+// entries at once).
+//
+// O(n^2) in the size of names (every name pairwise-compared against every
+// other): a real directory listing is never large enough, in any library
+// this project targets, for that to matter, and pairwise strings.EqualFold
+// is the simplest way to guarantee the result matches EqualFold's own
+// semantics exactly rather than an approximation of them.
+//
+// Order is deterministic and entirely a function of the input's own order:
+// groups are returned in the order their first member appears in names, and
+// each group lists its members in the order they appear in names — no
+// internal re-sorting, so a caller in a fixed listing order (os.ReadDir's
+// own alphabetical guarantee, or a test's own fixed slice) gets a fixed,
+// reproducible result.
+func detectCaseCollisions(names []string) [][]string {
+	var groups [][]string
+	assigned := make([]bool, len(names))
+	for i, a := range names {
+		if assigned[i] {
+			continue
+		}
+		group := []string{a}
+		distinct := map[string]bool{a: true}
+		for j := i + 1; j < len(names); j++ {
+			if assigned[j] {
+				continue
+			}
+			if strings.EqualFold(a, names[j]) {
+				group = append(group, names[j])
+				distinct[names[j]] = true
+				assigned[j] = true
+			}
+		}
+		if len(group) >= 2 && len(distinct) >= 2 {
+			groups = append(groups, group)
+		}
+	}
+	return groups
+}
+
+// fileReportDirLister lists one directory's own entries for
+// caseCollisionsInDir's pre-scan. A package-level var — the same seam
+// fileReportMountSampleSize already established for a different value this
+// file needs test control over — rather than a new parameter threaded
+// through evaluateFileReportRoot and its many existing call sites/tests:
+// production always uses the real os.ReadDir; a test can substitute a fake
+// lister returning SYNTHESIZED fs.DirEntry values (case-twin names a real
+// case-insensitive dev filesystem cannot hold at once) without touching
+// disk at all. Every test in this package runs sequentially (no
+// t.Parallel), so a test overriding this var and restoring it on cleanup is
+// safe, including under -race.
+var fileReportDirLister = os.ReadDir
+
+// caseCollisionEntry is one name within a case-collision finding: the
+// colliding entry's own name (not a full path — the containing directory is
+// already carried by the finding's diskPath/displayPath), and whether it
+// correlates against the tracked set (binding controller resolution 2:
+// "whether each name contains/IS a tracked path (correlate against the
+// tracked set where determinable)"). The tracked set is always fully built
+// by the time the walk runs, so "determinable" here always means "checked",
+// never "unknown" — a name outside the tracked set entirely (a stray
+// directory in an unmanaged corner of a root) simply correlates false,
+// exactly as orphan classification already treats an untracked location.
+type caseCollisionEntry struct {
+	name    string
+	tracked bool
+}
+
+// pathIsOrContainsTracked reports whether p (one colliding entry's own full
+// disk path) IS a tracked file or folder itself, or CONTAINS one — some
+// tracked file or folder lives at or under p. This is a case-collision-only
+// correlation (binding controller resolution 2) computed for a human's
+// benefit — it tells which of two colliding spellings looks like "the real
+// one" — and is never an input to classifyFileReportPath's own duplicate/
+// orphan decision, which stays exactly as it always was.
+func pathIsOrContainsTracked(p string, set instanceTrackedSet) bool {
+	if set.files[p] {
+		return true
+	}
+	if _, ok := set.folders[p]; ok {
+		return true
+	}
+	for f := range set.files {
+		if hasPathPrefix(f, p) {
+			return true
+		}
+	}
+	for f := range set.folders {
+		if hasPathPrefix(f, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// caseCollisionsInDir lists dirPath's own entries (fileReportDirLister — see
+// its own doc comment on why this is an injectable seam) and applies
+// detectCaseCollisions to the UNION of its subdirectory names and its file
+// names together (binding controller resolution 1: "applies to BOTH ... at
+// every level of the walk", extended by the [final review round] cross-type
+// ruling: a directory `Show` beside a file `show` is a real case-twin too —
+// the *arr still tracks at most one of them, and a case-insensitive view
+// still cannot address both — so it must be DETECTED, not silently allowed
+// to fall through to the ambiguous ReadDir that used to abort the whole
+// root). detectCaseCollisions itself stays a pure function over plain
+// names — it does not need to know which type a name is, only whether two
+// names fold together — so entry type is tracked separately, per name, by
+// this function, purely so each group's colliding names can be routed to
+// the right exclude map below. The collision check runs unfiltered by video
+// extension or any other classification rule, since it runs BEFORE any of
+// that (binding controller resolution 3). For every group found it returns
+// one case-collision finding, carrying the containing directory (diskPath/
+// displayPath, root-relative per the existing convention), every colliding
+// name and its tracked correlation, and an entryType that is "dir"/"file"
+// when every name in the group is that one type, or "mixed" when the group
+// spans both — and records every colliding entry's own full disk path in
+// excludeDirs/excludeFiles (a dir-typed name into excludeDirs, a file-typed
+// name into excludeFiles, regardless of whether its own finding's entryType
+// is single-type or mixed) so evaluateFileReportRoot's walk can exclude it
+// from descent (a directory) or classification (a file) entirely — see that
+// function's own walkFn closure for how the two maps are consumed.
+// excludedCount is the total number of colliding NAMES across every group
+// found here, both entry types combined — the new skip reason's own tally,
+// FileSkipReasonCaseTwin ("case-twin names excluded=N", binding controller
+// resolution 3).
+//
+// [Known simplicity/perf tradeoff, documented rather than engineered
+// around] This is a SECOND, independent read of dirPath's own entries:
+// fs.WalkDir does its own internal ReadDir on every directory it does not
+// SkipDir, and this function's own fileReportDirLister call happens
+// earlier, from inside walkFn, for the SAME directory. A custom,
+// from-scratch recursive walk could read each directory exactly once, but
+// would have to reimplement fs.WalkDir's own symlink-non-following,
+// sorted-order and error-propagation behavior byte for byte — all of it
+// already correct and already pinned by this file's own symlink/walk-error
+// tests. A doubled, cheap (ReadDir never touches file contents) directory
+// listing was judged the smaller risk.
+func caseCollisionsInDir(dirPath, rel string, root mediaRoot, set instanceTrackedSet) (findings []fileReportFinding, excludeDirs, excludeFiles map[string]bool, excludedCount int, err error) {
+	entries, err := fileReportDirLister(dirPath)
+	if err != nil {
+		return nil, nil, nil, 0, err
+	}
+	// allNames feeds detectCaseCollisions as a single unioned listing so a
+	// dir/file cross-type pair folds into the same group; entryTypeOf is the
+	// per-name side-table detectCaseCollisions' own name-only signature has
+	// no room for, consulted below once a group is known. Two entries can
+	// never share the exact same spelling here regardless of type — a
+	// directory and a file cannot occupy the identical name in one real
+	// directory listing — so a plain map keyed by name is unambiguous.
+	var allNames []string
+	entryTypeOf := map[string]string{}
+	for _, e := range entries {
+		allNames = append(allNames, e.Name())
+		if e.IsDir() {
+			entryTypeOf[e.Name()] = fileReportEntryTypeDir
+		} else {
+			entryTypeOf[e.Name()] = fileReportEntryTypeFile
+		}
+	}
+
+	excludeDirs = map[string]bool{}
+	excludeFiles = map[string]bool{}
+	display := rootRelativeDisplayPath(root, rel)
+
+	for _, group := range detectCaseCollisions(allNames) {
+		names := make([]caseCollisionEntry, len(group))
+		sawDir, sawFile := false, false
+		for i, n := range group {
+			full := cleanArrPath(path.Join(dirPath, n))
+			switch entryTypeOf[n] {
+			case fileReportEntryTypeDir:
+				excludeDirs[full] = true
+				sawDir = true
+			default:
+				excludeFiles[full] = true
+				sawFile = true
+			}
+			names[i] = caseCollisionEntry{name: n, tracked: pathIsOrContainsTracked(full, set)}
+		}
+		excludedCount += len(group)
+		entryType := fileReportEntryTypeMixed
+		switch {
+		case sawDir && !sawFile:
+			entryType = fileReportEntryTypeDir
+		case sawFile && !sawDir:
+			entryType = fileReportEntryTypeFile
+		}
+		findings = append(findings, fileReportFinding{
+			kind: fileKindCaseCollision, diskPath: dirPath, displayPath: display,
+			entryType: entryType, names: names,
+		})
+	}
+
+	return findings, excludeDirs, excludeFiles, excludedCount, nil
+}
+
 // --- mount-problem heuristic + walk (binding controller resolution 4) ------
 
 // fileReportMountSampleSize bounds how many tracked files under one root are
@@ -550,11 +812,12 @@ var fileReportMountSampleSize = 100
 // treated as a mount problem rather than a library with a few missing files.
 const fileReportMountHealthyFraction = 0.9
 
-// fileReportFinding is one duplicate or orphan file, ready to be logged.
-// groupCount (duplicates only) is filled in once the whole root has been
-// walked, since it counts SIBLINGS within the same display group.
+// fileReportFinding is one duplicate, orphan, or [v2.1] case-collision
+// finding, ready to be logged. groupCount (duplicates only) is filled in
+// once the whole root has been walked, since it counts SIBLINGS within the
+// same display group.
 type fileReportFinding struct {
-	kind     string // fileKindDuplicate or fileKindOrphan
+	kind     string // fileKindDuplicate, fileKindOrphan, or fileKindCaseCollision
 	diskPath string
 
 	// displayPath is diskPath rendered relative to its mapped root — see
@@ -571,6 +834,17 @@ type fileReportFinding struct {
 	group      string
 	folder     string // groupKey's real key (duplicates only) — see its doc comment.
 	groupCount int
+
+	// entryType/names are [v2.1] case-collision-only: which kind of entry
+	// collided (fileReportEntryTypeDir/fileReportEntryTypeFile, or
+	// fileReportEntryTypeMixed for a cross-type twin — a directory beside a
+	// file, e.g. `Show`/`show`) and every colliding name plus its
+	// tracked-set correlation (binding controller resolution 2). For this
+	// kind, diskPath/displayPath name the CONTAINING DIRECTORY the collision
+	// was found in, not any one of the colliding entries themselves — see
+	// caseCollisionsInDir's own doc comment.
+	entryType string
+	names     []caseCollisionEntry
 }
 
 // fileReportRootOutcome is one mapped root's walk result: either skipped (the
@@ -579,8 +853,8 @@ type fileReportFinding struct {
 // an incomplete result is never returned as if it were the whole truth), or
 // the classification of every file it found.
 //
-// seenTracked/seenSkippedByRule/seenSkippedUntrusted plus
-// len(findings-by-kind) are the five identity-term counters
+// seenTracked/seenSkippedByRule/seenSkippedUntrusted/seenCaseTwinExcluded
+// plus len(findings-by-kind) are the six identity-term counters
 // assertFileReportIdentity (filereport_test.go) checks always add up to the
 // number of files the walk actually visited.
 type fileReportRootOutcome struct {
@@ -592,6 +866,17 @@ type fileReportRootOutcome struct {
 	seenTracked          int
 	seenSkippedByRule    int
 	seenSkippedUntrusted int
+
+	// seenCaseTwinExcluded is [FIX, v2.2] the sixth identity term: every
+	// REAL on-disk FILE the walk's own real traversal visits and finds
+	// excluded by a case-collision increments this once — see the
+	// excludeFiles branch in evaluateFileReportRoot's walkFn for where and
+	// why. A colliding DIRECTORY never contributes here: fs.SkipDir means
+	// nothing inside it is ever visited at all, so its contents were never
+	// part of totalFilesOnDisk in the first place (assertFileReportIdentity
+	// treats that case by the caller simply not counting them, rather than
+	// needing a term of its own).
+	seenCaseTwinExcluded int
 }
 
 // errFileReportShutdown is fs.WalkDir's abort signal for a context
@@ -738,6 +1023,35 @@ func evaluateFileReportRoot(ctx context.Context, logger *slog.Logger, itemLevel 
 	outcome.skipReasons = map[string]int{}
 	videoFilesSeen := 0
 
+	// collisionEvidence is [FIX, v2.2] deliberately SEPARATE from
+	// videoFilesSeen — see the d.IsDir() branch below for where it is
+	// incremented and why. It feeds ONLY heuristic (c)'s "this root is not
+	// simply empty/unmounted" gate, never heuristic (d)'s "the walk found
+	// real video files here" trigger: the two heuristics ask different
+	// questions (c: "is there ANY sign of life here", d: "did we find real
+	// VIDEO content under a root this instance tracks nothing at all
+	// under") and a case-collision — evidence the LISTING succeeded and
+	// returned real, distinctly-named entries — only answers the first one.
+	// Feeding it into videoFilesSeen (which heuristic (d) also reads) used
+	// to make a root whose ONLY content was a colliding pair look, to
+	// heuristic (d), exactly like "the walk found real video files here" —
+	// aborting a root binding controller resolution 3 requires complete as
+	// fileReport=ran (collisions are FINDINGS, not abort causes). See
+	// TestEvaluateFileReportRoot_HeuristicDDoesNotFireOnCollisionOnlyUntrackedRoot.
+	collisionEvidence := 0
+
+	// excludeDirs/excludeFiles are [v2.1] populated by caseCollisionsInDir's
+	// pre-scan of a directory's own children the moment walkFn is called for
+	// THAT DIRECTORY itself — strictly before fs.WalkDir ever calls walkFn
+	// again for any one of those children (fs.WalkDir's own pre-order
+	// guarantee: a directory's walkFn call always precedes every descendant's).
+	// So by the time walkFn is invoked for a given child path, that child's
+	// own exclusion status (if any) was already decided by its PARENT's
+	// callback, one level up — see the d.IsDir() branch below for how each
+	// half is consumed.
+	excludeDirs := map[string]bool{}
+	excludeFiles := map[string]bool{}
+
 	walkErr := fs.WalkDir(os.DirFS(root.diskPath), ".", func(rel string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -745,11 +1059,103 @@ func evaluateFileReportRoot(ctx context.Context, logger *slog.Logger, itemLevel 
 		if ctx.Err() != nil {
 			return errFileReportShutdown
 		}
+
+		filePath := cleanArrPath(path.Join(root.diskPath, rel))
+
 		if d.IsDir() {
+			if excludeDirs[filePath] {
+				// [v2.1] This directory's own name collided with a
+				// sibling's, decided at its PARENT's pre-scan below (never
+				// this directory's own — a directory never pre-scans
+				// itself). fs.SkipDir is fs.WalkDir's only mechanism to
+				// omit one specific child's whole subtree while leaving
+				// every sibling's traversal untouched (binding controller
+				// resolution 3: "excluded from descent"): nothing inside is
+				// ever visited, or individually counted, this cycle.
+				return fs.SkipDir
+			}
+			findings, subDirs, subFiles, excluded, err := caseCollisionsInDir(filePath, rel, root, set)
+			if err != nil {
+				// A pre-scan read failure is exactly as fatal to this
+				// root's completeness contract as any other walk error —
+				// see this function's own warnAbort-on-walkErr handling
+				// below, which treats whatever this closure returns
+				// uniformly.
+				return err
+			}
+			outcome.findings = append(outcome.findings, findings...)
+			if excluded > 0 {
+				outcome.skipReasons[FileSkipReasonCaseTwin] += excluded
+				// [FIX, v2.2] Counted here, ONCE per directory's pre-scan,
+				// as proof toward heuristic (c) ("this root is not simply
+				// empty/unmounted") ONLY — never toward videoFilesSeen,
+				// which heuristic (d) also reads (see collisionEvidence's
+				// own doc comment above for why the two must stay
+				// separate). Not per individual file visit below either,
+				// since a colliding SUBDIRECTORY is never individually
+				// visited at all (fs.SkipDir prevents fs.WalkDir from ever
+				// reaching anything inside it), so there is no later
+				// per-file moment to count it at. Without SOME evidence
+				// here, a root whose only tracked file happens to sit
+				// inside a case-colliding folder — or IS itself a
+				// case-colliding file — would see videoFilesSeen stay at 0
+				// while len(tracked) > 0, tripping heuristic (c)'s
+				// "zero video files of any kind" abort and turning binding
+				// controller resolution 3's own required outcome
+				// ("a root whose only irregularities are detected
+				// collisions completes with fileReport=ran") into a false
+				// "skipped".
+				//
+				// [FIX, v2.2] Narrowed to the SAME evidentiary weight
+				// classifyFileReportPath's own wrong-extension rule already
+				// accepts (line ~1092's "a wrong-extension file (a poster,
+				// an nfo) proves nothing about whether real media exists
+				// here"): every colliding DIRECTORY counts (successfully
+				// listing 2+ distinctly-named subdirectories is real
+				// evidence of a live, properly mounted share, regardless of
+				// what turns out to be inside them), but a colliding FILE
+				// counts only when its name carries a recognized video
+				// extension — a poster.jpg/Poster.jpg or .nfo/.NFO twin
+				// proves nothing about whether real media exists here, same
+				// as a single wrong-extension file never did.
+				collisionEvidence += len(subDirs)
+				for f := range subFiles {
+					if videoExtensions[strings.ToLower(path.Ext(f))] {
+						collisionEvidence++
+					}
+				}
+			}
+			for k := range subDirs {
+				excludeDirs[k] = true
+			}
+			for k := range subFiles {
+				excludeFiles[k] = true
+			}
 			return nil
 		}
 
-		filePath := cleanArrPath(path.Join(root.diskPath, rel))
+		if excludeFiles[filePath] {
+			// [v2.1] Excluded at this file's own containing directory's
+			// pre-scan, above — already counted under FileSkipReasonCaseTwin
+			// (and, when its extension qualifies, toward collisionEvidence
+			// there — see the pre-scan's own comment on why), and already
+			// represented by the case-collision finding that pre-scan
+			// produced. Never classified as tracked/duplicate/orphan/
+			// skipped-* (binding controller resolution 3: "excluded from
+			// ... duplicate/orphan classification").
+			//
+			// [FIX, v2.2] outcome.seenCaseTwinExcluded is the sixth
+			// assertFileReportIdentity term: incremented once per REAL
+			// on-disk file THIS visit — fs.WalkDir's own real traversal —
+			// finds excluded, not once per synthesized name in the
+			// pre-scan's own group above (an injected-lister test's group
+			// can include a PHANTOM name that never exists on disk and this
+			// real traversal therefore never visits at all, so counting
+			// there would overcount against totalFilesOnDisk).
+			outcome.seenCaseTwinExcluded++
+			return nil
+		}
+
 		c := classifyFileReportPath(filePath, root, set)
 		switch c.kind {
 		case fileKindTracked:
@@ -799,8 +1205,14 @@ func evaluateFileReportRoot(ctx context.Context, logger *slog.Logger, itemLevel 
 	// anywhere on the walk is the same "this looks unmounted" signal as (b),
 	// caught here for the case where the specific tracked files sampled by
 	// (b) happen not to be the ones missing (a small sample, or files under a
-	// subtree heuristic (b) did not walk).
-	if len(tracked) > 0 && videoFilesSeen == 0 {
+	// subtree heuristic (b) did not walk). [FIX, v2.2] Also gated on
+	// collisionEvidence == 0 — a directory listing that succeeded and
+	// returned real, distinctly-named (if colliding) entries is itself
+	// evidence this root is not simply empty/unmounted, exactly as one real
+	// video file would be (see collisionEvidence's own doc comment, above,
+	// for why this is intentionally NOT the same counter heuristic (d)
+	// reads below).
+	if len(tracked) > 0 && videoFilesSeen == 0 && collisionEvidence == 0 {
 		return warnAbort("file report: mount-problem heuristic aborted this root: it tracks files but the walk found zero video files of any kind",
 			"trackedUnderRoot", len(tracked))
 	}
@@ -812,7 +1224,12 @@ func evaluateFileReportRoot(ctx context.Context, logger *slog.Logger, itemLevel 
 	// real video files anyway is not evidence of a legitimate empty or
 	// unmanaged root (a genuinely empty/unmanaged root has nothing to walk
 	// in the first place, which is exactly why this is gated on
-	// videoFilesSeen > 0). It is evidence THIS SPECIFIC root has a
+	// videoFilesSeen > 0 — [FIX, v2.2] real classified video files ONLY,
+	// deliberately excluding collisionEvidence: a root whose only content
+	// is a detected case-twin pair must complete as fileReport=ran per
+	// binding controller resolution 3, never abort here as if it were a
+	// media_root_map misconfiguration). It is evidence THIS SPECIFIC root
+	// has a
 	// media_root_map problem the instance-wide guard cannot see, because
 	// every one of the instance's OTHER tracked paths mapped fine: a key
 	// typo/case-mismatch on just this one root, or the same per-instance
@@ -872,20 +1289,39 @@ func groupKey(f fileReportFinding) string {
 }
 
 // logFileReportFinding emits the frozen vocabulary line (binding controller
-// resolution 7): msg="file-report finding", kind=duplicate|orphan, instance,
-// root and path (both CUTOFFARR-side / disk paths), plus duplicate-only
-// grouping attrs. Logged at itemLevel — the same demotion the forward and
-// reverse passes give their own per-item lines (full at startup/--once,
-// debug on repeating sweeps) — never at a level of its own.
+// resolution 7): msg="file-report finding", kind=duplicate|orphan|
+// case-collision, instance, root and path (both CUTOFFARR-side / disk
+// paths), plus duplicate-only grouping attrs or [v2.1] case-collision-only
+// entryType/names attrs. Logged at itemLevel — the same demotion the
+// forward and reverse passes give their own per-item lines (full at
+// startup/--once, debug on repeating sweeps) — never at a level of its own.
+//
+// [final review round fix] The names attr marks each tracked spelling
+// inline (`Show [tracked], show`) rather than joining bare names — docker
+// logs are this daemon's primary surface, and README/the GUI both promise
+// the tracked correlation ("so you know which spelling to keep"); without
+// this an operator reading the log sees two spellings and not the one
+// actionable bit the API/GUI already carry correctly.
 func logFileReportFinding(ctx context.Context, logger *slog.Logger, itemLevel slog.Level, inst Instance, root mediaRoot, f fileReportFinding) {
 	attrs := []any{"kind", f.kind, "instance", inst.Name, "type", inst.Type, "root", root.diskPath, "path", f.diskPath}
-	if f.kind == fileKindDuplicate {
+	switch f.kind {
+	case fileKindDuplicate:
 		if f.isSeries {
 			attrs = append(attrs, "series", f.title, "group", f.group)
 		} else {
 			attrs = append(attrs, "title", f.title)
 		}
 		attrs = append(attrs, "groupCount", f.groupCount)
+	case fileKindCaseCollision:
+		names := make([]string, len(f.names))
+		for i, n := range f.names {
+			if n.tracked {
+				names[i] = n.name + " [tracked]"
+			} else {
+				names[i] = n.name
+			}
+		}
+		attrs = append(attrs, "entryType", f.entryType, "names", strings.Join(names, ", "))
 	}
 	logger.Log(ctx, itemLevel, "file-report finding", attrs...)
 }
@@ -1093,10 +1529,18 @@ type fileReportCounts struct {
 	orphans     int
 	skipReasons map[string]int
 
+	// caseCollisions is [v2.1]: the number of case-collision FINDINGS (one
+	// per colliding GROUP, binding controller resolution 2 — never one per
+	// colliding NAME, which is what FileSkipReasonCaseTwin's own count under
+	// skipReasons already tallies instead). Counted the same way duplicates/
+	// orphans are, in mergeFileReportOutcome, by kind.
+	caseCollisions int
+
 	// findings is Phase 12's addition: the SAME findings duplicates/orphans
-	// already tally, kept as data. Appended alongside the existing counting
-	// in mergeFileReportOutcome, never in place of it, so the frozen "file
-	// report" summary line (logFileReportSummary) is untouched.
+	// (and, since v2.1, caseCollisions) already tally, kept as data.
+	// Appended alongside the existing counting in mergeFileReportOutcome,
+	// never in place of it, so the frozen "file report" summary line
+	// (logFileReportSummary) is untouched.
 	findings []fileReportFinding
 }
 
@@ -1139,7 +1583,7 @@ func logFileReportSummary(logger *slog.Logger, inst Instance, c fileReportCounts
 		logger.Debug("file report", attrs...)
 		return
 	}
-	attrs = append(attrs, "duplicates", c.duplicates, "orphans", c.orphans, "fileSkipReasons", formatSkipCounts(c.skipReasons))
+	attrs = append(attrs, "duplicates", c.duplicates, "orphans", c.orphans, "caseCollisions", c.caseCollisions, "fileSkipReasons", formatSkipCounts(c.skipReasons))
 	logger.Info("file report", attrs...)
 }
 
@@ -1242,18 +1686,28 @@ func warnIfAnyTrackedPathUnmapped(logger *slog.Logger, inst Instance, buildSkipC
 
 // mergeFileReportOutcome folds one root's outcome into the instance-wide
 // accounting, shared by both the Radarr and Sonarr entry points so the two
-// cannot drift on how a skipped root, or a duplicate-vs-orphan split, is
-// counted.
+// cannot drift on how a skipped root, or a duplicate/orphan/[v2.1]
+// case-collision split, is counted.
+//
+// [FIX, v2.1] This used to be an if/else ("duplicate" vs "else -> orphan"),
+// which silently miscounted every case-collision finding as an orphan the
+// moment this kind was added to the SAME outcome.findings slice — an
+// exhaustive switch, with every recognized kind named explicitly, is what
+// TestMergeFileReportOutcome_CountsCaseCollisionsSeparatelyFromOrphans
+// exists to pin against regressing back to.
 func mergeFileReportOutcome(c *fileReportCounts, outcome fileReportRootOutcome) {
 	if outcome.skipped {
 		c.anySkipped = true
 		return
 	}
 	for _, f := range outcome.findings {
-		if f.kind == fileKindDuplicate {
+		switch f.kind {
+		case fileKindDuplicate:
 			c.duplicates++
-		} else {
+		case fileKindOrphan:
 			c.orphans++
+		case fileKindCaseCollision:
+			c.caseCollisions++
 		}
 	}
 	// Phase 12: the findings themselves, carried alongside the counts above

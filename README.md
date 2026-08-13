@@ -463,13 +463,13 @@ to the walk, regardless of what it points to.
 ```
 level=INFO msg="file-report finding" kind=duplicate instance=radarr-main root=/data/media/Movies path="/data/media/Movies/Some Film (2020)/Some Film (2020) (2).mkv" title="Some Film (2020)" groupCount=1
 level=INFO msg="file-report finding" kind=orphan instance=radarr-main root=/data/media/Movies path="/data/media/Movies/Stray Folder/something.mkv"
-level=INFO msg="file report" instance=radarr-main type=radarr fileReport=ran duplicates=1 orphans=1 fileSkipReasons="none"
+level=INFO msg="file report" instance=radarr-main type=radarr fileReport=ran duplicates=1 orphans=1 caseCollisions=0 fileSkipReasons="none"
 ```
 
 Exactly like reverse-scan findings, individual `file-report finding` lines
 print in full on the startup scan and on `--once`, and demote to `debug` on
 the daemon's repeating reconciliation sweeps — where the summary's
-`duplicates=N orphans=N` is what stays visible.
+`duplicates=N orphans=N caseCollisions=N` is what stays visible.
 
 `fileReport` on that summary line is always one of three values, and the
 three are deliberately never confusable with each other:
@@ -481,9 +481,9 @@ three are deliberately never confusable with each other:
   trusted this cycle (see below) and was aborted with its own `WARN` naming
   it. `duplicates`/`orphans` still reflect whatever roots *did* complete —
   one root's problem never hides another root's real findings.
-- **`ran`** — every configured root completed. `duplicates=0 orphans=0` is a
-  real, positive statement that the report ran and found nothing, not
-  silence.
+- **`ran`** — every configured root completed. `duplicates=0 orphans=0
+  caseCollisions=0` is a real, positive statement that the report ran and
+  found nothing, not silence.
 
 ### Multi-episode files
 
@@ -504,6 +504,55 @@ disabled for a series entirely (every episode file sits flat in the series
 folder) and *any* one of that series' seasons is currently distrusted, every
 extra file in that series is withheld rather than guessed at, because there
 is no folder boundary left to tell them apart by.
+
+### Case-twin names
+
+A **case-twin** is two entries in the same directory — two movie/series
+folders, or two files — whose names differ *only* by letter case: `My Name
+Is Earl` next to `My Name is Earl`. This is a real library defect: a `*arr`
+tracks at most one of the two spellings, and the other is shadow content
+nothing manages or ever will. On a case-*insensitive* view of the same
+disk (a Samba/SMB share re-exported to a case-insensitive client, for
+example), the two names can also make directory addressing itself
+ambiguous — before this check existed, that ambiguity made the whole
+root's report abort as "could not be checked" the moment the walk reached
+it, rather than telling you what was actually wrong.
+
+Case-twins are caught from the directory **listing** itself — which works
+identically on every platform, case-sensitive or not — before anything
+else happens with that directory: every level of the walk, both the
+subdirectory names and the file names in it, are checked against each
+other for a case-only difference *before* any of them is descended into or
+classified as tracked/duplicate/orphan. That check is not scoped to one
+entry type at a time either: a **directory** named `Show` colliding with a
+**file** named `show` in the same parent is just as real a case-twin, and
+just as ambiguous to address on a case-insensitive view, as two folders or
+two files would be — it is caught the same way, reported with
+`entryType=mixed` rather than `dir`/`file`. A colliding pair (or larger
+group) is reported as its own finding, `kind=case-collision`, naming the
+containing directory and every colliding name — and, wherever cutoffarr
+can tell, whether each name IS or CONTAINS something the `*arr` actually
+tracks, so you know which spelling to keep. The colliding entries
+themselves are excluded from that cycle's duplicate/orphan accounting (and,
+for a folder, nothing inside it is walked or counted this cycle either) —
+counted instead under `fileSkipReasons["case-twin names excluded"]`. A root
+whose only irregularity is a detected case-twin still completes with
+`fileReport=ran`: a collision is a **finding**, not a reason to abort.
+
+```
+level=INFO msg="file-report finding" kind=case-collision instance=radarr-main root=/data/media/Movies path=/data/media/Movies entryType=dir names="My Name Is Earl [tracked], My Name is Earl"
+level=INFO msg="file report" instance=radarr-main type=radarr fileReport=ran duplicates=0 orphans=0 caseCollisions=1 fileSkipReasons="case-twin names excluded=2"
+```
+
+The tracked spelling — whichever of the colliding names IS or CONTAINS
+something the `*arr` actually tracks — is marked inline in the log line
+itself with a `[tracked]` suffix, the same correlation the API's
+`names[].tracked` and the dashboard's own row carry, so the one actionable
+bit ("keep this spelling") is visible from `docker logs` alone.
+
+As with every other finding here, resolving it — merging the two folders,
+renaming the stray one — is always a decision you make by hand, outside
+cutoffarr; nothing in this pass ever touches a file.
 
 ### The mount-problem safeguard
 
@@ -641,7 +690,7 @@ JavaScript framework, nothing loaded from anywhere but this one response —
 that shows, per configured instance, how much of the library is at rest
 (unmonitored, nothing left to do) versus still hunting (monitored, still
 being upgraded), plus anything that needs a human's attention: reverse-scan
-findings and file-report duplicates/orphans. There's a **Scan now** button
+findings and file-report duplicates/orphans/case-twins. There's a **Scan now** button
 that queues one full sweep on demand, for whenever you don't want to wait for
 the next `poll_interval` tick or restart the container.
 
@@ -681,7 +730,7 @@ script, a status-page widget, whatever) without ever loading the HTML:
         "reverseStatus": "ran",
         "reverseAsOf": "2026-03-01T12:00:00Z",
         "reverseFindings": [],
-        "fileReport": { "status": "ran", "duplicates": 0, "orphans": 1, "findings": [] },
+        "fileReport": { "status": "ran", "duplicates": 0, "orphans": 1, "caseCollisions": 0, "findings": [] },
         "lastActions": [],
         "lastCycleStatus": { "status": "ok" }
       }
@@ -712,18 +761,33 @@ script, a status-page widget, whatever) without ever loading the HTML:
   sweep has reached it yet); `skipped` means it ran this cycle but could not
   be trusted (a tracked root read failed; an incomplete unmonitored
   wanted/cutoff set); `ran` means a clean, trustworthy pass. `duplicates`/
-  `orphans`/`reverseFindings` being empty means "clean" ONLY when the
-  matching status is `ran` — never conflate `off` or `skipped` with "clean".
+  `orphans`/`caseCollisions`/`reverseFindings` being empty/zero means "clean"
+  ONLY when the matching status is `ran` — never conflate `off` or `skipped`
+  with "clean". `caseCollisions` is always present (including `0`) whenever
+  `fileReport.status` is `ran` or `skipped`, the same as `duplicates`/
+  `orphans`.
 
-  Each `fileReport.findings` item is `{"kind": "duplicate"|"orphan", "group":
-  "...", "path": "...", "display": "...", "count": N}` (`group`/`count` are
-  present only on a `duplicate`). `path` is the full cutoffarr-side (disk)
-  path — the same one the `msg="file-report finding"` log line carries.
-  `display` is that same file's path relative to its mapped `media_root_map`
-  root: the root's own last path segment, then the remainder underneath it
-  (`Movies/Some Title/file.mkv`, never the full, potentially much longer
-  host-specific mount path `path` carries). The dashboard renders `display`
-  in the row itself and puts `path` only in that row's hover title.
+  Each `fileReport.findings` item is `{"kind": "duplicate"|"orphan"|
+  "case-collision", "group": "...", "path": "...", "display": "...", "count":
+  N, "entryType": "dir"|"file"|"mixed", "names": [...]}`. `group`/`count` are
+  present only on a `duplicate`; `entryType`/`names` are present only on a
+  `case-collision`. `entryType` is `"dir"`/`"file"` when every colliding name
+  in the group is that one type, or `"mixed"` when the group spans both — a
+  directory and a file colliding on the same name, e.g. `Show`/`show` (see
+  [Case-twin names](#case-twin-names)). `names` is
+  `[{"name": "...", "tracked": bool}, ...]`,
+  every colliding name found in that directory plus, wherever cutoffarr
+  could tell, whether that exact name is or contains something the `*arr`
+  actually tracks (see [Case-twin names](#case-twin-names)). `path` is the
+  full cutoffarr-side (disk) path — the same one the `msg="file-report
+  finding"` log line carries, and for a `case-collision` the CONTAINING
+  DIRECTORY the collision was found in, never one of the colliding names
+  itself. `display` is that same path relative to its mapped
+  `media_root_map` root: the root's own last path segment, then the
+  remainder underneath it (`Movies/Some Title/file.mkv`, never the full,
+  potentially much longer host-specific mount path `path` carries). The
+  dashboard renders `display` in the row itself and puts `path` only in that
+  row's hover title.
 
   `reverseAsOf` is the timestamp of the reverse pass `reverseFindings` is
   CURRENTLY holding — the last cycle whose pass actually completed

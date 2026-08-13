@@ -3,13 +3,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -47,10 +50,18 @@ func writeFixtureFiles(t *testing.T, root string, relPaths ...string) []string {
 
 // assertFileReportIdentity is the exhaustive per-file check binding
 // controller resolution 6 requires: every video-or-not file the walk visited
-// resolves to EXACTLY one of the five identity terms, so nothing is silently
+// resolves to EXACTLY one of the six identity terms, so nothing is silently
 // double-counted or dropped. It is driven off the outcome's own bookkeeping
 // counters rather than re-walking the disk, since the outcome IS the claim
 // under test.
+//
+// [FIX, v2.2] The sixth term, o.seenCaseTwinExcluded, is read directly off
+// the outcome rather than taken as a caller-supplied parameter: a colliding
+// FILE (unlike a colliding directory, whose contents are never visited at
+// all — fs.SkipDir) IS visited by the walk's own real traversal and must
+// resolve to exactly one identity term the same as any other visited file,
+// or the sum below silently comes up short of totalFilesOnDisk whenever a
+// real on-disk file's name collided.
 func assertFileReportIdentity(t *testing.T, totalFilesOnDisk int, o fileReportRootOutcome) {
 	t.Helper()
 	dup, orphan := 0, 0
@@ -60,14 +71,23 @@ func assertFileReportIdentity(t *testing.T, totalFilesOnDisk int, o fileReportRo
 			dup++
 		case fileKindOrphan:
 			orphan++
+		case fileKindCaseCollision:
+			// [v2.1] A case-collision FINDING itself is never one of the
+			// six identity terms (binding controller resolution 3:
+			// "excluded from descent and from duplicate/orphan
+			// classification") — the FILES it excluded are accounted for
+			// through o.seenCaseTwinExcluded below instead, not through
+			// this loop. Recognized here only so a walk that also produced
+			// a case-collision finding does not fail this otherwise-
+			// unrelated exhaustiveness check.
 		default:
 			t.Fatalf("finding has unexpected kind %q", f.kind)
 		}
 	}
-	sum := o.seenTracked + dup + orphan + o.seenSkippedByRule + o.seenSkippedUntrusted
+	sum := o.seenTracked + dup + orphan + o.seenSkippedByRule + o.seenSkippedUntrusted + o.seenCaseTwinExcluded
 	if sum != totalFilesOnDisk {
-		t.Errorf("identity broken: tracked(%d)+duplicate(%d)+orphan(%d)+skipped-by-rule(%d)+skipped-untrusted(%d) = %d, want %d files seen on disk",
-			o.seenTracked, dup, orphan, o.seenSkippedByRule, o.seenSkippedUntrusted, sum, totalFilesOnDisk)
+		t.Errorf("identity broken: tracked(%d)+duplicate(%d)+orphan(%d)+skipped-by-rule(%d)+skipped-untrusted(%d)+case-twin-excluded(%d) = %d, want %d files seen on disk",
+			o.seenTracked, dup, orphan, o.seenSkippedByRule, o.seenSkippedUntrusted, o.seenCaseTwinExcluded, sum, totalFilesOnDisk)
 	}
 }
 
@@ -824,6 +844,66 @@ func TestLogFileReportFinding_EmitsTheFrozenVocabulary(t *testing.T) {
 				"root=/data/Movies", "path=/data/Movies/Stray/stray.mkv",
 			},
 		},
+		{
+			// [final review round fix] The per-name tracked correlation must
+			// render IN the log line, not just be discardable struct data:
+			// the tracked spelling gets a `[tracked]` suffix, the other
+			// spelling stays bare, so an operator reading docker logs alone
+			// (no GUI, no API) still sees which of the two to keep.
+			name: "case-collision dir",
+			inst: Instance{Name: "radarr-main", Type: "radarr"},
+			f: fileReportFinding{
+				kind: fileKindCaseCollision, diskPath: "/data/Movies",
+				entryType: fileReportEntryTypeDir,
+				names: []caseCollisionEntry{
+					{name: "My Name Is Earl", tracked: true},
+					{name: "my name is earl", tracked: false},
+				},
+			},
+			want: []string{
+				`msg="file-report finding"`, "kind=case-collision", "instance=radarr-main", "type=radarr",
+				"root=/data/Movies", "path=/data/Movies", "entryType=dir",
+				`names="My Name Is Earl [tracked], my name is earl"`,
+			},
+		},
+		{
+			name: "case-collision file",
+			inst: Instance{Name: "radarr-main", Type: "radarr"},
+			f: fileReportFinding{
+				kind: fileKindCaseCollision, diskPath: "/data/Movies/Movie A",
+				entryType: fileReportEntryTypeFile,
+				names: []caseCollisionEntry{
+					{name: "poster.jpg", tracked: false},
+					{name: "Poster.jpg", tracked: false},
+				},
+			},
+			want: []string{
+				`msg="file-report finding"`, "kind=case-collision", "instance=radarr-main", "type=radarr",
+				"root=/data/Movies", `path="/data/Movies/Movie A"`, "entryType=file",
+				`names="poster.jpg, Poster.jpg"`,
+			},
+		},
+		{
+			// [final review round] a cross-type twin (binding controller
+			// ruling F5): a directory and a file colliding on the same
+			// casefold name gets entryType=mixed, and the log line's own
+			// controller-cited example — `names="Show [tracked], show"`.
+			name: "case-collision mixed dir/file",
+			inst: Instance{Name: "sonarr-main", Type: "sonarr"},
+			f: fileReportFinding{
+				kind: fileKindCaseCollision, diskPath: "/data/TV",
+				entryType: fileReportEntryTypeMixed,
+				names: []caseCollisionEntry{
+					{name: "Show", tracked: true},
+					{name: "show", tracked: false},
+				},
+			},
+			want: []string{
+				`msg="file-report finding"`, "kind=case-collision", "instance=sonarr-main", "type=sonarr",
+				"root=/data/Movies", "path=/data/TV", "entryType=mixed",
+				`names="Show [tracked], show"`,
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -852,6 +932,22 @@ func TestLogFileReportFinding_EmitsTheFrozenVocabulary(t *testing.T) {
 		for _, unwanted := range []string{"title=", "series=", "group=", "groupCount="} {
 			if strings.Contains(out, unwanted) {
 				t.Errorf("orphan finding must not carry %q:\n%s", unwanted, out)
+			}
+		}
+	})
+
+	t.Run("case-collision carries no duplicate/orphan grouping attrs", func(t *testing.T) {
+		logger, buf := newFileReportTestLogger(slog.LevelDebug)
+		logFileReportFinding(context.Background(), logger, slog.LevelInfo,
+			Instance{Name: "radarr-main", Type: "radarr"}, root,
+			fileReportFinding{
+				kind: fileKindCaseCollision, diskPath: "/data/Movies", entryType: fileReportEntryTypeDir,
+				names: []caseCollisionEntry{{name: "A"}, {name: "a"}},
+			})
+		out := buf.String()
+		for _, unwanted := range []string{"title=", "series=", "group=", "groupCount="} {
+			if strings.Contains(out, unwanted) {
+				t.Errorf("case-collision finding must not carry %q:\n%s", unwanted, out)
 			}
 		}
 	})
@@ -3340,5 +3436,1117 @@ func TestAcceptance_Phase11_UnmountTriggersTheMountProblemAbort(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "level=WARN") {
 		t.Errorf("expected a WARN naming the aborted root:\n%s", buf.String())
+	}
+}
+
+// --- case-collision detection (v2.1: case-twin findings) --------------------
+//
+// t.TempDir on macOS (APFS, the default local dev filesystem) is CASE-
+// INSENSITIVE: creating "Earl" then "earl" in the same directory silently
+// collides with the FIRST entry rather than creating a second one, so no
+// test in this section can build real twin fixtures directly on a dev
+// laptop's temp filesystem. Three kinds of test close that gap without any
+// of them depending on host case-sensitivity:
+//
+//   - detectCaseCollisions is a pure function over a []string — no
+//     filesystem involved at all, so it runs identically everywhere.
+//   - caseCollisionsInDir and most of the walker-integration tests below
+//     inject a SYNTHESIZED directory listing through fileReportDirLister
+//     (the package-level seam this feature adds — see its own doc comment
+//     in filereport.go) so a collision can be manufactured without two
+//     real, differently-cased entries ever needing to coexist on disk.
+//   - a small number of "real fixture" tests, gated behind
+//     probeCaseSensitiveTempDir, build ACTUAL twin files/directories and
+//     t.Skipf with a documented reason on an insensitive filesystem; the
+//     Linux CI runner (test.yml) runs them for real.
+
+// fakeDirEntry is a minimal fs.DirEntry good enough for the seam above: only
+// Name() and IsDir() are ever read by caseCollisionsInDir. Type()/Info() are
+// never called from production code through this seam, so they return
+// enough to satisfy the interface without pretending to be meaningful.
+type fakeDirEntry struct {
+	name  string
+	isDir bool
+}
+
+func (e fakeDirEntry) Name() string { return e.name }
+func (e fakeDirEntry) IsDir() bool  { return e.isDir }
+func (e fakeDirEntry) Type() fs.FileMode {
+	if e.isDir {
+		return fs.ModeDir
+	}
+	return 0
+}
+func (e fakeDirEntry) Info() (fs.FileInfo, error) {
+	return nil, errors.New("fakeDirEntry: Info not implemented (unused by caseCollisionsInDir)")
+}
+
+func fakeDir(name string) fakeDirEntry  { return fakeDirEntry{name: name, isDir: true} }
+func fakeFile(name string) fakeDirEntry { return fakeDirEntry{name: name, isDir: false} }
+
+// withFakeDirLister overrides the package-level fileReportDirLister for the
+// duration of one test, restoring the real os.ReadDir on cleanup. listings
+// maps a directory's own full disk path to the entries fileReportDirLister
+// should answer for it; any directory NOT in the map falls through to the
+// real os.ReadDir, so a test only needs to describe the one directory whose
+// listing it wants to fake. The var is shared package-global state, but
+// every test in this suite runs sequentially (no t.Parallel anywhere in
+// this package), so save/restore around each test is sufficient — including
+// under -race.
+func withFakeDirLister(t *testing.T, listings map[string][]fs.DirEntry) {
+	t.Helper()
+	prev := fileReportDirLister
+	fileReportDirLister = func(dir string) ([]fs.DirEntry, error) {
+		if entries, ok := listings[dir]; ok {
+			return entries, nil
+		}
+		return prev(dir)
+	}
+	t.Cleanup(func() { fileReportDirLister = prev })
+}
+
+// probeCaseSensitiveTempDir reports whether t's own temp directory sits on a
+// case-SENSITIVE filesystem, by writing "cs-probe-a" then "cs-probe-A" and
+// checking whether the directory actually ends up holding two entries (an
+// insensitive filesystem silently collapses the second write into the
+// first). Callers that need REAL twin fixtures must call this first and
+// t.Skipf when it returns false — see this section's own header comment for
+// why, and for the platform-independent tests that cover the same behavior
+// unconditionally.
+func probeCaseSensitiveTempDir(t *testing.T) bool {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "cs-probe-a"), []byte("lower"), 0o600); err != nil {
+		t.Fatalf("probe WriteFile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cs-probe-A"), []byte("upper"), 0o600); err != nil {
+		t.Fatalf("probe WriteFile: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("probe ReadDir: %v", err)
+	}
+	return len(entries) == 2
+}
+
+// --- detectCaseCollisions: the pure detector --------------------------------
+
+func TestDetectCaseCollisions_FindsGroupDifferingOnlyByCase(t *testing.T) {
+	got := detectCaseCollisions([]string{"My Name Is Earl", "Other Show", "My Name is Earl"})
+	if len(got) != 1 {
+		t.Fatalf("groups = %+v, want exactly 1", got)
+	}
+	want := []string{"My Name Is Earl", "My Name is Earl"}
+	if !reflect.DeepEqual(got[0], want) {
+		t.Errorf("group = %v, want %v (input order preserved)", got[0], want)
+	}
+}
+
+func TestDetectCaseCollisions_NoCollisionsAmongDistinctNames(t *testing.T) {
+	got := detectCaseCollisions([]string{"Movie A", "Movie B", "Movie C"})
+	if len(got) != 0 {
+		t.Errorf("groups = %+v, want none", got)
+	}
+}
+
+// TestDetectCaseCollisions_ByteIdenticalNamesAreNotACollision: a real
+// directory listing can never repeat a byte-identical name twice (the
+// filesystem itself forbids it), but a synthesized name list can — and two
+// spellings that already match exactly have nothing to merge or rename, so
+// this must not be reported as a collision.
+func TestDetectCaseCollisions_ByteIdenticalNamesAreNotACollision(t *testing.T) {
+	got := detectCaseCollisions([]string{"Earl", "Earl"})
+	if len(got) != 0 {
+		t.Errorf("groups = %+v, want none: two byte-identical names have nothing to merge or rename", got)
+	}
+}
+
+func TestDetectCaseCollisions_GroupOfThreeCaseVariants(t *testing.T) {
+	got := detectCaseCollisions([]string{"EARL", "earl", "Earl"})
+	if len(got) != 1 || len(got[0]) != 3 {
+		t.Fatalf("groups = %+v, want one group of all three variants", got)
+	}
+}
+
+func TestDetectCaseCollisions_MultipleIndependentGroupsInOneListing(t *testing.T) {
+	got := detectCaseCollisions([]string{"A", "a", "B", "C", "c"})
+	if len(got) != 2 {
+		t.Fatalf("groups = %+v, want exactly 2 independent groups", got)
+	}
+	if !reflect.DeepEqual(got[0], []string{"A", "a"}) {
+		t.Errorf("first group = %v, want [A a] (first-appearance order)", got[0])
+	}
+	if !reflect.DeepEqual(got[1], []string{"C", "c"}) {
+		t.Errorf("second group = %v, want [C c]", got[1])
+	}
+}
+
+func TestDetectCaseCollisions_EmptyInputReturnsNoGroups(t *testing.T) {
+	if got := detectCaseCollisions(nil); len(got) != 0 {
+		t.Errorf("groups = %+v, want none for empty input", got)
+	}
+}
+
+func TestDetectCaseCollisions_SingleNameNeverFormsAGroup(t *testing.T) {
+	if got := detectCaseCollisions([]string{"Only One"}); len(got) != 0 {
+		t.Errorf("groups = %+v, want none for a single name", got)
+	}
+}
+
+// TestDetectCaseCollisions_UsesEqualFoldSemanticsNotASimpleLowerCaseKey pins
+// the binding requirement's own wording ("strings.EqualFold semantics /
+// casefold key") against a rune pair strings.ToLower does NOT unify but
+// strings.EqualFold does: U+017F LATIN SMALL LETTER LONG S ("ſ") is
+// Unicode's own standard example of the gap between a per-rune
+// strings.ToLower mapping and strings.EqualFold's case FOLDING —
+// strings.ToLower leaves "ſ" exactly as it is (it has no distinct
+// uppercase/lowercase pair of its own to map to), while strings.EqualFold
+// folds it into the SAME equivalence class as "S"/"s". A naive
+// strings.ToLower-keyed grouping would put "S" and "s" together but leave
+// "ſ" in a group of its own, missing exactly the pair this test exists
+// to catch.
+func TestDetectCaseCollisions_UsesEqualFoldSemanticsNotASimpleLowerCaseKey(t *testing.T) {
+	longS := "ſ"
+	if strings.ToLower("S") == strings.ToLower(longS) {
+		t.Fatal("test premise broken: strings.ToLower now unifies \"S\" and the long s — pick a different rune pair")
+	}
+	if !strings.EqualFold("S", longS) {
+		t.Fatal("test premise broken: strings.EqualFold(\"S\", long s) is no longer true in this Go version")
+	}
+	got := detectCaseCollisions([]string{"S", longS})
+	if len(got) != 1 || len(got[0]) != 2 {
+		t.Fatalf("groups = %+v, want one group containing both \"S\" and the long s", got)
+	}
+}
+
+// --- caseCollisionsInDir: the per-directory pre-scan ------------------------
+
+func TestCaseCollisionsInDir_DetectsDirNameCollisionAndMarksExclusion(t *testing.T) {
+	root := mediaRoot{arrPath: "/movies", diskPath: "/data/media/Movies"}
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		root.diskPath: {fakeDir("My Name Is Earl"), fakeDir("My Name is Earl"), fakeDir("Other Show")},
+	})
+	set := instanceTrackedSet{files: map[string]bool{}, folders: map[string]string{}}
+
+	findings, excludeDirs, excludeFiles, excluded, err := caseCollisionsInDir(root.diskPath, ".", root, set)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %+v, want exactly 1", findings)
+	}
+	f := findings[0]
+	if f.kind != fileKindCaseCollision {
+		t.Errorf("kind = %q, want %q", f.kind, fileKindCaseCollision)
+	}
+	if f.entryType != fileReportEntryTypeDir {
+		t.Errorf("entryType = %q, want %q", f.entryType, fileReportEntryTypeDir)
+	}
+	if f.diskPath != root.diskPath {
+		t.Errorf("diskPath = %q, want the containing directory %q", f.diskPath, root.diskPath)
+	}
+	if len(f.names) != 2 || f.names[0].name != "My Name Is Earl" || f.names[1].name != "My Name is Earl" {
+		t.Errorf("names = %+v, want [My Name Is Earl, My Name is Earl] in listing order", f.names)
+	}
+	earlA := path.Join(root.diskPath, "My Name Is Earl")
+	earlB := path.Join(root.diskPath, "My Name is Earl")
+	if !excludeDirs[earlA] || !excludeDirs[earlB] {
+		t.Errorf("excludeDirs = %+v, want both colliding names excluded", excludeDirs)
+	}
+	if other := path.Join(root.diskPath, "Other Show"); excludeDirs[other] {
+		t.Errorf("excludeDirs unexpectedly excludes the non-colliding sibling %q", other)
+	}
+	if len(excludeFiles) != 0 {
+		t.Errorf("excludeFiles = %+v, want none: no file-name collision here", excludeFiles)
+	}
+	if excluded != 2 {
+		t.Errorf("excludedCount = %d, want 2", excluded)
+	}
+}
+
+func TestCaseCollisionsInDir_DetectsFileNameCollisionAndMarksExclusion(t *testing.T) {
+	root := mediaRoot{arrPath: "/movies", diskPath: "/data/media/Movies"}
+	dirPath := path.Join(root.diskPath, "Movie A")
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		dirPath: {fakeFile("Movie.mkv"), fakeFile("movie.mkv")},
+	})
+	set := instanceTrackedSet{files: map[string]bool{}, folders: map[string]string{}}
+
+	findings, excludeDirs, excludeFiles, excluded, err := caseCollisionsInDir(dirPath, "Movie A", root, set)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(findings) != 1 || findings[0].entryType != fileReportEntryTypeFile {
+		t.Fatalf("findings = %+v, want exactly 1 file-type collision", findings)
+	}
+	if len(excludeDirs) != 0 {
+		t.Errorf("excludeDirs = %+v, want none", excludeDirs)
+	}
+	a := path.Join(dirPath, "Movie.mkv")
+	b := path.Join(dirPath, "movie.mkv")
+	if !excludeFiles[a] || !excludeFiles[b] {
+		t.Errorf("excludeFiles = %+v, want both %q and %q excluded", excludeFiles, a, b)
+	}
+	if excluded != 2 {
+		t.Errorf("excludedCount = %d, want 2", excluded)
+	}
+	if findings[0].diskPath != dirPath {
+		t.Errorf("diskPath = %q, want the containing directory %q", findings[0].diskPath, dirPath)
+	}
+	wantDisplay := rootRelativeDisplayPath(root, "Movie A")
+	if findings[0].displayPath != wantDisplay {
+		t.Errorf("displayPath = %q, want %q (root-relative, per the existing convention)", findings[0].displayPath, wantDisplay)
+	}
+}
+
+func TestCaseCollisionsInDir_NoCollisionsReturnsNothing(t *testing.T) {
+	root := mediaRoot{arrPath: "/movies", diskPath: "/data/media/Movies"}
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		root.diskPath: {fakeDir("Movie A"), fakeDir("Movie B"), fakeFile("readme.txt")},
+	})
+	findings, excludeDirs, excludeFiles, excluded, err := caseCollisionsInDir(root.diskPath, ".", root, instanceTrackedSet{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(findings) != 0 || len(excludeDirs) != 0 || len(excludeFiles) != 0 || excluded != 0 {
+		t.Errorf("got findings=%+v excludeDirs=%+v excludeFiles=%+v excluded=%d, want all empty/zero", findings, excludeDirs, excludeFiles, excluded)
+	}
+}
+
+// TestCaseCollisionsInDir_ExcludedCountSumsAcrossBothEntryTypes puts two
+// collision groups — one of each entry type — in a single directory
+// listing. [FIX, v2.2] excluded==5 alone would still pass if these two
+// groups had been merged into a single finding, or the file group had been
+// mistagged dir: assert the two groups arrive as two SEPARATE findings
+// (binding controller resolution 2: "reported once per colliding group ...
+// and entry type"), with each one's own entryType and names checked
+// individually.
+func TestCaseCollisionsInDir_ExcludedCountSumsAcrossBothEntryTypes(t *testing.T) {
+	root := mediaRoot{arrPath: "/movies", diskPath: "/data/media/Movies"}
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		root.diskPath: {
+			fakeDir("Show A"), fakeDir("show a"), // 2 colliding dirs
+			fakeFile("poster.jpg"), fakeFile("Poster.jpg"), fakeFile("POSTER.JPG"), // 3 colliding files
+		},
+	})
+	findings, _, _, excluded, err := caseCollisionsInDir(root.diskPath, ".", root, instanceTrackedSet{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if excluded != 5 {
+		t.Errorf("excludedCount = %d, want 5 (2 dirs + 3 files)", excluded)
+	}
+	if len(findings) != 2 {
+		t.Fatalf("findings = %+v, want exactly 2 (one per entry type, never merged into one)", findings)
+	}
+	var dirFinding, fileFinding *fileReportFinding
+	for i := range findings {
+		switch findings[i].entryType {
+		case fileReportEntryTypeDir:
+			dirFinding = &findings[i]
+		case fileReportEntryTypeFile:
+			fileFinding = &findings[i]
+		}
+	}
+	if dirFinding == nil || fileFinding == nil {
+		t.Fatalf("findings = %+v, want one dir finding and one file finding", findings)
+	}
+	if len(dirFinding.names) != 2 || dirFinding.names[0].name != "Show A" || dirFinding.names[1].name != "show a" {
+		t.Errorf("dir finding names = %+v, want [Show A, show a]", dirFinding.names)
+	}
+	if len(fileFinding.names) != 3 || fileFinding.names[0].name != "poster.jpg" || fileFinding.names[1].name != "Poster.jpg" || fileFinding.names[2].name != "POSTER.JPG" {
+		t.Errorf("file finding names = %+v, want [poster.jpg, Poster.jpg, POSTER.JPG]", fileFinding.names)
+	}
+}
+
+// TestCaseCollisionsInDir_TwoIndependentGroupsOfTheSameEntryTypeProduceTwoFindings
+// is the finding-level twin of
+// TestDetectCaseCollisions_MultipleIndependentGroupsInOneListing: two
+// independent collision groups of the SAME entry type in one directory
+// listing must arrive as two separate findings, never merged into one — a
+// regression that concatenated every colliding name in a directory into a
+// single finding (rather than one finding per detectCaseCollisions group)
+// would still pass excludedCount-only assertions.
+func TestCaseCollisionsInDir_TwoIndependentGroupsOfTheSameEntryTypeProduceTwoFindings(t *testing.T) {
+	root := mediaRoot{arrPath: "/movies", diskPath: "/data/media/Movies"}
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		root.diskPath: {
+			fakeDir("Show A"), fakeDir("show a"),
+			fakeDir("Show B"), fakeDir("show b"),
+		},
+	})
+	findings, _, _, excluded, err := caseCollisionsInDir(root.diskPath, ".", root, instanceTrackedSet{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if excluded != 4 {
+		t.Errorf("excludedCount = %d, want 4", excluded)
+	}
+	if len(findings) != 2 {
+		t.Fatalf("findings = %+v, want exactly 2 (one per independent group, never merged)", findings)
+	}
+	groups := map[string]bool{}
+	for _, f := range findings {
+		if f.entryType != fileReportEntryTypeDir {
+			t.Errorf("entryType = %q, want dir for every finding here", f.entryType)
+		}
+		var names []string
+		for _, n := range f.names {
+			names = append(names, n.name)
+		}
+		groups[strings.Join(names, ",")] = true
+	}
+	if !groups["Show A,show a"] {
+		t.Errorf("findings = %+v, missing the [Show A show a] group", findings)
+	}
+	if !groups["Show B,show b"] {
+		t.Errorf("findings = %+v, missing the [Show B show b] group", findings)
+	}
+}
+
+func TestCaseCollisionsInDir_ListerErrorPropagates(t *testing.T) {
+	root := mediaRoot{arrPath: "/movies", diskPath: "/data/media/Movies"}
+	wantErr := errors.New("boom")
+	prev := fileReportDirLister
+	fileReportDirLister = func(dir string) ([]fs.DirEntry, error) { return nil, wantErr }
+	t.Cleanup(func() { fileReportDirLister = prev })
+
+	_, _, _, _, err := caseCollisionsInDir(root.diskPath, ".", root, instanceTrackedSet{})
+	if !errors.Is(err, wantErr) {
+		t.Errorf("err = %v, want %v propagated verbatim", err, wantErr)
+	}
+}
+
+// TestCaseCollisionsInDir_DetectsCrossTypeCollisionBetweenDirAndFile is the
+// [final review round] regression test for controller ruling F5: a
+// directory `Show` beside a file `show` is a real case-twin exactly like two
+// same-type twins are — the *arr still tracks at most one of the two, and a
+// case-insensitive view still cannot address both unambiguously — so it
+// must be DETECTED, not silently allowed through because the two names sat
+// in different entry-type buckets. Before this fix, dirNames and fileNames
+// were each run through detectCaseCollisions independently, so this exact
+// shape produced zero findings and both names still descended/classified
+// normally, hitting the ambiguous ReadDir this whole feature exists to
+// route around.
+func TestCaseCollisionsInDir_DetectsCrossTypeCollisionBetweenDirAndFile(t *testing.T) {
+	root := mediaRoot{arrPath: "/tv", diskPath: "/data/media/TV"}
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		root.diskPath: {fakeDir("Show"), fakeFile("show"), fakeDir("Other Show")},
+	})
+	set := instanceTrackedSet{files: map[string]bool{}, folders: map[string]string{}}
+
+	findings, excludeDirs, excludeFiles, excluded, err := caseCollisionsInDir(root.diskPath, ".", root, set)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %+v, want exactly 1 cross-type collision", findings)
+	}
+	f := findings[0]
+	if f.entryType != fileReportEntryTypeMixed {
+		t.Errorf("entryType = %q, want %q for a dir/file cross-type collision", f.entryType, fileReportEntryTypeMixed)
+	}
+	if len(f.names) != 2 || f.names[0].name != "Show" || f.names[1].name != "show" {
+		t.Errorf("names = %+v, want [Show, show] in listing order", f.names)
+	}
+	dirEntry := path.Join(root.diskPath, "Show")
+	fileEntry := path.Join(root.diskPath, "show")
+	if !excludeDirs[dirEntry] {
+		t.Errorf("excludeDirs = %+v, want the dir half %q excluded", excludeDirs, dirEntry)
+	}
+	if !excludeFiles[fileEntry] {
+		t.Errorf("excludeFiles = %+v, want the file half %q excluded", excludeFiles, fileEntry)
+	}
+	if excluded != 2 {
+		t.Errorf("excludedCount = %d, want 2", excluded)
+	}
+	if other := path.Join(root.diskPath, "Other Show"); excludeDirs[other] {
+		t.Errorf("excludeDirs unexpectedly excludes the non-colliding sibling %q", other)
+	}
+}
+
+// --- caseCollisionsInDir: tracked-set correlation (binding controller
+// resolution 2: "whether each name contains/IS a tracked path") -----------
+
+func TestCaseCollisionsInDir_TrackedCorrelation_ExactFolderMatch(t *testing.T) {
+	root := mediaRoot{arrPath: "/movies", diskPath: "/data/media/Movies"}
+	trackedFolder := path.Join(root.diskPath, "My Name Is Earl")
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		root.diskPath: {fakeDir("My Name Is Earl"), fakeDir("My Name is Earl")},
+	})
+	set := instanceTrackedSet{files: map[string]bool{}, folders: map[string]string{trackedFolder: "My Name Is Earl"}}
+
+	findings, _, _, _, err := caseCollisionsInDir(root.diskPath, ".", root, set)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	byName := map[string]bool{}
+	for _, n := range findings[0].names {
+		byName[n.name] = n.tracked
+	}
+	if !byName["My Name Is Earl"] {
+		t.Error("the exact tracked folder name must correlate tracked=true")
+	}
+	if byName["My Name is Earl"] {
+		t.Error("the untracked sibling spelling must correlate tracked=false")
+	}
+}
+
+func TestCaseCollisionsInDir_TrackedCorrelation_ContainsTrackedFile(t *testing.T) {
+	root := mediaRoot{arrPath: "/tv", diskPath: "/data/media/TV"}
+	dirA := path.Join(root.diskPath, "Show A")
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		root.diskPath: {fakeDir("Show A"), fakeDir("show a")},
+	})
+	// The tracked set does not carry dirA as a FOLDER key at all, but does
+	// track a FILE underneath it — "contains" a tracked path, not "IS" one.
+	set := instanceTrackedSet{
+		files:   map[string]bool{path.Join(dirA, "Show A.S01E01.mkv"): true},
+		folders: map[string]string{},
+	}
+	findings, _, _, _, err := caseCollisionsInDir(root.diskPath, ".", root, set)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	byName := map[string]bool{}
+	for _, n := range findings[0].names {
+		byName[n.name] = n.tracked
+	}
+	if !byName["Show A"] {
+		t.Error("a name that CONTAINS a tracked file must correlate tracked=true")
+	}
+	if byName["show a"] {
+		t.Error("the sibling containing nothing tracked must correlate tracked=false")
+	}
+}
+
+func TestCaseCollisionsInDir_TrackedCorrelation_FileIsExactMatch(t *testing.T) {
+	root := mediaRoot{arrPath: "/movies", diskPath: "/data/media/Movies"}
+	dirPath := path.Join(root.diskPath, "Movie A")
+	trackedFile := path.Join(dirPath, "Movie A.mkv")
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		dirPath: {fakeFile("Movie A.mkv"), fakeFile("movie a.mkv")},
+	})
+	set := instanceTrackedSet{files: map[string]bool{trackedFile: true}, folders: map[string]string{}}
+
+	findings, _, _, _, err := caseCollisionsInDir(dirPath, "Movie A", root, set)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	byName := map[string]bool{}
+	for _, n := range findings[0].names {
+		byName[n.name] = n.tracked
+	}
+	if !byName["Movie A.mkv"] {
+		t.Error("the exact tracked file name must correlate tracked=true")
+	}
+	if byName["movie a.mkv"] {
+		t.Error("the untracked sibling spelling must correlate tracked=false")
+	}
+}
+
+// --- walker integration: exclude, don't abort (binding controller
+// resolution 3) -------------------------------------------------------------
+
+func TestEvaluateFileReportRoot_CaseCollisionDirExcludedFromDescentAndReportedAsFinding(t *testing.T) {
+	dir := t.TempDir()
+	// The REAL, on-disk half of the twin: a tracked movie folder with its
+	// own tracked file inside.
+	writeFixtureFiles(t, dir, "My Name Is Earl/My Name Is Earl.mkv")
+	trackedFile := filepath.Join(dir, "My Name Is Earl", "My Name Is Earl.mkv")
+	trackedFolder := filepath.Join(dir, "My Name Is Earl")
+
+	root := mediaRoot{arrPath: "/movies", diskPath: dir}
+	// The PHANTOM half is injected only at the listing layer — see this
+	// section's own header comment on why a real second entry cannot be
+	// created on a case-insensitive dev filesystem. Because the pre-scan
+	// marks BOTH names excluded (including the REAL one), fs.WalkDir's own
+	// later, real traversal of "My Name Is Earl" is what actually proves
+	// exclusion end to end, even though only one of the two names exists on
+	// disk.
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		dir: {fakeDir("My Name Is Earl"), fakeDir("my name is earl")},
+	})
+	set := instanceTrackedSet{
+		files:   map[string]bool{trackedFile: true},
+		folders: map[string]string{trackedFolder: "My Name Is Earl"},
+	}
+	logger, _ := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "radarr-main", Type: "radarr"}, root, set)
+
+	if outcome.skipped {
+		t.Fatalf("a case collision must never abort the root: %+v", outcome)
+	}
+	var collisions []fileReportFinding
+	for _, f := range outcome.findings {
+		if f.kind == fileKindCaseCollision {
+			collisions = append(collisions, f)
+		}
+		if strings.Contains(f.diskPath, "My Name Is Earl.mkv") {
+			t.Errorf("the real tracked file inside an EXCLUDED (colliding) folder must never be classified as duplicate/orphan, got %+v", f)
+		}
+	}
+	if len(collisions) != 1 {
+		t.Fatalf("case-collision findings = %+v, want exactly 1", outcome.findings)
+	}
+	if collisions[0].entryType != fileReportEntryTypeDir {
+		t.Errorf("entryType = %q, want dir", collisions[0].entryType)
+	}
+	if outcome.seenTracked != 0 {
+		t.Errorf("seenTracked = %d, want 0: the tracked file lives inside an excluded folder and is never visited this cycle", outcome.seenTracked)
+	}
+	if got := outcome.skipReasons[FileSkipReasonCaseTwin]; got != 2 {
+		t.Errorf("skipReasons[case-twin names excluded] = %d, want 2", got)
+	}
+	assertFileReportIdentity(t, 0, outcome) // the excluded folder's file was never visited
+}
+
+func TestEvaluateFileReportRoot_CaseCollisionFileExcludedFromClassification(t *testing.T) {
+	dir := t.TempDir()
+	// "Movie A" is a genuinely tracked, unrelated movie elsewhere under the
+	// same root — present so the mount-problem heuristics have real tracked
+	// evidence to work with (heuristic (d) otherwise aborts ANY instance
+	// that tracks nothing at all under a root where the walk finds real
+	// content, collision or not — a legitimate, SEPARATE guard against a
+	// misconfigured/unrelated media_root_map that this test is not about).
+	writeFixtureFiles(t, dir, "Movie A/Movie A.mkv", "Stray Folder/Something.mkv")
+	strayFolder := filepath.Join(dir, "Stray Folder")
+
+	root := mediaRoot{arrPath: "/movies", diskPath: dir}
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		strayFolder: {fakeFile("Something.mkv"), fakeFile("something.mkv")},
+	})
+	set := instanceTrackedSet{
+		files:   map[string]bool{filepath.Join(dir, "Movie A", "Movie A.mkv"): true},
+		folders: map[string]string{filepath.Join(dir, "Movie A"): "Movie A"},
+	}
+	logger, _ := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "radarr-main", Type: "radarr"}, root, set)
+
+	if outcome.skipped {
+		t.Fatalf("a case collision must never abort the root: %+v", outcome)
+	}
+	var collisions, orphans int
+	for _, f := range outcome.findings {
+		switch f.kind {
+		case fileKindCaseCollision:
+			collisions++
+			if f.entryType != fileReportEntryTypeFile {
+				t.Errorf("entryType = %q, want file", f.entryType)
+			}
+		case fileKindOrphan:
+			orphans++
+		}
+	}
+	if collisions != 1 {
+		t.Errorf("case-collision findings = %d, want 1", collisions)
+	}
+	if orphans != 0 {
+		t.Errorf("orphan findings = %d, want 0: the real file's own name collided and must never ALSO be classified as an orphan", orphans)
+	}
+	if got := outcome.skipReasons[FileSkipReasonCaseTwin]; got != 2 {
+		t.Errorf("skipReasons[case-twin names excluded] = %d, want 2", got)
+	}
+	// [FIX, v2.2] 2 real files on disk: Movie A.mkv (tracked) and
+	// Something.mkv (the REAL half of the twin — "something.mkv" is only a
+	// phantom name injected at the listing layer and is never visited by
+	// the real walk at all, so it is not one of totalFilesOnDisk here).
+	assertFileReportIdentity(t, 2, outcome)
+}
+
+// TestEvaluateFileReportRoot_CaseCollisionCrossTypeDirVsFileExcludesBoth is
+// the [final review round] end-to-end twin of
+// TestCaseCollisionsInDir_DetectsCrossTypeCollisionBetweenDirAndFile: a
+// directory `Show` beside a file `show` must exclude BOTH from the real
+// walk (the dir from descent, the file from classification) and complete
+// as fileReport=ran with one entryType=mixed finding, same as the two
+// same-type cross-exclusion tests above.
+func TestEvaluateFileReportRoot_CaseCollisionCrossTypeDirVsFileExcludesBoth(t *testing.T) {
+	dir := t.TempDir()
+	// The REAL half of the twin: a tracked directory "Show" with its own
+	// tracked file inside.
+	writeFixtureFiles(t, dir, "Show/Show.mkv")
+	trackedFile := filepath.Join(dir, "Show", "Show.mkv")
+	trackedFolder := filepath.Join(dir, "Show")
+
+	root := mediaRoot{arrPath: "/tv", diskPath: dir}
+	// The PHANTOM half — a FILE named "show" — is injected only at the
+	// listing layer: a case-insensitive dev filesystem cannot hold a
+	// directory "Show" and a file "show" side by side any more than it can
+	// hold two same-type twins (see this section's own header comment).
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		dir: {fakeDir("Show"), fakeFile("show")},
+	})
+	set := instanceTrackedSet{
+		files:   map[string]bool{trackedFile: true},
+		folders: map[string]string{trackedFolder: "Show"},
+	}
+	logger, _ := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "sonarr-main", Type: "sonarr"}, root, set)
+
+	if outcome.skipped {
+		t.Fatalf("a cross-type case collision must never abort the root: %+v", outcome)
+	}
+	var collisions []fileReportFinding
+	for _, f := range outcome.findings {
+		if f.kind == fileKindCaseCollision {
+			collisions = append(collisions, f)
+		}
+	}
+	if len(collisions) != 1 {
+		t.Fatalf("case-collision findings = %+v, want exactly 1", outcome.findings)
+	}
+	if collisions[0].entryType != fileReportEntryTypeMixed {
+		t.Errorf("entryType = %q, want %q: one colliding name is a dir, the other a file", collisions[0].entryType, fileReportEntryTypeMixed)
+	}
+	if outcome.seenTracked != 0 {
+		t.Errorf("seenTracked = %d, want 0: the tracked file lives inside the excluded (colliding) folder and is never visited this cycle", outcome.seenTracked)
+	}
+	if got := outcome.skipReasons[FileSkipReasonCaseTwin]; got != 2 {
+		t.Errorf("skipReasons[case-twin names excluded] = %d, want 2", got)
+	}
+	assertFileReportIdentity(t, 0, outcome) // the excluded folder's file was never visited
+}
+
+// TestEvaluateFileReportRoot_CaseCollisionDetectedAtEveryLevelOfTheWalk pins
+// binding controller resolution 1's "at every level of the walk": the
+// collision here sits TWO levels under root (a Season folder), and its
+// non-colliding sibling in the SAME directory must still be classified
+// normally — proving the exclusion is precise per-name, not "abort the
+// whole directory the collision was found in".
+func TestEvaluateFileReportRoot_CaseCollisionDetectedAtEveryLevelOfTheWalk(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureFiles(t, dir,
+		"Show/Season 01/Show.S01E01.mkv",
+		"Show/Season 01/Show.S01E02.mkv",
+	)
+	seasonDir := filepath.Join(dir, "Show", "Season 01")
+	root := mediaRoot{arrPath: "/tv", diskPath: dir}
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		seasonDir: {
+			fakeFile("Show.S01E01.mkv"), fakeFile("show.s01e01.mkv"), // collide
+			fakeFile("Show.S01E02.mkv"), // untouched sibling
+		},
+	})
+	set := instanceTrackedSet{
+		files:        map[string]bool{filepath.Join(seasonDir, "Show.S01E02.mkv"): true},
+		folders:      map[string]string{filepath.Join(dir, "Show"): "Show"},
+		seriesFolder: map[string]bool{filepath.Join(dir, "Show"): true},
+	}
+	logger, _ := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "sonarr-main", Type: "sonarr"}, root, set)
+
+	if outcome.skipped {
+		t.Fatalf("unexpectedly skipped: %+v", outcome)
+	}
+	var collisions int
+	for _, f := range outcome.findings {
+		if f.kind == fileKindCaseCollision {
+			collisions++
+		}
+	}
+	if collisions != 1 {
+		t.Errorf("case-collision findings = %d, want 1 (nested two levels under root)", collisions)
+	}
+	if outcome.seenTracked != 1 {
+		t.Errorf("seenTracked = %d, want 1: the NON-colliding sibling (S01E02) must still be classified normally", outcome.seenTracked)
+	}
+}
+
+func TestEvaluateFileReportRoot_CaseCollisionFindingCarriesPerNameTrackedCorrelation(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureFiles(t, dir, "My Name Is Earl/dummy.mkv")
+	trackedFolder := filepath.Join(dir, "My Name Is Earl")
+	trackedFile := filepath.Join(trackedFolder, "dummy.mkv")
+	root := mediaRoot{arrPath: "/movies", diskPath: dir}
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		dir: {fakeDir("My Name Is Earl"), fakeDir("my name is earl")},
+	})
+	set := instanceTrackedSet{
+		files:   map[string]bool{trackedFile: true},
+		folders: map[string]string{trackedFolder: "My Name Is Earl"},
+	}
+	logger, _ := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "radarr-main", Type: "radarr"}, root, set)
+	if outcome.skipped || len(outcome.findings) != 1 {
+		t.Fatalf("outcome = %+v, want exactly one case-collision finding", outcome)
+	}
+	byName := map[string]bool{}
+	for _, n := range outcome.findings[0].names {
+		byName[n.name] = n.tracked
+	}
+	if !byName["My Name Is Earl"] || byName["my name is earl"] {
+		t.Errorf("names = %+v, want the tracked spelling correlated true and the other false", outcome.findings[0].names)
+	}
+}
+
+func TestEvaluateFileReportRoot_CaseCollisionListerErrorAbortsTheRoot(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureFiles(t, dir, "Movie A/Movie A.mkv")
+	root := mediaRoot{arrPath: "/movies", diskPath: dir}
+	prev := fileReportDirLister
+	fileReportDirLister = func(d string) ([]fs.DirEntry, error) {
+		return nil, errors.New("simulated permission error")
+	}
+	t.Cleanup(func() { fileReportDirLister = prev })
+	set := instanceTrackedSet{files: map[string]bool{}, folders: map[string]string{}}
+	logger, buf := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "radarr-main", Type: "radarr"}, root, set)
+	if !outcome.skipped {
+		t.Fatal("a pre-scan lister failure must abort the whole root, exactly like any other walk error")
+	}
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("expected a WARN naming the root:\n%s", buf.String())
+	}
+}
+
+// TestEvaluateFileReportRoot_HeuristicCFiresWhenCollisionEvidenceIsNonVideoOnly
+// is [FIX, v2.2]'s discriminating regression test for the narrowing applied
+// to collisionEvidence: a colliding WRONG-EXTENSION pair (a poster.jpg/
+// Poster.jpg twin) must carry NONE of the evidentiary weight a colliding
+// video-extension name or colliding directory does — the same rule
+// classifyFileReportPath's own wrong-extension skip reason already applies
+// (a wrong-extension file "proves nothing about whether real media exists
+// here") must also hold for collision evidence. Mirrors
+// TestEvaluateFileReportRoot_TrackedFilesButZeroVideoFilesOnWalkAborts, with
+// a non-video collision pair added at the root: before this fix, the
+// unfiltered `videoFilesSeen += excluded` would have made this collision
+// pair look exactly like 2 video files, masking heuristic (c) and letting a
+// root whose real media is entirely absent report a false clean bill of
+// health.
+func TestEvaluateFileReportRoot_HeuristicCFiresWhenCollisionEvidenceIsNonVideoOnly(t *testing.T) {
+	dir := t.TempDir()
+	present := writeFixtureFiles(t, dir, "Movie A/Movie A.m4v") // stat-passing sample, wrong extension: zero video files on the walk
+	files := map[string]bool{present[0]: true}
+	root := mediaRoot{arrPath: "/movies", diskPath: dir}
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		dir: {fakeDir("Movie A"), fakeFile("poster.jpg"), fakeFile("Poster.jpg")},
+	})
+	set := instanceTrackedSet{files: files, folders: map[string]string{filepath.Join(dir, "Movie A"): "Movie A"}}
+	logger, buf := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "radarr-main", Type: "radarr"}, root, set)
+	if !outcome.skipped {
+		t.Fatalf("a root tracking N>0 files (present on disk) with zero RECOGNIZED video files AND only a wrong-extension collision pair (no evidentiary weight) must still abort under heuristic (c): %+v", outcome)
+	}
+	if !strings.Contains(buf.String(), "it tracks files but the walk found zero video files of any kind") {
+		t.Errorf("expected heuristic (c)'s own WARN text, not just any WARN:\n%s", buf.String())
+	}
+}
+
+// TestEvaluateFileReportRoot_HeuristicDDoesNotFireOnCollisionOnlyUntrackedRoot
+// is [FIX, v2.2]'s discriminating regression test for the CRITICAL finding
+// this round fixes directly: a root this instance tracks NOTHING under at
+// all (zero tracked files, zero tracked folders) whose only content is a
+// detected case-twin pair must complete as fileReport=ran (binding
+// controller resolution 3 — collisions are FINDINGS, not abort causes),
+// never abort under heuristic (d) as if it were a media_root_map
+// misconfiguration. Before this fix, the unfiltered
+// `videoFilesSeen += excluded` fed straight into heuristic (d)'s own
+// `videoFilesSeen > 0` trigger, so this exact root aborted with a
+// misleading "the walk found real video files here" WARN and its collision
+// finding was silently discarded — this is the injectable-lister,
+// every-platform twin of TestEvaluateFileReportRoot_RealCaseTwinFilesEndToEnd
+// (CI-only, real fixtures), covering the same shape of bug without needing a
+// case-sensitive filesystem.
+func TestEvaluateFileReportRoot_HeuristicDDoesNotFireOnCollisionOnlyUntrackedRoot(t *testing.T) {
+	dir := t.TempDir()
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		dir: {fakeFile("poster.jpg"), fakeFile("Poster.jpg")},
+	})
+	root := mediaRoot{arrPath: "/movies", diskPath: dir}
+	set := instanceTrackedSet{files: map[string]bool{}, folders: map[string]string{}}
+	logger, buf := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "radarr-main", Type: "radarr"}, root, set)
+	if outcome.skipped {
+		t.Fatalf("a root this instance tracks nothing under, whose only content is a case-twin pair, must complete as ran (binding controller resolution 3), never abort under heuristic (d): %+v\n%s", outcome, buf.String())
+	}
+	var collisions int
+	for _, f := range outcome.findings {
+		if f.kind == fileKindCaseCollision {
+			collisions++
+		}
+	}
+	if collisions != 1 {
+		t.Errorf("case-collision findings = %d, want 1", collisions)
+	}
+}
+
+// TestEvaluateFileReportRoot_HeuristicDIgnoresNonZeroCollisionEvidence is
+// round-3's [v2.1 review] discriminating regression test for a gap in
+// TestEvaluateFileReportRoot_HeuristicDDoesNotFireOnCollisionOnlyUntrackedRoot
+// (immediately above): that test's poster.jpg/Poster.jpg fixture is a
+// non-video FILE collision, which the v2.2 evidentiary-weight narrowing
+// (filereport.go's `for f := range subFiles { if videoExtensions[...] {
+// collisionEvidence++ } }` loop) deliberately gives NO weight — so that
+// fixture always produces `collisionEvidence == 0`, identically under
+// today's correct `videoFilesSeen`-only heuristic (d) AND under the
+// original, already-fixed `videoFilesSeen += excluded` bug. It therefore
+// only ever caught that first bug, never the natural "collapse the two
+// counters back together" regression a future reader might reintroduce as
+// `videoFilesSeen += collisionEvidence` — plausible because collisionEvidence
+// and videoFilesSeen are both incremented in the same d.IsDir() branch and
+// look redundant. This fixture — a colliding SUBDIRECTORY pair (the untracked
+// root's ONLY content) — takes the OTHER path into collisionEvidence
+// (`collisionEvidence += len(subDirs)`, filereport.go:1082), which carries
+// full evidentiary weight regardless of extension, so collisionEvidence > 0
+// here. Under a `videoFilesSeen += collisionEvidence` re-merge this root
+// would trip heuristic (d) at filereport.go:1207 and falsely abort with a
+// misleading media_root_map WARN, even though today's separated-counter code
+// correctly completes it as ran.
+func TestEvaluateFileReportRoot_HeuristicDIgnoresNonZeroCollisionEvidence(t *testing.T) {
+	dir := t.TempDir()
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		dir: {fakeDir("Show A"), fakeDir("show a")},
+	})
+	root := mediaRoot{arrPath: "/tv", diskPath: dir}
+	set := instanceTrackedSet{files: map[string]bool{}, folders: map[string]string{}}
+	logger, buf := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "sonarr-main", Type: "sonarr"}, root, set)
+
+	if outcome.skipped {
+		t.Fatalf("a root this instance tracks nothing under, whose only content is a colliding SUBDIRECTORY pair (real, non-zero collisionEvidence, unlike the poster.jpg/Poster.jpg sibling test above), must complete as ran (binding controller resolution 3), never abort under heuristic (d): %+v\n%s", outcome, buf.String())
+	}
+	var collisions int
+	for _, f := range outcome.findings {
+		if f.kind == fileKindCaseCollision {
+			collisions++
+		}
+	}
+	if collisions != 1 {
+		t.Errorf("case-collision findings = %d, want 1", collisions)
+	}
+}
+
+// TestEvaluateFileReportRoot_HeuristicCCountsVideoExtensionFileCollisionEvidence
+// is the discriminating regression test for the per-FILE half of
+// collisionEvidence (the `for f := range subFiles { if
+// videoExtensions[...] { collisionEvidence++ } }` loop in
+// evaluateFileReportRoot's d.IsDir() branch): a mirror image of
+// TestEvaluateFileReportRoot_HeuristicDDoesNotFireOnCollisionOnlyUntrackedRoot
+// above, but for heuristic (c) rather than (d), and for a TRACKED root
+// rather than an untracked one. "Movie A/Movie A.mkv" is real on disk and
+// genuinely tracked, so heuristic (b) samples it successfully (os.Stat
+// reads the real file directly, never through the excluded walk path) —
+// but the walk itself never classifies it as tracked, because its own name
+// is one half of a case-twin pair and is excluded from classification
+// (binding controller resolution 3). videoFilesSeen therefore stays 0, and
+// only the collisionEvidence contributed by the two colliding .mkv names
+// (there are zero colliding SUBDIRECTORIES anywhere in this fixture, so
+// len(subDirs) contributes nothing) can keep heuristic (c) from firing.
+// Deleting the per-file loop makes this test abort with heuristic (c)'s own
+// "zero video files of any kind" WARN — the same false abort binding
+// controller resolution 3 was written to eliminate — even though this
+// root's only irregularity is a detected case-collision.
+func TestEvaluateFileReportRoot_HeuristicCCountsVideoExtensionFileCollisionEvidence(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureFiles(t, dir, "Movie A/Movie A.mkv")
+	movieDir := filepath.Join(dir, "Movie A")
+	root := mediaRoot{arrPath: "/movies", diskPath: dir}
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		movieDir: {fakeFile("Movie A.mkv"), fakeFile("movie a.mkv")},
+	})
+	set := instanceTrackedSet{
+		files:   map[string]bool{filepath.Join(movieDir, "Movie A.mkv"): true},
+		folders: map[string]string{movieDir: "Movie A"},
+	}
+	logger, buf := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "radarr-main", Type: "radarr"}, root, set)
+	if outcome.skipped {
+		t.Fatalf("a tracked root whose only recognized video content is a case-twin pair must still complete as ran (binding controller resolution 3): %+v\n%s", outcome, buf.String())
+	}
+	if strings.Contains(buf.String(), "zero video files of any kind") {
+		t.Errorf("heuristic (c) must not fire: the collision itself is the root's only video-extension evidence:\n%s", buf.String())
+	}
+	var collisions int
+	for _, f := range outcome.findings {
+		if f.kind == fileKindCaseCollision {
+			collisions++
+		}
+	}
+	if collisions != 1 {
+		t.Errorf("case-collision findings = %d, want 1", collisions)
+	}
+}
+
+// --- real fixtures on a case-sensitive filesystem (CI only) ----------------
+
+func TestEvaluateFileReportRoot_RealCaseTwinDirectoriesEndToEnd(t *testing.T) {
+	if !probeCaseSensitiveTempDir(t) {
+		t.Skip("this filesystem is case-insensitive (macOS APFS default) and cannot hold two real case-twin directories at once; the injectable-lister tests above cover this behavior on every platform, and test.yml's ubuntu CI runner exercises this real-fixture path")
+	}
+	dir := t.TempDir()
+	writeFixtureFiles(t, dir, "My Name Is Earl/My Name Is Earl.mkv")
+	if err := os.MkdirAll(filepath.Join(dir, "my name is earl"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "my name is earl", "shadow.mkv"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	trackedFile := filepath.Join(dir, "My Name Is Earl", "My Name Is Earl.mkv")
+	trackedFolder := filepath.Join(dir, "My Name Is Earl")
+
+	root := mediaRoot{arrPath: "/movies", diskPath: dir}
+	set := instanceTrackedSet{
+		files:   map[string]bool{trackedFile: true},
+		folders: map[string]string{trackedFolder: "My Name Is Earl"},
+	}
+	logger, _ := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "radarr-main", Type: "radarr"}, root, set)
+
+	if outcome.skipped {
+		t.Fatalf("unexpectedly skipped: %+v", outcome)
+	}
+	var collisions int
+	for _, f := range outcome.findings {
+		if f.kind == fileKindCaseCollision {
+			collisions++
+		}
+		if strings.Contains(f.diskPath, ".mkv") {
+			t.Errorf("neither real twin's contents should ever be classified as duplicate/orphan: %+v", f)
+		}
+	}
+	if collisions != 1 {
+		t.Errorf("case-collision findings = %d, want 1 using the REAL default lister end to end", collisions)
+	}
+	if got := outcome.skipReasons[FileSkipReasonCaseTwin]; got != 2 {
+		t.Errorf("skipReasons[case-twin names excluded] = %d, want 2", got)
+	}
+}
+
+// TestEvaluateFileReportRoot_RealCaseTwinFilesEndToEnd's fixture carries a
+// real tracked item elsewhere under the root ("Movie A/Movie A.mkv") — [FIX,
+// v2.2] exactly as TestEvaluateFileReportRoot_CaseCollisionFileExcludedFromClassification
+// already does, and for the same reason its own comment gives: without real
+// tracked evidence somewhere under the root, this test's pass/fail is
+// entangled with the mount-problem heuristics' own correctness (specifically
+// heuristic (d), a legitimate SEPARATE guard against a misconfigured/
+// unrelated media_root_map — see TestEvaluateFileReportRoot_HeuristicDDoesNotFireOnCollisionOnlyUntrackedRoot
+// for that guard's own dedicated, platform-independent coverage), rather
+// than measuring only the real-filesystem file-collision exclusion behavior
+// this test exists to prove end to end.
+func TestEvaluateFileReportRoot_RealCaseTwinFilesEndToEnd(t *testing.T) {
+	if !probeCaseSensitiveTempDir(t) {
+		t.Skip("this filesystem is case-insensitive (macOS APFS default) and cannot hold two real case-twin files at once; see the injectable-lister tests above for the platform-independent coverage")
+	}
+	dir := t.TempDir()
+	writeFixtureFiles(t, dir, "Movie A/Movie A.mkv", "Stray/Something.mkv")
+	if err := os.WriteFile(filepath.Join(dir, "Stray", "something.mkv"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	root := mediaRoot{arrPath: "/movies", diskPath: dir}
+	set := instanceTrackedSet{
+		files:   map[string]bool{filepath.Join(dir, "Movie A", "Movie A.mkv"): true},
+		folders: map[string]string{filepath.Join(dir, "Movie A"): "Movie A"},
+	}
+	logger, _ := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "radarr-main", Type: "radarr"}, root, set)
+
+	if outcome.skipped {
+		t.Fatalf("unexpectedly skipped: %+v", outcome)
+	}
+	var collisions, orphans int
+	for _, f := range outcome.findings {
+		switch f.kind {
+		case fileKindCaseCollision:
+			collisions++
+		case fileKindOrphan:
+			orphans++
+		}
+	}
+	if collisions != 1 {
+		t.Errorf("case-collision findings = %d, want 1", collisions)
+	}
+	if orphans != 0 {
+		t.Errorf("orphan findings = %d, want 0: both real twins must be excluded from classification", orphans)
+	}
+	if got := outcome.skipReasons[FileSkipReasonCaseTwin]; got != 2 {
+		t.Errorf("skipReasons[case-twin names excluded] = %d, want 2", got)
+	}
+	// [FIX, v2.2] 3 real files on disk: Movie A.mkv (tracked) plus both
+	// real halves of the Stray twin (excluded).
+	assertFileReportIdentity(t, 3, outcome)
+}
+
+// --- counts, summary, and the frozen log vocabulary -------------------------
+
+func TestMergeFileReportOutcome_CountsCaseCollisionsSeparatelyFromOrphans(t *testing.T) {
+	c := &fileReportCounts{configured: true, skipReasons: map[string]int{}}
+	outcome := fileReportRootOutcome{
+		skipReasons: map[string]int{},
+		findings: []fileReportFinding{
+			{kind: fileKindDuplicate, folder: "/f", group: "g"},
+			{kind: fileKindOrphan},
+			{kind: fileKindCaseCollision, entryType: fileReportEntryTypeDir, names: []caseCollisionEntry{{name: "A"}, {name: "a"}}},
+		},
+	}
+	mergeFileReportOutcome(c, outcome)
+	if c.duplicates != 1 {
+		t.Errorf("duplicates = %d, want 1", c.duplicates)
+	}
+	if c.orphans != 1 {
+		t.Errorf("orphans = %d, want 1 — a case-collision finding must never be miscounted as an orphan", c.orphans)
+	}
+	if c.caseCollisions != 1 {
+		t.Errorf("caseCollisions = %d, want 1", c.caseCollisions)
+	}
+	if len(c.findings) != 3 {
+		t.Errorf("findings carried through = %d, want all 3", len(c.findings))
+	}
+}
+
+func TestLogFileReportSummary_RanIncludesCaseCollisionsAlwaysPresentIncludingZero(t *testing.T) {
+	logger, buf := newFileReportTestLogger(slog.LevelInfo)
+	logFileReportSummary(logger, Instance{Name: "radarr-main", Type: "radarr"},
+		fileReportCounts{configured: true, skipReasons: map[string]int{}})
+	out := buf.String()
+	if !strings.Contains(out, "caseCollisions=0") {
+		t.Errorf("expected caseCollisions=0 (always present when the report ran, even at zero):\n%s", out)
+	}
+}
+
+func TestLogFileReportSummary_SkippedAlsoCarriesCaseCollisions(t *testing.T) {
+	logger, buf := newFileReportTestLogger(slog.LevelInfo)
+	logFileReportSummary(logger, Instance{Name: "radarr-main", Type: "radarr"},
+		fileReportCounts{configured: true, anySkipped: true, caseCollisions: 1, skipReasons: map[string]int{}})
+	out := buf.String()
+	if !strings.Contains(out, "caseCollisions=1") {
+		t.Errorf("expected caseCollisions=1 to survive on a partially-skipped instance's summary too:\n%s", out)
+	}
+}
+
+func TestLogFileReportSummary_OffCarriesNoCaseCollisionsEither(t *testing.T) {
+	logger, buf := newFileReportTestLogger(slog.LevelDebug)
+	logFileReportSummary(logger, Instance{Name: "radarr-main", Type: "radarr"}, fileReportCounts{})
+	if strings.Contains(buf.String(), "caseCollisions=") {
+		t.Errorf("off must not carry caseCollisions, which would look like a completed report:\n%s", buf.String())
+	}
+}
+
+// TestRunRadarrFileReport_CaseCollisionOnlyRootStillReportsRan pins binding
+// controller resolution 3's own words verbatim: "a root whose only
+// irregularities are detected collisions completes with fileReport=ran
+// (collisions are FINDINGS, not abort causes)".
+func TestRunRadarrFileReport_CaseCollisionOnlyRootStillReportsRan(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureFiles(t, dir, "My Name Is Earl/My Name Is Earl.mkv")
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		dir: {fakeDir("My Name Is Earl"), fakeDir("my name is earl")},
+	})
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("My Name Is Earl"), HasFile: boolPtr(true),
+			Path:      strPtr("/movies/My Name Is Earl"),
+			MovieFile: &movieFileElement{Path: strPtr("/movies/My Name Is Earl/My Name Is Earl.mkv")}},
+	}
+	inst := Instance{Name: "radarr-main", Type: "radarr", MediaRootMap: map[string]string{"/movies": dir}}
+	logger, buf := newFileReportTestLogger(slog.LevelInfo)
+	c := runRadarrFileReport(context.Background(), logger, slog.LevelInfo, inst, movies, 0, false)
+	if c.state() != "ran" {
+		t.Fatalf("state() = %q, want ran — a root whose only irregularity is a detected case collision must still complete as ran:\n%s", c.state(), buf.String())
+	}
+	if c.caseCollisions != 1 {
+		t.Errorf("caseCollisions = %d, want 1", c.caseCollisions)
+	}
+	if c.duplicates != 0 || c.orphans != 0 {
+		t.Errorf("duplicates=%d orphans=%d, want 0/0", c.duplicates, c.orphans)
 	}
 }
