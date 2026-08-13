@@ -956,6 +956,11 @@ Concretely, an action refuses when:
   spelling;
 - the item is already monitored, or no longer fails the criteria that made it
   a finding;
+- the cross-check could not establish that the instance's own data agrees with
+  itself this cycle. The re-monitor button drives the *existing* gated reverse
+  write path, and that gate is not bypassed for a human click: confirming
+  *which* item to act on is not the same as establishing that the evidence
+  under the decision is sound. The refusal quotes the gate's own reason;
 - the media root is mounted read-only (see below).
 
 Refusals are answers, not silence: the row shows the reason in clay, and the

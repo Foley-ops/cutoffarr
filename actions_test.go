@@ -554,11 +554,12 @@ func TestTwinMergeEligibility_TheShapesThatGetAButtonAndTheShapesThatDoNot(t *te
 // It records every write it received so a test can assert the strongest thing
 // there is to assert about a rehearsal or a refusal: that NOTHING was written.
 type arrFake struct {
-	srv    *httptest.Server
-	mu     sync.Mutex
-	writes []string
-	movies string // JSON array for GET /api/v3/movie
-	series string
+	srv      *httptest.Server
+	mu       sync.Mutex
+	writes   []string
+	requests int
+	movies   string // JSON array for GET /api/v3/movie
+	series   string
 	// wanted maps the monitored filter value ("", "false") to a wanted/cutoff
 	// page body.
 	wanted       map[string]string
@@ -581,20 +582,30 @@ func newArrFake(t *testing.T) *arrFake {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(body))
 	}
-	mux.HandleFunc("/api/v3/system/status", func(w http.ResponseWriter, r *http.Request) {
+	// Every request, of any method, so a test can assert that a refusal
+	// happened WITHOUT the instance being contacted at all.
+	countAll := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			f.mu.Lock()
+			f.requests++
+			f.mu.Unlock()
+			next(w, r)
+		}
+	}
+	mux.HandleFunc("/api/v3/system/status", countAll(func(w http.ResponseWriter, r *http.Request) {
 		write(w, `{"version":"5.0.0.0"}`)
-	})
-	mux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/api/v3/qualityprofile", countAll(func(w http.ResponseWriter, r *http.Request) {
 		write(w, `[{"id":1,"name":"HD","cutoff":2,"items":[{"quality":{"id":1,"name":"720p"},"allowed":true},{"quality":{"id":2,"name":"1080p"},"allowed":true}],"upgradeAllowed":true,"cutoffFormatScore":0}]`)
-	})
-	mux.HandleFunc("/api/v3/tag", func(w http.ResponseWriter, r *http.Request) { write(w, `[]`) })
-	mux.HandleFunc("/api/v3/movie", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/api/v3/tag", countAll(func(w http.ResponseWriter, r *http.Request) { write(w, `[]`) }))
+	mux.HandleFunc("/api/v3/movie", countAll(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		body := f.movies
 		f.mu.Unlock()
 		write(w, body)
-	})
-	mux.HandleFunc("/api/v3/movie/", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/api/v3/movie/", countAll(func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimPrefix(r.URL.Path, "/api/v3/movie/")
 		if r.Method != http.MethodGet {
 			f.mu.Lock()
@@ -612,8 +623,8 @@ func newArrFake(t *testing.T) *arrFake {
 			return
 		}
 		write(w, body)
-	})
-	mux.HandleFunc("/api/v3/moviefile", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/api/v3/moviefile", countAll(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		body, ok := f.movieFiles[r.URL.Query().Get("movieId")]
 		f.mu.Unlock()
@@ -621,8 +632,8 @@ func newArrFake(t *testing.T) *arrFake {
 			body = `[]`
 		}
 		write(w, body)
-	})
-	mux.HandleFunc("/api/v3/wanted/cutoff", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/api/v3/wanted/cutoff", countAll(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		body, ok := f.wanted[r.URL.Query().Get("monitored")]
 		f.mu.Unlock()
@@ -630,14 +641,14 @@ func newArrFake(t *testing.T) *arrFake {
 			body = `{"page":1,"pageSize":1000,"totalRecords":0,"records":[]}`
 		}
 		write(w, body)
-	})
-	mux.HandleFunc("/api/v3/series", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/api/v3/series", countAll(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		body := f.series
 		f.mu.Unlock()
 		write(w, body)
-	})
-	mux.HandleFunc("/api/v3/episodefile", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/api/v3/episodefile", countAll(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		body, ok := f.episodeFiles[r.URL.Query().Get("seriesId")]
 		f.mu.Unlock()
@@ -645,8 +656,8 @@ func newArrFake(t *testing.T) *arrFake {
 			body = `[]`
 		}
 		write(w, body)
-	})
-	mux.HandleFunc("/api/v3/episode", func(w http.ResponseWriter, r *http.Request) { write(w, `[]`) })
+	}))
+	mux.HandleFunc("/api/v3/episode", countAll(func(w http.ResponseWriter, r *http.Request) { write(w, `[]`) }))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			f.mu.Lock()
@@ -664,6 +675,12 @@ func (f *arrFake) writeCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.writes)
+}
+
+func (f *arrFake) requestCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.requests
 }
 
 // radarrFileFixture builds a media root on disk plus the matching Radarr
@@ -1528,5 +1545,43 @@ func TestAction_TrashAndMerge_NeverWriteToTheArr(t *testing.T) {
 	}
 	if fake.writeCount() != 0 {
 		t.Errorf("a trash action wrote to the *arr: %v — file actions are §2.2-silent by construction", fake.writes)
+	}
+}
+
+// TestAction_Trash_ReadOnlyRootRefusesBeforeContactingTheArrAtAll is a
+// self-review finding about ORDER, not about correctness of the refusal.
+//
+// A read-only media mount is the DEFAULT deployment, so "every file button
+// refuses" is the ordinary steady state, not an edge case. Re-deriving the
+// finding first meant every one of those refusals first paid for a full
+// library read — a per-series /episodefile fetch across the whole library, for
+// Sonarr — to arrive at an answer that was already knowable from a directory
+// create.
+//
+// The order is therefore: the in-memory authorization gate (which is what
+// stops an arbitrary path from even causing a probe), then the writability
+// probe, then the expensive live re-derivation. Nothing is weakened — every
+// gate still runs before anything moves — and the common refusal became free.
+func TestAction_Trash_ReadOnlyRootRefusesBeforeContactingTheArrAtAll(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: a 0555 directory is still writable")
+	}
+	fake := newArrFake(t)
+	root, dupPath, inst := radarrFileFixture(t, fake)
+	cfg := Config{DryRun: false, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, _ := newActionFixture(t, cfg, inst)
+	seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "d", Size: 10})
+
+	if err := os.Chmod(root, 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(root, 0o755) })
+
+	status, out := postAction(t, ts, `{"kind":"trash","confirm":true,"instance":"radarr-main","path":`+jsonString(dupPath)+`,"finding":"duplicate","size":10}`)
+	if status != http.StatusConflict || out.Outcome != actionOutcomeRefused {
+		t.Fatalf("status=%d outcome=%q, want 409/refused", status, out.Outcome)
+	}
+	if n := fake.requestCount(); n != 0 {
+		t.Errorf("the *arr was contacted %d time(s) before a refusal that a directory create already settled; on the DEFAULT :ro deployment that is a full library read per click", n)
 	}
 }

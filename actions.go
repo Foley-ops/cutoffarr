@@ -843,6 +843,31 @@ func (a *actionRunner) trash(ctx context.Context, inst Instance, req actionReque
 	}
 	operation := trashOperationText(reported.Display, reported.Size)
 
+	root, ok := rootForPath(inst, req.Path)
+	if !ok {
+		return a.refuse(req, actionOutcomeRefused, operation, fmt.Sprintf("%s does not fall under any media root configured for %s, so there is no trash for it to go to", req.Path, inst.Name))
+	}
+
+	// Rule 8, at action time — and in a rehearsal too. A rehearsal that says
+	// "would move" on a read-only mount is a lie, and writability cannot be
+	// established without attempting it. The one filesystem effect a rehearsal
+	// therefore has is creating an EMPTY .cutoffarr-trash directory: nothing
+	// is moved, nothing is destroyed, and the operator gets a true answer
+	// instead of a hopeful one. (That directory is dot-prefixed, so the file
+	// report's own walk prunes it and it can never become a finding.)
+	//
+	// It runs HERE — after the in-memory authorization gate, before the
+	// expensive live re-derivation — and the order is a deliberate,
+	// self-review correction. A read-only media mount is the DEFAULT
+	// deployment, so "this button refuses" is the ordinary steady state, and
+	// paying for a full library read (a per-series /episodefile fetch across
+	// the whole library, on Sonarr) to reach an answer a directory create
+	// already settles is a cost per click for nothing. Gate 1 above still
+	// runs first, so an arbitrary path can never so much as cause a probe.
+	if err := probeRootWritable(root); err != nil {
+		return a.refuse(req, actionOutcomeRefused, operation, err.Error())
+	}
+
 	// Gate 2 — fresh re-derivation: the finding must still be produced by a
 	// file report run against live data, right now.
 	live, err := a.liveFileReport(ctx, inst)
@@ -868,22 +893,6 @@ func (a *actionRunner) trash(ctx context.Context, inst Instance, req actionReque
 	}
 	if !info.Mode().IsRegular() {
 		return a.refuse(req, actionOutcomeRefused, operation, fmt.Sprintf("%s is not a regular file, so cutoffarr will not move it", req.Path))
-	}
-
-	root, ok := rootForPath(inst, req.Path)
-	if !ok {
-		return a.refuse(req, actionOutcomeRefused, operation, fmt.Sprintf("%s does not fall under any media root configured for %s, so there is no trash for it to go to", req.Path, inst.Name))
-	}
-
-	// Rule 8, at action time — and in a rehearsal too. A rehearsal that says
-	// "would move" on a read-only mount is a lie, and writability cannot be
-	// established without attempting it. The one filesystem effect a rehearsal
-	// therefore has is creating an EMPTY .cutoffarr-trash directory: nothing
-	// is moved, nothing is destroyed, and the operator gets a true answer
-	// instead of a hopeful one. (That directory is dot-prefixed, so the file
-	// report's own walk prunes it and it can never become a finding.)
-	if err := probeRootWritable(root); err != nil {
-		return a.refuse(req, actionOutcomeRefused, operation, err.Error())
 	}
 
 	stamp := a.now()
@@ -940,6 +949,16 @@ func (a *actionRunner) mergeTwin(ctx context.Context, inst Instance, req actionR
 		return a.refuse(req, actionOutcomeRefused, operation, el.reason)
 	}
 
+	root, ok := rootForPath(inst, req.Path)
+	if !ok {
+		return a.refuse(req, actionOutcomeRefused, operation, fmt.Sprintf("%s does not fall under any media root configured for %s, so there is no trash for the emptied folder to go to", req.Path, inst.Name))
+	}
+	// Rule 8, before the expensive re-derivation — see the trash executor's
+	// own comment at the same point for why the order is what it is.
+	if err := probeRootWritable(root); err != nil {
+		return a.refuse(req, actionOutcomeRefused, operation, err.Error())
+	}
+
 	// Gate 2 — fresh re-derivation, and it is the one that catches the case
 	// this action most needs to catch: a twin somebody already merged by hand
 	// is simply no longer a finding, so it refuses here rather than "merging"
@@ -967,16 +986,8 @@ func (a *actionRunner) mergeTwin(ctx context.Context, inst Instance, req actionR
 			fmt.Sprintf("the twin at %s is no longer the one the button described: %s now tracks %q and not %q. Nothing was moved.", req.Path, inst.Name, el.tracked, req.Tracked))
 	}
 
-	root, ok := rootForPath(inst, req.Path)
-	if !ok {
-		return a.refuse(req, actionOutcomeRefused, operation, fmt.Sprintf("%s does not fall under any media root configured for %s, so there is no trash for the emptied folder to go to", req.Path, inst.Name))
-	}
 	untrackedDir := filepath.Join(req.Path, el.untracked)
 	trackedDir := filepath.Join(req.Path, el.tracked)
-
-	if err := probeRootWritable(root); err != nil {
-		return a.refuse(req, actionOutcomeRefused, operation, err.Error())
-	}
 
 	if a.cfg.DryRun {
 		// Rehearsal: everything above ran, and the one thing left — the moves
