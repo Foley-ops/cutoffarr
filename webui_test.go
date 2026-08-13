@@ -1837,6 +1837,30 @@ func TestWebUIPage_TrashButtonSendsTheFindingsIdentifyingFields(t *testing.T) {
 	}
 }
 
+// TestWebUIPage_ActionRequestsAreSentAsSameOriginJSON pins the CLIENT half of
+// the cross-site guard, which was a one-sided contract until this round.
+//
+// crossSiteRefusal (actions.go) makes `Content-Type: application/json` a hard
+// precondition for every action: a request without it is a 400 before any gate
+// runs, because a cross-site form post cannot set that header. The server-side
+// test proves the server ACCEPTS that shape; nothing proved the page PRODUCES
+// it. Deleting or editing the page's one Content-Type line therefore made every
+// action button on every surface answer 400 while `go test ./...`, `-race` and
+// `node --check` all stayed green — a guard that costs the real client nothing
+// only as long as the real client keeps sending it.
+//
+// The assertion is scoped to postAction's body rather than to the page, so it
+// is about the fetch that actually runs (see jsFunctionBody).
+func TestWebUIPage_ActionRequestsAreSentAsSameOriginJSON(t *testing.T) {
+	page := string(webUIPage)
+	post := jsFunctionBody(t, page, "postAction", "renderActionOutcome")
+	for _, want := range []string{`"/api/action"`, `method: "POST"`, `"Content-Type": "application/json"`} {
+		if !strings.Contains(post, want) {
+			t.Errorf("postAction() no longer sends %s, so every action button answers 400 at crossSiteRefusal; the function is:\n%s", want, post)
+		}
+	}
+}
+
 // TestWebUIPage_ActionOutcomesSurviveARepaint is the round-2 IMPORTANT on the
 // front end: renderFileReport and renderReverse each begin by clearing their
 // table (body.textContent = ""), and refresh() calls render(data) on a 30s
