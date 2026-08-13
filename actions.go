@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -544,6 +546,16 @@ type actionRunner struct {
 }
 
 func newActionRunner(cfg Config, logger *slog.Logger, stats *statsStore) *actionRunner {
+	if logger == nil {
+		// Self-review finding: a nil logger reached resolveExclusionTagID (and
+		// every other read-path helper an executor calls) and panicked on the
+		// first posted action. Production always passes a real one, but a test
+		// helper or a future embedding constructing a runner without one must
+		// get a quiet action rather than a crashed daemon — and the audit line
+		// going nowhere is a lesser failure than the process dying, which is
+		// why this discards rather than refusing to construct.
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	return &actionRunner{cfg: cfg, logger: logger, stats: stats, now: time.Now}
 }
 
@@ -784,6 +796,15 @@ func rootForPath(inst Instance, p string) (string, bool) {
 
 // humanSize renders a byte count the way a button has to say it: short, and
 // never more precise than the decision it informs.
+//
+// math.Round, not fmt's own %.0f, and that is not a style choice. The PAGE
+// builds the label the operator reads in the confirm dialog (webui.html's own
+// humanSize, using JavaScript's Math.round, which rounds halves AWAY FROM
+// ZERO); this builds the operation string the server echoes back into the
+// row. fmt's %.0f rounds halves to EVEN, so 2560 bytes read as "3 KB" in the
+// dialog and "2 KB" in the answer — the row quietly claiming the server acted
+// on a different file than the one confirmed. Same rounding on both sides, or
+// the two disagree about the same bytes.
 func humanSize(n int64) string {
 	switch {
 	case n <= 0:
@@ -791,9 +812,9 @@ func humanSize(n int64) string {
 	case n < 1024:
 		return fmt.Sprintf("%d B", n)
 	case n < 1024*1024:
-		return fmt.Sprintf("%.0f KB", float64(n)/1024)
+		return fmt.Sprintf("%d KB", int64(math.Round(float64(n)/1024)))
 	case n < 1024*1024*1024:
-		return fmt.Sprintf("%.0f MB", float64(n)/(1024*1024))
+		return fmt.Sprintf("%d MB", int64(math.Round(float64(n)/(1024*1024))))
 	default:
 		return fmt.Sprintf("%.1f GB", float64(n)/(1024*1024*1024))
 	}

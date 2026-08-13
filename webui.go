@@ -1,12 +1,26 @@
 package main
 
 import (
+	"context"
 	_ "embed"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 )
+
+// actionDeadline bounds one action end to end: the handler's own write
+// deadline and the context it hands the runner are both set from it, so the
+// two can never drift into a state where the work outlives the connection
+// allowed to report it.
+//
+// Ten minutes is chosen against the slowest thing an action legitimately
+// does — a Sonarr instance's full file report, which is one /episodefile
+// fetch per series plus a walk of every mapped root — with room for a large
+// library on a slow share. It is a ceiling, not a delay: an ordinary action
+// answers in well under a second.
+const actionDeadline = 10 * time.Minute
 
 // webui.go is Phase 12's (v2c) HTTP surface: the embedded GUI page and its
 // two JSON endpoints, mounted on the SAME listener the webhook endpoint
@@ -186,10 +200,41 @@ func (s *webUIServer) handleAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := s.actions.run(r.Context(), req)
+	// Self-review finding, and the reason this endpoint needs a deadline of
+	// its own. The daemon's *http.Server sets WriteTimeout: 30s — generous
+	// for every endpoint that came before, all of which answer out of memory.
+	// An action does not: rule 3 makes it re-derive its finding from LIVE
+	// data, and for a Sonarr instance that is a per-series /episodefile fetch
+	// across the whole library plus a full walk of every mapped root. Minutes,
+	// not seconds, on a real library.
+	//
+	// Without this the connection is torn down mid-action and the operator
+	// sees a network error with no way to know whether the file moved — the
+	// exact "never lies about what happened" failure this phase exists to
+	// prevent. The write deadline is extended, and the same constant bounds
+	// the work itself, so a genuinely stuck *arr cannot hold the single-flight
+	// lock forever and leave every later click queued behind it.
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(actionDeadline)); err != nil {
+		// Not fatal: an http.ResponseWriter that cannot carry a deadline (a
+		// test recorder, a future middleware) still serves the request
+		// correctly, it just inherits the server's own timeout.
+		s.logDebug("the action response deadline could not be extended", "error", err)
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), actionDeadline)
+	defer cancel()
+
+	resp := s.actions.run(ctx, req)
 	code := resp.status
 	if code == 0 {
 		code = http.StatusOK
 	}
 	writeJSON(code, resp)
+}
+
+// logDebug is the nil-safe logger this file's handlers use for the one or two
+// lines that are diagnostics rather than events.
+func (s *webUIServer) logDebug(msg string, args ...any) {
+	if s.logger != nil {
+		s.logger.Debug(msg, args...)
+	}
 }

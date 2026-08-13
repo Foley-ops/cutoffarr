@@ -1305,3 +1305,127 @@ func TestAction_MergeCaseTwin_IneligibleShapeIsRefusedWithItsReason(t *testing.T
 		t.Errorf("reason = %q, want the eligibility reason a row would show", out.Reason)
 	}
 }
+
+// --- self-review findings, pinned ------------------------------------------
+
+// TestActionEndpoint_ExtendsItsOwnDeadlineBeyondTheServersWriteTimeout is a
+// defect found in self-review and fixed with this test.
+//
+// The daemon's *http.Server sets WriteTimeout: 30s, which is generous for
+// every endpoint that existed before v2.2 — they answer from memory. An
+// action does not: rule 3 makes it re-derive its finding from LIVE data, and
+// for a Sonarr instance that is a per-series /episodefile fetch across the
+// whole library plus a full walk of every mapped root. On a real library that
+// is minutes, not seconds.
+//
+// Left alone, the connection would be torn down mid-action: the operator sees
+// a network error and has no idea whether the file moved, which is the exact
+// "never lies about what happened" failure this phase exists to avoid. The
+// handler therefore extends its own deadline (http.ResponseController), and
+// bounds the work with a matching context deadline so a genuinely stuck
+// action cannot run forever either.
+func TestActionEndpoint_ExtendsItsOwnDeadlineBeyondTheServersWriteTimeout(t *testing.T) {
+	page := readRepoFileForActions(t, "webui.go")
+	if !strings.Contains(page, "NewResponseController") {
+		t.Error("handleAction never extends its write deadline; a live re-derivation that outlasts the server's 30s WriteTimeout would tear the connection down mid-action")
+	}
+	if !strings.Contains(page, "actionDeadline") {
+		t.Error("the action's own deadline is not a named constant, so the write deadline and the context deadline can drift apart")
+	}
+	if !strings.Contains(page, "context.WithTimeout") {
+		t.Error("the action's context is unbounded: a stuck *arr would hold the single-flight lock forever and every later click would block behind it")
+	}
+}
+
+// TestHumanSize_MatchesThePagesOwnRounding is a second self-review finding.
+// The button's label is built by the PAGE and the operation the server echoes
+// back is built by the SERVER; if the two round differently, a 1.5 KB file
+// reads as "2 KB" in the confirm dialog and "1 KB" in the answer, and the row
+// is quietly claiming the server did something other than what was confirmed.
+func TestHumanSize_MatchesThePagesOwnRounding(t *testing.T) {
+	// The page uses Math.round, which rounds halves AWAY from zero. Go's
+	// %.0f rounds halves to EVEN, so these two cases diverged before the fix.
+	for _, tc := range []struct {
+		n    int64
+		want string
+	}{
+		{0, "size unknown"},
+		{-1, "size unknown"},
+		{512, "512 B"},
+		{1536, "2 KB"},         // 1.5 -> away from zero
+		{2560, "3 KB"},         // 2.5 -> away from zero (Go's %.0f gave "2")
+		{2621440, "3 MB"},      // 2.5 MB, same trap one unit up
+		{1610612736, "1.5 GB"}, // GB keeps one decimal, both sides
+	} {
+		if got := humanSize(tc.n); got != tc.want {
+			t.Errorf("humanSize(%d) = %q, want %q — the server's label must match the page's, or the confirm dialog and the answer disagree about the same file", tc.n, got, tc.want)
+		}
+	}
+}
+
+// TestActionRunner_NilLoggerNeverPanics is the third: a runner constructed
+// without a logger (every pre-v2.2 test helper builds a webUIServer that way,
+// and so could a future embedding) used to reach resolveExclusionTagID with a
+// nil *slog.Logger the moment anyone posted an action.
+func TestActionRunner_NilLoggerNeverPanics(t *testing.T) {
+	fake := newArrFake(t)
+	_, dupPath, inst := radarrFileFixture(t, fake)
+	cfg := Config{DryRun: true, GUIActions: true, ExclusionTag: "cutoffarr-exclude", Instances: []Instance{inst}}
+	store := newStatsStore(true)
+	seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "d", Size: 10})
+
+	runner := newActionRunner(cfg, nil, store)
+	resp := runner.run(context.Background(), actionRequest{
+		Kind: ActionTrash, Confirm: true, Instance: inst.Name, Path: dupPath, Finding: fileKindDuplicate, Size: 10,
+	})
+	if resp.Outcome != actionOutcomeRehearsed {
+		t.Errorf("outcome = %q (%q), want a normal rehearsal even with no logger wired", resp.Outcome, resp.Reason)
+	}
+}
+
+// TestAction_Rehearsal_CreatesOnlyTheEmptyTrashDirectory pins the one
+// filesystem effect a rehearsal has, as a DECISION rather than an accident.
+//
+// Rule 8 says the writability probe is the trash-directory create, at action
+// time. A rehearsal that skipped it would answer "this would work" on a
+// read-only mount, which is a rehearsal that lies — and the default deploy
+// mounts media :ro, so that is the COMMON case, not a corner. So the
+// rehearsal probes, and its entire footprint is one empty dot-directory that
+// the *arrs ignore and the file report prunes.
+func TestAction_Rehearsal_CreatesOnlyTheEmptyTrashDirectory(t *testing.T) {
+	fake := newArrFake(t)
+	root, dupPath, inst := radarrFileFixture(t, fake)
+	cfg := Config{DryRun: true, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, _ := newActionFixture(t, cfg, inst)
+	seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "d", Size: 10})
+
+	status, out := postAction(t, ts, `{"kind":"trash","confirm":true,"instance":"radarr-main","path":`+jsonString(dupPath)+`,"finding":"duplicate","size":10}`)
+	if status != http.StatusOK || out.Outcome != actionOutcomeRehearsed {
+		t.Fatalf("status=%d outcome=%q reason=%q, want 200/rehearsed", status, out.Outcome, out.Reason)
+	}
+
+	trash := filepath.Join(root, trashDirName)
+	info, err := os.Stat(trash)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("the rehearsal must have probed writability by creating %s: err=%v", trash, err)
+	}
+	entries, err := os.ReadDir(trash)
+	if err != nil {
+		t.Fatalf("reading the trash: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("the trash holds %d entry/entries after a REHEARSAL; its whole footprint must be one empty directory", len(entries))
+	}
+	if _, err := os.Lstat(dupPath); err != nil {
+		t.Errorf("the file itself must be untouched: %v", err)
+	}
+}
+
+func readRepoFileForActions(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(name)
+	if err != nil {
+		t.Fatalf("reading %s: %v", name, err)
+	}
+	return string(b)
+}
