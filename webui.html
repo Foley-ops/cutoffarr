@@ -362,14 +362,18 @@
      right for a long path but was breaking "duplicate" mid-word ("dupli-
      cate") whenever the auto-sized column came out narrower than the word
      itself. nowrap stops that outright; min-width reserves enough room for
-     "case-collision" — [v2.1] now the longest of the three kind values, 14
-     characters, surpassing "duplicate"'s 9 — at this table's own 12px mono
-     size — 1ch is one monospace glyph's width, so 14ch fits it exactly,
-     with the cell's own right padding (above) as the only breathing room
-     needed after it. */
+     "duplicate" — the longer of the table's own two remaining kind values
+     now that [ROUND, inline-display fix] moved case-collision out of
+     table.findings entirely (see renderFileReport) — at this table's own
+     12px mono size. 1ch is one monospace glyph's width, so 9ch fits
+     "duplicate" exactly, with the cell's own right padding (above) as the
+     only breathing room needed after it. Deliberately shrunk back down
+     from [v2.1]'s 14ch (sized for "case-collision", which can no longer
+     appear here) rather than left oversized for a value this column will
+     never render again. */
   table.findings td.kind {
     white-space: nowrap;
-    min-width: 14ch;
+    min-width: 9ch;
   }
 
   /* [v2.1] The kind cell's own chip: reuses .badge/.badge-hunt verbatim
@@ -401,15 +405,51 @@
   ul.status-notices li.status-off { color: var(--ink-faint); }
   ul.status-notices li.status-skipped { color: var(--hunt); }
 
-  /* [v2.1] The case-collision actionability notice — same mono/12px/hunt
-     (clay) treatment as .shelf-sub's own "N picked up on the reverse pass"
-     line, since both are the same kind of fact: not an alarm, just
-     something the operator should know is sitting there actionable. */
+  /* [ROUND, inline-display fix] The case-collision block: user-reported —
+     a "1 case-twin name collision found" notice pointed at collisions that
+     were then buried somewhere inside a multi-thousand-row paginated
+     table. The block below is now those collisions' only home (the
+     controller ruling: case-collision rows are dropped from
+     table.findings entirely — see renderFileReport). The intro line keeps
+     the notice's original mono/12px/hunt (amber) treatment — same
+     actionable-fact tone as .shelf-sub's own "N picked up on the reverse
+     pass" line — and each collision's own containing-directory line stays
+     that same amber, since it IS the notice now, one line per finding.
+     The colliding NAMES underneath render in the page's normal ink (not
+     amber): they are what the operator actually reads and acts on, so
+     they get the page's default readable body color, indented under their
+     directory, with the clay (--alert) [tracked] marker — the same ALERT
+     token .shelf-unreachable/.badge-alert already use — on whichever
+     spelling the *arr itself tracks. */
   .case-collision-notice {
-    margin: 0 0 14px;
+    margin: 0 0 10px;
     font-family: var(--mono);
     font-size: 12px;
     color: var(--hunt);
+  }
+
+  .case-collision-item {
+    margin: 0 0 10px;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+
+  .case-collision-item:last-child { margin-bottom: 14px; }
+
+  .case-collision-dir {
+    margin: 0 0 2px;
+    color: var(--hunt);
+  }
+
+  .case-collision-name {
+    margin: 0;
+    padding-left: 1.5em;
+    color: var(--ink);
+  }
+
+  .case-collision-tracked {
+    color: var(--alert);
+    margin-left: 0.5em;
   }
 
   /* Client-side pagination for the reverse-scan / file-clutter tables
@@ -1044,6 +1084,49 @@
     body.appendChild(buildPagerControls(reversePager, page, function () { renderReverse(lastInstances); }));
   }
 
+  // buildCaseCollisionBlock is [ROUND, inline-display fix]: renders every
+  // case-collision FINDING directly and prominently, rather than leaving a
+  // "found" notice pointing at rows buried somewhere inside a multi-
+  // thousand-row paginated table (the user-reported bug this exists to
+  // fix). Collisions are structurally few — this is never itself paged —
+  // so every one of them gets its own item, one line for the containing
+  // directory (display, instance-qualified the same way this page's other
+  // per-instance notices already are: "instance — ...") in the notice's
+  // own amber, then one indented line per colliding name in the page's
+  // normal ink, with the clay [tracked] marker on whichever spelling the
+  // *arr itself tracks (caseCollisionEntry.tracked, filereport.go) and the
+  // entryType called out only for the unusual "mixed" case (a folder
+  // colliding with a file) — a plain dir/dir or file/file collision needs
+  // no extra label, the names beneath already say it.
+  function buildCaseCollisionBlock(collisions) {
+    var wrap = el("div", "case-collision-block");
+    for (var i = 0; i < collisions.length; i++) {
+      var f = collisions[i].f;
+      var item = el("div", "case-collision-item");
+
+      var dir = el("p", "case-collision-dir");
+      var dirText = collisions[i].instance + " — " + (f.display || f.path || "");
+      if (f.entryType === "mixed") dirText += " (mixed: a folder and a file share this name)";
+      text(dir, dirText);
+      item.appendChild(dir);
+
+      var names = f.names || [];
+      for (var j = 0; j < names.length; j++) {
+        var nameLine = el("p", "case-collision-name");
+        text(nameLine, names[j].name);
+        if (names[j].tracked) {
+          var tag = el("span", "case-collision-tracked");
+          text(tag, "[tracked]");
+          nameLine.appendChild(tag);
+        }
+        item.appendChild(nameLine);
+      }
+
+      wrap.appendChild(item);
+    }
+    return wrap;
+  }
+
   // renderFileReport is status-aware: fileReport.status is ran|skipped|off
   // per instance (the API contract's own three-way vocabulary), and only a
   // "ran" instance's zero findings mean "no clutter". A "skipped" instance
@@ -1055,14 +1138,25 @@
   function renderFileReport(instances) {
     var body = document.getElementById("fileBody");
     var rows = [];
+    var collisions = [];
     var notices = [];
     var anyRan = false;
     var offCount = 0, skippedCount = 0;
-    // caseCollisionCount is [v2.1]: counted alongside rows (never a second
-    // pass, never a filter on rows itself — see
-    // TestWebUIPage_FileReportRowsAreNeverFilteredByKind) purely to decide
-    // whether the explanatory notice below is shown, and how it pluralizes.
-    var caseCollisionCount = 0;
+    // totalFindingCount is [ROUND, inline-display fix]: every finding of
+    // every kind this instance's file report produced, duplicate/orphan
+    // AND case-collision alike — the header count's own source of truth
+    // (see fileCountText below). rows (table.findings' own data, further
+    // down) deliberately excludes case-collision findings — the controller
+    // ruling is that they render ONLY in buildCaseCollisionBlock now, never
+    // duplicated into the paginated table too — but the header count must
+    // still include them: "3412" stays "3412" whether a case-collision
+    // finding renders as a table row or not, since the header counts
+    // FINDINGS, not rows. Routing every finding through totalFindingCount
+    // unconditionally, exactly the way TestWebUIPage_FileReportRowsAreNever
+    // FilteredByKind already required of rows.push before this round, keeps
+    // that same guarantee for the header even though rows.push itself is no
+    // longer unconditional.
+    var totalFindingCount = 0;
     for (var i = 0; i < instances.length; i++) {
       var inst = instances[i];
       var fr = inst.fileReport || {};
@@ -1071,8 +1165,12 @@
         anyRan = true;
         var findings = fr.findings || [];
         for (var j = 0; j < findings.length; j++) {
-          rows.push({ instance: inst.name, f: findings[j] });
-          if (findings[j].kind === "case-collision") caseCollisionCount++;
+          totalFindingCount++;
+          if (findings[j].kind === "case-collision") {
+            collisions.push({ instance: inst.name, f: findings[j] });
+          } else {
+            rows.push({ instance: inst.name, f: findings[j] });
+          }
         }
       } else if (status === "skipped") {
         notices.push({ instance: inst.name, status: "skipped" });
@@ -1089,12 +1187,12 @@
     // was ever looked at", indistinguishably. Once any instance is off or
     // skipped, the count is qualified right there in the summary, not only
     // in the body the operator has to expand to see.
-    var fileCountText = String(rows.length);
+    var fileCountText = String(totalFindingCount);
     if (offCount > 0 || skippedCount > 0) {
       var qualifiers = [];
       if (offCount > 0) qualifiers.push(offCount + " not configured");
       if (skippedCount > 0) qualifiers.push(skippedCount + " not checked");
-      fileCountText = rows.length + " · " + qualifiers.join(", ");
+      fileCountText = totalFindingCount + " · " + qualifiers.join(", ");
     }
     text(document.getElementById("fileCount"), fileCountText);
     body.textContent = "";
@@ -1112,19 +1210,20 @@
       body.appendChild(list);
     }
 
-    // [v2.1] The case-collision actionability notice: shown whenever this
-    // panel is currently displaying any case-collision rows, in the SAME
-    // operator voice as the panel's other copy ("No clutter found...",
-    // "not configured") — plain statement of fact, no second person,
-    // pluralized to the count exactly like the reverse-scan panel's own
-    // notice pluralizes "item"/"items" above. This explains what a
-    // case-twin IS and what to DO about it once, above the table, rather
-    // than repeating the same sentence on every row.
-    if (caseCollisionCount > 0) {
+    // [ROUND, inline-display fix] User-reported: the old one-line notice
+    // ("N case-twin name collisions found — ...") pointed at rows that were
+    // then buried somewhere inside a multi-thousand-row paginated table.
+    // The notice copy shortens — the collisions themselves, rendered right
+    // below by buildCaseCollisionBlock, now speak for themselves instead of
+    // being re-explained in prose — and pluralizes to the collision count
+    // the same way the reverse-scan panel's own notice pluralizes
+    // "item"/"items" above.
+    if (collisions.length > 0) {
       var ccNotice = el("p", "case-collision-notice");
-      text(ccNotice, caseCollisionCount + " case-twin name collision" + (caseCollisionCount === 1 ? "" : "s") +
-        " found — two names differing only by case; the *arr tracks at most one spelling, so merge or rename to resolve.");
+      text(ccNotice, "case-twin name" + (collisions.length === 1 ? "" : "s") +
+        " — the *arr tracks at most one spelling; merge or rename:");
       body.appendChild(ccNotice);
+      body.appendChild(buildCaseCollisionBlock(collisions));
     }
 
     resetPagerIfCountChanged(filePager, rows.length);
@@ -1134,8 +1233,12 @@
       // check (or none have reported in at all yet, matching the main
       // panel's own pre-cycle placeholder) — never as a stand-in for
       // "every instance was off or skipped", which the notices above
-      // already explain.
-      if (anyRan || instances.length === 0) {
+      // already explain. A file report with ONLY case-collision findings
+      // (rows empty, collisions not) is not "clean" either — the block
+      // above already said so, so the all-clear copy stays gated on
+      // collisions.length too, or this would contradict what the operator
+      // just read one paragraph up.
+      if (collisions.length === 0 && (anyRan || instances.length === 0)) {
         var p = el("p", "empty");
         text(p, "No clutter found. Every tracked file is exactly where it should be.");
         body.appendChild(p);
@@ -1150,31 +1253,16 @@
         var tr = el("tr");
         var group = r.f.group || "—";
         var count = r.f.count ? String(r.f.count) : "—";
-        // [FIX, v2.2] a case-collision finding never sets group/count
-        // (those are duplicate-only fields — see fileReportFindingRecord's
-        // own doc comment), so without this branch every collision row
-        // rendered as instance | [CASE-COLLISION] | — | <dir> | — :
-        // byte-identical to any other collision found in the SAME
-        // directory, and never showing the one thing the notice above
-        // tells the operator to act on — the colliding NAMES themselves.
-        // entryType/names carry exactly that (already in the API), so put
-        // them in the group/count cells instead of the unused duplicate
-        // fields.
-        if (r.f.kind === "case-collision") {
-          var names = r.f.names || [];
-          group = (r.f.entryType || "") + ": " + names.map(function (n) {
-            return n.name + (n.tracked ? " (tracked)" : "");
-          }).join(" | ");
-          count = String(names.length);
-        }
         var td;
         td = el("td"); text(td, r.instance); tr.appendChild(td);
         // [v2.1] The kind cell renders its text inside a chip — reusing the
         // page's OWN existing badge/badge-hunt clay pill (see this file's
         // token comment: "never introduced fresh") — rather than as bare
-        // text, so duplicate/orphan/case-collision read as the same kind
-        // of small, scannable label the dry-run/live and UNREACHABLE
-        // badges already are.
+        // text, so duplicate/orphan read as the same kind of small,
+        // scannable label the dry-run/live and UNREACHABLE badges already
+        // are. (case-collision never reaches this row builder at all as of
+        // [ROUND, inline-display fix] — see rows.push above — so this chip
+        // now only ever renders "duplicate"/"orphan".)
         td = el("td", "kind");
         var kindChip = el("span", "badge badge-hunt");
         text(kindChip, r.f.kind || "");
