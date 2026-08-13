@@ -5,6 +5,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -229,6 +232,57 @@ func TestWebUIHandler_Stats_ReverseStatusThreeStatesSurviveDistinctlyToTheClient
 	}
 	if len(statuses) != 3 {
 		t.Errorf("expected 3 PAIRWISE DISTINCT ReverseStatus values across ran/skipped/off on one response, got %v", statuses)
+	}
+}
+
+// TestWebUIHandler_Stats_ReverseAsOf_SurvivesToTheClientAcrossASkippedCycle
+// is the controller ruling's handler-level pin (Phase 12 final round: "the
+// skipped-reverse-pass overwrite is the highest-severity item — last-known-
+// good preservation + a staleness indicator on the page"): reverseAsOf must
+// reach the client holding the LAST TRUSTWORTHY pass's own timestamp, not
+// the most recent cycle's, and must be null when no pass has ever run.
+func TestWebUIHandler_Stats_ReverseAsOf_SurvivesToTheClientAcrossASkippedCycle(t *testing.T) {
+	s := newStatsStore(false)
+	goodAt := time.Date(2026, 2, 1, 9, 0, 0, 0, time.UTC)
+
+	s.recordInstance(cycleKindStartup, goodAt, "radarr-main", "radarr", cycleInstanceStats{
+		total: 5, decisionsRan: true, reverseRan: true,
+		reverseFindings: []reverseFinding{{ID: 1, Title: "Finding", Reason: ReasonQualityCutoffNotMet}},
+	})
+	s.recordInstance(cycleKindSweep, goodAt.Add(6*time.Hour), "radarr-main", "radarr", cycleInstanceStats{
+		total: 5, decisionsRan: true, reverseSkipped: true,
+	})
+	s.recordInstance(cycleKindStartup, time.Now(), "radarr-off", "radarr", cycleInstanceStats{
+		total: 5, decisionsRan: true,
+	})
+
+	ts, _ := newTestWebUIServer(t, s)
+	resp, err := http.Get(ts.URL + "/api/stats")
+	if err != nil {
+		t.Fatalf("GET /api/stats: %v", err)
+	}
+	defer resp.Body.Close()
+	var body statsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
+
+	byName := map[string]instanceStatsView{}
+	for _, inst := range body.Instances {
+		byName[inst.Name] = inst
+	}
+	main := byName["radarr-main"]
+	if main.ReverseStatus != "skipped" {
+		t.Fatalf("radarr-main ReverseStatus = %q, want %q", main.ReverseStatus, "skipped")
+	}
+	if main.ReverseAsOf == nil || !main.ReverseAsOf.Equal(goodAt) {
+		t.Errorf("radarr-main ReverseAsOf = %v, want %v (the last cycle that actually completed the pass, not the skipped cycle 6h later)", main.ReverseAsOf, goodAt)
+	}
+	if len(main.ReverseFindings) != 1 {
+		t.Errorf("radarr-main ReverseFindings = %+v, want the preserved finding from the last trustworthy pass", main.ReverseFindings)
+	}
+	if got := byName["radarr-off"].ReverseAsOf; got != nil {
+		t.Errorf("radarr-off ReverseAsOf = %v, want nil: no pass has ever run for this instance", got)
 	}
 }
 
@@ -586,6 +640,91 @@ func TestWebUIPage_ShelfCountHeroSizeIsInTheMandatedBand(t *testing.T) {
 	}
 }
 
+// TestWebUIPage_ShelfCountLabelClampsAwayFromCardEdges is round-4's final
+// finding: .shelf-count is `position: absolute` with `left:<pct>%` (set from
+// JS) and `transform: translateX(-50%)`, so at pct=0% (the common first-run
+// "nothing at rest yet" state) or pct=100% the label's own center sits
+// exactly on the card's edge and roughly HALF of the 28-36px mono hero
+// number's rendered width hangs off past it — there is no clamp anywhere in
+// the chain. A CSS-only `clamp()` on `.shelf-count`'s `left` cannot fix this:
+// updateShelfCard sets `style.left` directly (an inline style), which always
+// wins over a stylesheet rule for the same property regardless of
+// specificity, so the clamp has to happen in JS, using the label's own
+// measured width (not a guessed constant — the string's length varies with
+// the library's size, "5 / 12" vs "996 / 1042").
+func TestWebUIPage_ShelfCountLabelClampsAwayFromCardEdges(t *testing.T) {
+	page := string(webUIPage)
+
+	start := strings.Index(page, "function updateShelfCard(")
+	if start == -1 {
+		t.Fatal("page has no updateShelfCard function")
+	}
+	end := strings.Index(page[start:], "\n  function renderInstances(")
+	if end == -1 {
+		t.Fatal("could not find the end of updateShelfCard (renderInstances must follow it)")
+	}
+	body := page[start : start+end]
+
+	if !strings.Contains(body, "offsetWidth") {
+		t.Error("updateShelfCard never reads the label's own rendered offsetWidth; a clamp cannot know how much room the label actually needs without measuring it")
+	}
+	if !strings.Contains(body, "Math.max") || !strings.Contains(body, "Math.min") {
+		t.Error("updateShelfCard has no Math.max/Math.min clamp on the label's pixel position")
+	}
+	// The unclamped pct must not reach the label's own left directly outside
+	// the (rare, unlaid-out) fallback branch — it must instead flow through
+	// a pixel computation that Math.max/Math.min above bound to the wrap's
+	// own measured width.
+	countLeftAssignments := strings.Count(body, "els.count.style.left =")
+	if countLeftAssignments < 2 {
+		t.Errorf("expected updateShelfCard to set els.count.style.left from at least two branches (the measured pixel clamp, and an unlaid-out fallback), got %d assignment(s) — the common case must not be the raw unclamped percentage", countLeftAssignments)
+	}
+	if !strings.Contains(body, `els.count.style.left = pxLeft + "px";`) {
+		t.Error("updateShelfCard never sets the label's left to a clamped pixel value")
+	}
+	// The fill and marker are the truthful signal and must stay at the
+	// EXACT, unclamped percentage — only the text label's position may be
+	// nudged inward.
+	if !strings.Contains(body, "els.rest.style.width = pctStr;") {
+		t.Error("the shelf-rest fill must stay at the exact, unclamped percentage")
+	}
+	if !strings.Contains(body, "els.marker.style.left = pctStr;") {
+		t.Error("the shelf-marker line must stay at the exact, unclamped percentage")
+	}
+}
+
+// TestWebUIPage_ScriptIsSyntacticallyValidJS runs `node --check` over the
+// embedded page's inline <script> block — the one live-code check available
+// under this project's "no browser" testing constraint. It would have caught
+// a stray syntax error in the shelf-count clamp fix (round-4 final round)
+// long before a human ever opened the page.
+func TestWebUIPage_ScriptIsSyntacticallyValidJS(t *testing.T) {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; skipping JS syntax check")
+	}
+
+	page := string(webUIPage)
+	start := strings.Index(page, "<script>")
+	end := strings.Index(page, "</script>")
+	if start == -1 || end == -1 || end < start {
+		t.Fatal("page has no <script>...</script> block to check")
+	}
+	script := page[start+len("<script>") : end]
+
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "webui.js")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
+		t.Fatalf("could not write extracted script: %v", err)
+	}
+
+	cmd := exec.Command(nodePath, "--check", scriptPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Errorf("node --check reports a syntax error in the embedded page's script:\n%s", out)
+	}
+}
+
 // TestWebUIPage_ReusesShelfCardsAcrossRefreshesForTransitions pins the
 // mandated "bar widths transition 300ms ease-out on refresh" motion rule
 // structurally: a CSS transition needs a prior COMPUTED value on an
@@ -808,6 +947,40 @@ func TestWebUIPage_ReverseOffInstancesGetANoticeNotABlankBody(t *testing.T) {
 	// comment-only else, which is exactly what the pre-fix code did.
 	if strings.Count(body, "notices.push") < 2 {
 		t.Errorf("renderReverse must push a notice for BOTH the skipped case and the off/absent case, so the panel body is never left blank; got function body:\n%s", body)
+	}
+}
+
+// TestWebUIPage_ReverseSkippedNoticeShowsStalenessTimestamp is the
+// controller ruling's page-level pin (Phase 12 final round): "the
+// skipped-reverse-pass overwrite is the highest-severity item —
+// last-known-good preservation + a staleness indicator on the page
+// ('showing last complete sweep from <time>')". Preservation on the DATA
+// side (statsStore never clearing ReverseFindings on a skipped cycle) is
+// not enough if the GUI never surfaces WHEN those findings are from — this
+// pins that renderReverse reads reverseAsOf and renders the controller's own
+// wording, using the same fmtRelative helper every other timestamp on the
+// page already uses.
+func TestWebUIPage_ReverseSkippedNoticeShowsStalenessTimestamp(t *testing.T) {
+	page := string(webUIPage)
+
+	start := strings.Index(page, "function renderReverse(")
+	if start == -1 {
+		t.Fatal("page has no renderReverse function")
+	}
+	end := strings.Index(page[start:], "\n  function renderFileReport(")
+	if end == -1 {
+		t.Fatal("could not find the end of renderReverse (renderFileReport must follow it)")
+	}
+	body := page[start : start+end]
+
+	if !strings.Contains(body, "reverseAsOf") {
+		t.Error("renderReverse never reads reverseAsOf; a skipped pass's preserved findings have no way to say when they are actually from")
+	}
+	if !strings.Contains(body, "showing last complete sweep from") {
+		t.Error("renderReverse is missing the controller-mandated staleness copy \"showing last complete sweep from <time>\"")
+	}
+	if !strings.Contains(body, "fmtRelative(notice.asOf)") && !strings.Contains(body, "fmtRelative(") {
+		t.Error("the staleness notice does not render the timestamp through fmtRelative, the same relative-time helper every other timestamp on the page uses")
 	}
 }
 

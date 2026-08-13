@@ -140,9 +140,12 @@ const (
 // again between items inside the engines; the write paths detach their own
 // requests from it so an in-flight item completes (binding controller note 4).
 //
-// stats is Phase 12's in-memory capture (nil-safe: main.go's --once path
-// passes nil, since --once never starts a server for anything to serve a
-// snapshot to). For an in-scope instance whose read succeeded (dataOK), it
+// stats is Phase 12's in-memory capture. Every caller passes a real
+// *statsStore — including main.go's --once path, which builds its own
+// throwaway newStatsStore(cfg.DryRun) (see that call site's own comment for
+// why: so the "once" cycle kind is exercised by the real code path, not only
+// by a test, even though --once never starts a server for anything to serve
+// the snapshot to). For an in-scope instance whose read succeeded (dataOK), it
 // is updated from the cycleInstanceStats the decision engine returns —
 // Total/Monitored/Unmonitored/WouldUnmonitor/findings/actions all come from
 // there, and the store's last-known-good state for any of them is left

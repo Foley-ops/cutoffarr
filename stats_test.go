@@ -118,6 +118,65 @@ func TestStatsStore_RecordInstance_PreservesReverseFindingsWhenACycleDidNotRunRe
 	}
 }
 
+// TestStatsStore_RecordInstance_ReverseAsOf_StaysAtLastTrustworthyPass is the
+// controller ruling's own binding requirement (Phase 12 final round): "the
+// skipped-reverse-pass overwrite is the highest-severity item — last-known-
+// good preservation + a staleness indicator on the page". Preservation alone
+// (the test above) is not enough for a human to tell "found nothing five
+// minutes ago" from "found nothing five weeks ago"; ReverseAsOf must hold
+// the timestamp of the findings CURRENTLY being shown, frozen at the last
+// cycle whose reverse pass actually completed trustworthily, and must not
+// silently advance just because a later cycle merely attempted (and lost
+// trust in) the pass.
+func TestStatsStore_RecordInstance_ReverseAsOf_StaysAtLastTrustworthyPass(t *testing.T) {
+	s := newStatsStore(false)
+	goodAt := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	skippedAt := goodAt.Add(24 * time.Hour)
+
+	s.recordInstance(cycleKindStartup, goodAt, "radarr-main", "radarr", cycleInstanceStats{
+		total: 5, decisionsRan: true, reverseRan: true,
+		reverseFindings: []reverseFinding{{ID: 7, Title: "Accidental", Reason: ReasonQualityCutoffNotMet}},
+	})
+	got := s.snapshot().Instances[0]
+	if got.ReverseAsOf == nil || !got.ReverseAsOf.Equal(goodAt) {
+		t.Fatalf("ReverseAsOf = %v, want %v (the cycle that actually ran the pass)", got.ReverseAsOf, goodAt)
+	}
+
+	// A day later, the reverse pass could not be trusted this cycle (an
+	// incomplete unmonitored wanted/cutoff set) — findings are preserved,
+	// and ReverseAsOf must STILL say the findings are from goodAt, not
+	// silently jump to skippedAt (which would claim a pass that never
+	// actually completed).
+	s.recordInstance(cycleKindSweep, skippedAt, "radarr-main", "radarr", cycleInstanceStats{
+		total: 5, decisionsRan: true, reverseSkipped: true,
+	})
+	got = s.snapshot().Instances[0]
+	if len(got.ReverseFindings) != 1 || got.ReverseFindings[0].ID != 7 {
+		t.Fatalf("ReverseFindings = %+v, want the previous trustworthy pass's finding preserved", got.ReverseFindings)
+	}
+	if got.ReverseStatus != "skipped" {
+		t.Fatalf("ReverseStatus = %q, want %q", got.ReverseStatus, "skipped")
+	}
+	if got.ReverseAsOf == nil || !got.ReverseAsOf.Equal(goodAt) {
+		t.Errorf("ReverseAsOf = %v, want it to STILL say %v (the last cycle that actually completed the pass), not the skipped cycle's own time", got.ReverseAsOf, goodAt)
+	}
+}
+
+// TestStatsStore_RecordInstance_ReverseAsOf_NilUntilAPassActuallyRuns pins
+// the zero state: an instance that has never once had a trustworthy reverse
+// pass (reverse globally off, or only ever reached by a webhook cycle) must
+// report ReverseAsOf as null, not a zero time.Time that would render as some
+// implausible epoch date.
+func TestStatsStore_RecordInstance_ReverseAsOf_NilUntilAPassActuallyRuns(t *testing.T) {
+	s := newStatsStore(false)
+	s.recordInstance(cycleKindWebhook, time.Now(), "radarr-main", "radarr", cycleInstanceStats{total: 5, decisionsRan: true})
+
+	got := s.snapshot().Instances[0]
+	if got.ReverseAsOf != nil {
+		t.Errorf("ReverseAsOf = %v, want nil: no cycle has ever completed a trustworthy reverse pass for this instance", got.ReverseAsOf)
+	}
+}
+
 // TestStatsStore_RecordInstance_PreservesFileReportWhenACycleDidNotRunIt is
 // the file-report half of the same rule.
 func TestStatsStore_RecordInstance_PreservesFileReportWhenACycleDidNotRunIt(t *testing.T) {
@@ -574,6 +633,50 @@ func TestRunRadarrDecisionEngine_Stats_LibraryTotalsWouldUnmonitorAndConfirmedAc
 	}
 }
 
+// TestRunRadarrDecisionEngine_Stats_UnmonitoredExcludesAbsentMonitoredField is
+// round-4's final-round finding: unmonitored used to be computed as
+// total-monitored, which folds a movie whose "monitored" key is entirely
+// ABSENT (untrusted input — rule 1 excludes it and warnIfFieldAbsent warns
+// about it, see this function's own loop a few lines below the totals) into
+// the same bucket as a movie the *arr genuinely reports monitored=false. The
+// shelf's headline "N at rest" is built directly from Unmonitored, so an
+// untrusted movie used to silently count as "at rest" — the same
+// absence-is-untrusted-not-a-state posture this file already enforces
+// everywhere else, now pinned for the totals themselves.
+func TestRunRadarrDecisionEngine_Stats_UnmonitoredExcludesAbsentMonitoredField(t *testing.T) {
+	fake := newRadarrFake(t, "", nil)
+	movies := []movieListElement{
+		// monitored=true, still hunting (quality cutoff not met) — never a
+		// write candidate, so the fake needs no detail/PUT fixture for it.
+		crossCheckWitnessMovie(1, "Still Hunting"),
+		// monitored=false (trusted, already at rest).
+		unmonitoredBelowCutoffMovie(2, "Already At Rest"),
+		// monitored ENTIRELY ABSENT from the payload — untrusted, not a state.
+		{
+			ID: intPtr(3), Title: strPtr("Untrusted"), HasFile: boolPtr(true),
+			QualityProfileID: intPtr(1), Tags: &noTags,
+			MovieFile: &movieFileElement{ID: intPtr(1), QualityCutoffNotMet: boolPtr(true)},
+		},
+	}
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	result := runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude",
+		fullLibraryScope(slog.LevelInfo), false, reverseOptions{}, fileReportOptions{})
+
+	if result.total != 3 {
+		t.Fatalf("total = %d, want 3 (every library element, trusted or not):\n%s", result.total, buf.String())
+	}
+	if result.monitored != 1 {
+		t.Errorf("monitored = %d, want 1:\n%s", result.monitored, buf.String())
+	}
+	if result.unmonitored != 1 {
+		t.Errorf("unmonitored = %d, want 1 — a movie whose \"monitored\" field is entirely absent must land in NEITHER bucket, not be folded into \"at rest\" by a total-monitored subtraction:\n%s", result.unmonitored, buf.String())
+	}
+	if result.monitored+result.unmonitored == result.total {
+		t.Errorf("monitored(%d)+unmonitored(%d) == total(%d): the untrusted movie was folded into one of the two trusted buckets", result.monitored, result.unmonitored, result.total)
+	}
+}
+
 // TestRunRadarrDecisionEngine_Stats_ReverseFindingsAndRemonitorAction proves
 // the reverse-scan half: a confirmed re-monitor write is captured both as a
 // reverseFinding (report) and as an actions entry (the write itself),
@@ -730,6 +833,40 @@ func TestRunSonarrDecisionEngine_Stats_SeasonTotalsAndConfirmedAction(t *testing
 	a := unmonitors[0]
 	if a.ID != 1 || a.Title != "Write Me" || a.Season == nil || *a.Season != 1 {
 		t.Errorf("unmonitor action = %+v, want seriesId=1 title=%q season=1", a, "Write Me")
+	}
+}
+
+// TestRunSonarrDecisionEngine_Stats_UnmonitoredExcludesAbsentMonitoredSeason
+// is the Sonarr twin of the Radarr test above: a season whose "monitored"
+// field is entirely absent (evaluateSeries's own "skipping season: missing
+// monitored field" warn-and-exclude path, decision.go) must land in neither
+// the monitored nor the unmonitored season count, not be folded into "at
+// rest" by a total-monitored subtraction.
+func TestRunSonarrDecisionEngine_Stats_UnmonitoredExcludesAbsentMonitoredSeason(t *testing.T) {
+	fake := newSonarrEngineFake(t, "[]", "[]")
+	series := []seriesElement{
+		testSeries(1, "Show", true, 1, nil,
+			testSeason(1, true, 0, 0),
+			testSeason(2, false, 0, 0),
+			seriesSeasonElement{SeasonNumber: intPtr(3), Monitored: nil, Statistics: &seasonStatisticsElement{EpisodeFileCount: intPtr(0), TotalEpisodeCount: intPtr(0)}},
+		),
+	}
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	result := runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude",
+		fullLibraryScope(slog.LevelInfo), true, reverseOptions{}, fileReportOptions{})
+
+	if result.total != 3 {
+		t.Fatalf("total = %d, want 3 (every season, trusted or not):\n%s", result.total, buf.String())
+	}
+	if result.monitored != 1 {
+		t.Errorf("monitored = %d, want 1:\n%s", result.monitored, buf.String())
+	}
+	if result.unmonitored != 1 {
+		t.Errorf("unmonitored = %d, want 1 — a season whose \"monitored\" field is entirely absent must land in NEITHER bucket:\n%s", result.unmonitored, buf.String())
+	}
+	if result.monitored+result.unmonitored == result.total {
+		t.Errorf("monitored(%d)+unmonitored(%d) == total(%d): the untrusted season was folded into one of the two trusted buckets", result.monitored, result.unmonitored, result.total)
 	}
 }
 

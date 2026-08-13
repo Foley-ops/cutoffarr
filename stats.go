@@ -228,6 +228,22 @@ type instanceStatsView struct {
 	// FileReport.Status's own persistence rule below.
 	ReverseStatus string `json:"reverseStatus"`
 
+	// ReverseAsOf is the clock reading (cycle.now()) of the most recent
+	// cycle whose reverse pass actually completed trustworthily — the
+	// timestamp of the findings ReverseFindings is CURRENTLY holding, not of
+	// "now" or of the most recent cycle generally. It stays nil until the
+	// first cycle that sets ReverseStatus to "ran", and — the reason it
+	// exists (controller ruling, Phase 12 final round: "the skipped-reverse-
+	// pass overwrite is the highest-severity item ... last-known-good
+	// preservation + a staleness indicator") — it is left UNTOUCHED on a
+	// cycle that sets ReverseStatus to "skipped", exactly like
+	// ReverseFindings itself: last-known-good preservation without a
+	// timestamp still leaves a human unable to tell "found nothing five
+	// minutes ago" from "found nothing five weeks ago", so the GUI (round-4
+	// review fix) uses this to render "showing last complete sweep from
+	// <time>" whenever it displays preserved-but-now-unconfirmed findings.
+	ReverseAsOf *time.Time `json:"reverseAsOf"`
+
 	ReverseFindings []reverseFinding   `json:"reverseFindings"`
 	FileReport      fileReportSnapshot `json:"fileReport"`
 	LastActions     []actionRecord     `json:"lastActions"`
@@ -394,6 +410,13 @@ func (s *statsStore) recordInstance(kind string, at time.Time, name, typ string,
 		findings := make([]reverseFinding, len(cs.reverseFindings))
 		copy(findings, cs.reverseFindings)
 		v.ReverseFindings = findings
+		// ReverseAsOf tracks the findings' own freshness, not the cycle's:
+		// stamped here, alongside them, and left alone everywhere else (see
+		// ReverseAsOf's own doc comment) — the controller-ruling staleness
+		// indicator needs the LAST time these findings were confirmed, not
+		// the last time any cycle merely attempted the pass.
+		atCopy := at
+		v.ReverseAsOf = &atCopy
 	} else if cs.reverseSkipped {
 		// The pass ran but could not be trusted this cycle: say so, but —
 		// same three-state fidelity rule as the findings themselves — leave
@@ -544,8 +567,8 @@ func sonarrReverseFindings(fs []reverseSeasonFinding) []reverseFinding {
 // recordInstance call — not through slice aliasing (append growing v's own
 // slice in place would otherwise be invisible here but could still corrupt a
 // snapshot that shared the same backing array) and not through the LastRun/
-// LastCycleKind pointers (recordInstance always allocates a fresh one, but
-// this function does not rely on that staying true).
+// LastCycleKind/ReverseAsOf pointers (recordInstance always allocates a
+// fresh one, but this function does not rely on that staying true).
 func cloneInstanceStatsView(v instanceStatsView) instanceStatsView {
 	out := v
 
@@ -556,6 +579,10 @@ func cloneInstanceStatsView(v instanceStatsView) instanceStatsView {
 	if v.LastCycleKind != nil {
 		k := *v.LastCycleKind
 		out.LastCycleKind = &k
+	}
+	if v.ReverseAsOf != nil {
+		t := *v.ReverseAsOf
+		out.ReverseAsOf = &t
 	}
 
 	out.ReverseFindings = make([]reverseFinding, len(v.ReverseFindings))

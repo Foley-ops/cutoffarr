@@ -512,7 +512,7 @@
 
     card.appendChild(barWrap);
 
-    card._els = { name: name, kind: kind, count: count, countNum: countNum, rest: rest, marker: marker, unreachable: unreachable, sub: null };
+    card._els = { name: name, kind: kind, count: count, countNum: countNum, rest: rest, marker: marker, unreachable: unreachable, sub: null, barWrap: barWrap };
     return card;
   }
 
@@ -532,9 +532,36 @@
     text(els.kind, inst.type);
 
     els.countNum.data = atRest + " / " + total;
-    els.count.style.left = pctStr;
     els.rest.style.width = pctStr;
     els.marker.style.left = pctStr;
+
+    // Round-4 review fix: .shelf-count is `position: absolute` with
+    // `left:<pct>%` and `transform: translateX(-50%)` (webui.html's own
+    // rule) — at pct 0% (the common first-run "nothing at rest yet" state)
+    // or 100%, the label's center sits exactly on the card's edge and
+    // roughly HALF of the 28-36px mono hero number's own rendered width
+    // hangs off past it, clipping or forcing horizontal scroll at every
+    // width between the 420px stacking breakpoint and ~930px. A CSS-only
+    // clamp() on .shelf-count's `left` cannot fix this: an inline
+    // `style.left` set from JS always wins over a stylesheet rule for the
+    // same property, so the clamp happens here instead, in pixels, using
+    // the label's own MEASURED width — not a guessed constant, since the
+    // string's length varies with the library's size ("5 / 12" vs
+    // "996 / 1042"). els.rest/els.marker above are left at the exact,
+    // unclamped percentage: they are the truthful fill/cutoff signal; only
+    // the text label's position is nudged inward.
+    var wrapWidth = els.barWrap.clientWidth;
+    if (wrapWidth > 0) {
+      var half = els.count.offsetWidth / 2;
+      var pxLeft = (pct / 100) * wrapWidth;
+      pxLeft = Math.max(half, Math.min(wrapWidth - half, pxLeft));
+      els.count.style.left = pxLeft + "px";
+    } else {
+      // Not yet laid out (e.g. display:none on an ancestor) — clientWidth
+      // reads 0 and a pixel clamp is meaningless; fall back to the
+      // unclamped percentage rather than leaving left unset.
+      els.count.style.left = pctStr;
+    }
 
     // The totals above are always the last-known-good numbers (see
     // statsStore.recordUnreachable's own doc comment: they are never
@@ -674,7 +701,20 @@
           rows.push({ instance: inst.name, f: findings[j] });
         }
       } else if (status === "skipped") {
-        notices.push({ instance: inst.name, status: "skipped" });
+        // Round-4 review fix (controller ruling — the skipped-reverse-pass
+        // overwrite is the highest-severity finding this round): the store
+        // preserves the LAST TRUSTWORTHY pass's findings and their own
+        // timestamp (statsStore.recordInstance's reverseAsOf) rather than
+        // clearing them just because this cycle could not confirm them
+        // fresh — but preservation the GUI never surfaces is no different
+        // from silently discarding it. The notice below carries both: when
+        // the stale findings last came from a real pass, and how many
+        // there were, so "not trusted this sweep" never reads as "we don't
+        // know anything", only as "this is not fresh".
+        notices.push({
+          instance: inst.name, status: "skipped",
+          asOf: inst.reverseAsOf || null, count: (inst.reverseFindings || []).length
+        });
         skippedCount++;
       } else {
         // "off", or absent entirely — both mean the reverse scan has not
@@ -703,11 +743,28 @@
     if (notices.length > 0) {
       var list = el("ul", "status-notices");
       for (var n = 0; n < notices.length; n++) {
-        var li = el("li", "status-notice status-" + notices[n].status);
-        var word = notices[n].status === "off"
-          ? "the reverse scan has not completed a trustworthy pass for this instance yet"
-          : "reverse scan could not be trusted this sweep";
-        text(li, notices[n].instance + " — " + word);
+        var notice = notices[n];
+        var li = el("li", "status-notice status-" + notice.status);
+        var word;
+        if (notice.status === "off") {
+          word = "the reverse scan has not completed a trustworthy pass for this instance yet";
+        } else {
+          // Round-4 review fix (controller ruling): "not trusted this
+          // sweep" alone repeats the false-all-clear this round exists to
+          // close — it says nothing was found without saying whether
+          // anything was ever actually checked. When a previous trustworthy
+          // pass left findings in place (statsStore's own last-known-good
+          // preservation), say so, with the time they are FROM, exactly the
+          // controller's own wording.
+          word = "reverse scan could not be trusted this sweep";
+          if (notice.asOf) {
+            word += " — showing last complete sweep from " + fmtRelative(notice.asOf);
+            word += notice.count > 0
+              ? " (" + notice.count + " item" + (notice.count === 1 ? "" : "s") + " wrongly unmonitored)"
+              : " (nothing wrongly unmonitored)";
+          }
+        }
+        text(li, notice.instance + " — " + word);
         list.appendChild(li);
       }
       body.appendChild(list);

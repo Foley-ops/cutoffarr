@@ -489,13 +489,28 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// hand, so every return path below — including every early one — reports
 	// real library totals rather than zeroes that would read as "library is
 	// suddenly empty".
+	//
+	// round-4 review fix: unmonitored used to be `stats.total - stats.monitored`,
+	// which folds a movie whose "monitored" key is entirely ABSENT from the
+	// JSON into the same bucket as one the *arr genuinely reports
+	// monitored=false. Rule 1 below (warnIfFieldAbsent + the m.Monitored==nil
+	// branch) already treats that absence as untrusted input, not a state —
+	// excluded from evaluation and never assumed to already be at rest. The
+	// shelf's headline "N at rest" is built directly from Unmonitored, so the
+	// same posture now applies to the totals themselves: monitored and
+	// unmonitored are each counted explicitly, and a movie counted in neither
+	// is exactly the untrusted-absence case, not a rounding artifact.
 	stats.total = len(movies)
 	for _, m := range movies {
-		if m.Monitored != nil && *m.Monitored {
+		switch {
+		case m.Monitored == nil:
+			// Untrusted input, not a state — lands in neither bucket.
+		case *m.Monitored:
 			stats.monitored++
+		default:
+			stats.unmonitored++
 		}
 	}
-	stats.unmonitored = stats.total - stats.monitored
 
 	// The per-cycle-repetition logger (see demoteInfoTo): the profile fetch,
 	// the exclusion-tag resolution and the cross-check's per-sample lines are
@@ -2334,7 +2349,17 @@ func evaluateSeries(ctx context.Context, logger *slog.Logger, client *APIClient,
 // runSonarrWritePass, "unmonitored counts SEASONS"), computed straight from
 // each series' own Seasons list independent of the series' own monitored
 // flag or any decision rule, the same simple, rule-independent count the
-// Radarr twin takes from movies.Monitored.
+// Radarr twin takes from movies.Monitored. Ratified as-is (controller
+// resolution, Phase 12 final round): this necessarily counts season 0
+// (specials) alongside ordinary seasons, and every season of a series whose
+// OWN monitored flag is false — the loop below never reads s.Monitored, only
+// each season's own — because the shelf's "N at rest" is a library-wide
+// season count, and a season of an unmonitored series is still a season this
+// library has, unmonitored either way. As with the Radarr twin (round-4
+// review fix), a season whose OWN "monitored" field is entirely absent from
+// the JSON is untrusted input, not a state (evaluateSeries's own "skipping
+// season: missing monitored field" warn-and-exclude path, below), so it
+// lands in neither the monitored nor the unmonitored bucket.
 func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Instance, series []seriesElement, wantedEpisodeIDs map[int]bool, wantedSeasons map[seasonKey]bool, exclusionTagLabel string, scope evalScope, dryRun bool, reverse reverseOptions, fileReport fileReportOptions) (stats cycleInstanceStats) {
 	client := NewAPIClient(inst.URL, inst.APIKey)
 
@@ -2348,12 +2373,16 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		}
 		for _, season := range *s.Seasons {
 			stats.total++
-			if season.Monitored != nil && *season.Monitored {
+			switch {
+			case season.Monitored == nil:
+				// Untrusted input, not a state — lands in neither bucket.
+			case *season.Monitored:
 				stats.monitored++
+			default:
+				stats.unmonitored++
 			}
 		}
 	}
-	stats.unmonitored = stats.total - stats.monitored
 
 	// See the Radarr twin: the once-per-cycle informational reads log through
 	// a logger that demotes INFO to this cycle's report level.

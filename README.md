@@ -679,6 +679,7 @@ script, a status-page widget, whatever) without ever loading the HTML:
         "lastRun": "2026-03-01T12:00:00Z",
         "lastCycleKind": "sweep",
         "reverseStatus": "ran",
+        "reverseAsOf": "2026-03-01T12:00:00Z",
         "reverseFindings": [],
         "fileReport": { "status": "ran", "duplicates": 0, "orphans": 1, "findings": [] },
         "lastActions": [],
@@ -714,18 +715,29 @@ script, a status-page widget, whatever) without ever loading the HTML:
   `orphans`/`reverseFindings` being empty means "clean" ONLY when the
   matching status is `ran` — never conflate `off` or `skipped` with "clean".
 
+  `reverseAsOf` is the timestamp of the reverse pass `reverseFindings` is
+  CURRENTLY holding — the last cycle whose pass actually completed
+  trustworthily (`reverseStatus: "ran"`), not the most recent cycle. On a
+  `skipped` cycle the findings are last-known-good (preserved, not cleared)
+  and `reverseAsOf` stays exactly where it was, so the dashboard can say
+  "showing last complete sweep from &lt;time&gt;" instead of silently
+  presenting stale findings as fresh. It is `null` until the first cycle
+  that ever completes a trustworthy pass.
+
   `lastCycleStatus` is this instance's outcome on the single MOST RECENT
   cycle that named it, independent of everything else in this object:
-  `{"status": "ok"}` once that cycle actually reached the decision engine
-  (whatever the engine itself then did), or `{"status": "skipped", "reason":
-  "..."}` when the connectivity check or the library read itself failed —
-  the daemon's own warn-and-skip path, most often an `*arr` mid-restart.
-  Unlike every other field here, it is never carried forward from an
-  earlier cycle: an instance unreachable for a week reports `skipped` on
-  every poll, not a stale `ok` from the last time it was reachable. The
-  dashboard shows this as a clay "couldn't reach … last sweep" badge on
-  that instance's shelf card; every other number on the card is left
-  exactly as it last was.
+  `{"status": "ok"}` once that cycle's decision engine actually completed an
+  evaluation (`wouldUnmonitor` is a real, freshly computed number), or
+  `{"status": "skipped", "reason": "..."}` for any of three warn-and-skip
+  paths — the connectivity check failed, the library read failed, or (a
+  round-4 review fix) the cycle reached the engine but aborted INSIDE it
+  before finishing an evaluation (a quality-profile fetch failure, an
+  exclusion-tag resolution failure). Unlike every other field here, it is
+  never carried forward from an earlier cycle: an instance that cannot
+  complete an evaluation for a week reports `skipped` on every poll, not a
+  stale `ok` from the last time it could. The dashboard shows this as a clay
+  "last sweep incomplete — &lt;reason&gt;" badge on that instance's shelf
+  card; every other number on the card is left exactly as it last was.
 
   `lastActions` holds up to the last 50 confirmed `unmonitor`/`remonitor`
   writes across both directions; it's always empty in dry-run, because a
