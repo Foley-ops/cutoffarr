@@ -785,6 +785,19 @@ func (a *actionRunner) audit(req actionRequest, outcome, operation, detail strin
 //
 // Both are still audited to the log, which is where an unrecognized request
 // belongs. Pinned by TestAction_ARequestThatNamesNothingRealIsNeverListed.
+//
+// Everything else IS recorded, including the cross-site refusal and the
+// disabled-switch answer: an attempt on a real finding of a real instance is
+// exactly what an operator asking "did something try to move my files" needs to
+// see, and a refusal that appeared only in the log would be the half of the
+// trail item 9 exists to close. The cost is that anything which can reach this
+// unauthenticated port can push maxLastActions entries and age the daemon's own
+// writes out of the GUI list. That is accepted rather than overlooked: the LOG
+// is the audit trail of record and is untouched by this, the list has always
+// been a bounded, in-memory glance rather than a ledger, and the same caller
+// could already queue sweeps at will (POST /api/scan). Keeping the port on a
+// LAN you trust is the control, and it is the same control the whole page rests
+// on (see the README's trust model).
 func (a *actionRunner) recordAction(req actionRequest, outcome, detail string) {
 	if a.stats == nil || !actionKinds[req.Kind] {
 		return
