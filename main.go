@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 )
 
 // defaultConfigPath is where the container image expects the config to be
@@ -203,6 +204,12 @@ func run(args []string, stdout, stderr io.Writer, daemonOpts ...daemonOptions) i
 		if onlyIDSet {
 			fileReport = fileReportOptions{}
 		}
+		// stats is Phase 12's in-memory capture. --once never starts a
+		// server, so nothing ever serves this snapshot to anyone — it is
+		// still built and threaded through so runScanCycle's "once" cycle
+		// kind is exercised by the real code path rather than only by a
+		// test, and so a future phase that wants to expose it (e.g. printing
+		// a summary at exit) has something to read from.
 		runScanCycle(context.Background(), logger, *cfg, scanCycle{
 			instanceName: *instanceName,
 			samples:      parseSamples(*samplesFlag),
@@ -210,7 +217,9 @@ func run(args []string, stdout, stderr io.Writer, daemonOpts ...daemonOptions) i
 			dryRun:       cfg.DryRun,
 			reverse:      reverse,
 			fileReport:   fileReport,
-		})
+			kind:         cycleKindOnce,
+			now:          time.Now,
+		}, newStatsStore(cfg.DryRun))
 	} else {
 		// --only-id and --instance stay --once-only. Daemon mode DOES run
 		// passes now, but it decides their scope itself — from the webhook

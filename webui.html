@@ -1,0 +1,1038 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'">
+<title>cutoffarr</title>
+<style>
+  /* Tokens. Every other color in this file is derived from these five —
+     bg/panel/ink for structure and text, rest/hunt/alert for state — never
+     introduced fresh. This is a deliberately fixed, single-mode page (a
+     homelab operator glancing at one LAN dashboard), not a light/dark
+     adaptive one. */
+  :root {
+    --bg: #0F1517;
+    --panel: #1A2427;
+    --ink: #D8E2E0;
+    --ink-dim: rgb(216 226 224 / 62%);
+    --ink-faint: rgb(216 226 224 / 38%);
+    --border: rgb(216 226 224 / 12%);
+    --border-strong: rgb(216 226 224 / 22%);
+    --rest: #6FA08C;
+    --rest-dim: rgb(111 160 140 / 22%);
+    --hunt: #D9A05B;
+    --hunt-dim: rgb(217 160 91 / 22%);
+    --alert: #C46A5A;
+    --alert-dim: rgb(196 106 90 / 22%);
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+    /* The shelf count is the page's one hero number ("456 / 996 at rest"):
+       the design plan's type spec calls for 28-36px mono hero numbers with
+       small unit words. .shelf-bar-wrap's own padding-top is expressed
+       against this same token (below) so the two never drift apart. */
+    --shelf-count-size: 30px;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--ink);
+  }
+
+  body {
+    font-family: var(--sans);
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 40px 24px 80px;
+  }
+
+  /* --- header ---------------------------------------------------------- */
+
+  .topbar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin-bottom: 48px;
+  }
+
+  .brand {
+    font-family: var(--mono);
+    font-size: 20px;
+    letter-spacing: -0.01em;
+    color: var(--ink);
+  }
+
+  .brand .tick {
+    color: var(--rest);
+  }
+
+  .status-group {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-left: auto;
+    flex-wrap: wrap;
+  }
+
+  .badge {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 4px 9px;
+    border-radius: 999px;
+    border: 1px solid var(--border-strong);
+    white-space: nowrap;
+  }
+
+  .badge-rest { color: var(--rest); background: var(--rest-dim); border-color: rgb(111 160 140 / 40%); }
+  .badge-hunt { color: var(--hunt); background: var(--hunt-dim); border-color: rgb(217 160 91 / 40%); }
+  /* Shown in place of the dry-run/live badge when a poll of /api/stats
+     fails: a dead or unreachable backend must never look pixel-identical
+     to a healthy one (see refresh()'s own comment). */
+  .badge-alert { color: var(--alert); background: var(--alert-dim); border-color: rgb(196 106 90 / 40%); }
+
+  .last-swept {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-dim);
+    white-space: nowrap;
+  }
+
+  button#scanBtn {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.03em;
+    color: var(--bg);
+    background: var(--rest);
+    border: 1px solid var(--rest);
+    border-radius: 6px;
+    padding: 8px 14px;
+    cursor: pointer;
+  }
+
+  button#scanBtn:hover:not(:disabled) { background: #7FAE9B; }
+
+  button#scanBtn:disabled {
+    cursor: default;
+    color: var(--ink-dim);
+    background: transparent;
+    border-color: var(--border-strong);
+  }
+
+  button:focus-visible, summary:focus-visible, a:focus-visible {
+    outline: 2px solid var(--rest);
+    outline-offset: 2px;
+  }
+
+  /* --- the cutoff shelf: the one bold, signature element ---------------- */
+
+  #instances {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    margin-bottom: 40px;
+  }
+
+  .empty {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--ink-dim);
+  }
+
+  .shelf {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 22px;
+  }
+
+  .shelf-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 14px;
+    /* Round-4 review fix: without this, the UNREACHABLE badge (below) is a
+       flex item with no room to shrink OR wrap — its nowrap text sets its
+       min-content width to the whole string, and the row simply overflows
+       the shelf card. Wrapping the row lets a long badge drop to its own
+       line instead. */
+    flex-wrap: wrap;
+  }
+
+  .shelf-name {
+    font-family: var(--mono);
+    font-size: 15px;
+    color: var(--ink);
+  }
+
+  .shelf-type {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+
+  /* The UNREACHABLE badge (controller addition N2): an instance whose most
+     recent cycle never reached the decision engine at all. Reuses the same
+     .badge/.badge-alert tokens the header's disconnected state uses — ALERT
+     clay, the "needs review" color — rather than inventing a new visual
+     language for what is the same underlying fact (numbers on screen that
+     may no longer be current). margin-left:auto pushes it to the far edge
+     of the shelf-head row, away from the name/type it must never be
+     confused with. */
+  .shelf-unreachable {
+    margin-left: auto;
+    /* Round-4 review fix: .badge's own white-space: nowrap + text-transform:
+       uppercase are right for a short status word ("rehearsing", "live")
+       but wrong for this badge's copy, which carries a full sentence
+       (instance name + a reason drawn from cycleStatusView.Reason, up to
+       ~95 characters) — nowrap uppercase text cannot wrap or shrink and
+       overflowed the shelf card at every width, roughly 2x the mandated
+       360px minimum. Overridden here (later in the cascade than .badge,
+       same specificity, so this wins) rather than on .badge itself, which
+       every OTHER badge on the page still needs nowrap/uppercase for. */
+    white-space: normal;
+    text-transform: none;
+  }
+
+  .shelf-bar-wrap {
+    position: relative;
+    /* Reserves room above the bar for .shelf-count's own line height
+       (font-size * the inherited 1.45 line-height) plus breathing room,
+       expressed against the SAME --shelf-count-size token the count itself
+       uses so the two can never drift out of sync if that token changes. */
+    padding-top: calc(var(--shelf-count-size) * 1.7);
+  }
+
+  .shelf-count {
+    position: absolute;
+    top: 0;
+    left: 0;
+    transform: translateX(-50%);
+    white-space: nowrap;
+    font-family: var(--mono);
+    font-size: var(--shelf-count-size);
+    color: var(--ink);
+  }
+
+  .shelf-count .unit {
+    color: var(--ink-dim);
+    font-size: 11px;
+  }
+
+  .shelf-bar {
+    position: relative;
+    height: 30px;
+    border-radius: 5px;
+    background: var(--hunt-dim);
+    border: 1px solid rgb(217 160 91 / 30%);
+    overflow: hidden;
+  }
+
+  .shelf-rest {
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 0%;
+    background: var(--rest);
+    transition: width 0.3s ease-out;
+  }
+
+  .shelf-marker {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0%;
+    width: 2px;
+    margin-left: -1px;
+    background: var(--ink);
+    transition: left 0.3s ease-out;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    /* The design plan is explicit: "No other animation." The disclosure
+       caret's own rotate transition (details.panel summary::before, below)
+       is exactly that other animation, so it is disabled here alongside the
+       shelf bar/marker — round-3 review fix; this selector list is the
+       ENTIRE set of animated properties in this page, and must stay that
+       way as the single place motion is turned off. */
+    .shelf-rest, .shelf-marker, details.panel summary::before { transition: none; }
+  }
+
+  .shelf-sub {
+    margin: 12px 0 0;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--hunt);
+  }
+
+  /* Narrow viewports: the label stops trying to float over the cutoff
+     marker (it can run out of room to center itself near either edge) and
+     stacks as its own line above the bar instead. */
+  @media (max-width: 420px) {
+    .shelf-bar-wrap { padding-top: 0; }
+    .shelf-count {
+      position: static;
+      display: block;
+      transform: none;
+      margin-bottom: 8px;
+    }
+  }
+
+  /* --- reverse-scan / file-clutter panels -------------------------------- */
+
+  details.panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 16px;
+  }
+
+  details.panel summary {
+    cursor: pointer;
+    list-style: none;
+    padding: 16px 22px;
+    font-size: 13px;
+    color: var(--ink);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  details.panel summary::-webkit-details-marker { display: none; }
+
+  details.panel summary::before {
+    content: "▸";
+    color: var(--ink-faint);
+    font-size: 11px;
+    transition: transform 0.15s ease-out;
+  }
+
+  details.panel[open] summary::before { transform: rotate(90deg); }
+
+  .panel-body {
+    padding: 0 22px 20px;
+    border-top: 1px solid var(--border);
+    padding-top: 16px;
+  }
+
+  table.findings {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+
+  table.findings th {
+    text-align: left;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    font-weight: 400;
+    padding: 0 10px 8px 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  table.findings td {
+    padding: 7px 10px 7px 0;
+    border-bottom: 1px solid var(--border);
+    color: var(--ink-dim);
+    vertical-align: top;
+    word-break: break-word;
+  }
+
+  table.findings tr:last-child td { border-bottom: none; }
+
+  table.findings td.path { color: var(--ink-faint); }
+
+  .findings-scroll { overflow-x: auto; }
+
+  /* Per-instance file-report status notices (off/skipped) — the three-state
+     fidelity the API contract requires: a skipped instance must never look
+     like a clean "ran" one, and an off instance must say it is unconfigured
+     rather than silently produce zero rows indistinguishable from clean. */
+  ul.status-notices {
+    list-style: none;
+    margin: 0 0 14px;
+    padding: 0;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+
+  ul.status-notices li { padding: 3px 0; }
+  ul.status-notices li.status-off { color: var(--ink-faint); }
+  ul.status-notices li.status-skipped { color: var(--hunt); }
+
+  footer {
+    margin-top: 48px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--ink-faint);
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="topbar">
+    <div class="brand">cutoffarr<span class="tick">_</span></div>
+    <div class="status-group">
+      <span id="dryRunBadge" class="badge">…</span>
+      <span id="lastSwept" class="last-swept">last swept —</span>
+      <button id="scanBtn" type="button">Scan now</button>
+    </div>
+  </header>
+
+  <!-- signature element: the cutoff shelf. One horizontal shelf bar per
+       instance — sage (rest) meets amber (hunt) at a 2px vertical marker
+       carrying the "N / total at rest" count above it. -->
+  <main id="instances" data-cutoff-shelf>
+    <p class="empty">First sweep in progress — the shelves fill in when it finishes.</p>
+  </main>
+
+  <details class="panel">
+    <summary>Needs your eyes — reverse scan (<span id="reverseCount">0</span>)</summary>
+    <div class="panel-body findings-scroll" id="reverseBody">
+      <p class="empty">Nothing wrongly unmonitored. The shelves are in order.</p>
+    </div>
+  </details>
+
+  <details class="panel">
+    <summary>File clutter — duplicates &amp; orphans (<span id="fileCount">0</span>)</summary>
+    <div class="panel-body findings-scroll" id="fileBody">
+      <p class="empty">No clutter found. Every tracked file is exactly where it should be.</p>
+    </div>
+  </details>
+
+  <footer>cutoffarr <span id="versionLabel">· dev</span></footer>
+
+</div>
+<script>
+(function () {
+  "use strict";
+
+  var POLL_MS = 30000;
+  var scanBtn = document.getElementById("scanBtn");
+  var pollHandle = null;
+
+  function text(el, s) { el.textContent = s; }
+
+  function el(tag, cls) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    return e;
+  }
+
+  // fmtRelative renders an RFC3339 timestamp (or null) as "just now" / "3m
+  // ago" / "2h ago" / "5d ago" — the operator glances at this, so relative
+  // and coarse beats exact and precise.
+  function fmtRelative(iso) {
+    if (!iso) return "never";
+    var then = new Date(iso).getTime();
+    if (isNaN(then)) return "never";
+    var diffSec = Math.max(0, Math.round((Date.now() - then) / 1000));
+    if (diffSec < 5) return "just now";
+    if (diffSec < 60) return diffSec + "s ago";
+    var m = Math.round(diffSec / 60);
+    if (m < 60) return m + "m ago";
+    var h = Math.round(m / 60);
+    if (h < 24) return h + "h ago";
+    var d = Math.round(h / 24);
+    return d + "d ago";
+  }
+
+  function clampPct(n) {
+    if (!isFinite(n)) return 0;
+    return Math.max(0, Math.min(100, n));
+  }
+
+  // shelfCards keys the live shelf <section> elements by instance name, so
+  // a refresh UPDATES the same DOM nodes (text and the two style
+  // properties the bar/marker transition) rather than tearing the whole
+  // panel down and rebuilding it from scratch. This is what makes the
+  // "bar widths transition 300ms ease-out on refresh" motion rule
+  // (webui.html's .shelf-rest/.shelf-marker transitions, above) actually
+  // fire: a CSS transition needs a prior COMPUTED value on an
+  // already-rendered element to animate from, and a freshly-inserted node
+  // with its final width set inline renders at that width immediately —
+  // there is nothing to transition from. Reusing the element across polls
+  // gives the browser a real "before" frame to animate away from.
+  var shelfCards = {};
+
+  // buildShelfCard creates ONE instance's shelf DOM shell, once. Every text
+  // node and style-bearing element a later refresh needs to touch is kept
+  // on card._els so updateShelfCard never has to search the DOM (and never
+  // risks matching the wrong node if markup nearby ever changes).
+  function buildShelfCard() {
+    var card = el("section", "shelf");
+
+    var head = el("div", "shelf-head");
+    var name = el("span", "shelf-name");
+    var kind = el("span", "shelf-type");
+    // unreachable is the round-3 UNREACHABLE badge (controller addition N2):
+    // built once, hidden by default, and only shown by updateShelfCard when
+    // this instance's most recent cycle never reached the decision engine
+    // (lastCycleStatus.status === "skipped") — see that function for why it
+    // must never be silently indistinguishable from a healthy card.
+    var unreachable = el("span", "badge badge-alert shelf-unreachable");
+    unreachable.hidden = true;
+    head.appendChild(name);
+    head.appendChild(kind);
+    head.appendChild(unreachable);
+    card.appendChild(head);
+
+    var barWrap = el("div", "shelf-bar-wrap");
+
+    var count = el("span", "shelf-count");
+    var countNum = document.createTextNode("");
+    var unit = el("span", "unit");
+    text(unit, " at rest");
+    count.appendChild(countNum);
+    count.appendChild(unit);
+    barWrap.appendChild(count);
+
+    var bar = el("div", "shelf-bar");
+    var rest = el("div", "shelf-rest");
+    var marker = el("div", "shelf-marker");
+    bar.appendChild(rest);
+    bar.appendChild(marker);
+    barWrap.appendChild(bar);
+
+    card.appendChild(barWrap);
+
+    card._els = { name: name, kind: kind, count: count, countNum: countNum, rest: rest, marker: marker, unreachable: unreachable, sub: null, barWrap: barWrap };
+    return card;
+  }
+
+  // updateShelfCard writes one instance's current numbers into an EXISTING
+  // card's text nodes and style properties only — never replaces a node —
+  // so the browser sees an in-place property change on every refresh but
+  // the initial one, which is exactly what a CSS transition animates.
+  function updateShelfCard(card, inst) {
+    var total = inst.total || 0;
+    var atRest = inst.unmonitored || 0;
+    var pct = total > 0 ? clampPct((atRest / total) * 100) : 0;
+    var pctStr = pct.toFixed(1) + "%";
+    var els = card._els;
+
+    card.setAttribute("data-instance", inst.name);
+    text(els.name, inst.name);
+    text(els.kind, inst.type);
+
+    els.countNum.data = atRest + " / " + total;
+    els.rest.style.width = pctStr;
+    els.marker.style.left = pctStr;
+
+    // Round-4 review fix: .shelf-count is `position: absolute` with
+    // `left:<pct>%` and `transform: translateX(-50%)` (webui.html's own
+    // rule) — at pct 0% (the common first-run "nothing at rest yet" state)
+    // or 100%, the label's center sits exactly on the card's edge and
+    // roughly HALF of the 28-36px mono hero number's own rendered width
+    // hangs off past it, clipping or forcing horizontal scroll at every
+    // width between the 420px stacking breakpoint and ~930px. A CSS-only
+    // clamp() on .shelf-count's `left` cannot fix this: an inline
+    // `style.left` set from JS always wins over a stylesheet rule for the
+    // same property, so the clamp happens here instead, in pixels, using
+    // the label's own MEASURED width — not a guessed constant, since the
+    // string's length varies with the library's size ("5 / 12" vs
+    // "996 / 1042"). els.rest/els.marker above are left at the exact,
+    // unclamped percentage: they are the truthful fill/cutoff signal; only
+    // the text label's position is nudged inward.
+    var wrapWidth = els.barWrap.clientWidth;
+    if (wrapWidth > 0) {
+      var half = els.count.offsetWidth / 2;
+      var pxLeft = (pct / 100) * wrapWidth;
+      pxLeft = Math.max(half, Math.min(wrapWidth - half, pxLeft));
+      els.count.style.left = pxLeft + "px";
+    } else {
+      // Not yet laid out (e.g. display:none on an ancestor) — clientWidth
+      // reads 0 and a pixel clamp is meaningless; fall back to the
+      // unclamped percentage rather than leaving left unset.
+      els.count.style.left = pctStr;
+    }
+
+    // The totals above are always the last-known-good numbers (see
+    // statsStore.recordUnreachable's own doc comment: they are never
+    // clobbered by a cycle that could not reach this instance) — so the
+    // shelf bar itself stays exactly as it was. The badge is the ONLY
+    // signal that those numbers may now be stale, which is the point: a
+    // week-unreachable *arr must never look identical to one swept a
+    // moment ago.
+    //
+    // Round-4 review fix: the copy used to lead with a claim that this
+    // instance could not be reached at all, which is FALSE for one of the
+    // three cases this same badge now covers — a cycle that DID reach the
+    // instance (connectivity and the library read both succeeded) but
+    // aborted INSIDE the engine before completing an evaluation. "last
+    // sweep incomplete" is accurate for all three of LastCycleStatus's
+    // skipped reasons; the instance name is dropped (redundant — it is
+    // already the card's own .shelf-name) so the reason itself has more
+    // room before wrapping (see .shelf-unreachable's white-space: normal /
+    // .shelf-head's flex-wrap: wrap).
+    var status = inst.lastCycleStatus;
+    if (status && status.status === "skipped") {
+      var msg = "last sweep incomplete";
+      if (status.reason) msg += " — " + status.reason;
+      text(els.unreachable, msg);
+      els.unreachable.hidden = false;
+    } else {
+      els.unreachable.hidden = true;
+    }
+
+    if (inst.wouldUnmonitor > 0) {
+      if (!els.sub) {
+        els.sub = el("p", "shelf-sub");
+        card.appendChild(els.sub);
+      }
+      text(els.sub, inst.wouldUnmonitor + " more ready to rest this sweep");
+    } else if (els.sub) {
+      card.removeChild(els.sub);
+      els.sub = null;
+    }
+  }
+
+  function renderInstances(instances) {
+    var root = document.getElementById("instances");
+    if (!instances || instances.length === 0) {
+      root.textContent = "";
+      shelfCards = {};
+      var p = el("p", "empty");
+      text(p, "First sweep in progress — the shelves fill in when it finishes.");
+      root.appendChild(p);
+      return;
+    }
+    if (root.querySelector(".empty")) {
+      // First real data after the placeholder (or an empty state): clear
+      // it once, rather than on every refresh.
+      root.textContent = "";
+    }
+    var seen = {};
+    for (var i = 0; i < instances.length; i++) {
+      var inst = instances[i];
+      seen[inst.name] = true;
+      var card = shelfCards[inst.name];
+      if (!card) {
+        card = buildShelfCard();
+        shelfCards[inst.name] = card;
+      }
+      updateShelfCard(card, inst);
+      // Keeps DOM order matching the instances array's own (config) order.
+      // A no-op move when the card is already the last child, which is the
+      // common case once every instance has been seen once.
+      root.appendChild(card);
+    }
+    // Instances are never removed from a running daemon's config, but keep
+    // this tidy (and correct) rather than relying on that.
+    for (var name in shelfCards) {
+      if (!seen[name]) {
+        var stale = shelfCards[name];
+        if (stale.parentNode) stale.parentNode.removeChild(stale);
+        delete shelfCards[name];
+      }
+    }
+  }
+
+  function findingsTable(headers, rows, rowFn) {
+    var table = el("table", "findings");
+    var thead = el("thead");
+    var htr = el("tr");
+    for (var h = 0; h < headers.length; h++) {
+      var th = el("th"); text(th, headers[h]);
+      htr.appendChild(th);
+    }
+    thead.appendChild(htr);
+    table.appendChild(thead);
+    var tbody = el("tbody");
+    for (var i = 0; i < rows.length; i++) {
+      tbody.appendChild(rowFn(rows[i]));
+    }
+    table.appendChild(tbody);
+    return table;
+  }
+
+  // renderReverse is reverseStatus-aware — round-3 review fix, the reverse
+  // scan's own twin of renderFileReport's three-state fidelity above: only
+  // an instance whose reverseStatus is "ran" can make an empty
+  // reverseFindings mean "checked, found nothing". Before this field
+  // existed, "never ran" and "ran but could not be trusted" (an incomplete
+  // unmonitored wanted/cutoff set, or a shutdown mid-evaluation —
+  // reverse.go's reverseCounts.skipped) both looked EXACTLY like "ran and
+  // found nothing", printing the same "Nothing wrongly unmonitored"
+  // all-clear over a pass that never actually completed.
+  //
+  // Round-4 review fix: "off" (or absent — an instance recordUnreachable
+  // just created, or a cycle that aborted before reaching the reverse pass)
+  // used to contribute NOTHING here — no row, no notice — unlike
+  // renderFileReport's own off/skipped handling below, which pushes a
+  // notice AND qualifies its summary count for exactly this case. Two
+  // consequences followed: the collapsed <details> summary (what the
+  // glancing operator actually sees) showed a bare "(0)" indistinguishable
+  // from "every instance is genuinely clean", and — worse — when EVERY
+  // instance was off, the panel body was left with literally nothing
+  // appended (the empty-state invitation below is gated on
+  // anyRan||instances.length===0, which an all-off deployment satisfies
+  // neither), so expanding the panel showed a blank box. Both are fixed the
+  // same way renderFileReport already handles its own off/skipped instances.
+  function renderReverse(instances) {
+    var body = document.getElementById("reverseBody");
+    var rows = [];
+    var notices = [];
+    var anyRan = false;
+    var offCount = 0, skippedCount = 0;
+    for (var i = 0; i < instances.length; i++) {
+      var inst = instances[i];
+      var status = inst.reverseStatus;
+      if (status === "ran") {
+        anyRan = true;
+        var findings = inst.reverseFindings || [];
+        for (var j = 0; j < findings.length; j++) {
+          rows.push({ instance: inst.name, f: findings[j] });
+        }
+      } else if (status === "skipped") {
+        // Round-4 review fix (controller ruling — the skipped-reverse-pass
+        // overwrite is the highest-severity finding this round): the store
+        // preserves the LAST TRUSTWORTHY pass's findings and their own
+        // timestamp (statsStore.recordInstance's reverseAsOf) rather than
+        // clearing them just because this cycle could not confirm them
+        // fresh — but preservation the GUI never surfaces is no different
+        // from silently discarding it. The notice below carries both: when
+        // the stale findings last came from a real pass, and how many
+        // there were, so "not trusted this sweep" never reads as "we don't
+        // know anything", only as "this is not fresh".
+        notices.push({
+          instance: inst.name, status: "skipped",
+          asOf: inst.reverseAsOf || null, count: (inst.reverseFindings || []).length
+        });
+        skippedCount++;
+      } else {
+        // "off", or absent entirely — both mean the reverse scan has not
+        // completed a trustworthy pass for this instance yet (globally
+        // disabled, never reached by a full cycle, or an instance
+        // recordUnreachable just created).
+        notices.push({ instance: inst.name, status: "off" });
+        offCount++;
+      }
+    }
+    // The SUMMARY text is what a COLLAPSED <details> — the state the
+    // glancing operator actually sees — shows, and a bare row count made
+    // "(0)" mean either "every instance is clean" or "nothing was ever
+    // trustworthily checked", indistinguishably (renderFileReport's own
+    // fileCount fix, mirrored here).
+    var reverseCountText = String(rows.length);
+    if (offCount > 0 || skippedCount > 0) {
+      var qualifiers = [];
+      if (offCount > 0) qualifiers.push(offCount + " not checked yet");
+      if (skippedCount > 0) qualifiers.push(skippedCount + " not trusted this sweep");
+      reverseCountText = rows.length + " · " + qualifiers.join(", ");
+    }
+    text(document.getElementById("reverseCount"), reverseCountText);
+    body.textContent = "";
+
+    if (notices.length > 0) {
+      var list = el("ul", "status-notices");
+      for (var n = 0; n < notices.length; n++) {
+        var notice = notices[n];
+        var li = el("li", "status-notice status-" + notice.status);
+        var word;
+        if (notice.status === "off") {
+          word = "the reverse scan has not completed a trustworthy pass for this instance yet";
+        } else {
+          // Round-4 review fix (controller ruling): "not trusted this
+          // sweep" alone repeats the false-all-clear this round exists to
+          // close — it says nothing was found without saying whether
+          // anything was ever actually checked. When a previous trustworthy
+          // pass left findings in place (statsStore's own last-known-good
+          // preservation), say so, with the time they are FROM, exactly the
+          // controller's own wording.
+          word = "reverse scan could not be trusted this sweep";
+          if (notice.asOf) {
+            word += " — showing last complete sweep from " + fmtRelative(notice.asOf);
+            word += notice.count > 0
+              ? " (" + notice.count + " item" + (notice.count === 1 ? "" : "s") + " wrongly unmonitored)"
+              : " (nothing wrongly unmonitored)";
+          }
+        }
+        text(li, notice.instance + " — " + word);
+        list.appendChild(li);
+      }
+      body.appendChild(list);
+    }
+
+    if (rows.length === 0) {
+      // Same gate as renderFileReport's own: only claim "clean" when at
+      // least one instance actually completed a trustworthy pass (or none
+      // have reported in at all yet).
+      if (anyRan || instances.length === 0) {
+        var p = el("p", "empty");
+        text(p, "Nothing wrongly unmonitored. The shelves are in order.");
+        body.appendChild(p);
+      }
+      return;
+    }
+    body.appendChild(findingsTable(
+      ["instance", "item", "season", "reason"],
+      rows,
+      function (r) {
+        var tr = el("tr");
+        var item = r.f.title || r.f.series || "";
+        var season = (r.f.season === undefined || r.f.season === null) ? "—" : String(r.f.season);
+        var cells = [r.instance, item, season, r.f.reason || ""];
+        for (var c = 0; c < cells.length; c++) {
+          var td = el("td"); text(td, cells[c]);
+          tr.appendChild(td);
+        }
+        return tr;
+      }
+    ));
+  }
+
+  // renderFileReport is status-aware: fileReport.status is ran|skipped|off
+  // per instance (the API contract's own three-way vocabulary), and only a
+  // "ran" instance's zero findings mean "no clutter". A "skipped" instance
+  // (a tracked root that could not be trusted this sweep — its
+  // duplicates/orphans counts, if any survived, are a partial truth) must
+  // never render identically to a clean ran instance, and an "off" instance
+  // (media_root_map never configured) must say so rather than silently
+  // showing zero rows indistinguishable from clean.
+  function renderFileReport(instances) {
+    var body = document.getElementById("fileBody");
+    var rows = [];
+    var notices = [];
+    var anyRan = false;
+    var offCount = 0, skippedCount = 0;
+    for (var i = 0; i < instances.length; i++) {
+      var inst = instances[i];
+      var fr = inst.fileReport || {};
+      var status = fr.status;
+      if (status === "ran") {
+        anyRan = true;
+        var findings = fr.findings || [];
+        for (var j = 0; j < findings.length; j++) {
+          rows.push({ instance: inst.name, f: findings[j] });
+        }
+      } else if (status === "skipped") {
+        notices.push({ instance: inst.name, status: "skipped" });
+        skippedCount++;
+      } else {
+        // "off", or absent entirely — both mean not configured.
+        notices.push({ instance: inst.name, status: "off" });
+        offCount++;
+      }
+    }
+    // Round-3 review fix: the SUMMARY text is what a collapsed <details> —
+    // the state the glancing operator actually sees — shows, and a bare
+    // row count made "(0)" mean either "every root was clean" or "nothing
+    // was ever looked at", indistinguishably. Once any instance is off or
+    // skipped, the count is qualified right there in the summary, not only
+    // in the body the operator has to expand to see.
+    var fileCountText = String(rows.length);
+    if (offCount > 0 || skippedCount > 0) {
+      var qualifiers = [];
+      if (offCount > 0) qualifiers.push(offCount + " not configured");
+      if (skippedCount > 0) qualifiers.push(skippedCount + " not checked");
+      fileCountText = rows.length + " · " + qualifiers.join(", ");
+    }
+    text(document.getElementById("fileCount"), fileCountText);
+    body.textContent = "";
+
+    if (notices.length > 0) {
+      var list = el("ul", "status-notices");
+      for (var n = 0; n < notices.length; n++) {
+        var li = el("li", "status-notice status-" + notices[n].status);
+        var word = notices[n].status === "off"
+          ? "not configured"
+          : "could not be checked this sweep";
+        text(li, notices[n].instance + " — " + word);
+        list.appendChild(li);
+      }
+      body.appendChild(list);
+    }
+
+    if (rows.length === 0) {
+      // Only claim "clean" when at least one instance actually ran the
+      // check (or none have reported in at all yet, matching the main
+      // panel's own pre-cycle placeholder) — never as a stand-in for
+      // "every instance was off or skipped", which the notices above
+      // already explain.
+      if (anyRan || instances.length === 0) {
+        var p = el("p", "empty");
+        text(p, "No clutter found. Every tracked file is exactly where it should be.");
+        body.appendChild(p);
+      }
+      return;
+    }
+    body.appendChild(findingsTable(
+      ["instance", "kind", "group", "path", "count"],
+      rows,
+      function (r) {
+        var tr = el("tr");
+        var group = r.f.group || "—";
+        var count = r.f.count ? String(r.f.count) : "—";
+        var td;
+        td = el("td"); text(td, r.instance); tr.appendChild(td);
+        td = el("td"); text(td, r.f.kind || ""); tr.appendChild(td);
+        td = el("td"); text(td, group); tr.appendChild(td);
+        td = el("td", "path"); text(td, r.f.path || ""); tr.appendChild(td);
+        td = el("td"); text(td, count); tr.appendChild(td);
+        return tr;
+      }
+    ));
+  }
+
+  function render(data) {
+    var badge = document.getElementById("dryRunBadge");
+    if (data.dryRun) {
+      badge.className = "badge badge-hunt";
+      text(badge, "rehearsing");
+    } else {
+      badge.className = "badge badge-rest";
+      text(badge, "live");
+    }
+
+    var instances = data.instances || [];
+    var latest = null;
+    for (var i = 0; i < instances.length; i++) {
+      var lr = instances[i].lastRun;
+      if (lr && (!latest || new Date(lr) > new Date(latest))) latest = lr;
+    }
+    text(document.getElementById("lastSwept"), "last swept " + fmtRelative(latest));
+    text(document.getElementById("versionLabel"), "· " + (data.version || "dev"));
+
+    renderInstances(instances);
+    renderReverse(instances);
+    renderFileReport(instances);
+  }
+
+  // lastSuccessAt is the local clock's reading the last time /api/stats
+  // actually answered 2xx with decodable JSON — used only to say how stale
+  // the numbers on screen are while disconnected (see showDisconnected).
+  var lastSuccessAt = null;
+
+  // showDisconnected flips the header badge to the ALERT clay token: a
+  // dashboard whose backend has died, restarted, or is answering 5xx/HTML
+  // through a proxy must never stay pixel-identical to a healthy one — this
+  // page's entire job is "glance and trust these numbers". Once real data
+  // has been shown at least once (lastSuccessAt is set), the numbers
+  // themselves (instances, findings) are left exactly as they were; only
+  // the badge changes, and polling keeps retrying on the next tick.
+  //
+  // Round-3 review fix (controller addition N1): when lastSuccessAt is
+  // STILL null — this page has never once heard back from a daemon, which
+  // is exactly the "page served without its daemon" case (a stale browser
+  // tab, a crashed container, a proxy) — #instances is still showing its
+  // static "first sweep in progress" placeholder, and that placeholder
+  // reads as a fact: a sweep IS in progress. It is not; nothing here knows
+  // whether ANY daemon exists to run one. That placeholder is replaced with
+  // an explicit "can't reach the daemon at all" message, which the design
+  // note is explicit must NEVER be confused with "a sweep is running".
+  function showDisconnected() {
+    var badge = document.getElementById("dryRunBadge");
+    badge.className = "badge badge-alert";
+    var since = lastSuccessAt ? fmtRelative(lastSuccessAt.toISOString()) : null;
+    text(badge, since ? ("disconnected — showing data from " + since) : "disconnected — no data yet");
+
+    if (!lastSuccessAt) {
+      var root = document.getElementById("instances");
+      root.textContent = "";
+      shelfCards = {};
+      var p = el("p", "empty");
+      text(p, "Can't reach cutoffarr. The page is being served without its daemon — start cutoffarr and reload.");
+      root.appendChild(p);
+    }
+  }
+
+  function refresh() {
+    return fetch("/api/stats", { headers: { "Accept": "application/json" } })
+      .then(function (r) {
+        if (!r.ok) throw new Error("GET /api/stats: " + r.status);
+        return r.json();
+      })
+      .then(function (data) {
+        lastSuccessAt = new Date();
+        render(data);
+        scanBtn.disabled = false;
+        text(scanBtn, "Scan now");
+      })
+      .catch(function () {
+        // The backend is unreachable, restarted, or answering something
+        // that is not valid JSON (a proxy's error page, for instance).
+        // Never swallowed silently: surface it, then keep retrying — the
+        // next poll (or the next click) tries again on its own.
+        showDisconnected();
+        scanBtn.disabled = false;
+        text(scanBtn, "Scan now");
+      });
+  }
+
+  function schedulePoll() {
+    if (pollHandle) clearTimeout(pollHandle);
+    if (document.hidden) return;
+    pollHandle = setTimeout(function () {
+      refresh().then(schedulePoll);
+    }, POLL_MS);
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) {
+      if (pollHandle) clearTimeout(pollHandle);
+      pollHandle = null;
+    } else {
+      refresh().then(schedulePoll);
+    }
+  });
+
+  // Round-3 review fix: this used to ignore the POST's response entirely
+  // (neither its status nor its body), so a refused or failed scan
+  // (404/405/500 — fetch only REJECTS on a network failure, never on a non-
+  // 2xx status) was indistinguishable from a queued one: refresh() still
+  // ran, still repainted a healthy badge, still re-enabled the button with
+  // "Scan now". Now: !r.ok is checked exactly like refresh()'s own GET
+  // /api/stats does, the {"status": "queued"|"already-pending"} body is
+  // actually read and shown on the button, and a genuine failure (network
+  // error or non-2xx) routes through the SAME showDisconnected() signal a
+  // failed poll does, rather than a bare silent button reset.
+  scanBtn.addEventListener("click", function () {
+    scanBtn.disabled = true;
+    text(scanBtn, "Queued…");
+    fetch("/api/scan", { method: "POST" })
+      .then(function (r) {
+        if (!r.ok) throw new Error("POST /api/scan: " + r.status);
+        return r.json();
+      })
+      .then(function (body) {
+        return refresh().then(function () {
+          // refresh()'s own success path already re-enabled the button and
+          // reset it to "Scan now"; only override that when THIS click did
+          // not actually queue anything (a cycle was already running or one
+          // was already queued), so the operator learns their click landed
+          // on an in-progress scan rather than believing it started a new
+          // one.
+          if (body && body.status === "already-pending") {
+            text(scanBtn, "Already scanning…");
+          }
+        });
+      })
+      .catch(function () {
+        showDisconnected();
+        scanBtn.disabled = false;
+        text(scanBtn, "Scan now");
+      });
+  });
+
+  refresh().then(schedulePoll);
+})();
+</script>
+</body>
+</html>

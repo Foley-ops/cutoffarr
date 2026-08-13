@@ -2174,7 +2174,7 @@ func TestRunWritePass_UnrecognizedCrossCheckStatus_WritePassBlocked(t *testing.T
 			// — so the status really is the only thing keeping this pass
 			// shut, and a gate that stopped consulting it would write.
 			cc := crossCheckResult{status: tc.status, verified: 1, writeVerified: 1}
-			unmonitored, writeErrors, echoUnverified, writesRefused, _ := runWritePass(context.Background(), logger, client, fake.instance(), decisions, cc, 0, false, false)
+			unmonitored, writeErrors, echoUnverified, writesRefused, _ := runWritePass(context.Background(), logger, client, fake.instance(), decisions, cc, 0, false, false, nil)
 
 			if writes := fake.writes(); len(writes) != 0 {
 				t.Fatalf("cross-check status %q is not %q and must block every write, got %d: %+v",
@@ -2228,7 +2228,7 @@ func TestRunWritePass_UnrecognizedCrossCheckStatus_NothingPending_StillWarns(t *
 	// noise-budget fix downgrades to INFO for a KNOWN status.
 	decisions := []movieDecision{{id: 1, title: "Skipped Movie", wouldUnmonitor: false, reason: ReasonNoFile}}
 	cc := crossCheckResult{status: "partially-verified"} // not one of the three known constants
-	unmonitored, writeErrors, echoUnverified, writesRefused, withheld := runWritePass(context.Background(), logger, client, fake.instance(), decisions, cc, 0, false, false)
+	unmonitored, writeErrors, echoUnverified, writesRefused, withheld := runWritePass(context.Background(), logger, client, fake.instance(), decisions, cc, 0, false, false, nil)
 
 	if unmonitored != 0 || writeErrors != 0 || echoUnverified != 0 || writesRefused != 0 || withheld != 0 {
 		t.Errorf("unmonitored/writeErrors/echoUnverified/writesRefused/withheld = %d/%d/%d/%d/%d, want all 0", unmonitored, writeErrors, echoUnverified, writesRefused, withheld)
@@ -3340,7 +3340,7 @@ func TestRunWritePass_PassedButNoWouldUnmonitorItemVerified_BlocksAndNamesTheRat
 	// The pass the old gate saw: "passed", one item verified. That item was
 	// a skip.
 	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 1, unverifiable: 1, writeVerified: 0, writeUnverifiable: 1}
-	unmonitored, writeErrors, echoUnverified, writesRefused, _ := runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, 0, false, false)
+	unmonitored, writeErrors, echoUnverified, writesRefused, _ := runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, 0, false, false, nil)
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("a pass that verified no would-unmonitor decision must authorize no write, got %+v", writes)
@@ -3370,7 +3370,7 @@ func TestRunWritePass_MostWouldUnmonitorSamplesUnverifiable_Blocks(t *testing.T)
 	// One verified would-unmonitor item out of ten sampled: verification
 	// happened, but not enough of it to speak for the pool.
 	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 1, unverifiable: 19, writeVerified: 1, writeUnverifiable: 9}
-	runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, 0, false, false)
+	runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, 0, false, false, nil)
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("a sample where 9 of 10 would-unmonitor items were unverifiable must authorize no write, got %+v", writes)
@@ -3391,7 +3391,7 @@ func TestRunWritePass_MinorityUnverifiable_WritesButWarnsAtTheGate(t *testing.T)
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 9, unverifiable: 1, writeVerified: 9, writeUnverifiable: 1}
-	unmonitored, writeErrors, echoUnverified, writesRefused, _ := runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, 0, false, false)
+	unmonitored, writeErrors, echoUnverified, writesRefused, _ := runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, 0, false, false, nil)
 
 	if n := len(fake.puts()); n != 1 {
 		t.Fatalf("expected the write to proceed on a well-verified sample, got %d PUT(s)", n)
@@ -3423,7 +3423,7 @@ func TestRunWritePass_MinorityUnverifiable_DryRun_WordingDoesNotClaimWritesHappe
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 9, unverifiable: 1, writeVerified: 9, writeUnverifiable: 1}
-	unmonitored, writeErrors, echoUnverified, writesRefused, _ := runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, 0, false, true)
+	unmonitored, writeErrors, echoUnverified, writesRefused, _ := runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, 0, false, true, nil)
 
 	if n := len(fake.writes()); n != 0 {
 		t.Fatalf("dry-run must make zero write requests, got %d: %+v", n, fake.writes())
@@ -3455,7 +3455,7 @@ func TestRunWritePass_FullyVerified_WritesWithNoPartialVerificationWarning(t *te
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
 
 	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 4, unverifiable: 0, writeVerified: 4, writeUnverifiable: 0}
-	runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, 0, false, false)
+	runWritePass(context.Background(), logger, client, fake.instance(), gateTestDecision(), cc, 0, false, false, nil)
 
 	if n := len(fake.puts()); n != 1 {
 		t.Fatalf("expected exactly 1 PUT on a fully verified sample, got %d", n)
@@ -3476,7 +3476,7 @@ func TestRunWritePass_NothingToWrite_UnverifiedPoolIsNotAnAlarm(t *testing.T) {
 
 	decisions := []movieDecision{{id: 1, title: "Skipped Movie", wouldUnmonitor: false, reason: ReasonNoFile}}
 	cc := crossCheckResult{status: crossCheckStatusPassed, verified: 3, unverifiable: 1, writeVerified: 0, writeUnverifiable: 0}
-	unmonitored, writeErrors, echoUnverified, writesRefused, _ := runWritePass(context.Background(), logger, client, fake.instance(), decisions, cc, 0, false, false)
+	unmonitored, writeErrors, echoUnverified, writesRefused, _ := runWritePass(context.Background(), logger, client, fake.instance(), decisions, cc, 0, false, false, nil)
 
 	if writes := fake.writes(); len(writes) != 0 {
 		t.Fatalf("a pass with no would-unmonitor decisions must write nothing, got %+v", writes)

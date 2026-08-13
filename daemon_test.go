@@ -1017,6 +1017,100 @@ func TestDaemon_IdleCycleWithAnInconclusiveCrossCheck_StaysWithinTheNoiseBudget(
 	}
 }
 
+// TestDaemon_IdleCycleWithAWebUIPoller_StaysByteIdenticalToNoPoller pins
+// Phase 11's binding "Next phase inputs", carried forward into Phase 12 and
+// left unpinned by round 3: "the two-cycle idle test must stay byte-identical
+// with a webui poller hitting /api/stats". Before this test, nothing in the
+// suite ever issued a GET /api/stats during an idle reconciliation window,
+// and nothing asserted handleStats' (webui.go) own doc-commented "no logging
+// here, deliberately" claim actually holds — a future DEBUG/INFO line added
+// there, or any request-logging middleware folded into the composed mux
+// (daemon.go's runDaemon), would silently blow the idle noise budget for
+// every operator who leaves the dashboard tab open, polling every 30s
+// forever, and nothing would catch it.
+//
+// Runs the SAME fixture twice, at "debug" (not "info": a stray DEBUG line is
+// exactly the shape of regression named above, and
+// assertIdleCycleInfoIsWithinTheBudget only ever inspects level=INFO lines,
+// so it alone could not see one) — once with nothing polling the idle
+// window, once with several GET /api/stats requests fired while the
+// reconciliation sweep is deterministically held open inside its own
+// library read (the same block-then-release technique
+// TestDaemon_ScanNow_NeverInterleavesWithAWebhookCycle, daemon_webui_test.go,
+// uses). The two captured windows — each line's own time= attribute
+// stripped, the only thing two otherwise-identical runs may legitimately
+// differ on — must be byte-for-byte identical.
+func TestDaemon_IdleCycleWithAWebUIPoller_StaysByteIdenticalToNoPoller(t *testing.T) {
+	run := func(t *testing.T, poll bool) string {
+		fake := writableSonarrFake(t)
+		h := startDaemon(t, writeDaemonConfig(t, "sonarr", fake.srv.URL, false, "debug", "1h", "45s"))
+		h.waitReady()
+		eventually(t, "the reconciliation schedule to be announced", func() bool {
+			return strings.Contains(h.out.String(), "reconciliation sweep scheduled")
+		})
+
+		var blocked, release chan struct{}
+		var once sync.Once
+		if poll {
+			// Installed only AFTER the startup scan has already finished, so
+			// it can never pause the startup scan itself — only the
+			// reconciliation sweep this test triggers next.
+			blocked = make(chan struct{})
+			release = make(chan struct{})
+			fake.onRequest = func(method, path string) {
+				if method == http.MethodGet && path == "/api/v3/series" {
+					once.Do(func() { close(blocked) })
+					<-release
+				}
+			}
+		}
+
+		mark := h.mark()
+		h.clock.Advance(time.Hour)
+
+		if poll {
+			select {
+			case <-blocked:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("the reconciliation sweep never reached its library read:\n%s", h.out.String())
+			}
+			// Fired WHILE the cycle is deterministically held open — exactly
+			// the condition a webui tab left open on a 30s poll timer
+			// produces during a real reconciliation sweep.
+			for i := 0; i < 5; i++ {
+				getStats(t, h)
+			}
+			close(release)
+		}
+
+		h.awaitLogCount("reconciliation sweep complete", 1)
+		// The cycle's own output, captured BEFORE the shutdown, exactly like
+		// this test's sibling above.
+		cycle := h.since(mark)
+		h.stop()
+		return cycle
+	}
+
+	withoutPoll := run(t, false)
+	withPoll := run(t, true)
+
+	if !assertIdleCycleInfoIsWithinTheBudget(t, withPoll) {
+		t.Errorf("the summary is what an idle cycle DOES print, even with a poller hitting /api/stats throughout it:\n%s", withPoll)
+	}
+
+	strip := func(out string) string {
+		var lines []string
+		for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+			lines = append(lines, stripTimeAttr(line))
+		}
+		return strings.Join(lines, "\n")
+	}
+	if strip(withoutPoll) != strip(withPoll) {
+		t.Errorf("the idle cycle's log output changed because a webui poller hit GET /api/stats during it (handleStats must log nothing, per its own doc comment):\nwithout poller:\n%s\n\nwith poller:\n%s",
+			strip(withoutPoll), strip(withPoll))
+	}
+}
+
 // TestDaemon_ExclusionTagNotDefined_IsSaidOnEveryCycleNotOnlyTheFirst is the
 // one INFO line the idle-cycle noise budget must not demote, and the reason it
 // is an exception rather than an oversight.

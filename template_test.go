@@ -116,27 +116,48 @@ func TestTemplate_AgreesWithComposeExample_Image(t *testing.T) {
 	}
 }
 
-// TestTemplate_NoWebUIElement pins the deliberate omission: cutoffarr has no
-// web UI, and a <WebUI> element would point Unraid's WebUI button at the
-// webhook endpoint, which only ever answers with 405. Checked structurally
-// (see unraidTemplate.WebUI's own comment) rather than by raw substring
-// search, because the file's explanatory comment about this very omission
-// legitimately contains the text "<WebUI>" in prose.
-func TestTemplate_NoWebUIElement(t *testing.T) {
+// TestTemplate_HasWebUIElement pins Phase 12 (v2c)'s reversal of the
+// pre-v2c omission: cutoffarr now serves a small read-only dashboard on the
+// SAME port as the webhook endpoint (webui.go), so a <WebUI> element no
+// longer sends a human to a 405 — it must be present, and must use Unraid's
+// own [IP]/[PORT:n] placeholder syntax naming defaultWebhookPort (config.go)
+// rather than a literal, so this can never silently drift from the actual
+// webhook_port default the same way
+// TestTemplate_AgreesWithComposeExample_WebhookPort already guards the Port
+// Config against.
+func TestTemplate_HasWebUIElement(t *testing.T) {
 	tmpl := parseUnraidTemplate(t)
-	if tmpl.WebUI != nil {
-		t.Errorf("templates/cutoffarr.xml must not contain a <WebUI> element (got %q): cutoffarr has no web UI, and the button would only ever reach a 405", *tmpl.WebUI)
+	want := "http://[IP]:[PORT:" + strconv.Itoa(defaultWebhookPort) + "]/"
+	if tmpl.WebUI == nil {
+		t.Fatalf("templates/cutoffarr.xml must contain a <WebUI>%s</WebUI> element: cutoffarr now serves a dashboard on this port", want)
+	}
+	if *tmpl.WebUI != want {
+		t.Errorf("<WebUI> = %q, want %q", *tmpl.WebUI, want)
 	}
 }
 
-// TestTemplate_CarriesTheWebUI405Rationale pins that the omission above is
-// explained, not merely silent — the same "deliberate, not an oversight"
-// standard container_test.go already holds docker-compose.example.yml's own
-// webui omission to.
-func TestTemplate_CarriesTheWebUI405Rationale(t *testing.T) {
-	raw := readRepoFile(t, "templates/cutoffarr.xml")
-	if !strings.Contains(raw, "405") {
-		t.Errorf("templates/cutoffarr.xml must explain the WebUI omission with its 405 rationale (a POST-only endpoint answers a browser GET with 405):\n%s", raw)
+// TestTemplate_AgreesWithComposeExample_WebUI is the WebUI element's own
+// field-for-field agreement check, in the same shape as this file's other
+// Agrees-tests (e.g. TestTemplate_AgreesWithComposeExample_IconURL): the
+// template's <WebUI> and docker-compose.example.yml's own
+// net.unraid.docker.webui label must name the exact same URL, or a human
+// copying one deployment shape to the other gets a silently different
+// button.
+func TestTemplate_AgreesWithComposeExample_WebUI(t *testing.T) {
+	tmpl := parseUnraidTemplate(t)
+	if tmpl.WebUI == nil {
+		t.Fatal("templates/cutoffarr.xml has no <WebUI> element to compare")
+	}
+
+	compose := readRepoFile(t, "docker-compose.example.yml")
+	m := regexp.MustCompile(`net\.unraid\.docker\.webui:\s*"([^"]+)"`).FindStringSubmatch(uncommented(compose))
+	if m == nil {
+		t.Fatalf("docker-compose.example.yml must set the net.unraid.docker.webui label:\n%s", compose)
+	}
+	composeWebUI := m[1]
+
+	if *tmpl.WebUI != composeWebUI {
+		t.Errorf("template WebUI = %q, docker-compose.example.yml's net.unraid.docker.webui = %q; they must name the same URL", *tmpl.WebUI, composeWebUI)
 	}
 }
 

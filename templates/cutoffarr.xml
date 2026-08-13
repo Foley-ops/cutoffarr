@@ -50,17 +50,21 @@
   <Privileged>false</Privileged>
   <Support>https://github.com/Foley-ops/cutoffarr/issues</Support>
   <Project>https://github.com/Foley-ops/cutoffarr</Project>
-  <Overview>cutoffarr unmonitors Radarr movies and Sonarr seasons once they have genuinely finished upgrading (quality cutoff AND custom-format cutoff score both reached), so your indexers stop being asked to search for something no release will ever provide. It never deletes, moves, or renames a file, and the only field it ever writes is `monitored` -- never quality profiles, tags, or any other setting. dry_run defaults to true: a fresh deployment writes nothing until you edit config.yml and explicitly turn it off. See the README (https://github.com/Foley-ops/cutoffarr#readme) for the full config reference, the safety/dry-run guarantees, and how to point each *arr's Settings -> Connect -> Webhook at this container. Mount your config.yml (copied from config.example.yml) at the Config path below; API keys referenced in it as ${VAR} are read from the container's own environment, which you can supply with additional "Variable" entries on this template (Add another Path, Port, Variable...).</Overview>
+  <Overview>cutoffarr unmonitors Radarr movies and Sonarr seasons once they have genuinely finished upgrading (quality cutoff AND custom-format cutoff score both reached), so your indexers stop being asked to search for something no release will ever provide. It never deletes, moves, or renames a file, and the only field it ever writes is `monitored` -- never quality profiles, tags, or any other setting. dry_run defaults to true: a fresh deployment writes nothing until you edit config.yml and explicitly turn it off. A small read-only dashboard (WebUI button below) shows each instance's current rest/hunting split, any reverse-scan or file-report findings, and a "Scan now" button to trigger a full sweep on demand -- unauthenticated, since this is a LAN-only tool. See the README (https://github.com/Foley-ops/cutoffarr#readme) for the full config reference, the safety/dry-run guarantees, and how to point each *arr's Settings -> Connect -> Webhook at this container. Mount your config.yml (copied from config.example.yml) at the Config path below; API keys referenced in it as ${VAR} are read from the container's own environment, which you can supply with additional "Variable" entries on this template (Add another Path, Port, Variable...).</Overview>
   <Category>Tools:</Category>
   <!--
-    net.unraid.docker.webui / the <WebUI> element is DELIBERATELY OMITTED,
-    not forgotten: cutoffarr has no web UI at all. The one HTTP endpoint the
-    container exposes is POST /webhook/{instance-name}, which every *arr's
-    own Connect -> Webhook setting talks to directly — a human clicking
-    Unraid's "WebUI" button would only ever see a bare 405 Method Not
-    Allowed, since the endpoint accepts POST and nothing else. Leaving the
-    element out entirely is what keeps that button itself from appearing.
+    net.unraid.docker.webui / <WebUI> point at the same port as the webhook
+    endpoint. Phase 12 (v2c) added a small, read-only, UNAUTHENTICATED
+    dashboard (GET /, GET /api/stats, POST /api/scan) on that port
+    alongside POST /webhook/{instance-name} — this button now takes a human
+    to a real page instead of the 405 it used to (webhook.go's own POST-only
+    endpoint is untouched; the dashboard is served from a separate route on
+    the same listener). [IP] and [PORT:9898] are Unraid's own template
+    placeholders, substituted at render time; 9898 must match the Webhook
+    Port Config's Target below (see
+    TestTemplate_AgreesWithComposeExample_WebUI, template_test.go).
   -->
+  <WebUI>http://[IP]:[PORT:9898]/</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/Foley-ops/cutoffarr/main/templates/cutoffarr.xml</TemplateURL>
   <Icon>https://raw.githubusercontent.com/Foley-ops/cutoffarr/main/icon.png</Icon>
   <!--
@@ -87,7 +91,7 @@
   <DonateLink/>
   <Requires/>
   <Config Name="Config" Target="/config" Default="/mnt/user/appdata/cutoffarr" Mode="ro" Description="Directory holding config.yml (copied from this repo's config.example.yml). Mounted read-only: cutoffarr never writes to disk." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/cutoffarr</Config>
-  <Config Name="Webhook Port" Target="9898" Default="9898" Mode="tcp" Description="POST /webhook/{instance-name} -- point each *arr's Settings -> Connect -> Webhook at http://cutoffarr:9898/webhook/&lt;instance-name&gt; on the shared network above; publishing this port is only needed to reach the endpoint from outside Docker." Type="Port" Display="always" Required="true" Mask="false">9898</Config>
+  <Config Name="Webhook Port" Target="9898" Default="9898" Mode="tcp" Description="POST /webhook/{instance-name} -- point each *arr's Settings -> Connect -> Webhook at http://cutoffarr:9898/webhook/&lt;instance-name&gt; on the shared network above; publishing this port is only needed to reach the endpoint from outside Docker. Also serves the read-only WebUI dashboard (GET /) and its two JSON endpoints on this same port -- see the WebUI button above." Type="Port" Display="always" Required="true" Mask="false">9898</Config>
   <!--
     Variable Configs below mirror docker-compose.example.yml's own
     `environment:` block exactly (template_test.go pins the two lists against

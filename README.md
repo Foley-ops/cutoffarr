@@ -24,6 +24,7 @@ enforced and checked.
 - [The file report](#the-file-report)
 - [Known limitations](#known-limitations)
 - [Webhook setup](#webhook-setup)
+- [The web dashboard](#the-web-dashboard)
 - [FAQ](#faq)
 - [License](#license)
 
@@ -120,7 +121,7 @@ blank.
 | --- | --- | --- |
 | `dry_run` | **`true`** | **Read this one first.** When true, cutoffarr performs zero write requests — not one — and only logs what it would do. Every write code path checks this flag immediately before its HTTP call, not once at startup, so nothing short of setting it to `false` in the loaded config ever causes a write. `--dry-run` on the command line can force it *on* but can never turn it off. |
 | `poll_interval` | `24h` | How often the reconciliation full sweep runs, as a Go duration string. Minimum `1h` if nonzero; `0` disables the sweep entirely (webhooks and the startup scan are then the only triggers). This is the safety net for events missed while the container was down. |
-| `webhook_port` | `9898` | The port the webhook HTTP listener binds, inside the container. Must be `1`-`65535`. |
+| `webhook_port` | `9898` | The port the webhook HTTP listener binds, inside the container. Also serves [the web dashboard](#the-web-dashboard) (`GET /`, `GET /api/stats`, `POST /api/scan`) on the same port. Must be `1`-`65535`. |
 | `webhook_debounce` | `45s` | How long to wait after the *last* event for a given movie/series before evaluating it — so a season-pack import (many episode-import events) becomes one evaluation, not one per episode. `0` evaluates immediately, with no wait. |
 | `log_level` | `info` | One of `debug`, `info`, `warn`, `error`. Logging is always to stdout only, via `log/slog`'s text handler — never to a file. |
 | `exclusion_tag` | `cutoffarr-exclude` | The tag label that opts an item out of everything cutoffarr does, in every mode, including dry-run reporting. Must not be empty or all-whitespace (omit the key entirely to use the default; an explicit empty string is a fatal config error, not a silent "exclude nothing"). |
@@ -631,6 +632,129 @@ URL. A webhook fires an evaluation of only the movie or season the event
 named, debounced by `webhook_debounce`; everything else eligible still gets
 picked up by the next full reconciliation sweep (`poll_interval`, default
 `24h`).
+
+## The web dashboard
+
+`GET http://cutoffarr:9898/` (or whatever host/port you've mapped
+`webhook_port` to) is a small, self-contained page — no build step, no
+JavaScript framework, nothing loaded from anywhere but this one response —
+that shows, per configured instance, how much of the library is at rest
+(unmonitored, nothing left to do) versus still hunting (monitored, still
+being upgraded), plus anything that needs a human's attention: reverse-scan
+findings and file-report duplicates/orphans. There's a **Scan now** button
+that queues one full sweep on demand, for whenever you don't want to wait for
+the next `poll_interval` tick or restart the container.
+
+It reads the SAME in-memory state the log lines already come from — nothing
+it shows is computed specially for the page, and nothing about what it shows
+changes what any cycle decides or writes. Before the first cycle has
+completed (a container that only just started), the page and its JSON both
+show an empty instance list rather than an error; give it a few seconds and
+reload, or watch `docker logs cutoffarr` for "startup scan complete".
+
+**No authentication.** This is a LAN homelab tool, the same posture the
+webhook endpoint already has: nothing here exposes an `*arr` API key or any
+control an operator on the LAN doesn't already have some other way to reach
+(the dashboard can trigger a sweep; it cannot change what that sweep does,
+and dry-run/write mode is still entirely a `config.yml` decision). Do not
+publish this port to the open internet, same as you would not publish the
+webhook one.
+
+Two endpoints back the page, and either can be used on its own (a shell
+script, a status-page widget, whatever) without ever loading the HTML:
+
+- **`GET /api/stats`** — JSON, always `200`, never an error (a store with
+  nothing in it yet just means an empty `instances` array):
+
+  ```json
+  {
+    "instances": [
+      {
+        "name": "radarr-main",
+        "type": "radarr",
+        "total": 996,
+        "monitored": 540,
+        "unmonitored": 456,
+        "wouldUnmonitor": 3,
+        "lastRun": "2026-03-01T12:00:00Z",
+        "lastCycleKind": "sweep",
+        "reverseStatus": "ran",
+        "reverseAsOf": "2026-03-01T12:00:00Z",
+        "reverseFindings": [],
+        "fileReport": { "status": "ran", "duplicates": 0, "orphans": 1, "findings": [] },
+        "lastActions": [],
+        "lastCycleStatus": { "status": "ok" }
+      }
+    ],
+    "dryRun": true,
+    "version": "dev"
+  }
+  ```
+
+  `lastCycleKind` is `startup`, `sweep`, `webhook`, or `once`. `lastRun`/
+  `lastCycleKind` are `null` when this instance has never once completed a
+  full evaluation — either because its only cycle(s) so far each aborted
+  before finishing one (a profile-fetch failure, say — a `total`/`monitored`/
+  `unmonitored` shown alongside a `null` `lastRun` is a real library read
+  from a cycle that didn't get further), or because the daemon has never
+  once been able to reach it at all (see `lastCycleStatus` below, where
+  `total` and friends stay at `0`). An instance is absent from `instances`
+  entirely only before its very first cycle has been ATTEMPTED — the brief
+  window before the startup scan reaches it. A manual scan (below) reports
+  itself as `sweep`, since it's mechanically the same full-library pass,
+  just run on demand instead of on the timer.
+
+  `fileReport.status` and `reverseStatus` are each the same three-way
+  `ran`/`skipped`/`off` vocabulary the log's own `msg="file report"` line
+  and `reverseScan` attr use: `off` means that pass has never run a
+  complete, trustworthy cycle for this instance yet (`media_root_map` never
+  set, for the file report; the reverse scan globally disabled, or no full
+  sweep has reached it yet); `skipped` means it ran this cycle but could not
+  be trusted (a tracked root read failed; an incomplete unmonitored
+  wanted/cutoff set); `ran` means a clean, trustworthy pass. `duplicates`/
+  `orphans`/`reverseFindings` being empty means "clean" ONLY when the
+  matching status is `ran` — never conflate `off` or `skipped` with "clean".
+
+  `reverseAsOf` is the timestamp of the reverse pass `reverseFindings` is
+  CURRENTLY holding — the last cycle whose pass actually completed
+  trustworthily (`reverseStatus: "ran"`), not the most recent cycle. On a
+  `skipped` cycle the findings are last-known-good (preserved, not cleared)
+  and `reverseAsOf` stays exactly where it was, so the dashboard can say
+  "showing last complete sweep from &lt;time&gt;" instead of silently
+  presenting stale findings as fresh. It is `null` until the first cycle
+  that ever completes a trustworthy pass.
+
+  `lastCycleStatus` is this instance's outcome on the single MOST RECENT
+  cycle that named it, independent of everything else in this object:
+  `{"status": "ok"}` once that cycle's decision engine actually completed an
+  evaluation (`wouldUnmonitor` is a real, freshly computed number), or
+  `{"status": "skipped", "reason": "..."}` for any of three warn-and-skip
+  paths — the connectivity check failed, the library read failed, or (a
+  round-4 review fix) the cycle reached the engine but aborted INSIDE it
+  before finishing an evaluation (a quality-profile fetch failure, an
+  exclusion-tag resolution failure). Unlike every other field here, it is
+  never carried forward from an earlier cycle: an instance that cannot
+  complete an evaluation for a week reports `skipped` on every poll, not a
+  stale `ok` from the last time it could. The dashboard shows this as a clay
+  "last sweep incomplete — &lt;reason&gt;" badge on that instance's shelf
+  card; every other number on the card is left exactly as it last was.
+
+  `lastActions` holds up to the last 50 confirmed `unmonitor`/`remonitor`
+  writes across both directions; it's always empty in dry-run, because a
+  rehearsal is never reported as an action taken.
+
+- **`POST /api/scan`** — queues one full-library sweep (the same
+  `fullLibraryScope`/reverse/file-report shape the reconciliation sweep and
+  the startup scan use — never webhook-scoped, never `--only-id`-narrowed).
+  Always `202`, with a body naming what actually happened:
+  `{"status":"queued"}` the first time, or `{"status":"already-pending"}` if
+  a cycle is already running or one is already queued — idempotent by
+  design, so mashing the button never stacks up extra sweeps.
+
+Both endpoints, and the page itself, live on the same listener and port as
+the webhook endpoint (`webhook_port`); nothing about `POST
+/webhook/{instance-name}`'s own routing, method handling, or response
+changed to make room for them.
 
 ## FAQ
 
