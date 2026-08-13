@@ -693,6 +693,65 @@ func TestWebUIPage_ShelfCountLabelClampsAwayFromCardEdges(t *testing.T) {
 	}
 }
 
+// TestWebUIPage_InitialShelfLabelPositioningRoutesThroughSharedUpdateFn pins
+// the fix for the "hero count overhangs the card's left edge on the FIRST
+// render" bug: buildShelfCard's freshly-created card isn't laid out yet at
+// the moment renderInstances appends it, so calling updateShelfCard's
+// offsetWidth-based clamp (pinned above) right there measures 0 and skips
+// the clamp — the label hangs off the card's edge until the next 30s poll
+// re-measures it correctly. The fix must not solve this by forking a
+// second, first-render-only copy of the positioning logic: both the
+// first-render path and the refresh path must call the SAME
+// updateShelfCard, with only the first-render call deferred (e.g. via
+// requestAnimationFrame) so it runs after the browser has actually laid the
+// just-appended card out.
+func TestWebUIPage_InitialShelfLabelPositioningRoutesThroughSharedUpdateFn(t *testing.T) {
+	page := string(webUIPage)
+
+	// Exactly one updateShelfCard definition: no forked, first-render-only
+	// copy of the positioning logic.
+	if n := strings.Count(page, "function updateShelfCard("); n != 1 {
+		t.Fatalf("expected exactly one updateShelfCard definition, found %d — the initial-render path must reuse it, not fork a second copy of the label-positioning logic", n)
+	}
+
+	// Something must defer the first-render call until after layout.
+	// requestAnimationFrame is the standard mechanism for "run this after
+	// the browser has laid the DOM out"; a synchronous call at the moment
+	// of append is exactly the bug being fixed.
+	if !strings.Contains(page, "requestAnimationFrame") {
+		t.Error("page never uses requestAnimationFrame; the first-render label positioning must be deferred until after the browser has laid the freshly-appended card out, or it will measure a width of 0 like the original bug")
+	}
+
+	// updateShelfCard(card, inst) must be the call both paths make — once
+	// from inside the deferred callback, once directly on refresh. A
+	// single call site would mean one of the two paths isn't actually
+	// routed through the shared function.
+	if calls := strings.Count(page, "updateShelfCard(card, inst)"); calls < 2 {
+		t.Errorf("expected updateShelfCard(card, inst) to be invoked from at least two call sites (a requestAnimationFrame-deferred first-render call, and a direct refresh call), found %d", calls)
+	}
+
+	// renderInstances' own new-card branch must be the one doing the
+	// deferring, not some unrelated part of the script.
+	start := strings.Index(page, "function renderInstances(")
+	if start == -1 {
+		t.Fatal("page has no renderInstances function")
+	}
+	end := strings.Index(page[start:], "\n  function findingsTable(")
+	if end == -1 {
+		t.Fatal("could not find the end of renderInstances (findingsTable must follow it)")
+	}
+	body := page[start : start+end]
+	if !strings.Contains(body, "isNewCard") {
+		t.Error("renderInstances no longer distinguishes a brand-new card from a reused one; that distinction is what routes only the unlaid-out first render through the deferred path")
+	}
+	if !strings.Contains(body, "scheduleInitialShelfUpdate(card, inst)") {
+		t.Error("renderInstances' new-card branch does not call scheduleInitialShelfUpdate — the deferred, layout-safe path to updateShelfCard")
+	}
+	if !strings.Contains(body, "updateShelfCard(card, inst)") {
+		t.Error("renderInstances' reused-card branch no longer calls updateShelfCard directly")
+	}
+}
+
 // TestWebUIPage_ScriptIsSyntacticallyValidJS runs `node --check` over the
 // embedded page's inline <script> block — the one live-code check available
 // under this project's "no browser" testing constraint. It would have caught
@@ -741,6 +800,115 @@ func TestWebUIPage_ReusesShelfCardsAcrossRefreshesForTransitions(t *testing.T) {
 		if !strings.Contains(page, want) {
 			t.Errorf("page is missing %q: the per-instance card must be built once (keyed so a later refresh finds the SAME element) and updated in place, not recreated, for the bar-width transition to ever have a prior value to animate from", want)
 		}
+	}
+}
+
+// TestWebUIPage_FindingsPaginationDefaultsAndSizeTokens pins the reverse-scan
+// / file-clutter pagination's basic contract: a default page size of 25, and
+// the exact four size tokens (10 · 25 · 50 · all) an operator can switch
+// between — a typo or dropped token here would silently remove a size
+// option or change what a fresh page load shows before anyone clicks
+// anything.
+func TestWebUIPage_FindingsPaginationDefaultsAndSizeTokens(t *testing.T) {
+	page := string(webUIPage)
+
+	if !strings.Contains(page, "DEFAULT_PAGE_SIZE = 25") {
+		t.Error("page's default findings page size is not pinned to 25")
+	}
+	if !strings.Contains(page, `PAGE_SIZES = [10, 25, 50, "all"]`) {
+		t.Error(`page does not define the four page-size tokens as [10, 25, 50, "all"]`)
+	}
+	if !strings.Contains(page, "size: DEFAULT_PAGE_SIZE") {
+		t.Error("a pager's initial state does not default to DEFAULT_PAGE_SIZE")
+	}
+}
+
+// TestWebUIPage_FindingsPaginationSlicingIsOneSharedImplementation pins that
+// renderReverse and renderFileReport slice their rows through the SAME
+// paginateRows function — a second, drifted copy of the arithmetic in one
+// section would be exactly the kind of bug that only shows up once a panel
+// has enough rows to page past page 1.
+func TestWebUIPage_FindingsPaginationSlicingIsOneSharedImplementation(t *testing.T) {
+	page := string(webUIPage)
+
+	if n := strings.Count(page, "function paginateRows("); n != 1 {
+		t.Fatalf("expected exactly one paginateRows definition, found %d — the reverse-scan and file-clutter panels must share one slicing implementation, not each carry their own", n)
+	}
+	if n := strings.Count(page, "= paginateRows(rows,"); n != 2 {
+		t.Errorf("expected paginateRows to be called (assigned to a result) from exactly two call sites (renderReverse and renderFileReport), found %d", n)
+	}
+
+	start := strings.Index(page, "function renderReverse(")
+	if start == -1 {
+		t.Fatal("page has no renderReverse function")
+	}
+	end := strings.Index(page[start:], "\n  function renderFileReport(")
+	if end == -1 {
+		t.Fatal("could not find the end of renderReverse (renderFileReport must follow it)")
+	}
+	reverseBody := page[start : start+end]
+	if !strings.Contains(reverseBody, "paginateRows(rows, reversePager)") {
+		t.Error("renderReverse does not call paginateRows against its own reversePager state")
+	}
+
+	fileStart := start + end
+	fileEnd := strings.Index(page[fileStart:], "\n  function render(data)")
+	if fileEnd == -1 {
+		t.Fatal("could not find the end of renderFileReport (render(data) must follow it)")
+	}
+	fileBody := page[fileStart : fileStart+fileEnd]
+	if !strings.Contains(fileBody, "paginateRows(rows, filePager)") {
+		t.Error("renderFileReport does not call paginateRows against its own filePager state")
+	}
+}
+
+// TestWebUIPage_FindingsPaginationPositionLineFormat pins the "a–b of n"
+// position-line format (an en dash, matching the design plan's exact
+// wording) that buildPagerControls renders next to each section's page-size
+// and prev/next controls.
+func TestWebUIPage_FindingsPaginationPositionLineFormat(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, `(page.start + 1) + "–" + page.end + " of " + page.total`) {
+		t.Error(`buildPagerControls does not render the "a–b of n" position line in the expected format`)
+	}
+	if !strings.Contains(page, "pager-position") {
+		t.Error("page has no pager-position element for the position line")
+	}
+}
+
+// TestWebUIPage_FindingsPaginationPreservesPositionAcrossPollsWithSameCount
+// pins the "do not yank the operator back to page 1 every 30s" requirement:
+// a poll refresh must only reset a section's page back to 1 when that
+// section's row COUNT has actually changed since the last render — never
+// unconditionally on every refresh, which would make paging past page 1
+// useless on a page that re-polls every 30 seconds.
+func TestWebUIPage_FindingsPaginationPreservesPositionAcrossPollsWithSameCount(t *testing.T) {
+	page := string(webUIPage)
+
+	if !strings.Contains(page, "function resetPagerIfCountChanged(") {
+		t.Fatal("page has no resetPagerIfCountChanged function guarding page resets by row-count change")
+	}
+	if !strings.Contains(page, "resetPagerIfCountChanged(reversePager, rows.length)") {
+		t.Error("renderReverse never calls resetPagerIfCountChanged — its page could reset on every poll regardless of whether the row count changed")
+	}
+	if !strings.Contains(page, "resetPagerIfCountChanged(filePager, rows.length)") {
+		t.Error("renderFileReport never calls resetPagerIfCountChanged — its page could reset on every poll regardless of whether the row count changed")
+	}
+
+	start := strings.Index(page, "function resetPagerIfCountChanged(")
+	if start == -1 {
+		t.Fatal("page has no resetPagerIfCountChanged function")
+	}
+	end := strings.Index(page[start:], "\n  }")
+	if end == -1 {
+		t.Fatal("could not find the end of resetPagerIfCountChanged")
+	}
+	body := page[start : start+end]
+	if !strings.Contains(body, "pager.lastCount !== count") {
+		t.Error("resetPagerIfCountChanged does not compare against a persisted lastCount before resetting the page — a reset on every call would reintroduce the yank-to-page-1 bug")
+	}
+	if !strings.Contains(body, "pager.page = 1") {
+		t.Error("resetPagerIfCountChanged never resets the page to 1 when the count actually changed")
 	}
 }
 

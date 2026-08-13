@@ -375,6 +375,63 @@
   ul.status-notices li.status-off { color: var(--ink-faint); }
   ul.status-notices li.status-skipped { color: var(--hunt); }
 
+  /* Client-side pagination for the reverse-scan / file-clutter tables
+     (findings-scroll's own tables, above) — both panels can carry hundreds
+     of rows, and rendering all of them at once was the entire panel's cost.
+     Plain text buttons rather than button#scanBtn's filled-pill treatment:
+     this is quiet, secondary chrome under a table, not a primary action.
+     Keyboard focus reuses button:focus-visible's page-wide outline rule
+     above; nothing extra is needed here for that. */
+  .pager {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px 16px;
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid var(--border);
+  }
+
+  .pager-position {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    color: var(--ink-dim);
+    margin-right: auto;
+  }
+
+  .pager-sizes, .pager-nav {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.02em;
+    color: var(--ink-faint);
+    white-space: nowrap;
+  }
+
+  .pager-sizes button, .pager-nav button {
+    font: inherit;
+    letter-spacing: inherit;
+    color: var(--ink-dim);
+    background: none;
+    border: none;
+    padding: 2px 3px;
+    cursor: pointer;
+  }
+
+  /* The active page size is the one spot this control group borrows the
+     shelf's own sage "rest" token — everywhere else here stays quiet ink. */
+  .pager-sizes button.active { color: var(--rest); }
+
+  .pager-sizes button:hover:not(.active),
+  .pager-nav button:hover:not(:disabled) {
+    color: var(--ink);
+  }
+
+  .pager-nav button:disabled {
+    color: var(--ink-faint);
+    cursor: default;
+  }
+
   footer {
     margin-top: 48px;
     font-family: var(--mono);
@@ -426,6 +483,12 @@
   var POLL_MS = 30000;
   var scanBtn = document.getElementById("scanBtn");
   var pollHandle = null;
+
+  // PAGE_SIZES is the reverse-scan / file-clutter panels' shared page-size
+  // menu, in display order; "all" is the one non-numeric size and turns
+  // paging off entirely (paginateRows below resolves it to every row).
+  var PAGE_SIZES = [10, 25, 50, "all"];
+  var DEFAULT_PAGE_SIZE = 25;
 
   function text(el, s) { el.textContent = s; }
 
@@ -603,6 +666,29 @@
     }
   }
 
+  // requestAnimationFrame is missing only in exotic embedded contexts; fall
+  // back to an immediate call there rather than never positioning a card's
+  // label at all.
+  var raf = typeof requestAnimationFrame === "function" ? requestAnimationFrame : function (cb) { cb(); };
+
+  // scheduleInitialShelfUpdate defers a brand-new card's FIRST
+  // updateShelfCard call to the next animation frame. buildShelfCard's
+  // freshly-created elements aren't laid out yet at the moment
+  // renderInstances appends them, so calling updateShelfCard synchronously
+  // right there would hit its offsetWidth-based hero-number clamp (see that
+  // function's Round-4 review comment) before the browser has sized
+  // anything: the measurement reads 0, the clamp is skipped, and the number
+  // hangs off the card's left edge until the next 30s poll re-measures it
+  // correctly. Routing this first call through the SAME updateShelfCard one
+  // frame later — after the card is already in the document — fixes the
+  // overhang without a second, first-render-only copy of the positioning
+  // logic: one function, both paths, just measured at a point where layout
+  // has actually happened. Every later refresh reuses this same, by-then
+  // already-laid-out card and calls updateShelfCard directly.
+  function scheduleInitialShelfUpdate(card, inst) {
+    raf(function () { updateShelfCard(card, inst); });
+  }
+
   function renderInstances(instances) {
     var root = document.getElementById("instances");
     if (!instances || instances.length === 0) {
@@ -623,15 +709,23 @@
       var inst = instances[i];
       seen[inst.name] = true;
       var card = shelfCards[inst.name];
-      if (!card) {
+      var isNewCard = !card;
+      if (isNewCard) {
         card = buildShelfCard();
         shelfCards[inst.name] = card;
       }
-      updateShelfCard(card, inst);
       // Keeps DOM order matching the instances array's own (config) order.
       // A no-op move when the card is already the last child, which is the
       // common case once every instance has been seen once.
       root.appendChild(card);
+      if (isNewCard) {
+        // See scheduleInitialShelfUpdate's own comment: this card has just
+        // been appended and isn't laid out yet, so its first update must be
+        // deferred a frame rather than measured here.
+        scheduleInitialShelfUpdate(card, inst);
+      } else {
+        updateShelfCard(card, inst);
+      }
     }
     // Instances are never removed from a running daemon's config, but keep
     // this tidy (and correct) rather than relying on that.
@@ -660,6 +754,117 @@
     }
     table.appendChild(tbody);
     return table;
+  }
+
+  // lastInstances is the last full instances array render(data) received —
+  // kept only so a pager control's click (page/size change) can re-run
+  // renderReverse/renderFileReport against the SAME data a poll would have,
+  // without either panel needing to remember its own copy.
+  var lastInstances = [];
+
+  // reversePager/filePager are each panel's own persisted paging state:
+  // which page it's on, which page size it's set to, and the row count its
+  // page was last computed against (see resetPagerIfCountChanged below).
+  // Two objects, not one shared object — the panels' row counts and
+  // operator attention are independent of each other.
+  var reversePager = { page: 1, size: DEFAULT_PAGE_SIZE, lastCount: null };
+  var filePager = { page: 1, size: DEFAULT_PAGE_SIZE, lastCount: null };
+
+  // resetPagerIfCountChanged is what keeps a 30s poll from yanking the
+  // operator back to page 1 while they're reading page 6: it only resets
+  // when the section's row COUNT has actually changed since the last time
+  // this ran (a finding appeared, was resolved, or the set otherwise
+  // shifted) — not on every refresh, and not on a manual page/size click,
+  // which calls this too but never changes the count in between.
+  // lastCount starts at null (never computed) so the very first render — a
+  // "change" from nothing — is exempted rather than being treated as a
+  // reset away from a page the operator never had a chance to leave.
+  function resetPagerIfCountChanged(pager, count) {
+    if (pager.lastCount !== null && pager.lastCount !== count) {
+      pager.page = 1;
+    }
+    pager.lastCount = count;
+  }
+
+  // paginateRows is the ONE slicing implementation both renderReverse and
+  // renderFileReport call — every other piece of pagination (the size
+  // buttons, prev/next, the position line) is UI wrapped around this, never
+  // a second copy of the arithmetic. `pager.page` is clamped into range
+  // here rather than trusted blindly, since rows.length can shrink between
+  // renders (a poll, or a size change) and leave a stale page number
+  // pointing past the end.
+  function paginateRows(rows, pager) {
+    var size = pager.size === "all" ? (rows.length || 1) : pager.size;
+    var pageCount = Math.max(1, Math.ceil(rows.length / size));
+    if (pager.page > pageCount) pager.page = pageCount;
+    if (pager.page < 1) pager.page = 1;
+    var start = (pager.page - 1) * size;
+    var end = Math.min(rows.length, start + size);
+    return { pageRows: rows.slice(start, end), start: start, end: end, total: rows.length, pageCount: pageCount };
+  }
+
+  // makeSizeClickHandler returns a size-button's own click handler as a
+  // closure over that ONE button's size — not the loop variable
+  // buildPagerControls declares it from, which every iteration would
+  // otherwise share (var, not let) and which would leave every button
+  // switching to whichever size the loop last ran with.
+  function makeSizeClickHandler(pager, size, rerender) {
+    return function () {
+      if (pager.size === size) return;
+      pager.size = size;
+      pager.page = 1;
+      rerender();
+    };
+  }
+
+  // buildPagerControls renders one section's page-size buttons, "a–b of n"
+  // position line, and prev/next buttons from that section's already-sliced
+  // `page` (paginateRows' own return value) and persisted `pager` state.
+  // `rerender` re-invokes the section's own render function against
+  // lastInstances; every control here does nothing but mutate `pager` and
+  // ask for that repaint — never touches the table's data itself.
+  function buildPagerControls(pager, page, rerender) {
+    var wrap = el("div", "pager");
+
+    var position = el("span", "pager-position");
+    text(position, (page.start + 1) + "–" + page.end + " of " + page.total);
+    wrap.appendChild(position);
+
+    var sizes = el("span", "pager-sizes");
+    for (var i = 0; i < PAGE_SIZES.length; i++) {
+      var size = PAGE_SIZES[i];
+      var sizeBtn = el("button", pager.size === size ? "active" : "");
+      sizeBtn.type = "button";
+      text(sizeBtn, String(size));
+      sizeBtn.addEventListener("click", makeSizeClickHandler(pager, size, rerender));
+      sizes.appendChild(sizeBtn);
+      if (i < PAGE_SIZES.length - 1) sizes.appendChild(document.createTextNode(" · "));
+    }
+    wrap.appendChild(sizes);
+
+    var nav = el("span", "pager-nav");
+    var prevBtn = el("button");
+    prevBtn.type = "button";
+    text(prevBtn, "prev");
+    prevBtn.disabled = pager.page <= 1;
+    prevBtn.addEventListener("click", function () {
+      pager.page -= 1;
+      rerender();
+    });
+    nav.appendChild(prevBtn);
+    nav.appendChild(document.createTextNode(" / "));
+    var nextBtn = el("button");
+    nextBtn.type = "button";
+    text(nextBtn, "next");
+    nextBtn.disabled = pager.page >= page.pageCount;
+    nextBtn.addEventListener("click", function () {
+      pager.page += 1;
+      rerender();
+    });
+    nav.appendChild(nextBtn);
+    wrap.appendChild(nav);
+
+    return wrap;
   }
 
   // renderReverse is reverseStatus-aware — round-3 review fix, the reverse
@@ -770,6 +975,8 @@
       body.appendChild(list);
     }
 
+    resetPagerIfCountChanged(reversePager, rows.length);
+
     if (rows.length === 0) {
       // Same gate as renderFileReport's own: only claim "clean" when at
       // least one instance actually completed a trustworthy pass (or none
@@ -781,9 +988,10 @@
       }
       return;
     }
+    var page = paginateRows(rows, reversePager);
     body.appendChild(findingsTable(
       ["instance", "item", "season", "reason"],
-      rows,
+      page.pageRows,
       function (r) {
         var tr = el("tr");
         var item = r.f.title || r.f.series || "";
@@ -796,6 +1004,7 @@
         return tr;
       }
     ));
+    body.appendChild(buildPagerControls(reversePager, page, function () { renderReverse(lastInstances); }));
   }
 
   // renderFileReport is status-aware: fileReport.status is ran|skipped|off
@@ -860,6 +1069,8 @@
       body.appendChild(list);
     }
 
+    resetPagerIfCountChanged(filePager, rows.length);
+
     if (rows.length === 0) {
       // Only claim "clean" when at least one instance actually ran the
       // check (or none have reported in at all yet, matching the main
@@ -873,9 +1084,10 @@
       }
       return;
     }
+    var page = paginateRows(rows, filePager);
     body.appendChild(findingsTable(
       ["instance", "kind", "group", "path", "count"],
-      rows,
+      page.pageRows,
       function (r) {
         var tr = el("tr");
         var group = r.f.group || "—";
@@ -889,6 +1101,7 @@
         return tr;
       }
     ));
+    body.appendChild(buildPagerControls(filePager, page, function () { renderFileReport(lastInstances); }));
   }
 
   function render(data) {
@@ -902,6 +1115,7 @@
     }
 
     var instances = data.instances || [];
+    lastInstances = instances;
     var latest = null;
     for (var i = 0; i < instances.length; i++) {
       var lr = instances[i].lastRun;
