@@ -239,3 +239,189 @@ func dirIsEmptyOfFiles(p string) (bool, error) {
 	}
 	return empty, nil
 }
+
+// --- the case-twin merge (rule 5) -------------------------------------------
+
+// twinMergeVerdict is twinMergeEligibility's answer: whether this case-twin
+// finding is one a button may be offered for at all, and — when it is not —
+// the reason, in words the GUI puts on the row so a human can tell "cutoffarr
+// judged this unsafe" apart from "cutoffarr forgot".
+type twinMergeVerdict struct {
+	ok        bool
+	tracked   string
+	untracked string
+	reason    string
+}
+
+// twinMergeEligibility decides rule 5's "which shapes get a button".
+//
+// A merge is only ever offered for the one shape whose right answer is not a
+// judgement call: TWO directory spellings, exactly one of which the *arr
+// actually tracks. Then "merge into the tracked one" is not a preference, it
+// is the only outcome that makes the library consistent with what the *arr
+// already believes.
+//
+// Every other shape is report-only, with its reason shown:
+//
+//   - No tracked side. Nothing establishes which spelling is "the real one",
+//     and picking would be cutoffarr inventing an opinion about a human's
+//     library. (This is common and benign: two stray folders in an unmanaged
+//     corner of a root.)
+//   - Both tracked. The *arr has two entries pointing at two spellings, which
+//     is a problem in the *arr's own database, not on disk; merging the
+//     folders would leave one of those entries pointing at nothing.
+//   - Mixed (a folder beside a file). There is no "contents" to merge, and
+//     whatever the right fix is, it is a human's call.
+//   - File twins. Same: a file has no contents to move into another file, and
+//     "which copy wins" is exactly the question cutoffarr must not answer.
+//   - More than two spellings. The pairwise "merge A into B" operation the
+//     button names does not describe what would happen.
+func twinMergeEligibility(f fileReportFindingRecord) twinMergeVerdict {
+	if f.Kind != fileKindCaseCollision {
+		return twinMergeVerdict{reason: "this finding is not a case-twin"}
+	}
+	switch f.EntryType {
+	case fileReportEntryTypeMixed:
+		return twinMergeVerdict{reason: "this twin is a folder and a file sharing one name — there are no folder contents to merge, so the fix is a human's call"}
+	case fileReportEntryTypeFile:
+		return twinMergeVerdict{reason: "these twins are files, not folders — merging would mean choosing which copy wins, which cutoffarr will not decide for you"}
+	}
+	if len(f.Names) != 2 {
+		return twinMergeVerdict{reason: fmt.Sprintf("this twin has more than two spellings (%d) — the pairwise merge a button could name does not describe what would happen", len(f.Names))}
+	}
+
+	var tracked, untracked []string
+	for _, n := range f.Names {
+		if n.Tracked {
+			tracked = append(tracked, n.Name)
+		} else {
+			untracked = append(untracked, n.Name)
+		}
+	}
+	switch {
+	case len(tracked) == 0:
+		return twinMergeVerdict{reason: "neither spelling is tracked by this instance, so nothing establishes which one is the real folder — merging would be cutoffarr inventing an opinion about your library"}
+	case len(tracked) == 2:
+		return twinMergeVerdict{reason: "both spellings are tracked by this instance — that is a problem in the *arr's own database rather than on disk, and merging the folders would leave one of its entries pointing at nothing"}
+	}
+	return twinMergeVerdict{ok: true, tracked: tracked[0], untracked: untracked[0]}
+}
+
+// twinMergeResult is what one merge did, itemized. Every field is reported
+// back to the page verbatim: rule 5 requires collisions to be itemized in the
+// response, and a human who has just moved files needs to see exactly which
+// ones went where without going to the log.
+type twinMergeResult struct {
+	// moved are the destination paths of files that changed spelling.
+	moved []string
+	// collided are one human-readable line per file whose destination was
+	// already occupied — the source copy went to the trash instead, and the
+	// line says so, naming both.
+	collided []string
+	// trashedDir is where the emptied untracked directory itself ended up.
+	trashedDir string
+}
+
+// mergeCaseTwinDir performs rule 5's merge: move every file under the
+// UNTRACKED spelling into the same relative position under the TRACKED
+// spelling, then trash-move the emptied untracked directory.
+//
+// Per-file rename-moves, never a directory rename of the whole tree: the
+// tracked spelling already exists and already has contents (that is what
+// makes it the tracked one), so a wholesale rename would either fail or
+// clobber it. Walking gives every file its own collision decision, which is
+// the only place the "never overwrite" rule can actually be applied.
+//
+// A destination collision NEVER overwrites. The source file goes to the trash
+// instead and the collision is itemized. That choice is deliberate and it is
+// the conservative one in both directions: the tracked copy is the one the
+// *arr has scored, imported and is serving, so it stays; the untracked copy
+// is not destroyed either, it is one directory away in .cutoffarr-trash if
+// the human decides it was the better file.
+//
+// The emptied directory is trash-moved rather than removed for the reason
+// this whole file exists: os.Remove does not appear in this codebase. Moving
+// it also preserves anything the walk could not account for (an empty
+// subdirectory tree, a non-regular entry) instead of silently discarding it.
+func mergeCaseTwinDir(root, untrackedDir, trackedDir string, stamp time.Time) (twinMergeResult, error) {
+	var res twinMergeResult
+
+	if err := probeRootWritable(root); err != nil {
+		return res, err
+	}
+	for _, d := range []string{untrackedDir, trackedDir} {
+		info, err := os.Lstat(d)
+		if err != nil {
+			return res, fmt.Errorf("%s could not be read, so the merge this button described cannot be performed: %w", d, err)
+		}
+		if !info.IsDir() {
+			return res, fmt.Errorf("%s is not a directory, so there is nothing to merge into or out of", d)
+		}
+	}
+
+	walkErr := filepath.WalkDir(untrackedDir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(untrackedDir, p)
+		if err != nil {
+			return fmt.Errorf("%s is not expressible relative to %s: %w", p, untrackedDir, err)
+		}
+		dest := filepath.Join(trackedDir, rel)
+
+		if _, err := os.Lstat(dest); err == nil {
+			// Occupied: the tracked spelling wins, and the source copy is
+			// trashed rather than destroyed or silently left in place (leaving
+			// it would make the "emptied directory" step below a lie).
+			trashed, err := moveToTrash(root, p, stamp)
+			if err != nil {
+				return err
+			}
+			res.collided = append(res.collided, fmt.Sprintf("%s already existed under the tracked spelling, so the copy under the untracked one was moved to %s instead", rel, trashed))
+			return nil
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("checking whether %s is already occupied: %w", dest, err)
+		}
+
+		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+			return fmt.Errorf("creating %s: %w", filepath.Dir(dest), err)
+		}
+		if err := os.Rename(p, dest); err != nil {
+			return fmt.Errorf("moving %s to %s: %w", p, dest, err)
+		}
+		res.moved = append(res.moved, dest)
+		return nil
+	})
+	if walkErr != nil {
+		// Deliberately NOT rolled back. Every move this walk completed was a
+		// correct, individually-verified move into the tracked spelling; undoing
+		// them would be a second batch of unverified moves made by a code path
+		// that has just proved it is meeting conditions it did not expect. What
+		// the caller does instead is report exactly what was done (res is
+		// returned alongside the error) so the human sees the partial state
+		// rather than discovering it later.
+		return res, walkErr
+	}
+
+	// The emptied source directory. Checked rather than assumed: if anything
+	// is still in there, something happened between the walk and now, and
+	// trashing a directory that still holds files would move them out from
+	// under the *arr as a side effect of an operation the button described as
+	// a merge.
+	empty, err := dirIsEmptyOfFiles(untrackedDir)
+	if err != nil {
+		return res, fmt.Errorf("re-checking that %s is empty before trashing it: %w", untrackedDir, err)
+	}
+	if !empty {
+		return res, fmt.Errorf("%s still holds files after the merge, so it was left exactly where it is rather than being trashed with contents nobody asked to move", untrackedDir)
+	}
+	trashedDir, err := moveToTrash(root, untrackedDir, stamp)
+	if err != nil {
+		return res, err
+	}
+	res.trashedDir = trashedDir
+	return res, nil
+}
