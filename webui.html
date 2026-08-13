@@ -603,6 +603,29 @@
     }
   }
 
+  // requestAnimationFrame is missing only in exotic embedded contexts; fall
+  // back to an immediate call there rather than never positioning a card's
+  // label at all.
+  var raf = typeof requestAnimationFrame === "function" ? requestAnimationFrame : function (cb) { cb(); };
+
+  // scheduleInitialShelfUpdate defers a brand-new card's FIRST
+  // updateShelfCard call to the next animation frame. buildShelfCard's
+  // freshly-created elements aren't laid out yet at the moment
+  // renderInstances appends them, so calling updateShelfCard synchronously
+  // right there would hit its offsetWidth-based hero-number clamp (see that
+  // function's Round-4 review comment) before the browser has sized
+  // anything: the measurement reads 0, the clamp is skipped, and the number
+  // hangs off the card's left edge until the next 30s poll re-measures it
+  // correctly. Routing this first call through the SAME updateShelfCard one
+  // frame later — after the card is already in the document — fixes the
+  // overhang without a second, first-render-only copy of the positioning
+  // logic: one function, both paths, just measured at a point where layout
+  // has actually happened. Every later refresh reuses this same, by-then
+  // already-laid-out card and calls updateShelfCard directly.
+  function scheduleInitialShelfUpdate(card, inst) {
+    raf(function () { updateShelfCard(card, inst); });
+  }
+
   function renderInstances(instances) {
     var root = document.getElementById("instances");
     if (!instances || instances.length === 0) {
@@ -623,15 +646,23 @@
       var inst = instances[i];
       seen[inst.name] = true;
       var card = shelfCards[inst.name];
-      if (!card) {
+      var isNewCard = !card;
+      if (isNewCard) {
         card = buildShelfCard();
         shelfCards[inst.name] = card;
       }
-      updateShelfCard(card, inst);
       // Keeps DOM order matching the instances array's own (config) order.
       // A no-op move when the card is already the last child, which is the
       // common case once every instance has been seen once.
       root.appendChild(card);
+      if (isNewCard) {
+        // See scheduleInitialShelfUpdate's own comment: this card has just
+        // been appended and isn't laid out yet, so its first update must be
+        // deferred a frame rather than measured here.
+        scheduleInitialShelfUpdate(card, inst);
+      } else {
+        updateShelfCard(card, inst);
+      }
     }
     // Instances are never removed from a running daemon's config, but keep
     // this tidy (and correct) rather than relying on that.

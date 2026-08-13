@@ -693,6 +693,65 @@ func TestWebUIPage_ShelfCountLabelClampsAwayFromCardEdges(t *testing.T) {
 	}
 }
 
+// TestWebUIPage_InitialShelfLabelPositioningRoutesThroughSharedUpdateFn pins
+// the fix for the "hero count overhangs the card's left edge on the FIRST
+// render" bug: buildShelfCard's freshly-created card isn't laid out yet at
+// the moment renderInstances appends it, so calling updateShelfCard's
+// offsetWidth-based clamp (pinned above) right there measures 0 and skips
+// the clamp — the label hangs off the card's edge until the next 30s poll
+// re-measures it correctly. The fix must not solve this by forking a
+// second, first-render-only copy of the positioning logic: both the
+// first-render path and the refresh path must call the SAME
+// updateShelfCard, with only the first-render call deferred (e.g. via
+// requestAnimationFrame) so it runs after the browser has actually laid the
+// just-appended card out.
+func TestWebUIPage_InitialShelfLabelPositioningRoutesThroughSharedUpdateFn(t *testing.T) {
+	page := string(webUIPage)
+
+	// Exactly one updateShelfCard definition: no forked, first-render-only
+	// copy of the positioning logic.
+	if n := strings.Count(page, "function updateShelfCard("); n != 1 {
+		t.Fatalf("expected exactly one updateShelfCard definition, found %d — the initial-render path must reuse it, not fork a second copy of the label-positioning logic", n)
+	}
+
+	// Something must defer the first-render call until after layout.
+	// requestAnimationFrame is the standard mechanism for "run this after
+	// the browser has laid the DOM out"; a synchronous call at the moment
+	// of append is exactly the bug being fixed.
+	if !strings.Contains(page, "requestAnimationFrame") {
+		t.Error("page never uses requestAnimationFrame; the first-render label positioning must be deferred until after the browser has laid the freshly-appended card out, or it will measure a width of 0 like the original bug")
+	}
+
+	// updateShelfCard(card, inst) must be the call both paths make — once
+	// from inside the deferred callback, once directly on refresh. A
+	// single call site would mean one of the two paths isn't actually
+	// routed through the shared function.
+	if calls := strings.Count(page, "updateShelfCard(card, inst)"); calls < 2 {
+		t.Errorf("expected updateShelfCard(card, inst) to be invoked from at least two call sites (a requestAnimationFrame-deferred first-render call, and a direct refresh call), found %d", calls)
+	}
+
+	// renderInstances' own new-card branch must be the one doing the
+	// deferring, not some unrelated part of the script.
+	start := strings.Index(page, "function renderInstances(")
+	if start == -1 {
+		t.Fatal("page has no renderInstances function")
+	}
+	end := strings.Index(page[start:], "\n  function findingsTable(")
+	if end == -1 {
+		t.Fatal("could not find the end of renderInstances (findingsTable must follow it)")
+	}
+	body := page[start : start+end]
+	if !strings.Contains(body, "isNewCard") {
+		t.Error("renderInstances no longer distinguishes a brand-new card from a reused one; that distinction is what routes only the unlaid-out first render through the deferred path")
+	}
+	if !strings.Contains(body, "scheduleInitialShelfUpdate(card, inst)") {
+		t.Error("renderInstances' new-card branch does not call scheduleInitialShelfUpdate — the deferred, layout-safe path to updateShelfCard")
+	}
+	if !strings.Contains(body, "updateShelfCard(card, inst)") {
+		t.Error("renderInstances' reused-card branch no longer calls updateShelfCard directly")
+	}
+}
+
 // TestWebUIPage_ScriptIsSyntacticallyValidJS runs `node --check` over the
 // embedded page's inline <script> block — the one live-code check available
 // under this project's "no browser" testing constraint. It would have caught
