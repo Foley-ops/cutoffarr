@@ -193,6 +193,66 @@ func TestStatsStore_RecordInstance_PreservesFileReportWhenACycleDidNotRunIt(t *t
 	}
 }
 
+// TestStatsStore_RecordInstance_CapturesCaseCollisionsAndPreservesThemAcrossACycleThatDidNotRunTheFileReport
+// is [v2.1]'s addition to the file-report three-state fidelity rule above:
+// CaseCollisions and a case-collision finding's own Names/EntryType must
+// survive a later cycle that never ran the file report at all, exactly like
+// Duplicates/Orphans/Findings already do.
+func TestStatsStore_RecordInstance_CapturesCaseCollisionsAndPreservesThemAcrossACycleThatDidNotRunTheFileReport(t *testing.T) {
+	s := newStatsStore(false)
+	s.recordInstance(cycleKindStartup, time.Now(), "radarr-main", "radarr", cycleInstanceStats{
+		total: 5, fileReportRan: true,
+		fileReport: fileReportSnapshot{
+			Status: "ran", Duplicates: 1, Orphans: 0, CaseCollisions: 1,
+			Findings: []fileReportFindingRecord{{
+				Kind: "case-collision", Path: "/movies/Show", Display: "Movies/Show", EntryType: "dir",
+				Names: []caseCollisionNameRecord{{Name: "Show", Tracked: true}, {Name: "show", Tracked: false}},
+			}},
+		},
+	})
+	s.recordInstance(cycleKindWebhook, time.Now(), "radarr-main", "radarr", cycleInstanceStats{total: 5})
+
+	got := s.snapshot().Instances[0]
+	if got.FileReport.CaseCollisions != 1 {
+		t.Errorf("CaseCollisions = %d, want 1 preserved from the previous full cycle", got.FileReport.CaseCollisions)
+	}
+	if len(got.FileReport.Findings) != 1 || got.FileReport.Findings[0].EntryType != "dir" {
+		t.Fatalf("Findings = %+v, want the preserved case-collision finding", got.FileReport.Findings)
+	}
+	names := got.FileReport.Findings[0].Names
+	if len(names) != 2 || names[0].Name != "Show" || !names[0].Tracked || names[1].Name != "show" || names[1].Tracked {
+		t.Errorf("Names = %+v, want both colliding names with their tracked correlation preserved", names)
+	}
+}
+
+// TestCloneInstanceStatsView_DeepCopiesCaseCollisionNames is the [v2.1]
+// isolation check TestStatsStore_Snapshot_IsolatedFromLaterMutation already
+// runs for ReverseFindings/LastActions/FileReport.Findings, extended one
+// level deeper: a fileReportFindingRecord's own Names slice must not alias
+// the store's backing array either, or writing through a handed-out
+// snapshot's Names element would silently corrupt the store.
+func TestCloneInstanceStatsView_DeepCopiesCaseCollisionNames(t *testing.T) {
+	s := newStatsStore(false)
+	s.recordInstance(cycleKindStartup, time.Now(), "radarr-main", "radarr", cycleInstanceStats{
+		total: 1, fileReportRan: true,
+		fileReport: fileReportSnapshot{
+			Status: "ran", CaseCollisions: 1,
+			Findings: []fileReportFindingRecord{{
+				Kind: "case-collision", Path: "/a", EntryType: "dir",
+				Names: []caseCollisionNameRecord{{Name: "A", Tracked: true}, {Name: "a", Tracked: false}},
+			}},
+		},
+	})
+	first := s.snapshot()
+	first.Instances[0].FileReport.Findings[0].Names[0].Tracked = false
+	first.Instances[0].FileReport.Findings[0].Names[0].Name = "MUTATED"
+
+	verify := s.snapshot().Instances[0]
+	if verify.FileReport.Findings[0].Names[0].Name != "A" || !verify.FileReport.Findings[0].Names[0].Tracked {
+		t.Errorf("writing through the first snapshot's Names element corrupted the store: a fresh snapshot now reads %+v, want the untouched original {A true}", verify.FileReport.Findings[0].Names[0])
+	}
+}
+
 // TestStatsStore_RecordInstance_NewInstanceDefaultsFileReportToOff pins the
 // pre-any-full-cycle default: an instance recorded for the first time by a
 // cycle that never ran the file report (e.g. a webhook cycle firing before
@@ -548,6 +608,42 @@ func TestFileReportSnapshotFrom_ConvertsCountsAndFindings(t *testing.T) {
 	}
 	if orphan.Display != "Movies/Untracked/stray.mkv" {
 		t.Errorf("orphan finding Display = %q, want the source fileReportFinding.displayPath carried through verbatim", orphan.Display)
+	}
+}
+
+// TestFileReportSnapshotFrom_ConvertsCaseCollisionFindingWithNamesAndEntryType
+// is [v2.1]'s addition to TestFileReportSnapshotFrom_ConvertsCountsAndFindings
+// above: a case-collision finding's own entryType/names must survive the
+// filereport.go -> stats.go conversion, and it carries no duplicate-only
+// group/count (a case-collision finding has no sibling group).
+func TestFileReportSnapshotFrom_ConvertsCaseCollisionFindingWithNamesAndEntryType(t *testing.T) {
+	c := fileReportCounts{
+		configured: true, caseCollisions: 1,
+		findings: []fileReportFinding{
+			{
+				kind: fileKindCaseCollision, diskPath: "/movies/Show", displayPath: "Movies/Show",
+				entryType: fileReportEntryTypeDir,
+				names:     []caseCollisionEntry{{name: "Show", tracked: true}, {name: "show", tracked: false}},
+			},
+		},
+	}
+	snap := fileReportSnapshotFrom(c)
+	if snap.CaseCollisions != 1 {
+		t.Errorf("CaseCollisions = %d, want 1", snap.CaseCollisions)
+	}
+	if len(snap.Findings) != 1 {
+		t.Fatalf("Findings = %+v, want 1", snap.Findings)
+	}
+	f := snap.Findings[0]
+	if f.Kind != "case-collision" || f.EntryType != "dir" || f.Path != "/movies/Show" || f.Display != "Movies/Show" {
+		t.Errorf("finding = %+v, fields do not match the source fileReportFinding", f)
+	}
+	if f.Group != "" || f.Count != 0 {
+		t.Errorf("finding = %+v, want an empty group and zero count: a case-collision finding has no duplicate grouping", f)
+	}
+	wantNames := []caseCollisionNameRecord{{Name: "Show", Tracked: true}, {Name: "show", Tracked: false}}
+	if len(f.Names) != 2 || f.Names[0] != wantNames[0] || f.Names[1] != wantNames[1] {
+		t.Errorf("Names = %+v, want %+v carried through with their tracked correlation", f.Names, wantNames)
 	}
 }
 

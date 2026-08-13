@@ -82,23 +82,41 @@ type reverseFinding struct {
 	SeriesMonitored *bool  `json:"seriesMonitored,omitempty"`
 }
 
-// fileReportFindingRecord is one duplicate or orphan finding, matching the
-// API contract's `{kind, group, path, display, count?}`. Group is empty for
-// an orphan (fileReportFinding never sets one for fileKindOrphan — see
-// filereport.go); Count is the duplicate group's size and is omitted
-// (rather than printed as a misleading 0) for an orphan, which has no group.
-// Path is the full cutoffarr-side (disk) path — the same one
-// logFileReportFinding already logs — kept verbatim for a client that wants
-// it (e.g. a hover title); Display is that same file's path relative to its
-// mapped root (rootRelativeDisplayPath, filereport.go), always present and
-// always shorter, for a client that wants something screen-sized instead of
-// a possibly long, host-specific mount prefix.
+// caseCollisionNameRecord is [v2.1] one colliding name within a
+// case-collision fileReportFindingRecord, matching the API contract's
+// `{name, tracked}` — see fileReportFindingRecord.Names' own doc comment.
+type caseCollisionNameRecord struct {
+	Name    string `json:"name"`
+	Tracked bool   `json:"tracked"`
+}
+
+// fileReportFindingRecord is one duplicate, orphan, or [v2.1] case-collision
+// finding, matching the API contract's `{kind, group, path, display, count?,
+// entryType?, names?}`. Group is empty for an orphan or case-collision
+// (fileReportFinding never sets one for either — see filereport.go); Count
+// is the duplicate group's size and is omitted (rather than printed as a
+// misleading 0) for anything else, which has no group. Path is the full
+// cutoffarr-side (disk) path — the same one logFileReportFinding already
+// logs, and for a case-collision the CONTAINING DIRECTORY the collision was
+// found in, never one of the colliding entries itself — kept verbatim for a
+// client that wants it (e.g. a hover title); Display is that same path
+// relative to its mapped root (rootRelativeDisplayPath, filereport.go),
+// always present and always shorter, for a client that wants something
+// screen-sized instead of a possibly long, host-specific mount prefix.
+//
+// EntryType ("dir"|"file") and Names are case-collision-only (binding
+// controller resolution 2: "all colliding names, whether each name
+// contains/IS a tracked path ..., and entry type"), both omitted for a
+// duplicate or orphan the same way Group/Count are omitted for anything
+// that isn't a duplicate.
 type fileReportFindingRecord struct {
-	Kind    string `json:"kind"`
-	Group   string `json:"group,omitempty"`
-	Path    string `json:"path"`
-	Display string `json:"display"`
-	Count   int    `json:"count,omitempty"`
+	Kind      string                    `json:"kind"`
+	Group     string                    `json:"group,omitempty"`
+	Path      string                    `json:"path"`
+	Display   string                    `json:"display"`
+	Count     int                       `json:"count,omitempty"`
+	EntryType string                    `json:"entryType,omitempty"`
+	Names     []caseCollisionNameRecord `json:"names,omitempty"`
 }
 
 // fileReportSnapshot is one instance's Phase 11 file report, as of the last
@@ -106,11 +124,17 @@ type fileReportFindingRecord struct {
 // cycle only). Status is fileReportCounts.state()'s own three-way vocabulary
 // (ran|skipped|off) verbatim, so the GUI and this struct can never drift
 // from what logFileReportSummary already says about the same cycle.
+// CaseCollisions is [v2.1]'s addition, following the exact same identity/
+// token disciplines as Duplicates/Orphans: always present (including 0)
+// whenever Status is ran or skipped, and — like them — left untouched by a
+// cycle that never ran the file report (recordInstance's three-state
+// fidelity rule).
 type fileReportSnapshot struct {
-	Status     string                    `json:"status"`
-	Duplicates int                       `json:"duplicates"`
-	Orphans    int                       `json:"orphans"`
-	Findings   []fileReportFindingRecord `json:"findings"`
+	Status         string                    `json:"status"`
+	Duplicates     int                       `json:"duplicates"`
+	Orphans        int                       `json:"orphans"`
+	CaseCollisions int                       `json:"caseCollisions"`
+	Findings       []fileReportFindingRecord `json:"findings"`
 }
 
 // cycleInstanceStats is what one call to runRadarrDecisionEngine or
@@ -435,10 +459,11 @@ func (s *statsStore) recordInstance(kind string, at time.Time, name, typ string,
 		findings := make([]fileReportFindingRecord, len(cs.fileReport.Findings))
 		copy(findings, cs.fileReport.Findings)
 		v.FileReport = fileReportSnapshot{
-			Status:     cs.fileReport.Status,
-			Duplicates: cs.fileReport.Duplicates,
-			Orphans:    cs.fileReport.Orphans,
-			Findings:   findings,
+			Status:         cs.fileReport.Status,
+			Duplicates:     cs.fileReport.Duplicates,
+			Orphans:        cs.fileReport.Orphans,
+			CaseCollisions: cs.fileReport.CaseCollisions,
+			Findings:       findings,
 		}
 	}
 
@@ -537,11 +562,28 @@ func (s *statsStore) snapshot() statsResponse {
 func fileReportSnapshotFrom(c fileReportCounts) fileReportSnapshot {
 	findings := make([]fileReportFindingRecord, 0, len(c.findings))
 	for _, f := range c.findings {
-		findings = append(findings, fileReportFindingRecord{
+		rec := fileReportFindingRecord{
 			Kind: f.kind, Group: f.group, Path: f.diskPath, Display: f.displayPath, Count: f.groupCount,
-		})
+		}
+		if f.kind == fileKindCaseCollision {
+			// [v2.1] entryType/names are case-collision-only — see
+			// fileReportFindingRecord's own doc comment. Group/Count above
+			// are already f.group/f.groupCount's zero values for this kind
+			// (classifyFileReportPath/caseCollisionsInDir never set either
+			// on a case-collision fileReportFinding), so nothing needs
+			// clearing here.
+			rec.EntryType = f.entryType
+			rec.Names = make([]caseCollisionNameRecord, len(f.names))
+			for i, n := range f.names {
+				rec.Names[i] = caseCollisionNameRecord{Name: n.name, Tracked: n.tracked}
+			}
+		}
+		findings = append(findings, rec)
 	}
-	return fileReportSnapshot{Status: c.state(), Duplicates: c.duplicates, Orphans: c.orphans, Findings: findings}
+	return fileReportSnapshot{
+		Status: c.state(), Duplicates: c.duplicates, Orphans: c.orphans, CaseCollisions: c.caseCollisions,
+		Findings: findings,
+	}
 }
 
 // radarrReverseFindings converts a Radarr reverse pass's findings
@@ -600,6 +642,18 @@ func cloneInstanceStatsView(v instanceStatsView) instanceStatsView {
 
 	out.FileReport.Findings = make([]fileReportFindingRecord, len(v.FileReport.Findings))
 	copy(out.FileReport.Findings, v.FileReport.Findings)
+	// [v2.1] The copy above is a shallow, per-element struct copy: each
+	// fileReportFindingRecord's own Names slice still shares its backing
+	// array with v's (and therefore the store's) until each element is
+	// given its own — see TestCloneInstanceStatsView_DeepCopiesCaseCollisionNames.
+	for i, f := range out.FileReport.Findings {
+		if len(f.Names) == 0 {
+			continue
+		}
+		names := make([]caseCollisionNameRecord, len(f.Names))
+		copy(names, f.Names)
+		out.FileReport.Findings[i].Names = names
+	}
 
 	return out
 }
