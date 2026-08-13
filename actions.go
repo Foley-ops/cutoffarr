@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"math"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -585,6 +586,58 @@ func (a *actionRunner) switchRefusal(kind string) string {
 	return ""
 }
 
+// crossSiteRefusal is the browser guard, and it exists because the LAN trust
+// model this page has always had covers LAN PEERS and nothing else.
+//
+// "Anything that can reach this port can click these buttons" is an honest
+// statement about a machine on the network. It is NOT a statement about a
+// random web page the operator happens to open in a browser that is already on
+// that network — and such a page can POST here without CORS ever being
+// consulted, because a form submission is a "simple request": no preflight, and
+// the fact that the attacking page cannot read the response is irrelevant when
+// the request itself moved a file.
+//
+// Neither of the guards already in place stops that request:
+//
+//   - confirm: true is a hidden form field.
+//   - DisallowUnknownFields is satisfied by a form whose INPUT NAME is
+//     `{"kind":"trash","confirm":true,…,"path":"` and whose VALUE is `"}`,
+//     which posts the body `{"kind":"trash",…,"path":"="}` under
+//     enctype="text/plain" — valid JSON, every field known.
+//
+// What such a request cannot do is set a header. A cross-site form can send
+// only three enctypes, none of them application/json, and anything that DOES
+// set application/json is a fetch/XHR, which is preflighted and which this
+// server never grants (it sends no CORS headers at all). Sec-Fetch-Site is the
+// second, independent half: the BROWSER stamps it, script cannot forge it, and
+// same-origin/none are the only two values the page's own fetch or a direct
+// client produce. Together they cost the real client nothing — the page already
+// sends the content type (webui.html) — and they close the drive-by.
+//
+// This is not authentication and does not pretend to be: a peer on the LAN with
+// curl can still set any header it likes, which is exactly what the README's
+// trust model says and why gui_actions defaults to false.
+//
+// It lives here rather than in the handler because the runner owns every
+// refusal and every audit line in this system (see refuse/audit), and a refusal
+// that skipped the audit would be the one action attempt that left no trace.
+func (a *actionRunner) crossSiteRefusal(req actionRequest, h http.Header) (actionResponse, bool) {
+	mediaType, _, err := mime.ParseMediaType(h.Get("Content-Type"))
+	if err != nil || !strings.EqualFold(mediaType, "application/json") {
+		reason := fmt.Sprintf("an action must be sent as application/json; this request arrived as %q, which is the shape of a form posted by some other page rather than a request from cutoffarr's own dashboard. Nothing was changed.", h.Get("Content-Type"))
+		return a.refuse(req, actionOutcomeRefused, "", reason).withStatus(http.StatusBadRequest), true
+	}
+	// Absent (a direct client, an older browser) is not evidence of anything, so
+	// it is not treated as evidence: the content type above is the guard that
+	// always applies. Present-and-cross-site IS evidence, and it is the browser's
+	// own word rather than the page's.
+	if site := strings.ToLower(strings.TrimSpace(h.Get("Sec-Fetch-Site"))); site != "" && site != "same-origin" && site != "none" {
+		reason := fmt.Sprintf("this request was sent from another site (the browser stamped Sec-Fetch-Site: %s), and cutoffarr only acts on findings for its own dashboard. Nothing was changed.", site)
+		return a.refuse(req, actionOutcomeRefused, "", reason).withStatus(http.StatusForbidden), true
+	}
+	return actionResponse{}, false
+}
+
 // instanceByName finds the configured instance a request names.
 func (a *actionRunner) instanceByName(name string) (Instance, bool) {
 	for _, inst := range a.cfg.Instances {
@@ -704,6 +757,17 @@ func (a *actionRunner) audit(req actionRequest, outcome, operation, detail strin
 // (cycleInstanceStats.actions' own rule), and a rehearsal that appeared there
 // would make the one list an operator trusts to say what changed start
 // listing things that did not.
+//
+// This is the ONE place this implementation reads brief item 9 narrowly, and
+// the narrowing is deliberate, stated, and pinned in both directions by
+// TestAction_OnlyPerformedActionsReachLastActions. Item 9's sentence is "every
+// action (rehearsed, performed, refused) logs msg=action ... and appears in
+// lastActions": the log half is honored unconditionally (audit, called from
+// every exit including refuse), and the lastActions half is honored for what
+// landed. The alternative reading contradicts three standing contracts at once
+// — lastActions' own meaning, the README's "always empty in dry-run", and the
+// rule that this program never reports an action it did not take — so it is
+// flagged for the controller rather than silently taken either way.
 func (a *actionRunner) recordAction(inst Instance, rec actionRecord) {
 	if a.stats == nil {
 		return

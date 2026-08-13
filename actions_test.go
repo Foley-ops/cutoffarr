@@ -5,6 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -555,18 +559,32 @@ func TestTwinMergeEligibility_TheShapesThatGetAButtonAndTheShapesThatDoNot(t *te
 // It records every write it received so a test can assert the strongest thing
 // there is to assert about a rehearsal or a refusal: that NOTHING was written.
 type arrFake struct {
-	srv      *httptest.Server
-	mu       sync.Mutex
-	writes   []string
-	requests int
-	movies   string // JSON array for GET /api/v3/movie
-	series   string
+	srv    *httptest.Server
+	mu     sync.Mutex
+	writes []string
+	// writeBodies is writes' parallel slice, recorded only for the two Sonarr
+	// season-write endpoints. The path alone cannot say WHICH SEASON was
+	// written — both halves of a season write address the series — so a test
+	// that a click on one season touched only that season has to read the body.
+	writeBodies []string
+	requests    int
+	movies      string // JSON array for GET /api/v3/movie
+	series      string
 	// wanted maps the monitored filter value ("", "false") to a wanted/cutoff
 	// page body.
 	wanted       map[string]string
 	episodeFiles map[string]string
 	movieByID    map[string]string
 	movieFiles   map[string]string
+
+	// The Sonarr write path's own endpoints, keyed by series id as strings:
+	// the per-series episode list the season write re-reads, and the
+	// GET/PUT /api/v3/series/{id} pair. They exist so a Sonarr re-monitor can
+	// be driven all the way through the decision engine and its gated write —
+	// see sonarrRemonitorFixture, and the round-3 review finding that no test
+	// reached that engine at all.
+	episodes   map[string]string
+	seriesByID map[string]string
 	// tags is GET /api/v3/tag's body — "[]" by default (the exclusion tag is
 	// simply not defined in this instance), and settable to something
 	// undecodable so a test can reach the §2.6 warn-and-skip return the
@@ -582,6 +600,8 @@ func newArrFake(t *testing.T) *arrFake {
 		episodeFiles: map[string]string{},
 		movieByID:    map[string]string{},
 		movieFiles:   map[string]string{},
+		episodes:     map[string]string{},
+		seriesByID:   map[string]string{},
 	}
 	mux := http.NewServeMux()
 	write := func(w http.ResponseWriter, body string) {
@@ -668,7 +688,65 @@ func newArrFake(t *testing.T) *arrFake {
 		}
 		write(w, body)
 	}))
-	mux.HandleFunc("/api/v3/episode", countAll(func(w http.ResponseWriter, r *http.Request) { write(w, `[]`) }))
+	mux.HandleFunc("/api/v3/episode", countAll(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		body, ok := f.episodes[r.URL.Query().Get("seriesId")]
+		f.mu.Unlock()
+		if !ok {
+			body = `[]`
+		}
+		write(w, body)
+	}))
+	// The season write's first half. Sonarr answers with the updated episode
+	// resources, and the writer verifies that echo, so a fake that answered
+	// anything else would exercise a failure path instead of the happy one.
+	mux.HandleFunc("/api/v3/episode/monitor", countAll(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			EpisodeIDs []int `json:"episodeIds"`
+			Monitored  bool  `json:"monitored"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		f.mu.Lock()
+		f.writes = append(f.writes, r.Method+" "+r.URL.Path)
+		f.writeBodies = append(f.writeBodies, string(body))
+		f.mu.Unlock()
+		var elems []string
+		for _, id := range req.EpisodeIDs {
+			elems = append(elems, fmt.Sprintf(`{"id":%d,"monitored":%t}`, id, req.Monitored))
+		}
+		write(w, "["+strings.Join(elems, ",")+"]")
+	}))
+	// The season write's second half, and the pre-write fetch that precedes it.
+	mux.HandleFunc("/api/v3/series/", countAll(func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/api/v3/series/")
+		if r.Method != http.MethodGet {
+			// Sonarr echoes the object it was sent; the writer verifies that
+			// echo names this series, this season and the value it asked for.
+			echo, _ := io.ReadAll(r.Body)
+			f.mu.Lock()
+			f.writes = append(f.writes, r.Method+" "+r.URL.Path)
+			f.writeBodies = append(f.writeBodies, string(echo))
+			f.mu.Unlock()
+			write(w, string(echo))
+			return
+		}
+		f.mu.Lock()
+		body, ok := f.seriesByID[id]
+		f.mu.Unlock()
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		write(w, body)
+	}))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			f.mu.Lock()
@@ -858,6 +936,82 @@ func TestAction_Trash_PerformsTheMoveLogsItAndRecordsItInLastActions(t *testing.
 	}
 }
 
+// TestAction_OnlyPerformedActionsReachLastActions pins the one place where this
+// implementation reads brief item 9 NARROWLY, so that the narrowing is a
+// decision with a test rather than an accident nobody notices.
+//
+// Item 9 says every action "logs msg=action ... and appears in lastActions". The
+// log half is unconditional and is asserted all over this file, for rehearsals,
+// refusals, disablements and failures alike. The lastActions half is not:
+// lastActions has meant "writes that actually landed" since the daemon's own
+// first write (cycleInstanceStats.actions), the dashboard renders it under that
+// meaning, and the API contract states it — so a rehearsal listed there would
+// make the one table an operator trusts to say what changed start listing things
+// that did not happen. dry_run's own contract ("always empty in dry-run") says
+// the same thing from the other side.
+//
+// It is pinned in BOTH directions because either drift is a lie: a performed
+// action missing from the list, or a rehearsed/refused one appearing in it.
+func TestAction_OnlyPerformedActionsReachLastActions(t *testing.T) {
+	// A rehearsal: every check runs, nothing is written, nothing is recorded.
+	t.Run("a rehearsed action is audited but never listed", func(t *testing.T) {
+		fake := newArrFake(t)
+		_, dupPath, inst := radarrFileFixture(t, fake)
+		cfg := Config{DryRun: true, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
+		_, ts, store, buf := newActionFixture(t, cfg, inst)
+		seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "d", Size: 10})
+
+		status, out := postAction(t, ts, `{"kind":"trash","confirm":true,"instance":"radarr-main","path":`+jsonString(dupPath)+`,"finding":"duplicate","size":10}`)
+		if status != http.StatusOK || out.Outcome != actionOutcomeRehearsed {
+			t.Fatalf("status=%d outcome=%q reason=%q, want 200/rehearsed", status, out.Outcome, out.Reason)
+		}
+		assertActionAudited(t, buf, "trash", actionOutcomeRehearsed, dupPath)
+		if acts := store.snapshot().Instances[0].LastActions; len(acts) != 0 {
+			t.Errorf("lastActions = %+v, want empty: a rehearsal moved nothing, and lastActions is the one list that says what actually changed", acts)
+		}
+	})
+
+	// A refusal: the finding is stale, so nothing happened and nothing is listed.
+	t.Run("a refused action is audited but never listed", func(t *testing.T) {
+		fake := newArrFake(t)
+		_, dupPath, inst := radarrFileFixture(t, fake)
+		cfg := Config{DryRun: false, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
+		_, ts, store, buf := newActionFixture(t, cfg, inst)
+		seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "d", Size: 10})
+		// The size the button promised no longer matches the file on disk.
+		if err := os.WriteFile(dupPath, []byte("a much larger sample file than before"), 0o644); err != nil {
+			t.Fatalf("replacing the file: %v", err)
+		}
+
+		status, out := postAction(t, ts, `{"kind":"trash","confirm":true,"instance":"radarr-main","path":`+jsonString(dupPath)+`,"finding":"duplicate","size":10}`)
+		if status != http.StatusConflict || out.Outcome != actionOutcomeRefused {
+			t.Fatalf("status=%d outcome=%q, want 409/refused", status, out.Outcome)
+		}
+		assertActionAudited(t, buf, "trash", actionOutcomeRefused, dupPath)
+		if acts := store.snapshot().Instances[0].LastActions; len(acts) != 0 {
+			t.Errorf("lastActions = %+v, want empty: cutoffarr declined, so nothing changed", acts)
+		}
+	})
+
+	// The control, without which the two assertions above would also pass on an
+	// implementation that never recorded anything at all.
+	t.Run("a performed action is listed", func(t *testing.T) {
+		fake := newArrFake(t)
+		_, dupPath, inst := radarrFileFixture(t, fake)
+		cfg := Config{DryRun: false, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
+		_, ts, store, _ := newActionFixture(t, cfg, inst)
+		seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "d", Size: 10})
+
+		if status, out := postAction(t, ts, `{"kind":"trash","confirm":true,"instance":"radarr-main","path":`+jsonString(dupPath)+`,"finding":"duplicate","size":10}`); status != http.StatusOK || out.Outcome != actionOutcomePerformed {
+			t.Fatalf("status=%d outcome=%q reason=%q, want 200/performed", status, out.Outcome, out.Reason)
+		}
+		acts := store.snapshot().Instances[0].LastActions
+		if len(acts) != 1 || acts[0].Action != ActionTrash {
+			t.Fatalf("lastActions = %+v, want exactly one %s record", acts, ActionTrash)
+		}
+	})
+}
+
 // --- staleness refusals -----------------------------------------------------
 
 // TestAction_Trash_RefusesAPathNoSweepEverReportedAsAFinding is the guard that
@@ -1010,6 +1164,108 @@ func TestActionEndpoint_ValidationAndMethodConventions(t *testing.T) {
 	}
 }
 
+// postActionWith is postAction with control over the two headers the
+// cross-site guard reads. An empty contentType sends none at all.
+func postActionWith(t *testing.T, ts *httptest.Server, body, contentType, secFetchSite string) (int, actionResponse) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/action", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("building the request: %v", err)
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	if secFetchSite != "" {
+		req.Header.Set("Sec-Fetch-Site", secFetchSite)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /api/action: %v", err)
+	}
+	defer resp.Body.Close()
+	var out actionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decoding the action response: %v", err)
+	}
+	return resp.StatusCode, out
+}
+
+// TestActionEndpoint_RefusesACrossSiteDriveByPost is the review finding this
+// endpoint had no answer to: the page has no authentication (LAN trust model,
+// README), and that model covers LAN PEERS — it does not cover a random web
+// page the operator opens in a browser that is already on that LAN. Such a page
+// can POST here with no CORS involvement at all, because a form post is a
+// "simple request": no preflight, and the response body it cannot read is not
+// the point when the request itself moved a file.
+//
+// `confirm: true` does not stop it (a form field can say confirm), and neither
+// does DisallowUnknownFields: a form whose INPUT NAME is
+//
+//	{"kind":"trash","confirm":true,...,"path":"
+//
+// and whose value is `"}` posts the body `{"kind":"trash",...,"path":"="}` under
+// enctype=text/plain — every field known, valid JSON, no header the attacking
+// page had to set.
+//
+// The two things such a request cannot do are the guard: it cannot set
+// Content-Type to application/json (the three enctypes a form can send are the
+// only ones available without a preflight), and it cannot forge Sec-Fetch-Site,
+// which the browser itself stamps. The page's own fetch already sends the
+// former, so the guard costs the real client nothing — the third case here is
+// what proves that.
+func TestActionEndpoint_RefusesACrossSiteDriveByPost(t *testing.T) {
+	fake := newArrFake(t)
+	_, dupPath, inst := radarrFileFixture(t, fake)
+	cfg := Config{DryRun: false, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, buf := newActionFixture(t, cfg, inst)
+	seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "d", Size: 10})
+
+	body := `{"kind":"trash","confirm":true,"instance":"radarr-main","path":` + jsonString(dupPath) + `,"finding":"duplicate","size":10}`
+
+	// The drive-by form post: the enctype a cross-site form can actually send,
+	// carrying a body that is valid JSON with every field known.
+	t.Run("a form-post content type is refused", func(t *testing.T) {
+		status, out := postActionWith(t, ts, body, "text/plain;charset=UTF-8", "")
+		if status != http.StatusBadRequest || out.Outcome != actionOutcomeRefused {
+			t.Fatalf("status=%d outcome=%q, want 400/refused: a text/plain POST is a cross-site form post, not this page's fetch", status, out.Outcome)
+		}
+		if !strings.Contains(out.Reason, "application/json") {
+			t.Errorf("reason = %q, want it to name the content type an action must arrive as", out.Reason)
+		}
+		if _, err := os.Stat(dupPath); err != nil {
+			t.Fatalf("the file was moved by a refused cross-site request: %v", err)
+		}
+	})
+
+	// A page that fetches with the right content type still cannot forge the
+	// header the browser stamps for it.
+	t.Run("a cross-site fetch is refused", func(t *testing.T) {
+		status, out := postActionWith(t, ts, body, "application/json", "cross-site")
+		if status != http.StatusForbidden || out.Outcome != actionOutcomeRefused {
+			t.Fatalf("status=%d outcome=%q, want 403/refused", status, out.Outcome)
+		}
+		if !strings.Contains(out.Reason, "another site") {
+			t.Errorf("reason = %q, want it to say plainly where the request came from", out.Reason)
+		}
+		if _, err := os.Stat(dupPath); err != nil {
+			t.Fatalf("the file was moved by a refused cross-site request: %v", err)
+		}
+	})
+
+	// Both refusals must leave the trace rule 9 requires; neither reaches the
+	// runner, so this handler owes the line itself.
+	assertActionAudited(t, buf, "trash", actionOutcomeRefused, dupPath)
+
+	// The control, and the whole reason the guard is these two headers and not
+	// something stricter: the page's own request is unaffected.
+	t.Run("the page's own fetch still works", func(t *testing.T) {
+		status, out := postActionWith(t, ts, body, "application/json", "same-origin")
+		if status != http.StatusOK || out.Outcome != actionOutcomePerformed {
+			t.Fatalf("status=%d outcome=%q reason=%q, want 200/performed — the guard must not break the page it protects\nlog:\n%s", status, out.Outcome, out.Reason, buf.String())
+		}
+	})
+}
+
 // --- single-flight ----------------------------------------------------------
 
 // TestActionRunner_SerializesActions is the "never concurrent with each other"
@@ -1057,24 +1313,121 @@ func TestActionRunner_SerializesActions(t *testing.T) {
 
 // --- the structural pin the whole ruling rests on ---------------------------
 
-// TestTree_ExecutorsAreReachableOnlyFromTheActionEndpoint is the pin that keeps
-// the owner's ruling true no matter what any later phase does: the ruling
-// permits a HUMAN to act, and it is only honest if no autonomous code path can
-// reach an executor at all.
+// actionsFileEntryPointsAllowedOutside is the entire published surface of
+// actions.go: the two names another file may legitimately mention, and the file
+// each one is allowed in.
 //
-// The check is structural rather than aspirational: the executor entry points
-// are named, and no non-test file other than actions.go itself and the one HTTP
-// handler file may so much as mention them.
+//   - webui.go holds the ONE handler. It may hand a request to the runner
+//     (run) and it may ask the runner to vet the request's headers before doing
+//     so (crossSiteRefusal). Both are gates; neither is an executor.
+//   - daemon.go may CONSTRUCT the runner, because wiring is not acting.
+//
+// Anything else actions.go declares — every executor, every re-derivation,
+// every operation-text helper — is unreachable from the rest of the program by
+// construction, which is what the ruling rests on.
+var actionsFileEntryPointsAllowedOutside = map[string]map[string]bool{
+	"webui.go":  {"run": true, "crossSiteRefusal": true},
+	"daemon.go": {"newActionRunner": true},
+}
+
+// TestTree_ExecutorsAreReachableOnlyFromTheActionEndpoint is the pin the whole
+// v2.2 ruling rests on: the ruling permits a HUMAN to act, and it is only
+// honest if no autonomous code path can reach an executor at all.
+//
+// It DERIVES the banned set rather than listing it, and that is the round-3
+// review fix. The previous version named five symbols, which pinned today's
+// names instead of the property: a new entry point added to actions.go — say a
+// startTrashJanitor() that called moveToTrash — and invoked from daemon.go's
+// sweep loop passed this audit (daemon.go named none of the five strings) AND
+// passed TestActionsFile_EveryMutationIsATrashMoveOrAMergeMove (the mutations
+// still sat inside the approved moveToTrash), so the owner's ruling that no
+// autonomous path can ever touch a file would have become false with every
+// audit green.
+//
+// So: parse actions.go, collect EVERY top-level func and method it declares,
+// and fail if any other non-test file references one of them, save the two
+// published entry points above.
+//
+// It is an identifier check rather than a substring scan (go/ast, the same
+// machinery TestActionsFile_EveryMutationIsATrashMoveOrAMergeMove uses), and it
+// tells the two kinds of reference apart, which is what keeps it from crying
+// wolf on names this package legitimately reuses:
+//
+//   - a PLAIN FUNCTION of actions.go can only be reached by naming it bare, so
+//     only bare identifiers are checked. main.go's own top-level `run` is
+//     therefore not a hit against actionRunner.run, which is a method.
+//   - a METHOD can only be reached through a selector, so only `x.name` is
+//     checked — EXCEPT where some other file declares a field or method of that
+//     name itself, which makes the selector genuinely ambiguous to an audit
+//     working without type information (reverseOptions.remonitor, read as
+//     opts.remonitor all over reverse.go, is the live example). That exemption
+//     is derived from the tree, not hand-listed, so it cannot quietly grow to
+//     cover a real caller: a file would have to declare a field named `run` of
+//     its own before it could call the runner's.
 func TestTree_ExecutorsAreReachableOnlyFromTheActionEndpoint(t *testing.T) {
-	executors := []string{"moveToTrash(", "mergeCaseTwinDir(", "probeRootWritable(", ".run(", "newActionRunner("}
-	allowed := map[string]map[string]bool{
-		// actions.go declares them all, and calls them from its own executors.
-		"actions.go": {"moveToTrash(": true, "mergeCaseTwinDir(": true, "probeRootWritable(": true, ".run(": true, "newActionRunner(": true},
-		// webui.go holds the ONE handler, and it may call the runner and
-		// nothing else. daemon.go may construct it (wiring is not acting).
-		"webui.go":  {".run(": true},
-		"daemon.go": {"newActionRunner(": true},
+	const source = "actions.go"
+	fset := token.NewFileSet()
+	parsed, err := parser.ParseFile(fset, source, nil, 0)
+	if err != nil {
+		t.Fatalf("parsing %s: %v", source, err)
 	}
+	bannedFuncs, bannedMethods := map[string]bool{}, map[string]bool{}
+	for _, decl := range parsed.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		if fn.Recv != nil {
+			bannedMethods[fn.Name.Name] = true
+			continue
+		}
+		bannedFuncs[fn.Name.Name] = true
+	}
+	// Vacuity guard, the twin of the mutation audit's own: a rename, a moved
+	// file or a parse that silently produced nothing would leave this test green
+	// while checking an empty set.
+	for _, must := range []string{"moveToTrash", "mergeCaseTwinDir", "probeRootWritable", "newActionRunner"} {
+		if !bannedFuncs[must] {
+			t.Fatalf("%s no longer declares func %s, so this audit is not looking at the action system at all", source, must)
+		}
+	}
+	for _, must := range []string{"run", "trash", "mergeTwin", "remonitor"} {
+		if !bannedMethods[must] {
+			t.Fatalf("%s no longer declares a %s method, so this audit is not looking at the action system at all", source, must)
+		}
+	}
+
+	others := nonTestGoFilesExcept(t, source)
+	ambiguous := selectorNamesDeclaredIn(t, fset, others)
+	for _, path := range others {
+		file, parseErr := parser.ParseFile(fset, path, nil, 0)
+		if parseErr != nil {
+			t.Fatalf("parsing %s: %v", path, parseErr)
+		}
+		selectors, declarations := identRoles(file)
+		ast.Inspect(file, func(n ast.Node) bool {
+			id, ok := n.(*ast.Ident)
+			if !ok || declarations[id.Pos()] || actionsFileEntryPointsAllowedOutside[path][id.Name] {
+				return true
+			}
+			switch {
+			case selectors[id.Pos()] && bannedMethods[id.Name] && !ambiguous[id.Name]:
+			case !selectors[id.Pos()] && bannedFuncs[id.Name]:
+			default:
+				return true
+			}
+			t.Errorf("%s:%d references %s, which %s declares: the action system must stay reachable ONLY from the action endpoint handler in webui.go, and a sweep, webhook, reconciliation or startup path that can reach any part of it would make the owner's human-acts ruling false",
+				path, fset.Position(id.Pos()).Line, id.Name, source)
+			return true
+		})
+	}
+}
+
+// nonTestGoFilesExcept lists this package's non-test .go files, minus the one
+// named, in walk order.
+func nonTestGoFilesExcept(t *testing.T, except string) []string {
+	t.Helper()
+	var out []string
 	err := filepath.WalkDir(".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -1086,24 +1439,101 @@ func TestTree_ExecutorsAreReachableOnlyFromTheActionEndpoint(t *testing.T) {
 			return nil
 		}
 		name := filepath.ToSlash(p)
-		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") || name == except {
 			return nil
 		}
-		src, readErr := os.ReadFile(p)
-		if readErr != nil {
-			return readErr
-		}
-		body := string(src)
-		for _, ex := range executors {
-			if strings.Contains(body, ex) && !allowed[name][ex] {
-				t.Errorf("%s names %s: the action executors must stay reachable ONLY from the action endpoint handler — a sweep, webhook, reconciliation or startup path that can reach one would make the owner's human-acts ruling false", name, ex)
-			}
-		}
+		out = append(out, name)
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("walking the tree: %v", err)
 	}
+	if len(out) < minScannedNonTestGoFiles {
+		t.Fatalf("found only %d non-test .go files, want at least %d: this audit is vacuous unless it is actually reading the tree", len(out), minScannedNonTestGoFiles)
+	}
+	return out
+}
+
+// selectorNamesDeclaredIn collects every name these files declare that can be
+// read through a selector — struct/interface field and method names, plus the
+// methods they define. Those are the names on which `x.name` cannot be
+// attributed to actions.go without type information. See the test's own comment
+// for why the exemption is derived instead of listed.
+func selectorNamesDeclaredIn(t *testing.T, fset *token.FileSet, paths []string) map[string]bool {
+	t.Helper()
+	out := map[string]bool{}
+	for _, p := range paths {
+		file, err := parser.ParseFile(fset, p, nil, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", p, err)
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.FuncDecl:
+				if node.Recv != nil {
+					out[node.Name.Name] = true
+				}
+			case *ast.StructType:
+				for _, f := range node.Fields.List {
+					for _, name := range f.Names {
+						out[name.Name] = true
+					}
+				}
+			case *ast.InterfaceType:
+				for _, f := range node.Methods.List {
+					for _, name := range f.Names {
+						out[name.Name] = true
+					}
+				}
+			}
+			return true
+		})
+	}
+	return out
+}
+
+// identRoles splits one file's identifiers into the two roles this audit cares
+// about: the ones being read through a selector (`x.name`), and the ones that
+// are DECLARING a name rather than referencing one. Everything else is a bare
+// reference.
+func identRoles(file *ast.File) (selectors, declarations map[token.Pos]bool) {
+	selectors, declarations = map[token.Pos]bool{}, map[token.Pos]bool{}
+	mark := func(m map[token.Pos]bool, ids ...*ast.Ident) {
+		for _, id := range ids {
+			if id != nil {
+				m[id.Pos()] = true
+			}
+		}
+	}
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.SelectorExpr:
+			mark(selectors, node.Sel)
+		case *ast.FuncDecl:
+			mark(declarations, node.Name)
+		case *ast.TypeSpec:
+			mark(declarations, node.Name)
+		case *ast.ValueSpec:
+			mark(declarations, node.Names...)
+		case *ast.Field:
+			mark(declarations, node.Names...)
+		case *ast.ImportSpec:
+			mark(declarations, node.Name)
+		case *ast.LabeledStmt:
+			mark(declarations, node.Label)
+		case *ast.AssignStmt:
+			if node.Tok != token.DEFINE {
+				return true
+			}
+			for _, lhs := range node.Lhs {
+				if id, ok := lhs.(*ast.Ident); ok {
+					mark(declarations, id)
+				}
+			}
+		}
+		return true
+	})
+	return selectors, declarations
 }
 
 func jsonString(s string) string {
@@ -1537,6 +1967,247 @@ func TestAction_Remonitor_SonarrDispatchesTheSeasonPathAndWritesNothingWhenStale
 	}
 	if fake.writeCount() != 0 {
 		t.Errorf("a refused Sonarr re-monitor must send no write; writes=%v", fake.writes)
+	}
+}
+
+// sonarrRemonitorFixture is remonitorFixture's Sonarr twin, and it exists
+// because of a round-3 review finding: once the pre-check
+// (sonarrRemonitorTargetRefusal) landed, EVERY Sonarr re-monitor test stopped
+// before runSonarrDecisionEngine was entered, so rule 6's Sonarr half — drive
+// the existing gated reverse path scoped to ONE season — had no end-to-end
+// coverage at all. A wrong argument, a scope that failed to narrow to the
+// season, or a broken remonitorOutcome mapping would have been invisible.
+//
+// Two series, for the same reason the Radarr fixture has two movies:
+//
+//   - series 7 is the CROSS-CHECK WITNESS. Monitored, complete, aired, its own
+//     file agreeing that its cutoff is met. Without at least one verifiable
+//     sample, reverseWriteGateBlockReason withholds every reverse write by
+//     design and the test would prove only that a blocked pass writes nothing.
+//     It is also the control for the scope: nothing may ever be written to it,
+//     in either direction, however eligible the forward pass finds it.
+//   - series 9 holds TWO equally eligible findings: season 1 (the one clicked)
+//     and season 2. Both are UNMONITORED, complete, aired and — when
+//     belowCutoff — both sit in the unmonitored wanted set. Season 2 is what
+//     makes "scoped to the one item" checkable instead of asserted: a scope
+//     that narrowed to the series and not to the season would write both, and
+//     both halves of a season write address the SERIES, so only the request
+//     bodies can tell the difference.
+//
+// belowCutoff false is the SAME library with the one difference that makes the
+// seasons no longer findings — Sonarr no longer reports their episodes as below
+// cutoff — which is what drives remonitorOutcome's default branch.
+func sonarrRemonitorFixture(t *testing.T, fake *arrFake, belowCutoff bool) Instance {
+	t.Helper()
+	fake.series = `[
+	  {"id":7,"title":"Ordinary Monitored Show","monitored":true,"qualityProfileId":1,"tags":[],"path":"/tv/Ordinary",
+	   "seasons":[{"seasonNumber":1,"monitored":true,"statistics":{"episodeFileCount":1,"totalEpisodeCount":1}}]},
+	  {"id":9,"title":"Show","monitored":true,"qualityProfileId":1,"tags":[],"path":"/tv/Show",
+	   "seasons":[{"seasonNumber":1,"monitored":false,"statistics":{"episodeFileCount":1,"totalEpisodeCount":1}},
+	              {"seasonNumber":2,"monitored":false,"statistics":{"episodeFileCount":1,"totalEpisodeCount":1}}]}
+	]`
+	fake.episodes["7"] = `[{"id":700,"seriesId":7,"seasonNumber":1,"episodeNumber":1,"monitored":true,"hasFile":true,"airDateUtc":"` + pastAirDate + `","episodeFileId":7000}]`
+	fake.episodeFiles["7"] = `[{"id":7000,"seriesId":7,"seasonNumber":1,"customFormatScore":200,"qualityCutoffNotMet":false}]`
+	// The clicked season's episodes are unmonitored too: a season this project
+	// itself unmonitored, episodes and all, which is the shape the reverse pass
+	// is allowed to write (a season with monitored episodes inside it is
+	// refused as a mixed state — binding controller ruling R2).
+	fake.episodes["9"] = `[{"id":900,"seriesId":9,"seasonNumber":1,"episodeNumber":1,"monitored":false,"hasFile":true,"airDateUtc":"` + pastAirDate + `","episodeFileId":9000},
+	  {"id":901,"seriesId":9,"seasonNumber":2,"episodeNumber":1,"monitored":false,"hasFile":true,"airDateUtc":"` + pastAirDate + `","episodeFileId":9001}]`
+	fake.episodeFiles["9"] = fmt.Sprintf(`[{"id":9000,"seriesId":9,"seasonNumber":1,"customFormatScore":200,"qualityCutoffNotMet":%t},
+	  {"id":9001,"seriesId":9,"seasonNumber":2,"customFormatScore":200,"qualityCutoffNotMet":%t}]`, belowCutoff, belowCutoff)
+
+	emptyWanted := `{"page":1,"pageSize":1000,"totalRecords":0,"records":[]}`
+	fake.wanted[""] = emptyWanted
+	fake.wanted["false"] = emptyWanted
+	if belowCutoff {
+		fake.wanted["false"] = `{"page":1,"pageSize":1000,"totalRecords":2,"records":[
+		  {"id":900,"seriesId":9,"seasonNumber":1},{"id":901,"seriesId":9,"seasonNumber":2}]}`
+	}
+
+	// The write path's own pre-write fetch, which must agree with the library
+	// read: the series monitored, both seasons not.
+	fake.seriesByID["9"] = `{"id":9,"title":"Show","monitored":true,"qualityProfileId":1,"tags":[],"path":"/tv/Show",
+	  "seasons":[{"seasonNumber":1,"monitored":false,"statistics":{"episodeFileCount":1,"totalEpisodeCount":1}},
+	             {"seasonNumber":2,"monitored":false,"statistics":{"episodeFileCount":1,"totalEpisodeCount":1}}]}`
+	fake.seriesByID["7"] = `{"id":7,"title":"Ordinary Monitored Show","monitored":true,"qualityProfileId":1,"tags":[],"path":"/tv/Ordinary",
+	  "seasons":[{"seasonNumber":1,"monitored":true,"statistics":{"episodeFileCount":1,"totalEpisodeCount":1}}]}`
+	return Instance{Name: "sonarr-main", Type: "sonarr", URL: fake.srv.URL, APIKey: "k"}
+}
+
+// TestAction_Remonitor_SonarrPerformsExactlyOneSeasonWrite is rule 6's Sonarr
+// half, end to end through the endpoint and all the way through
+// runSonarrDecisionEngine's gated reverse write pass.
+//
+// What it pins that no Radarr test can: that the season really is the unit. The
+// library holds a second, entirely eligible series and a second monitored
+// season, and the click must reach neither — not through the reverse pass (the
+// scope's ids), not through the forward pass (the scope's
+// noForwardWrites suppression), not through anything.
+func TestAction_Remonitor_SonarrPerformsExactlyOneSeasonWrite(t *testing.T) {
+	fake := newArrFake(t)
+	inst := sonarrRemonitorFixture(t, fake, true)
+	cfg := Config{DryRun: false, GUIActions: true, ReverseScanRemonitor: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, buf := newActionFixture(t, cfg, inst)
+	season := 1
+	seedReverseFinding(store, inst, reverseFinding{SeriesID: 9, Series: "Show", Season: &season, Reason: ReasonQualityCutoffNotMet})
+
+	status, out := postAction(t, ts, `{"kind":"remonitor","confirm":true,"instance":"sonarr-main","id":9,"season":1}`)
+	if status != http.StatusOK || out.Outcome != actionOutcomePerformed {
+		t.Fatalf("status=%d outcome=%q reason=%q, want 200/performed\nlog:\n%s", status, out.Outcome, out.Reason, buf.String())
+	}
+	if !strings.Contains(out.Operation, "season 1") || !strings.Contains(out.Operation, "series 9") {
+		t.Errorf("operation = %q, want it to name the season and the series id", out.Operation)
+	}
+
+	fake.mu.Lock()
+	writes := append([]string(nil), fake.writes...)
+	bodies := append([]string(nil), fake.writeBodies...)
+	fake.mu.Unlock()
+	// A season is TWO writes by construction (writeSeasonMonitored: the
+	// episodes, then the season flag), and both must name series 9.
+	want := []string{"PUT /api/v3/episode/monitor", "PUT /api/v3/series/9"}
+	if len(writes) != len(want) {
+		t.Fatalf("writes = %v, want exactly %v — one season, one pair of writes\nlog:\n%s", writes, want, buf.String())
+	}
+	for i, w := range want {
+		if writes[i] != w {
+			t.Errorf("writes[%d] = %q, want %q", i, writes[i], w)
+		}
+	}
+	if strings.Contains(strings.Join(writes, " "), "/api/v3/series/7") {
+		t.Errorf("the click on series 9 wrote to series 7 as well: %v", writes)
+	}
+
+	// The season narrowing, read from the bodies because the paths cannot show
+	// it: season 2 of this same series is an equally eligible finding, and a
+	// scope that stopped at the series would have taken it too.
+	if !strings.Contains(bodies[0], `"episodeIds":[900]`) {
+		t.Errorf("the episode write named %s, want exactly episode 900 — season 1's only episode; 901 belongs to the season nobody clicked", bodies[0])
+	}
+	var written struct {
+		ID      int `json:"id"`
+		Seasons []struct {
+			SeasonNumber int  `json:"seasonNumber"`
+			Monitored    bool `json:"monitored"`
+		} `json:"seasons"`
+	}
+	if err := json.Unmarshal([]byte(bodies[1]), &written); err != nil {
+		t.Fatalf("the season write body is not a series object: %v\n%s", err, bodies[1])
+	}
+	if written.ID != 9 || len(written.Seasons) != 2 {
+		t.Fatalf("the season write named series %d with %d seasons, want series 9 with both of its seasons intact", written.ID, len(written.Seasons))
+	}
+	for _, s := range written.Seasons {
+		if want := s.SeasonNumber == 1; s.Monitored != want {
+			t.Errorf("the write set season %d monitored=%t, want %t: a click on season 1 must change season 1 and nothing else", s.SeasonNumber, s.Monitored, want)
+		}
+	}
+
+	log := buf.String()
+	for _, wantAttr := range []string{"msg=action", "source=gui", "kind=remonitor", "outcome=performed", "season=1", "id=9"} {
+		if !strings.Contains(log, wantAttr) {
+			t.Errorf("audit line is missing %q; log:\n%s", wantAttr, log)
+		}
+	}
+	// The write is only real if it is also the one the operator's table shows.
+	acts := store.snapshot().Instances[0].LastActions
+	if len(acts) != 1 || acts[0].Action != ActionRemonitor {
+		t.Fatalf("lastActions = %+v, want exactly one %s record", acts, ActionRemonitor)
+	}
+	if acts[0].Season == nil || *acts[0].Season != 1 || acts[0].ID != 9 {
+		t.Errorf("lastActions[0] = %+v, want it to name series 9 season 1", acts[0])
+	}
+}
+
+// TestAction_Remonitor_SonarrSeasonThatIsNoLongerAFindingIsAnsweredHonestly
+// drives remonitorOutcome's DEFAULT branch on the Sonarr shape: the season is
+// still unmonitored — so the pre-check passes and the engine really runs — but
+// Sonarr no longer reports it as below cutoff, so the reverse pass finds
+// nothing and every counter stays at zero.
+//
+// The honest answer to that is "this instance no longer reports the item as
+// wrongly unmonitored", and it must be told apart from the ambiguous zero the
+// round-2 fix separated out (a pass that never completed). Nothing may be
+// written, and nothing may be recorded.
+func TestAction_Remonitor_SonarrSeasonThatIsNoLongerAFindingIsAnsweredHonestly(t *testing.T) {
+	fake := newArrFake(t)
+	inst := sonarrRemonitorFixture(t, fake, false)
+	cfg := Config{DryRun: false, GUIActions: true, ReverseScanRemonitor: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, buf := newActionFixture(t, cfg, inst)
+	season := 1
+	seedReverseFinding(store, inst, reverseFinding{SeriesID: 9, Series: "Show", Season: &season, Reason: ReasonQualityCutoffNotMet})
+
+	status, out := postAction(t, ts, `{"kind":"remonitor","confirm":true,"instance":"sonarr-main","id":9,"season":1}`)
+	if status != http.StatusConflict || out.Outcome != actionOutcomeRefused {
+		t.Fatalf("status=%d outcome=%q reason=%q, want 409/refused\nlog:\n%s", status, out.Outcome, out.Reason, buf.String())
+	}
+	if !strings.Contains(out.Reason, "no longer reports") {
+		t.Errorf("reason = %q, want the default branch's own sentence — not the could-not-complete one, which means something entirely different", out.Reason)
+	}
+	// The proof that the ENGINE is what answered, rather than a pre-check: the
+	// executor paid for the whole live re-derivation, including this series'
+	// own episode fetch.
+	if fake.requestCount() < 4 {
+		t.Errorf("only %d requests were made; this answer must come from a completed live evaluation, not from a short-circuit", fake.requestCount())
+	}
+	if fake.writeCount() != 0 {
+		t.Errorf("a season that is no longer a finding must never be written: %v", fake.writes)
+	}
+	if acts := store.snapshot().Instances[0].LastActions; len(acts) != 0 {
+		t.Errorf("lastActions = %+v, want empty: nothing was written", acts)
+	}
+}
+
+// TestActionScope_SuppressesTheSonarrForwardWritePassStructurally is the Sonarr
+// twin of the Radarr pin of the same name, and it closes the gap a round-3
+// review found: the Sonarr half of the round-2 CRITICAL ("a Re-monitor click
+// can never perform an unmonitor") was guarded by nothing but a source-text
+// grep, which matches the guard's own words within a window and would pass on
+// an INVERTED guard.
+//
+// The scenario is the Sonarr stale tab: the operator re-monitored season 1
+// themselves and an upgrade landed, so the season now MEETS the forward
+// criteria — monitored, complete, aired, at cutoff — and a scoped forward write
+// pass would PUT monitored:false on exactly the season the button offered to
+// re-monitor.
+//
+// The engine is driven directly, deliberately: the executor's own pre-check
+// (sonarrRemonitorTargetRefusal) refuses this state before the engine is
+// reached, so an end-to-end click can only ever prove the pre-check. This is
+// the only place the second, independent guard is observable at all.
+func TestActionScope_SuppressesTheSonarrForwardWritePassStructurally(t *testing.T) {
+	fake := newArrFake(t)
+	inst := sonarrRemonitorFixture(t, fake, false)
+	// The stale tab: season 1 is monitored again and its episode is at cutoff.
+	fake.series = strings.Replace(fake.series,
+		`{"seasonNumber":1,"monitored":false,"statistics":{"episodeFileCount":1,"totalEpisodeCount":1}},
+	              {"seasonNumber":2,`,
+		`{"seasonNumber":1,"monitored":true,"statistics":{"episodeFileCount":1,"totalEpisodeCount":1}},
+	              {"seasonNumber":2,`, 1)
+	fake.episodes["9"] = strings.Replace(fake.episodes["9"], `"seasonNumber":1,"episodeNumber":1,"monitored":false`, `"seasonNumber":1,"episodeNumber":1,"monitored":true`, 1)
+	fake.seriesByID["9"] = strings.Replace(fake.seriesByID["9"], `{"seasonNumber":1,"monitored":false`, `{"seasonNumber":1,"monitored":true`, 1)
+
+	logger, buf := newActionTestLogger()
+	ctx := context.Background()
+	series, wantedEpisodeIDs, wantedSeasons, ok := inspectSonarrLibrary(ctx, logger, inst)
+	if !ok {
+		t.Fatalf("the fixture library could not be read; log:\n%s", buf.String())
+	}
+	season := 1
+	stats := runSonarrDecisionEngine(ctx, logger, inst, series, wantedEpisodeIDs, wantedSeasons, "cutoffarr-exclude",
+		actionScope(9, &season), false, reverseOptions{enabled: true, remonitor: true}, fileReportOptions{})
+
+	if fake.writeCount() != 0 {
+		t.Fatalf("an engine run under a GUI action scope wrote %v — a human-clicked action drives the reverse half only, and the one write available here is the INVERSE of the operation the button named; log:\n%s", fake.writes, buf.String())
+	}
+	if stats.reverse.remonitored != 0 {
+		t.Errorf("reverse remonitored = %d, want 0: this season is already monitored", stats.reverse.remonitored)
+	}
+	// Without this the test could pass on a fixture the forward pass never
+	// found anything in, which would prove nothing about the suppression.
+	if !strings.Contains(buf.String(), `msg=would-unmonitor instance=sonarr-main seriesId=9 series=Show season=1`) {
+		t.Errorf("the forward pass never decided season 1 of series 9 was at cutoff, so there was no forward write for the scope to suppress and this test proves nothing; log:\n%s", buf.String())
 	}
 }
 

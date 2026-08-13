@@ -756,9 +756,17 @@ script, a status-page widget, whatever) without ever loading the HTML:
       }
     ],
     "dryRun": true,
+    "guiActions": false,
+    "reverseScanRemonitor": false,
     "version": "dev"
   }
   ```
+
+  `guiActions` and `reverseScanRemonitor` (v2.2) are this daemon's two
+  action switches, reported as the config holds them rather than summarised,
+  because "which switch is missing" is exactly what a disabled action button
+  has to say (see [Acting on findings](#acting-on-findings)). `dryRun` is the
+  third: with it `true`, an action rehearses instead of acting.
 
   `lastCycleKind` is `startup`, `sweep`, `webhook`, or `once`. `lastRun`/
   `lastCycleKind` are `null` when this instance has never once completed a
@@ -789,9 +797,14 @@ script, a status-page widget, whatever) without ever loading the HTML:
 
   Each `fileReport.findings` item is `{"kind": "duplicate"|"orphan"|
   "case-collision", "group": "...", "path": "...", "display": "...", "count":
-  N, "entryType": "dir"|"file"|"mixed", "names": [...]}`. `group`/`count` are
-  present only on a `duplicate`; `entryType`/`names` are present only on a
-  `case-collision`. `entryType` is `"dir"`/`"file"` when every colliding name
+  N, "size": N, "entryType": "dir"|"file"|"mixed", "names": [...]}`.
+  `group`/`count` are present only on a `duplicate`; `size` (v2.2) is the
+  file's size in bytes, present only on a `duplicate` or an `orphan` and
+  omitted when it could not be read; `entryType`/`names` are present only on
+  a `case-collision`. `size` is what a client needs to state a trash
+  operation in full ("Move to trash — …/ETRG.Sample.mkv (12 MB)"), and
+  `POST /api/action` re-stats the file against that exact number before it
+  moves anything. `entryType` is `"dir"`/`"file"` when every colliding name
   in the group is that one type, or `"mixed"` when the group spans both — a
   directory and a file colliding on the same name, e.g. `Show`/`show` (see
   [Case-twin names](#case-twin-names)). `names` is
@@ -833,9 +846,15 @@ script, a status-page widget, whatever) without ever loading the HTML:
   "last sweep incomplete — &lt;reason&gt;" badge on that instance's shelf
   card; every other number on the card is left exactly as it last was.
 
-  `lastActions` holds up to the last 50 confirmed `unmonitor`/`remonitor`
-  writes across both directions; it's always empty in dry-run, because a
-  rehearsal is never reported as an action taken.
+  `lastActions` holds up to the last 50 changes cutoffarr actually made, and
+  its `action` field has four values: `unmonitor`/`remonitor` are the
+  daemon's own writes in the two directions, and `trash`/`merge-case-twin`
+  (v2.2) are the file moves a human performed through
+  [`POST /api/action`](#acting-on-findings). Switch on all four — a client
+  that knows only the two write tokens will meet the other two the first time
+  somebody clicks a button. It is always empty in dry-run, and holds only
+  what LANDED: a rehearsed or refused action is audited in the log but never
+  listed here, because a rehearsal is not an action taken.
 
 - **`POST /api/scan`** — queues one full-library sweep (the same
   `fullLibraryScope`/reverse/file-report shape the reconciliation sweep and
@@ -849,11 +868,12 @@ script, a status-page widget, whatever) without ever loading the HTML:
   A JSON body naming the action kind, the finding's own identifying fields,
   and `confirm: true`. It answers `200` for a performed or rehearsed action,
   `409` for a refusal with the reason, `403` when a config switch is off
-  (naming which one), `400` for a malformed or unconfirmed request, and `502`
-  when an operation was attempted and something outside cutoffarr failed.
-  Actions are serialized through a single-flight executor and are never
-  reachable from any autonomous code path. See
-  [Acting on findings](#acting-on-findings).
+  (naming which one) or when the browser says the request came from another
+  site, `400` for a malformed or unconfirmed request — including one that did
+  not arrive as `Content-Type: application/json` — and `502` when an operation
+  was attempted and something outside cutoffarr failed. Actions are serialized
+  through a single-flight executor and are never reachable from any autonomous
+  code path. See [Acting on findings](#acting-on-findings).
 
 All three endpoints, and the page itself, live on the same listener and port
 as the webhook endpoint (`webhook_port`); nothing about `POST
@@ -865,6 +885,16 @@ knowing when the page was read-only; now that one of them can move files, it
 is worth stating flatly: anything that can reach this port can click these
 buttons. See the trust-model note in
 [Acting on findings](#acting-on-findings).
+
+`POST /api/action` does carry one guard that is not authentication and is not
+a substitute for it. It requires `Content-Type: application/json` and refuses
+a request the browser has stamped `Sec-Fetch-Site: cross-site`/`same-site`.
+That covers the one case the sentence above does *not*: a random web page
+opened in a browser that is already on your LAN can post a form to this
+endpoint without CORS ever being consulted, and neither `confirm: true` nor
+strict JSON decoding stops it — a form can carry both. A header is the thing
+such a page cannot set. A peer on the LAN with `curl` still can, which is the
+point of the sentence above and of `gui_actions` defaulting to false.
 
 ## Acting on findings
 

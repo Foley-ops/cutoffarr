@@ -1848,6 +1848,12 @@ func TestWebUIPage_TrashButtonSendsTheFindingsIdentifyingFields(t *testing.T) {
 // The brief requires the row to update from the response "without waiting for
 // the next sweep"; holding that state for at most one poll does not satisfy it,
 // and a re-armed button reads to the operator as "the action did not work".
+// Each assertion below is scoped to the function that has to make the CALL,
+// which is the round-3 review fix: the previous version looked for
+// "rememberedActionOutcome(" anywhere in the page, and the DECLARATION satisfied
+// that. Deleting the one call inside buildActionButton — re-introducing the
+// exact defect this test is named for — left it green, and `node --check` does
+// not notice an uncalled function either.
 func TestWebUIPage_ActionOutcomesSurviveARepaint(t *testing.T) {
 	page := string(webUIPage)
 	if !strings.Contains(page, "var actionOutcomes") {
@@ -1856,11 +1862,37 @@ func TestWebUIPage_ActionOutcomesSurviveARepaint(t *testing.T) {
 	if !strings.Contains(page, "function actionKey(") {
 		t.Error("there is no per-finding identity to key an outcome by; instance+kind+path / instance+id+season is what a rebuilt row has to match on")
 	}
-	if !strings.Contains(page, "rememberedActionOutcome(") {
-		t.Error("a rebuilt row never consults the remembered outcome, so the button re-arms and the note is gone")
+
+	// The read side: a rebuilt row consults the memory, keyed off the very body
+	// it would POST, BEFORE it decides anything about the button.
+	build := jsFunctionBody(t, page, "buildActionButton", "attachActionClick")
+	if !strings.Contains(build, "rememberedActionOutcome(opts.body)") {
+		t.Error("buildActionButton never consults the remembered outcome, so a rebuilt row re-arms its button and loses its note — the poll erases the result of the click")
 	}
-	if !strings.Contains(page, "pruneActionOutcomes(") {
-		t.Error("remembered outcomes are never dropped, so a row keeps its strike-through after the finding stops appearing in the snapshot")
+	if !strings.Contains(build, "renderActionOutcome(note, opts.container, remembered)") {
+		t.Error("buildActionButton looks the outcome up and then does not render it")
+	}
+	rememberedAt := strings.Index(build, "rememberedActionOutcome(opts.body)")
+	reasonAt := strings.Index(build, "var reason = opts.ineligible")
+	if rememberedAt == -1 || reasonAt == -1 || rememberedAt > reasonAt {
+		t.Error("the remembered outcome must be applied before the disabled-reason path returns, or a performed action on an ineligible-for-other-reasons row is never shown")
+	}
+
+	// The write side: the memory is written from the answer, not from optimism.
+	click := jsFunctionBody(t, page, "attachActionClick", "reverseActionLabel")
+	if !strings.Contains(click, "rememberActionOutcome(") {
+		t.Error("a click's answer is never remembered, so the next 30s poll erases it")
+	}
+
+	// The expiry side: pruning is driven by the snapshot, from render().
+	render := jsFunctionBody(t, page, "render", "")
+	if !strings.Contains(render, "pruneActionOutcomes(instances)") {
+		t.Error("render never prunes remembered outcomes, so a row keeps its strike-through long after the finding stopped appearing in the snapshot")
+	}
+	pruneAt := strings.Index(render, "pruneActionOutcomes(instances)")
+	renderReverseAt := strings.Index(render, "renderReverse(instances)")
+	if renderReverseAt == -1 || pruneAt > renderReverseAt {
+		t.Error("pruning must happen before the tables are rebuilt, or the rows are rebuilt from a memory this snapshot has already contradicted")
 	}
 }
 
@@ -1868,10 +1900,38 @@ func TestWebUIPage_ActionOutcomesSurviveARepaint(t *testing.T) {
 // the one bulk action: buildBulkRemonitor wrote its summary into `note` and
 // then called rerender(), whose first act is body.textContent = "" — destroying
 // the summary in the same tick, so it was never visible at all.
+//
+// Scoped to the call sites for the same reason as the test above: the previous
+// version searched the whole page for "bulkRemonitorSummary", which the
+// `var bulkRemonitorSummary = null;` declaration alone satisfied.
 func TestWebUIPage_BulkRemonitorSummarySurvivesItsOwnRerender(t *testing.T) {
 	page := string(webUIPage)
-	if !strings.Contains(page, "bulkRemonitorSummary") {
+	if !strings.Contains(page, "var bulkRemonitorSummary = null;") {
 		t.Fatal("the bulk summary is not kept anywhere, so the rerender that follows it destroys it in the same tick")
+	}
+	bulk := jsFunctionBody(t, page, "buildBulkRemonitor", "buildCaseCollisionBlock")
+
+	applyAt := strings.Index(bulk, "text(note, bulkRemonitorSummary.text)")
+	if applyAt == -1 {
+		t.Fatal("the rebuilt bulk control never re-applies the summary it stored, so the rerender it triggers still destroys it")
+	}
+	// It has to be re-applied BEFORE the disabled-reason early return, or the
+	// summary vanishes the moment a switch is off — which is precisely when an
+	// operator most needs to read what just happened.
+	returnAt := strings.Index(bulk, `var reason = actionDisabledReason("remonitor")`)
+	if returnAt == -1 {
+		t.Fatal("buildBulkRemonitor no longer has its disabled-reason path")
+	}
+	if applyAt > returnAt {
+		t.Error("the summary is re-applied after the disabled-reason early return, so it is never shown when a switch is off")
+	}
+	if !strings.Contains(bulk, "bulkRemonitorSummary = {") {
+		t.Error("the run never stores a summary, so there is nothing for the rerender to bring back")
+	}
+	storeAt := strings.Index(bulk, "bulkRemonitorSummary = {")
+	rerenderAt := strings.Index(bulk[storeAt:], "rerender()")
+	if rerenderAt == -1 {
+		t.Error("the bulk run never triggers the rerender that brings the per-row outcomes back")
 	}
 }
 
@@ -1879,9 +1939,58 @@ func TestWebUIPage_BulkRemonitorSummarySurvivesItsOwnRerender(t *testing.T) {
 // the same finding: the loop counted a 502 `failed` and a network error
 // identically to a refusal ("N answered yes, M were refused or rehearsed"),
 // asserting a decision where the outcome is genuinely unknown.
+//
+// The round-3 fix is that this now checks the COUNTER, not the sentence: the
+// old version only proved the string "failed or unknown" existed somewhere,
+// which stayed true with `unknown` stuck at zero forever and every failure
+// silently counted as a refusal again.
 func TestWebUIPage_BulkRemonitorNeverCallsAFailureARefusal(t *testing.T) {
 	page := string(webUIPage)
-	if !strings.Contains(page, "failed or unknown") {
+	bulk := jsFunctionBody(t, page, "buildBulkRemonitor", "buildCaseCollisionBlock")
+	if !strings.Contains(bulk, "failed or unknown") {
 		t.Error("a failed or unreachable bulk item is still reported as refused; those are different outcomes and one of them means go and look at the server")
 	}
+	if !strings.Contains(bulk, "var performed = 0, declined = 0, unknown = 0;") {
+		t.Fatal("the bulk loop no longer keeps three separate counters")
+	}
+	// The two paths that must reach `unknown`: an answer whose outcome is
+	// neither performed nor one of the three decided ones (a 502 failed), and a
+	// request that never answered at all.
+	if !strings.Contains(bulk, "else unknown++;") {
+		t.Error("an answer that is not performed/refused/rehearsed/disabled is not counted as unknown, so a 502 `failed` is being reported as a refusal — a decision cutoffarr did not make")
+	}
+	catchAt := strings.Index(bulk, ".catch(function ()")
+	if catchAt == -1 {
+		t.Fatal("the bulk loop has no catch, so one network error stops it mid-run")
+	}
+	if !strings.Contains(bulk[catchAt:], "unknown++") {
+		t.Error("a request that never answered is not counted as unknown; a network error is the definition of an outcome nobody knows")
+	}
+}
+
+// jsFunctionBody slices one function out of webui.html: from `function name(`
+// to the declaration of `until` (or to the next top-level function, when until
+// is empty). Assertions made against a slice are assertions about the code that
+// has to RUN — a whole-page substring search is satisfied by a declaration, and
+// an uncalled function is exactly the defect these tests exist to catch.
+func jsFunctionBody(t *testing.T, page, name, until string) string {
+	t.Helper()
+	start := strings.Index(page, "function "+name+"(")
+	if start == -1 {
+		t.Fatalf("webui.html no longer declares %s(), so this pin is looking at nothing", name)
+	}
+	rest := page[start:]
+	end := -1
+	if until != "" {
+		end = strings.Index(rest, "\n  function "+until+"(")
+		if end == -1 {
+			t.Fatalf("could not find the end of %s(): %s() no longer follows it", name, until)
+		}
+	} else {
+		end = strings.Index(rest, "\n  function ")
+		if end == -1 {
+			t.Fatalf("could not find the end of %s()", name)
+		}
+	}
+	return rest[:end]
 }

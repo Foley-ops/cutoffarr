@@ -172,6 +172,12 @@ func (s *webUIServer) handleScan(w http.ResponseWriter, r *http.Request) {
 // anything that can reach this port can click these buttons, so the port
 // belongs on a LAN you trust, and gui_actions stays false until you have
 // decided that it is.
+//
+// What IS here, since a review round found it missing, is the guard that trust
+// model does not cover: a web page the operator opens in a browser that is
+// already on that LAN is not a LAN peer, and it can post a form here with no
+// CORS involvement at all. crossSiteRefusal (actions.go) is that check, and its
+// doc comment is where the reasoning lives.
 func (s *webUIServer) handleAction(w http.ResponseWriter, r *http.Request) {
 	writeJSON := func(code int, body any) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -197,6 +203,18 @@ func (s *webUIServer) handleAction(w http.ResponseWriter, r *http.Request) {
 	if err := dec.Decode(&req); err != nil {
 		reason := fmt.Sprintf("the action request could not be read as JSON: %v", err)
 		writeJSON(http.StatusBadRequest, actionResponse{Outcome: actionOutcomeRefused, Message: reason, Reason: reason})
+		return
+	}
+
+	// The browser guard (review finding). The body is decoded FIRST, on
+	// purpose: decoding has no side effects, and it is what lets this refusal
+	// carry the same kind=/path=/id= audit line every other refusal carries
+	// instead of one that says only "something was rejected". The rule itself
+	// is the runner's — see crossSiteRefusal, which explains why a
+	// content-type check stops a cross-site form post that confirm: true and
+	// DisallowUnknownFields do not.
+	if resp, refused := s.actions.crossSiteRefusal(req, r.Header); refused {
+		writeJSON(resp.status, resp)
 		return
 	}
 
