@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
@@ -46,8 +48,8 @@ func TestStatsStore_RecordInstance_CapturesFieldsAndPreservesConfigOrder(t *test
 	s := newStatsStore(false)
 	at := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 
-	s.recordInstance(cycleKindStartup, at, "sonarr-main", "sonarr", cycleInstanceStats{total: 10, monitored: 3, unmonitored: 7, wouldUnmonitor: 1})
-	s.recordInstance(cycleKindStartup, at, "radarr-main", "radarr", cycleInstanceStats{total: 20, monitored: 5, unmonitored: 15})
+	s.recordInstance(cycleKindStartup, at, "sonarr-main", "sonarr", cycleInstanceStats{total: 10, monitored: 3, unmonitored: 7, wouldUnmonitor: 1, decisionsRan: true})
+	s.recordInstance(cycleKindStartup, at, "radarr-main", "radarr", cycleInstanceStats{total: 20, monitored: 5, unmonitored: 15, decisionsRan: true})
 
 	snap := s.snapshot()
 	if len(snap.Instances) != 2 {
@@ -73,8 +75,8 @@ func TestStatsStore_RecordInstance_CapturesFieldsAndPreservesConfigOrder(t *test
 // snapshot of the library, not an accumulator).
 func TestStatsStore_RecordInstance_LaterCycleOverwritesTotalsForTheSameInstance(t *testing.T) {
 	s := newStatsStore(false)
-	s.recordInstance(cycleKindStartup, time.Now(), "radarr-main", "radarr", cycleInstanceStats{total: 10, monitored: 10})
-	s.recordInstance(cycleKindSweep, time.Now(), "radarr-main", "radarr", cycleInstanceStats{total: 10, monitored: 4, unmonitored: 6})
+	s.recordInstance(cycleKindStartup, time.Now(), "radarr-main", "radarr", cycleInstanceStats{total: 10, monitored: 10, decisionsRan: true})
+	s.recordInstance(cycleKindSweep, time.Now(), "radarr-main", "radarr", cycleInstanceStats{total: 10, monitored: 4, unmonitored: 6, decisionsRan: true})
 
 	snap := s.snapshot()
 	if len(snap.Instances) != 1 {
@@ -97,11 +99,13 @@ func TestStatsStore_RecordInstance_LaterCycleOverwritesTotalsForTheSameInstance(
 func TestStatsStore_RecordInstance_PreservesReverseFindingsWhenACycleDidNotRunReverse(t *testing.T) {
 	s := newStatsStore(false)
 	s.recordInstance(cycleKindStartup, time.Now(), "radarr-main", "radarr", cycleInstanceStats{
-		total: 5, reverseRan: true, reverseFindings: []reverseFinding{{ID: 7, Title: "Accidental", Reason: ReasonQualityCutoffNotMet}},
+		total: 5, decisionsRan: true, reverseRan: true, reverseFindings: []reverseFinding{{ID: 7, Title: "Accidental", Reason: ReasonQualityCutoffNotMet}},
 	})
 	// A webhook cycle: reverseRan is false (the zero value), exactly as a
-	// real webhook cycle's cycleInstanceStats would be.
-	s.recordInstance(cycleKindWebhook, time.Now(), "radarr-main", "radarr", cycleInstanceStats{total: 5, wouldUnmonitor: 2})
+	// real webhook cycle's cycleInstanceStats would be — but decisionsRan is
+	// still true, since a webhook cycle DOES run the evaluation loop (only
+	// the reverse/file-report passes are scheduling-gated off it).
+	s.recordInstance(cycleKindWebhook, time.Now(), "radarr-main", "radarr", cycleInstanceStats{total: 5, decisionsRan: true, wouldUnmonitor: 2})
 
 	snap := s.snapshot()
 	got := snap.Instances[0]
@@ -184,11 +188,21 @@ func TestStatsStore_LastActions_CapsAt50AndOrdersNewestFirst(t *testing.T) {
 
 // TestStatsStore_Snapshot_IsolatedFromLaterMutation is the explicit isolation
 // requirement: a snapshot handed to an HTTP handler must never change
-// underneath it because a later cycle recorded more data.
+// underneath it because a later cycle recorded more data, AND — the part a
+// length-only check cannot catch — must not share backing storage with the
+// store at all: writing THROUGH the handed-out snapshot's own elements must
+// never reach the store's live state either. A shallow struct copy (or a
+// snapshot loop that dropped cloneInstanceStatsView) would pass every
+// length/count assertion here while still aliasing the same slice backing
+// arrays and the same *time.Time, which is exactly the hazard this test
+// exists to catch: a future recordInstance that appends into spare capacity,
+// or any code that mutates an element in place, would silently corrupt a
+// snapshot a handler is in the middle of serializing.
 func TestStatsStore_Snapshot_IsolatedFromLaterMutation(t *testing.T) {
 	s := newStatsStore(false)
 	s.recordInstance(cycleKindStartup, time.Now(), "radarr-main", "radarr", cycleInstanceStats{
-		total: 1, reverseRan: true, reverseFindings: []reverseFinding{{ID: 1, Title: "A", Reason: ReasonCutoffMet}},
+		total: 1, decisionsRan: true,
+		reverseRan: true, reverseFindings: []reverseFinding{{ID: 1, Title: "A", Reason: ReasonCutoffMet}},
 		fileReportRan: true, fileReport: fileReportSnapshot{Status: "ran", Findings: []fileReportFindingRecord{{Kind: "orphan", Path: "/a"}}},
 		actions: []actionRecord{{Action: ActionUnmonitor, ID: 1, Title: "A"}},
 	})
@@ -197,15 +211,42 @@ func TestStatsStore_Snapshot_IsolatedFromLaterMutation(t *testing.T) {
 	firstJSON := len(first.Instances[0].ReverseFindings)
 	firstActions := len(first.Instances[0].LastActions)
 	firstFiles := len(first.Instances[0].FileReport.Findings)
-	firstLastRun := *first.Instances[0].LastRun
 
-	// Mutate the store extensively AFTER taking the snapshot above.
+	// Write THROUGH the handed-out snapshot's own elements — not append,
+	// mutate what is already there. If cloneInstanceStatsView were deleted
+	// or weakened to a shallow copy, every one of these writes would land
+	// in the store's own backing arrays/pointee, and the "fresh snapshot"
+	// assertions below would see the corruption.
+	first.Instances[0].ReverseFindings[0].ID = -1
+	first.Instances[0].ReverseFindings[0].Title = "MUTATED"
+	first.Instances[0].LastActions[0].Title = "MUTATED"
+	first.Instances[0].FileReport.Findings[0].Path = "MUTATED"
+	*first.Instances[0].LastRun = time.Unix(0, 0)
+
+	verify := s.snapshot()
+	vGot := verify.Instances[0]
+	if vGot.ReverseFindings[0].ID != 1 || vGot.ReverseFindings[0].Title != "A" {
+		t.Errorf("writing through the first snapshot's ReverseFindings element corrupted the store: a fresh snapshot now reads %+v, want the untouched original {ID:1 Title:A}", vGot.ReverseFindings[0])
+	}
+	if vGot.LastActions[0].Title != "A" {
+		t.Errorf("writing through the first snapshot's LastActions element corrupted the store: a fresh snapshot now reads Title=%q, want the untouched original %q", vGot.LastActions[0].Title, "A")
+	}
+	if vGot.FileReport.Findings[0].Path != "/a" {
+		t.Errorf("writing through the first snapshot's FileReport.Findings element corrupted the store: a fresh snapshot now reads Path=%q, want the untouched original %q", vGot.FileReport.Findings[0].Path, "/a")
+	}
+	if vGot.LastRun.Equal(time.Unix(0, 0)) {
+		t.Errorf("writing through *first.Instances[0].LastRun corrupted the store: a fresh snapshot's LastRun now reads the mutated value; recordInstance/cloneInstanceStatsView must hand out a pointer to its OWN copy, never the store's")
+	}
+
+	// Mutate the store extensively AFTER taking the snapshot above (a real
+	// later cycle, not a write-through) — the store-side half of isolation.
 	s.recordInstance(cycleKindSweep, time.Now().Add(time.Hour), "radarr-main", "radarr", cycleInstanceStats{
-		total: 1, reverseRan: true, reverseFindings: []reverseFinding{{ID: 2}, {ID: 3}},
+		total: 1, decisionsRan: true,
+		reverseRan: true, reverseFindings: []reverseFinding{{ID: 2}, {ID: 3}},
 		fileReportRan: true, fileReport: fileReportSnapshot{Status: "ran", Findings: []fileReportFindingRecord{{Kind: "duplicate"}, {Kind: "orphan"}}},
 		actions: []actionRecord{{Action: ActionUnmonitor, ID: 9}},
 	})
-	s.recordInstance(cycleKindSweep, time.Now().Add(2*time.Hour), "radarr-2", "radarr", cycleInstanceStats{total: 99})
+	s.recordInstance(cycleKindSweep, time.Now().Add(2*time.Hour), "radarr-2", "radarr", cycleInstanceStats{total: 99, decisionsRan: true})
 
 	if len(first.Instances) != 1 {
 		t.Errorf("the FIRST snapshot grew a second instance after a later recordInstance call; snapshots must be independent copies")
@@ -218,9 +259,6 @@ func TestStatsStore_Snapshot_IsolatedFromLaterMutation(t *testing.T) {
 	}
 	if len(first.Instances[0].FileReport.Findings) != firstFiles {
 		t.Errorf("first snapshot's FileReport.Findings changed after a later cycle recorded more (len %d -> %d)", firstFiles, len(first.Instances[0].FileReport.Findings))
-	}
-	if !first.Instances[0].LastRun.Equal(firstLastRun) {
-		t.Errorf("first snapshot's LastRun changed after a later cycle (%v -> %v)", firstLastRun, *first.Instances[0].LastRun)
 	}
 
 	second := s.snapshot()
@@ -465,5 +503,203 @@ func TestRunSonarrDecisionEngine_Stats_SeasonTotalsAndConfirmedAction(t *testing
 	a := unmonitors[0]
 	if a.ID != 1 || a.Title != "Write Me" || a.Season == nil || *a.Season != 1 {
 		t.Errorf("unmonitor action = %+v, want seriesId=1 title=%q season=1", a, "Write Me")
+	}
+}
+
+// --- review-fix regression coverage: reverseRan/decisionsRan gating ------
+//
+// The four tests below pin two review fixes together: a reverse pass that
+// RAN but could not be trusted (reverseCounts.skipped) must not be captured
+// as reverseRan=true with an empty findings slice, and a cycle that ABORTED
+// before its evaluation loop ran to completion must not be captured as
+// decisionsRan=true with wouldUnmonitor at its zero value. Both are the same
+// shape of bug — "this cycle is in no position to state that number" (the
+// wording reverseCounts.summaryAttrs' own doc comment uses) captured as
+// though it were an observed fact — and each is proven at two levels: the
+// engine's own return value, and the store-level consequence (a previous
+// real cycle's data must survive being folded in behind the untrustworthy
+// one).
+
+// TestRunRadarrDecisionEngine_Stats_ReverseScanSkipped_ReverseRanStaysFalse
+// reuses TestRunRadarrDecisionEngine_ReverseScan_IncompleteWantedSet_
+// SkipsOnlyTheReversePass's exact fixture (reverse_test.go): an unmonitored
+// wanted/cutoff set that claims more records than it returns, which sets
+// reverseCounts.skipped and returns before ever populating movieFindings.
+func TestRunRadarrDecisionEngine_Stats_ReverseScanSkipped_ReverseRanStaysFalse(t *testing.T) {
+	fake := newRadarrFake(t, "", nil)
+	fake.reverseWantedJSON = `{"page":1,"pageSize":100,"totalRecords":50,"records":[]}` // claims 50, returns 0
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	movies := []movieListElement{
+		wouldUnmonitorMovie(1, "Forward Candidate"),
+		unmonitoredBelowCutoffMovie(7, "Reverse Candidate"),
+	}
+
+	result := runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{}, "cutoffarr-exclude",
+		fullLibraryScope(slog.LevelInfo), true, reverseScanOn(), fileReportOptions{})
+
+	if result.reverseRan {
+		t.Fatalf("reverseRan = true, want false: the reverse pass was skipped (an incomplete unmonitored wanted set), so it must not be captured as a pass that ran and found nothing:\n%s", buf.String())
+	}
+	if len(result.reverseFindings) != 0 {
+		t.Errorf("reverseFindings = %+v, want empty/unset alongside reverseRan=false", result.reverseFindings)
+	}
+
+	// Store-level consequence: a previous cycle's real finding must survive
+	// being folded in behind this skipped one.
+	s := newStatsStore(false)
+	prevAt := time.Now()
+	s.recordInstance(cycleKindStartup, prevAt, "radarr-main", "radarr", cycleInstanceStats{
+		total: 2, decisionsRan: true, reverseRan: true,
+		reverseFindings: []reverseFinding{{ID: 99, Title: "Real finding from a trustworthy cycle", Reason: ReasonQualityCutoffNotMet}},
+	})
+	s.recordInstance(cycleKindSweep, prevAt.Add(time.Hour), "radarr-main", "radarr", result)
+
+	got := s.snapshot().Instances[0]
+	if len(got.ReverseFindings) != 1 || got.ReverseFindings[0].ID != 99 {
+		t.Errorf("ReverseFindings after a skipped reverse pass = %+v, want the PREVIOUS cycle's real finding preserved, not cleared", got.ReverseFindings)
+	}
+}
+
+// TestRunSonarrDecisionEngine_Stats_ReverseScanSkipped_ReverseRanStaysFalse
+// is the Sonarr twin, reusing TestRunSonarrDecisionEngine_ReverseScan_
+// IncompleteWantedSet_SkipsOnlyTheReversePass's fixture.
+func TestRunSonarrDecisionEngine_Stats_ReverseScanSkipped_ReverseRanStaysFalse(t *testing.T) {
+	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "," + episodeJSON(200, 2, 1, pastAirDate, 600) + "]"
+	filesJSON := "[" + episodeFileJSON(500, 1, 200, false) + "," + episodeFileJSON(600, 2, 200, true) + "]"
+	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	fake.reverseWantedJSON = `{"page":1,"pageSize":100,"totalRecords":50,"records":[]}`
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	series := []seriesElement{testSeries(1, "Mixed Show", true, 1, []int{}, testSeason(1, true, 1, 1), testSeason(2, false, 1, 1))}
+
+	result := runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{},
+		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseScanOn(), fileReportOptions{})
+
+	if result.reverseRan {
+		t.Fatalf("reverseRan = true, want false: the reverse pass was skipped:\n%s", buf.String())
+	}
+	if len(result.reverseFindings) != 0 {
+		t.Errorf("reverseFindings = %+v, want empty/unset alongside reverseRan=false", result.reverseFindings)
+	}
+
+	s := newStatsStore(false)
+	prevAt := time.Now()
+	season := 3
+	s.recordInstance(cycleKindStartup, prevAt, "sonarr-main", "sonarr", cycleInstanceStats{
+		total: 2, decisionsRan: true, reverseRan: true,
+		reverseFindings: []reverseFinding{{SeriesID: 1, Series: "Real finding", Season: &season, Reason: ReasonQualityCutoffNotMet}},
+	})
+	s.recordInstance(cycleKindSweep, prevAt.Add(time.Hour), "sonarr-main", "sonarr", result)
+
+	got := s.snapshot().Instances[0]
+	if len(got.ReverseFindings) != 1 || got.ReverseFindings[0].SeriesID != 1 {
+		t.Errorf("ReverseFindings after a skipped reverse pass = %+v, want the PREVIOUS cycle's real finding preserved, not cleared", got.ReverseFindings)
+	}
+}
+
+// TestRunRadarrDecisionEngine_Stats_AbortedCycle_PreservesPreviousWouldUnmonitorAndLastRun
+// reuses TestRunRadarrDecisionEngine_ProfileFetchFailure_NoReportLinesAtAll's
+// exact fixture (decision_test.go): a quality-profile fetch failure aborts
+// the cycle at one of §2.6's warn-and-skip paths, before the evaluation loop
+// that computes wouldUnmonitor ever runs.
+func TestRunRadarrDecisionEngine_Stats_AbortedCycle_PreservesPreviousWouldUnmonitorAndLastRun(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "radarr-main", Type: "radarr", URL: srv.URL, APIKey: "key"}
+	movies := []movieListElement{
+		{ID: intPtr(1), Title: strPtr("Some Movie"), Monitored: boolPtr(true), HasFile: boolPtr(true), QualityProfileID: intPtr(1)},
+	}
+
+	result := runRadarrDecisionEngine(context.Background(), logger, inst, movies, map[int]bool{}, "cutoffarr-exclude",
+		fullLibraryScope(slog.LevelInfo), true, reverseOptions{}, fileReportOptions{})
+
+	if result.decisionsRan {
+		t.Fatalf("decisionsRan = true, want false: the cycle aborted at the quality-profile fetch, before the evaluation loop ever ran:\n%s", buf.String())
+	}
+	if result.wouldUnmonitor != 0 {
+		t.Errorf("wouldUnmonitor = %d, want 0 (the zero value; this aborted cycle never computed a real one)", result.wouldUnmonitor)
+	}
+	// total is trustworthy even on this path: it comes from the library
+	// listing, already a complete read by the time this function was called.
+	if result.total != 1 {
+		t.Errorf("total = %d, want 1 (the library read succeeded; only the decision loop was aborted)", result.total)
+	}
+
+	s := newStatsStore(false)
+	prevAt := time.Now()
+	s.recordInstance(cycleKindStartup, prevAt, "radarr-main", "radarr", cycleInstanceStats{
+		total: 1, monitored: 1, decisionsRan: true, wouldUnmonitor: 37,
+	})
+	s.recordInstance(cycleKindSweep, prevAt.Add(time.Hour), "radarr-main", "radarr", result)
+
+	got := s.snapshot().Instances[0]
+	if got.WouldUnmonitor != 37 {
+		t.Errorf("WouldUnmonitor after an aborted cycle = %d, want the PREVIOUS real cycle's 37 preserved, not overwritten with 0", got.WouldUnmonitor)
+	}
+	if got.LastRun == nil || !got.LastRun.Equal(prevAt) {
+		t.Errorf("LastRun after an aborted cycle = %v, want the PREVIOUS real cycle's timestamp %v preserved (an aborted cycle must not claim \"last swept just now\")", got.LastRun, prevAt)
+	}
+	if got.LastCycleKind == nil || *got.LastCycleKind != cycleKindStartup {
+		t.Errorf("LastCycleKind after an aborted cycle = %v, want the PREVIOUS real cycle's %q preserved", got.LastCycleKind, cycleKindStartup)
+	}
+	// Total, unlike WouldUnmonitor, DOES update even on an aborted cycle:
+	// recordInstance treats it unconditionally, since it comes from a
+	// library read that already succeeded regardless of what happened after.
+	if got.Total != 1 {
+		t.Errorf("Total after an aborted cycle = %d, want 1 (this cycle's own library read, trustworthy even though the decision loop aborted)", got.Total)
+	}
+}
+
+// TestRunSonarrDecisionEngine_Stats_AbortedCycle_PreservesPreviousWouldUnmonitorAndLastRun
+// is the Sonarr twin, reusing TestRunSonarrDecisionEngine_
+// ProfileFetchFailure_NoReportLinesAtAll's fixture.
+func TestRunSonarrDecisionEngine_Stats_AbortedCycle_PreservesPreviousWouldUnmonitorAndLastRun(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: srv.URL, APIKey: "key"}
+	series := []seriesElement{testSeries(1, "Some Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
+
+	result := runSonarrDecisionEngine(context.Background(), logger, inst, series, map[int]bool{}, map[seasonKey]bool{},
+		"cutoffarr-exclude", fullLibraryScope(slog.LevelInfo), true, reverseOptions{}, fileReportOptions{})
+
+	if result.decisionsRan {
+		t.Fatalf("decisionsRan = true, want false: the cycle aborted at the quality-profile fetch, before the evaluation loop ever ran:\n%s", buf.String())
+	}
+	if result.wouldUnmonitor != 0 {
+		t.Errorf("wouldUnmonitor = %d, want 0 (the zero value; this aborted cycle never computed a real one)", result.wouldUnmonitor)
+	}
+	if result.total != 1 {
+		t.Errorf("total = %d, want 1 (the library read succeeded; only the decision loop was aborted)", result.total)
+	}
+
+	s := newStatsStore(false)
+	prevAt := time.Now()
+	s.recordInstance(cycleKindStartup, prevAt, "sonarr-main", "sonarr", cycleInstanceStats{
+		total: 1, monitored: 1, decisionsRan: true, wouldUnmonitor: 12,
+	})
+	s.recordInstance(cycleKindSweep, prevAt.Add(time.Hour), "sonarr-main", "sonarr", result)
+
+	got := s.snapshot().Instances[0]
+	if got.WouldUnmonitor != 12 {
+		t.Errorf("WouldUnmonitor after an aborted cycle = %d, want the PREVIOUS real cycle's 12 preserved, not overwritten with 0", got.WouldUnmonitor)
+	}
+	if got.LastRun == nil || !got.LastRun.Equal(prevAt) {
+		t.Errorf("LastRun after an aborted cycle = %v, want the PREVIOUS real cycle's timestamp %v preserved", got.LastRun, prevAt)
+	}
+	if got.LastCycleKind == nil || *got.LastCycleKind != cycleKindStartup {
+		t.Errorf("LastCycleKind after an aborted cycle = %v, want the PREVIOUS real cycle's %q preserved", got.LastCycleKind, cycleKindStartup)
 	}
 }

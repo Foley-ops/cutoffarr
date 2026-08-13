@@ -313,14 +313,35 @@ func newScanCoordinator() *scanCoordinator {
 }
 
 // requestScan is POST /api/scan's entire job. It returns true if this call is
-// the one that queued a scan; false if a cycle is already running OR one is
-// already queued — the API contract's single-flight idempotency ("never two
-// queued"), and the reason a second rapid POST while a scan is in flight
-// cannot stack a second one behind it.
+// the one that queued a scan; false if one was already queued — the API
+// contract's single-flight idempotency ("never two queued"), and the reason a
+// second rapid POST while a scan is already pending cannot stack a second one
+// behind it.
+//
+// REVIEW FIX: a request arriving while a cycle is RUNNING (running=true,
+// pending=false — the startup scan, a reconciliation sweep, or a webhook
+// cycle, since begin()/end() now bracket every one of them) used to be
+// dropped outright: the old `if s.running || s.pending { return false }`
+// returned without ever setting pending, so the request queued NOTHING, yet
+// the caller was told "already-pending" — a statement that a full sweep is
+// coming, when in fact none was enqueued and none would run. This is worst
+// for a webhook cycle, which is scoped to one item and runs no reverse pass
+// and no file report, so "already-pending" was doubly false: the running
+// cycle was not even the full sweep that was asked for.
+//
+// Now: pending is set (and the loop notified) whenever this call is not
+// itself redundant with an already-pending one, regardless of whether
+// something is currently running. The request therefore always survives —
+// queued to run on the daemon's own loop the moment the current cycle ends
+// (see (*daemon).loop's takePending check) — and the return value (and thus
+// the wire status) still distinguishes "nothing was running, so this starts
+// right away" (true/queued) from "something was already running, so this
+// waits its turn" (false/already-pending), but the latter is now truthful
+// rather than a dropped request wearing an honest-sounding label.
 func (s *scanCoordinator) requestScan() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.running || s.pending {
+	if s.pending {
 		return false
 	}
 	s.pending = true
@@ -328,7 +349,7 @@ func (s *scanCoordinator) requestScan() bool {
 	case s.notify <- struct{}{}:
 	default:
 	}
-	return true
+	return !s.running
 }
 
 // takePending reports whether a manual scan is waiting to start, clearing the

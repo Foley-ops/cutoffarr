@@ -130,13 +130,38 @@ type fileReportSnapshot struct {
 type cycleInstanceStats struct {
 	total, monitored, unmonitored, wouldUnmonitor int
 
+	// decisionsRan is true only once the evaluation loop that computes
+	// wouldUnmonitor has run to completion — set at the same place in both
+	// engines that wouldUnmonitor itself is (see each engine's own comment
+	// at that line). §2.6's warn-and-skip paths (a scope miss, a quality
+	// profile fetch failure, an exclusion-tag resolution failure) and the
+	// shutdown-mid-evaluation boundary all bare-`return` BEFORE that point,
+	// so on any of those cycles this stays false and wouldUnmonitor stays at
+	// its zero value — a number this cycle never actually computed, not a
+	// real "nothing would be unmonitored". recordInstance must leave the
+	// PREVIOUS cycle's WouldUnmonitor (and LastRun/LastCycleKind, so a dead
+	// cycle cannot look like "last swept just now" either) untouched when
+	// this is false, the same never-overwrite-with-nothing-happened rule
+	// reverseRan/fileReportRan already apply below. total/monitored/
+	// unmonitored are NOT gated by this: they are read from the library
+	// listing itself, which this function's own doc comment establishes is
+	// already complete and trustworthy the instant it is in hand, before any
+	// early return.
+	decisionsRan bool
+
 	// reverseRan/fileReportRan mirror this cycle's own reverse.enabled /
-	// fileReport.enabled (scheduling, not per-instance config): a webhook or
-	// --only-id cycle runs neither, and recordInstance must leave the
-	// PREVIOUS cycle's findings/fileReport exactly as they were rather than
-	// overwrite them with "nothing happened" — the three-state fidelity the
-	// Phase 11 branch review's binding notes require (a pass that did not run
-	// this cycle must never render as a pass that ran and found nothing).
+	// fileReport.enabled (scheduling, not per-instance config) AND — for
+	// reverseRan — whether the pass, having run, could actually be trusted:
+	// a webhook or --only-id cycle runs neither, and an unmonitored
+	// wanted/cutoff set that could not be fetched completely (or a shutdown
+	// mid-evaluation) leaves the reverse pass's own reverseCounts.skipped
+	// true with an empty findings slice (reverse.go). Either way,
+	// recordInstance must leave the PREVIOUS cycle's findings/fileReport
+	// exactly as they were rather than overwrite them with "nothing
+	// happened" — the three-state fidelity the Phase 11 branch review's
+	// binding notes require (a pass that did not run, or ran but could not
+	// be trusted, this cycle must never render as a pass that ran and found
+	// nothing).
 	reverseRan      bool
 	reverseFindings []reverseFinding
 
@@ -169,10 +194,12 @@ type instanceStatsView struct {
 
 	// LastRun/LastCycleKind are pointers so the API contract's "RFC3339 or
 	// null" / "startup|sweep|webhook|once|null" is representable literally.
-	// In practice neither is ever nil once an instance has an entry at all —
-	// an entry is created by recordInstance, which always sets both in the
-	// same call — but a client reading the documented shape should not have
-	// to assume that from this program's current behavior alone.
+	// Both stay nil until the FIRST cycle whose cycleInstanceStats.decisionsRan
+	// is true — an entry can be created by a cycle that aborted before ever
+	// completing an evaluation (e.g. a quality-profile fetch failure on this
+	// instance's very first cycle), and such a cycle never ran a decision to
+	// report the time of, so recordInstance leaves both nil rather than
+	// stamping a "last run" that produced no WouldUnmonitor at all.
 	LastRun       *time.Time `json:"lastRun"`
 	LastCycleKind *string    `json:"lastCycleKind"`
 
@@ -249,12 +276,23 @@ func (s *statsStore) recordInstance(kind string, at time.Time, name, typ string,
 	v.Total = cs.total
 	v.Monitored = cs.monitored
 	v.Unmonitored = cs.unmonitored
-	v.WouldUnmonitor = cs.wouldUnmonitor
 
-	atCopy := at
-	v.LastRun = &atCopy
-	kindCopy := kind
-	v.LastCycleKind = &kindCopy
+	// decisionsRan gates WouldUnmonitor and LastRun/LastCycleKind together
+	// (see cycleInstanceStats.decisionsRan's own comment): a cycle that
+	// aborted before the evaluation loop finished must not overwrite the
+	// last real WouldUnmonitor with the zero value it never actually
+	// computed, and must not claim "last swept just now" for a sweep that
+	// never produced a decision. total/monitored/unmonitored above are
+	// unconditional because they come from the library read, which already
+	// succeeded (daemon.go only calls the engine after dataOK) regardless of
+	// what happened after.
+	if cs.decisionsRan {
+		v.WouldUnmonitor = cs.wouldUnmonitor
+		atCopy := at
+		v.LastRun = &atCopy
+		kindCopy := kind
+		v.LastCycleKind = &kindCopy
+	}
 
 	// Three-state fidelity (see cycleInstanceStats.reverseRan's own comment):
 	// a cycle that did not run the reverse pass leaves the previous findings

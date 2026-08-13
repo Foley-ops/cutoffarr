@@ -713,6 +713,10 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// The loop ran to completion (a shutdown-abandoned one already returned
 	// above, without reaching here) — see libraryWouldUnmonitor's own comment.
 	stats.wouldUnmonitor = libraryWouldUnmonitor
+	// Phase 12 (review fix): only from this point on has the evaluation
+	// actually produced a wouldUnmonitor worth recording — see
+	// cycleInstanceStats.decisionsRan's own comment.
+	stats.decisionsRan = true
 
 	cc := runCrossCheck(cycleLogger, inst, decisions, wantedIDs)
 	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
@@ -727,12 +731,19 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 			profiles: profiles, exclusionTagID: exclusionTagID, tagActive: tagActive,
 			cc: cc, scope: scope, itemLevel: scope.itemLevel, dryRun: dryRun, opts: reverse,
 		}.runRadarr(ctx, movies)
-		// Phase 12: captured only when this cycle actually ran the pass — see
-		// cycleInstanceStats.reverseRan's own comment on why a cycle that
-		// skipped it must leave the store's previous findings untouched
-		// rather than overwrite them here with an empty slice.
-		stats.reverseRan = true
-		stats.reverseFindings = radarrReverseFindings(rev.movieFindings)
+		// Phase 12 (review fix): captured only when this cycle actually ran
+		// the pass AND the pass could trust what it found — see
+		// cycleInstanceStats.reverseRan's own comment. rev.skipped means the
+		// unmonitored wanted/cutoff set could not be fetched completely (or
+		// a shutdown cut the evaluation short), in which case rev.movieFindings
+		// is unset (reverse.go returns before ever populating it) and
+		// capturing it here as "ran and found nothing" would be exactly the
+		// false all-clear reverseCounts.summaryAttrs refuses to print on the
+		// log side.
+		if !rev.skipped {
+			stats.reverseRan = true
+			stats.reverseFindings = radarrReverseFindings(rev.movieFindings)
+		}
 	}
 	// Combined here, once, regardless of which passes ran: forwardActions is
 	// always a real (possibly empty) slice, and rev.actions is the reverse
@@ -2541,6 +2552,10 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 			stats.wouldUnmonitor++
 		}
 	}
+	// Phase 12 (review fix): see the Radarr twin's identical comment —
+	// cycleInstanceStats.decisionsRan's own doc comment for why this is set
+	// here rather than unconditionally at the top of the function.
+	stats.decisionsRan = true
 
 	cc := runSonarrCrossCheck(ctx, cycleLogger, client, inst, allDecisions, wantedEpisodeIDs)
 	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
@@ -2555,9 +2570,11 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 			profiles: profiles, exclusionTagID: exclusionTagID, tagActive: tagActive,
 			cc: cc, scope: scope, itemLevel: scope.itemLevel, dryRun: dryRun, opts: reverse,
 		}.runSonarr(ctx, series)
-		// Phase 12: see the Radarr twin's identical comment.
-		stats.reverseRan = true
-		stats.reverseFindings = sonarrReverseFindings(rev.seasonFindings)
+		// Phase 12 (review fix): see the Radarr twin's identical comment.
+		if !rev.skipped {
+			stats.reverseRan = true
+			stats.reverseFindings = sonarrReverseFindings(rev.seasonFindings)
+		}
 	}
 	// Combined here, once, regardless of which passes ran — see the Radarr
 	// twin's identical comment.

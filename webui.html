@@ -27,6 +27,11 @@
     --alert-dim: rgb(196 106 90 / 22%);
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+    /* The shelf count is the page's one hero number ("456 / 996 at rest"):
+       the design plan's type spec calls for 28-36px mono hero numbers with
+       small unit words. .shelf-bar-wrap's own padding-top is expressed
+       against this same token (below) so the two never drift apart. */
+    --shelf-count-size: 30px;
   }
 
   * { box-sizing: border-box; }
@@ -92,6 +97,10 @@
 
   .badge-rest { color: var(--rest); background: var(--rest-dim); border-color: rgb(111 160 140 / 40%); }
   .badge-hunt { color: var(--hunt); background: var(--hunt-dim); border-color: rgb(217 160 91 / 40%); }
+  /* Shown in place of the dry-run/live badge when a poll of /api/stats
+     fails: a dead or unreachable backend must never look pixel-identical
+     to a healthy one (see refresh()'s own comment). */
+  .badge-alert { color: var(--alert); background: var(--alert-dim); border-color: rgb(196 106 90 / 40%); }
 
   .last-swept {
     font-family: var(--mono);
@@ -171,7 +180,11 @@
 
   .shelf-bar-wrap {
     position: relative;
-    padding-top: 1.8em;
+    /* Reserves room above the bar for .shelf-count's own line height
+       (font-size * the inherited 1.45 line-height) plus breathing room,
+       expressed against the SAME --shelf-count-size token the count itself
+       uses so the two can never drift out of sync if that token changes. */
+    padding-top: calc(var(--shelf-count-size) * 1.7);
   }
 
   .shelf-count {
@@ -181,7 +194,7 @@
     transform: translateX(-50%);
     white-space: nowrap;
     font-family: var(--mono);
-    font-size: 13px;
+    font-size: var(--shelf-count-size);
     color: var(--ink);
   }
 
@@ -238,7 +251,7 @@
       position: static;
       display: block;
       transform: none;
-      margin-bottom: 6px;
+      margin-bottom: 8px;
     }
   }
 
@@ -310,6 +323,22 @@
   table.findings td.path { color: var(--ink-faint); }
 
   .findings-scroll { overflow-x: auto; }
+
+  /* Per-instance file-report status notices (off/skipped) — the three-state
+     fidelity the API contract requires: a skipped instance must never look
+     like a clean "ran" one, and an off instance must say it is unconfigured
+     rather than silently produce zero rows indistinguishable from clean. */
+  ul.status-notices {
+    list-style: none;
+    margin: 0 0 14px;
+    padding: 0;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+
+  ul.status-notices li { padding: 3px 0; }
+  ul.status-notices li.status-off { color: var(--ink-faint); }
+  ul.status-notices li.status-skipped { color: var(--hunt); }
 
   footer {
     margin-top: 48px;
@@ -394,18 +423,29 @@
     return Math.max(0, Math.min(100, n));
   }
 
-  function renderShelf(inst) {
-    var total = inst.total || 0;
-    var atRest = inst.unmonitored || 0;
-    var pct = total > 0 ? clampPct((atRest / total) * 100) : 0;
-    var pctStr = pct.toFixed(1) + "%";
+  // shelfCards keys the live shelf <section> elements by instance name, so
+  // a refresh UPDATES the same DOM nodes (text and the two style
+  // properties the bar/marker transition) rather than tearing the whole
+  // panel down and rebuilding it from scratch. This is what makes the
+  // "bar widths transition 300ms ease-out on refresh" motion rule
+  // (webui.html's .shelf-rest/.shelf-marker transitions, above) actually
+  // fire: a CSS transition needs a prior COMPUTED value on an
+  // already-rendered element to animate from, and a freshly-inserted node
+  // with its final width set inline renders at that width immediately —
+  // there is nothing to transition from. Reusing the element across polls
+  // gives the browser a real "before" frame to animate away from.
+  var shelfCards = {};
 
+  // buildShelfCard creates ONE instance's shelf DOM shell, once. Every text
+  // node and style-bearing element a later refresh needs to touch is kept
+  // on card._els so updateShelfCard never has to search the DOM (and never
+  // risks matching the wrong node if markup nearby ever changes).
+  function buildShelfCard() {
     var card = el("section", "shelf");
-    card.setAttribute("data-instance", inst.name);
 
     var head = el("div", "shelf-head");
-    var name = el("span", "shelf-name"); text(name, inst.name);
-    var kind = el("span", "shelf-type"); text(kind, inst.type);
+    var name = el("span", "shelf-name");
+    var kind = el("span", "shelf-type");
     head.appendChild(name);
     head.appendChild(kind);
     card.appendChild(head);
@@ -413,44 +453,96 @@
     var barWrap = el("div", "shelf-bar-wrap");
 
     var count = el("span", "shelf-count");
-    count.style.left = pctStr;
+    var countNum = document.createTextNode("");
     var unit = el("span", "unit");
     text(unit, " at rest");
-    count.textContent = atRest + " / " + total;
+    count.appendChild(countNum);
     count.appendChild(unit);
     barWrap.appendChild(count);
 
     var bar = el("div", "shelf-bar");
     var rest = el("div", "shelf-rest");
-    rest.style.width = pctStr;
     var marker = el("div", "shelf-marker");
-    marker.style.left = pctStr;
     bar.appendChild(rest);
     bar.appendChild(marker);
     barWrap.appendChild(bar);
 
     card.appendChild(barWrap);
 
-    if (inst.wouldUnmonitor > 0) {
-      var sub = el("p", "shelf-sub");
-      text(sub, inst.wouldUnmonitor + " more ready to rest this sweep");
-      card.appendChild(sub);
-    }
-
+    card._els = { name: name, kind: kind, count: count, countNum: countNum, rest: rest, marker: marker, sub: null };
     return card;
+  }
+
+  // updateShelfCard writes one instance's current numbers into an EXISTING
+  // card's text nodes and style properties only — never replaces a node —
+  // so the browser sees an in-place property change on every refresh but
+  // the initial one, which is exactly what a CSS transition animates.
+  function updateShelfCard(card, inst) {
+    var total = inst.total || 0;
+    var atRest = inst.unmonitored || 0;
+    var pct = total > 0 ? clampPct((atRest / total) * 100) : 0;
+    var pctStr = pct.toFixed(1) + "%";
+    var els = card._els;
+
+    card.setAttribute("data-instance", inst.name);
+    text(els.name, inst.name);
+    text(els.kind, inst.type);
+
+    els.countNum.data = atRest + " / " + total;
+    els.count.style.left = pctStr;
+    els.rest.style.width = pctStr;
+    els.marker.style.left = pctStr;
+
+    if (inst.wouldUnmonitor > 0) {
+      if (!els.sub) {
+        els.sub = el("p", "shelf-sub");
+        card.appendChild(els.sub);
+      }
+      text(els.sub, inst.wouldUnmonitor + " more ready to rest this sweep");
+    } else if (els.sub) {
+      card.removeChild(els.sub);
+      els.sub = null;
+    }
   }
 
   function renderInstances(instances) {
     var root = document.getElementById("instances");
-    root.textContent = "";
     if (!instances || instances.length === 0) {
+      root.textContent = "";
+      shelfCards = {};
       var p = el("p", "empty");
       text(p, "No cycle has completed yet. The first sweep is still working.");
       root.appendChild(p);
       return;
     }
+    if (root.querySelector(".empty")) {
+      // First real data after the placeholder (or an empty state): clear
+      // it once, rather than on every refresh.
+      root.textContent = "";
+    }
+    var seen = {};
     for (var i = 0; i < instances.length; i++) {
-      root.appendChild(renderShelf(instances[i]));
+      var inst = instances[i];
+      seen[inst.name] = true;
+      var card = shelfCards[inst.name];
+      if (!card) {
+        card = buildShelfCard();
+        shelfCards[inst.name] = card;
+      }
+      updateShelfCard(card, inst);
+      // Keeps DOM order matching the instances array's own (config) order.
+      // A no-op move when the card is already the last child, which is the
+      // common case once every instance has been seen once.
+      root.appendChild(card);
+    }
+    // Instances are never removed from a running daemon's config, but keep
+    // this tidy (and correct) rather than relying on that.
+    for (var name in shelfCards) {
+      if (!seen[name]) {
+        var stale = shelfCards[name];
+        if (stale.parentNode) stale.parentNode.removeChild(stale);
+        delete shelfCards[name];
+      }
     }
   }
 
@@ -507,23 +599,63 @@
     ));
   }
 
+  // renderFileReport is status-aware: fileReport.status is ran|skipped|off
+  // per instance (the API contract's own three-way vocabulary), and only a
+  // "ran" instance's zero findings mean "no clutter". A "skipped" instance
+  // (a tracked root that could not be trusted this sweep — its
+  // duplicates/orphans counts, if any survived, are a partial truth) must
+  // never render identically to a clean ran instance, and an "off" instance
+  // (media_root_map never configured) must say so rather than silently
+  // showing zero rows indistinguishable from clean.
   function renderFileReport(instances) {
     var body = document.getElementById("fileBody");
     var rows = [];
+    var notices = [];
+    var anyRan = false;
     for (var i = 0; i < instances.length; i++) {
       var inst = instances[i];
       var fr = inst.fileReport || {};
-      var findings = fr.findings || [];
-      for (var j = 0; j < findings.length; j++) {
-        rows.push({ instance: inst.name, f: findings[j] });
+      var status = fr.status;
+      if (status === "ran") {
+        anyRan = true;
+        var findings = fr.findings || [];
+        for (var j = 0; j < findings.length; j++) {
+          rows.push({ instance: inst.name, f: findings[j] });
+        }
+      } else if (status === "skipped") {
+        notices.push({ instance: inst.name, status: "skipped" });
+      } else {
+        // "off", or absent entirely — both mean not configured.
+        notices.push({ instance: inst.name, status: "off" });
       }
     }
     text(document.getElementById("fileCount"), String(rows.length));
     body.textContent = "";
+
+    if (notices.length > 0) {
+      var list = el("ul", "status-notices");
+      for (var n = 0; n < notices.length; n++) {
+        var li = el("li", "status-notice status-" + notices[n].status);
+        var word = notices[n].status === "off"
+          ? "not configured"
+          : "could not be checked this sweep";
+        text(li, notices[n].instance + " — " + word);
+        list.appendChild(li);
+      }
+      body.appendChild(list);
+    }
+
     if (rows.length === 0) {
-      var p = el("p", "empty");
-      text(p, "No clutter found. Every tracked file is exactly where it should be.");
-      body.appendChild(p);
+      // Only claim "clean" when at least one instance actually ran the
+      // check (or none have reported in at all yet, matching the main
+      // panel's own pre-cycle placeholder) — never as a stand-in for
+      // "every instance was off or skipped", which the notices above
+      // already explain.
+      if (anyRan || instances.length === 0) {
+        var p = el("p", "empty");
+        text(p, "No clutter found. Every tracked file is exactly where it should be.");
+        body.appendChild(p);
+      }
       return;
     }
     body.appendChild(findingsTable(
@@ -568,17 +700,44 @@
     renderFileReport(instances);
   }
 
+  // lastSuccessAt is the local clock's reading the last time /api/stats
+  // actually answered 2xx with decodable JSON — used only to say how stale
+  // the numbers on screen are while disconnected (see showDisconnected).
+  var lastSuccessAt = null;
+
+  // showDisconnected flips the header badge to the ALERT clay token: a
+  // dashboard whose backend has died, restarted, or is answering 5xx/HTML
+  // through a proxy must never stay pixel-identical to a healthy one — this
+  // page's entire job is "glance and trust these numbers". The numbers
+  // themselves (instances, findings) are left exactly as they were; only
+  // the badge changes, and polling keeps retrying on the next tick.
+  function showDisconnected() {
+    var badge = document.getElementById("dryRunBadge");
+    badge.className = "badge badge-alert";
+    var since = lastSuccessAt ? fmtRelative(lastSuccessAt.toISOString()) : null;
+    text(badge, since ? ("disconnected — showing data from " + since) : "disconnected — no data yet");
+  }
+
   function refresh() {
     return fetch("/api/stats", { headers: { "Accept": "application/json" } })
-      .then(function (r) { return r.json(); })
+      .then(function (r) {
+        if (!r.ok) throw new Error("GET /api/stats: " + r.status);
+        return r.json();
+      })
       .then(function (data) {
+        lastSuccessAt = new Date();
         render(data);
         scanBtn.disabled = false;
         text(scanBtn, "Scan now");
       })
       .catch(function () {
-        // A transient network hiccup talking to our own server is not worth
-        // alarming over; the next poll (or the next click) tries again.
+        // The backend is unreachable, restarted, or answering something
+        // that is not valid JSON (a proxy's error page, for instance).
+        // Never swallowed silently: surface it, then keep retrying — the
+        // next poll (or the next click) tries again on its own.
+        showDisconnected();
+        scanBtn.disabled = false;
+        text(scanBtn, "Scan now");
       });
   }
 

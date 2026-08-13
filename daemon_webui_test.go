@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -112,11 +114,29 @@ func TestDaemon_ScanNow_RunsExactlyOneExtraSweep(t *testing.T) {
 	}
 }
 
-// TestDaemon_ScanNow_SecondRequestWhileFirstIsRunning_ReturnsAlreadyPending
-// proves the single-flight coordination end to end: a POST that arrives
-// while the daemon's loop goroutine is already inside a manual scan's
-// runScanCycle call must not queue a second one.
-func TestDaemon_ScanNow_SecondRequestWhileFirstIsRunning_ReturnsAlreadyPending(t *testing.T) {
+// TestDaemon_ScanNow_RequestWhileRunning_SurvivesAsExactlyOneQueuedFollowUp
+// proves the single-flight coordination end to end, including the
+// REVIEW FIX to scanCoordinator.requestScan (daemon.go): a POST that
+// arrives while the daemon's loop goroutine is already inside a manual
+// scan's runScanCycle call must NOT be silently dropped — it must survive
+// as pending and run once the in-flight cycle ends — while a THIRD POST,
+// arriving once one is already queued behind the running cycle, must still
+// be refused outright (the actual "never two queued" guarantee: at most
+// one extra scan may ever be queued behind whatever is currently running).
+//
+// Renamed from …_ReturnsAlreadyPending (this test's own prior name):
+// the wire response for the second POST is still, correctly,
+// already-pending — that part never changed — but this test used to also
+// assert that only ONE manual scan ever ran, i.e. that the second POST's
+// request was silently discarded rather than queued. That was pinning the
+// exact bug the fix corrects: the old requestScan returned false without
+// ever setting scanCoordinator.pending when only .running was true, so a
+// "Scan now" click landing while any cycle was running queued nothing at
+// all, yet was reported as "already-pending" — a statement that a sweep is
+// coming, when none was. The corrected implementation still forbids TWO
+// requests from ever being queued at once (there is only one pending
+// flag), but a request that lands during a RUNNING cycle is no longer lost.
+func TestDaemon_ScanNow_RequestWhileRunning_SurvivesAsExactlyOneQueuedFollowUp(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 
@@ -125,8 +145,11 @@ func TestDaemon_ScanNow_SecondRequestWhileFirstIsRunning_ReturnsAlreadyPending(t
 	h.waitReady()
 
 	// Installed only AFTER the startup scan has already finished, so it can
-	// never pause the startup scan itself — only the manual scan this test
-	// triggers next.
+	// never pause the startup scan itself — only the manual scans this test
+	// triggers next. Not gated to fire once: BOTH manual scans this test
+	// expects to run will pass through their own GET /api/v3/movie, and the
+	// second one must sail through once release is closed (a receive on an
+	// already-closed channel returns immediately rather than blocking).
 	fake.onRequest = func(method, path string) {
 		if method == http.MethodGet && path == "/api/v3/movie" {
 			select {
@@ -151,18 +174,30 @@ func TestDaemon_ScanNow_SecondRequestWhileFirstIsRunning_ReturnsAlreadyPending(t
 		t.Fatalf("expected the manual scan's own beginning line before it blocked on the read:\n%s", h.out.String())
 	}
 
+	// The coordinator truthfully reports already-pending (something IS
+	// running right now) — but, unlike the pre-fix behavior, this request
+	// survives to run once the running cycle ends.
 	second := postScanTo(t, h.url)
 	if second.status != http.StatusAccepted || second.body["status"] != "already-pending" {
 		t.Fatalf("POST /api/scan while the first is still running = %+v, want 202 {status: already-pending}", second)
 	}
 
-	close(release)
-	h.awaitLogCount("manual scan complete", 1)
+	// A THIRD POST, while one is already queued behind the running cycle,
+	// must be refused outright: this is the real "never two queued"
+	// guarantee.
+	third := postScanTo(t, h.url)
+	if third.status != http.StatusAccepted || third.body["status"] != "already-pending" {
+		t.Fatalf("POST /api/scan while one scan is already pending behind the running cycle = %+v, want 202 {status: already-pending}", third)
+	}
 
-	// Exactly one manual sweep ran, never two — the second POST must not
-	// have stacked a scan behind the first.
-	if got := strings.Count(h.out.String(), "radarr decision summary"); got != 2 {
-		t.Errorf("summaries = %d, want 2 (startup + exactly one manual sweep, never a stacked second one):\n%s", got, h.out.String())
+	close(release)
+	h.awaitLogCount("manual scan complete", 2)
+
+	// Exactly TWO manual sweeps ran (the first POST's own, plus the ONE
+	// queued behind it by the second POST) — never three, which is what
+	// the third POST above would have produced had it also been queued.
+	if got := strings.Count(h.out.String(), "radarr decision summary"); got != 3 {
+		t.Errorf("summaries = %d, want 3 (startup + the first manual scan + exactly one queued follow-up, never a second stacked one):\n%s", got, h.out.String())
 	}
 }
 
@@ -180,68 +215,93 @@ func postScanTo(t *testing.T, baseURL string) scanResponse {
 	return scanResponse{status: resp.StatusCode, body: body}
 }
 
-// TestDaemon_ScanNow_NeverInterleavesWithAWebhookCycle sends a webhook and a
-// manual scan request close together and checks the log shows them running
-// strictly one after another (a "webhook debounce expired" line fully
-// followed by its own summary before "manual scan beginning" appears, or
-// vice versa) rather than interleaved attrs from two concurrent cycles.
+// TestDaemon_ScanNow_NeverInterleavesWithAWebhookCycle proves — structurally,
+// not by inspecting whether a log line "tore" — that a webhook cycle and a
+// manual scan never actually run at the same time.
+//
+// REVIEW FIX: this test used to grep every "radarr decision summary" line
+// for a trailing "crossCheck=" attr, on the theory that two concurrently
+// running cycles would corrupt one another's log line. That instrument
+// cannot fail: h.out is a mutex-guarded syncBuffer (see its own doc comment)
+// and each slog record is written in one Write call, so lines never tear no
+// matter how many goroutines log concurrently — the test could pass even if
+// two cycles genuinely ran at once. And the retry loop it used to POST
+// /api/scan up to 200 times papered over precisely the window this test
+// exists to prove is safe (a POST arriving WHILE the webhook cycle is
+// running), rather than exercising it.
+//
+// Now: the webhook cycle is held open deterministically inside its own
+// GET /api/v3/movie library read (the same fake.onRequest technique the
+// sibling TestDaemon_ScanNow_SecondRequestWhileFirstIsRunning_
+// ReturnsAlreadyPending test above uses for a manual scan). A SINGLE POST
+// /api/scan during that window is asserted to return already-pending — the
+// coordinator correctly seeing a webhook cycle as "running" — and then the
+// read is released and the manual scan the POST queued is asserted to run
+// afterwards, proving the request survived rather than being silently
+// dropped (the requestScan bug this same round fixed in daemon.go). An
+// in-flight counter inside onRequest fails the test outright if two library
+// reads are ever open at the same time, which is what an actual
+// interleaving regression would produce.
 func TestDaemon_ScanNow_NeverInterleavesWithAWebhookCycle(t *testing.T) {
 	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{wouldUnmonitorStatefulMovie(1, "Movie")})
 	h := startDaemon(t, writeDaemonConfig(t, "radarr", fake.srv.URL, true, "info", "0", "1ms"))
 	h.waitReady()
 
+	var inFlight int32
+	var sawOverlap int32
+	blocked := make(chan struct{})
+	released := make(chan struct{})
+	var once sync.Once
+
+	// Installed only AFTER the startup scan has already finished, so it can
+	// never pause the startup scan itself — only the webhook cycle this test
+	// triggers next, and (once released) the manual scan queued behind it.
+	fake.onRequest = func(method, path string) {
+		if method != http.MethodGet || path != "/api/v3/movie" {
+			return
+		}
+		if atomic.AddInt32(&inFlight, 1) > 1 {
+			atomic.StoreInt32(&sawOverlap, 1)
+		}
+		defer atomic.AddInt32(&inFlight, -1)
+		// Only the FIRST library read this test ever sees — the webhook
+		// cycle's own — blocks. The manual scan's later read (after
+		// release) must sail through, or this would deadlock waiting on a
+		// release that already happened.
+		once.Do(func() {
+			close(blocked)
+			<-released
+		})
+	}
+
 	h.post("radarr-main", downloadMoviePayload)
 	h.clock.Advance(time.Second)
 	h.awaitLogCount("webhook debounce expired; evaluating", 1)
 
-	// The webhook cycle's own runScanCycle may still be in flight at this
-	// exact instant (the log line above is written before it starts, not
-	// after) — under -race in particular, real wall-clock time passes
-	// between that line and the cycle's completion. Retried rather than
-	// posted once: while the webhook cycle still holds scanCoordinator's
-	// running flag, this legitimately (and correctly) reports
-	// already-pending — which is not a nothing-happened outcome, it is the
-	// single-flight contract doing its job — and posting again a moment
-	// later is exactly what a human re-clicking the button would do.
-	queued := false
-	for i := 0; i < 200; i++ {
-		resp, err := http.Post(h.url+"/api/scan", "", nil)
-		if err != nil {
-			t.Fatalf("POST /api/scan: %v", err)
-		}
-		var body map[string]string
-		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-			t.Fatalf("POST /api/scan: response is not valid JSON: %v", err)
-		}
-		resp.Body.Close()
-		if body["status"] == "queued" {
-			queued = true
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if !queued {
-		t.Fatalf("POST /api/scan never queued after retrying (the webhook cycle never released the running flag):\n%s", h.out.String())
+	select {
+	case <-blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the webhook cycle never reached its library read:\n%s", h.out.String())
 	}
 
+	// A single POST — not a retry loop — while the webhook cycle is
+	// deterministically held open inside its own library read.
+	resp := postScanTo(t, h.url)
+	if resp.status != http.StatusAccepted || resp.body["status"] != "already-pending" {
+		t.Fatalf("POST /api/scan while the webhook cycle is running = %+v, want 202 {status: already-pending}", resp)
+	}
+
+	close(released)
 	h.awaitLogCount("manual scan complete", 1)
 
-	// Both cycles ran (the webhook cycle's own summary line, plus the manual
-	// scan's), each fully formed: the fastest structural check that nothing
-	// interleaved two concurrent runScanCycle calls into one torn line is
-	// that BOTH complete summary lines with matching attrs are present,
-	// which a corrupted/interleaved write to the shared log buffer would be
-	// very unlikely to produce by chance for two multi-attribute lines.
+	if atomic.LoadInt32(&sawOverlap) != 0 {
+		t.Fatal("two library reads were open at the same time: the webhook cycle and the manual scan actually ran concurrently, which the coordinator's single-flight guarantee must prevent")
+	}
+
+	// Both cycles ran, in addition to the startup scan — proving the
+	// already-pending POST above was truthfully queued rather than dropped.
 	out := h.out.String()
 	if got := strings.Count(out, "radarr decision summary"); got != 3 {
 		t.Fatalf("summaries = %d, want 3 (startup + webhook cycle + manual scan):\n%s", got, out)
-	}
-	for _, line := range strings.Split(out, "\n") {
-		if !strings.Contains(line, "msg=\"radarr decision summary\"") {
-			continue
-		}
-		if !strings.Contains(line, "crossCheck=") {
-			t.Errorf("a decision summary line is missing its own trailing attrs entirely, which an interleaved write would produce: %q", line)
-		}
 	}
 }
