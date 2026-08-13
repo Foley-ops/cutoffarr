@@ -1066,3 +1066,242 @@ func jsonString(s string) string {
 	}
 	return string(b)
 }
+
+// --- the re-monitor action, end to end --------------------------------------
+
+// remonitorFixture builds a Radarr library with exactly the two movies this
+// action needs to be exercised honestly:
+//
+//   - movie 1: monitored, has a file, cutoff MET. It is the cross-check's
+//     sample — an item whose wanted-set membership can actually be verified —
+//     and without at least one of those, reverseWriteGateBlockReason blocks
+//     every reverse write by design ("the cross-check sampled nothing this
+//     cycle"). A fixture without it would test the gate, not the action.
+//   - movie 152: UNMONITORED, has a file, still below cutoff. That is the
+//     reverse-scan finding a human clicks the button on.
+func remonitorFixture(t *testing.T, fake *arrFake) Instance {
+	t.Helper()
+	fake.movies = `[
+	  {"id":1,"title":"Already Fine","monitored":true,"hasFile":true,"qualityProfileId":1,"tags":[],
+	   "movieFile":{"id":10,"path":"/movies/Already Fine/f.mkv","quality":{"quality":{"id":2,"name":"1080p"}},"qualityCutoffNotMet":false}},
+	  {"id":152,"title":"Fever Pitch","monitored":false,"hasFile":true,"qualityProfileId":1,"tags":[],
+	   "movieFile":{"id":20,"path":"/movies/Fever Pitch/f.mkv","quality":{"quality":{"id":1,"name":"720p"}},"qualityCutoffNotMet":true}}
+	]`
+	fake.wanted[""] = `{"page":1,"pageSize":1000,"totalRecords":0,"records":[]}`
+	fake.wanted["false"] = `{"page":1,"pageSize":1000,"totalRecords":1,"records":[{"id":152}]}`
+	fake.movieByID["152"] = `{"id":152,"title":"Fever Pitch","monitored":false,"hasFile":true,"qualityProfileId":1,"tags":[],
+	   "movieFile":{"id":20,"path":"/movies/Fever Pitch/f.mkv","quality":{"quality":{"id":1,"name":"720p"}},"qualityCutoffNotMet":true}}`
+	fake.movieFiles["152"] = `[{"id":20,"movieId":152,"customFormatScore":0}]`
+	return Instance{Name: "radarr-main", Type: "radarr", URL: fake.srv.URL, APIKey: "k"}
+}
+
+// seedReverseFinding puts the reverse-scan finding into the store, as a
+// completed sweep would, so the operation sentence is built from what
+// cutoffarr reported rather than from what the request claimed.
+func seedReverseFinding(store *statsStore, inst Instance, f reverseFinding) {
+	store.recordInstance(cycleKindSweep, time.Now(), inst.Name, inst.Type, cycleInstanceStats{
+		decisionsRan: true, reverseRan: true, reverseFindings: []reverseFinding{f},
+	})
+}
+
+// TestAction_Remonitor_RemonitorFlagOff_Is403AndNamesThatSecondSwitch is rule
+// 6: gui_actions alone is not enough for a re-monitor, and the refusal must
+// name the OTHER flag or an operator who has already turned gui_actions on is
+// left staring at a button that does nothing.
+func TestAction_Remonitor_RemonitorFlagOff_Is403AndNamesThatSecondSwitch(t *testing.T) {
+	fake := newArrFake(t)
+	inst := remonitorFixture(t, fake)
+	cfg := Config{DryRun: false, GUIActions: true, ReverseScanRemonitor: false, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, _ := newActionFixture(t, cfg, inst)
+	seedReverseFinding(store, inst, reverseFinding{ID: 152, Title: "Fever Pitch", Reason: ReasonQualityCutoffNotMet})
+
+	status, out := postAction(t, ts, `{"kind":"remonitor","confirm":true,"instance":"radarr-main","id":152}`)
+	if status != http.StatusForbidden || out.Outcome != actionOutcomeDisabled {
+		t.Fatalf("status=%d outcome=%q, want 403/disabled", status, out.Outcome)
+	}
+	if !strings.Contains(out.Reason, "reverse_scan_remonitor") {
+		t.Errorf("the refusal must name the second switch; got %q", out.Reason)
+	}
+	if fake.writeCount() != 0 {
+		t.Errorf("a disabled re-monitor must send no write; writes=%v", fake.writes)
+	}
+}
+
+// TestAction_Remonitor_DryRun_RehearsesAgainstFreshDataAndWritesNothing is the
+// rehearsal semantics on the *arr side: every fetch and every re-verification
+// happens, and the write is withheld at §2.1's gate immediately before the PUT.
+func TestAction_Remonitor_DryRun_RehearsesAgainstFreshDataAndWritesNothing(t *testing.T) {
+	fake := newArrFake(t)
+	inst := remonitorFixture(t, fake)
+	cfg := Config{DryRun: true, GUIActions: true, ReverseScanRemonitor: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, buf := newActionFixture(t, cfg, inst)
+	seedReverseFinding(store, inst, reverseFinding{ID: 152, Title: "Fever Pitch", Reason: ReasonQualityCutoffNotMet})
+
+	status, out := postAction(t, ts, `{"kind":"remonitor","confirm":true,"instance":"radarr-main","id":152}`)
+	if status != http.StatusOK || out.Outcome != actionOutcomeRehearsed {
+		t.Fatalf("status=%d outcome=%q reason=%q, want 200/rehearsed", status, out.Outcome, out.Reason)
+	}
+	if !strings.Contains(out.Operation, "Fever Pitch") || !strings.Contains(out.Operation, "152") {
+		t.Errorf("operation = %q, want it to state the item and its id", out.Operation)
+	}
+	if fake.writeCount() != 0 {
+		t.Errorf("a rehearsal must send no write; writes=%v", fake.writes)
+	}
+	if !strings.Contains(buf.String(), "outcome=rehearsed") {
+		t.Errorf("the rehearsal must be audited; log:\n%s", buf.String())
+	}
+}
+
+// TestAction_Remonitor_PerformsExactlyOneWriteForExactlyTheItemClicked is rule
+// 6's whole promise: the existing gated reverse path, scoped to one item. One
+// PUT, for movie 152 and nothing else — the other movie in the library is
+// monitored and correct, and must not be touched in either direction.
+func TestAction_Remonitor_PerformsExactlyOneWriteForExactlyTheItemClicked(t *testing.T) {
+	fake := newArrFake(t)
+	inst := remonitorFixture(t, fake)
+	cfg := Config{DryRun: false, GUIActions: true, ReverseScanRemonitor: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, buf := newActionFixture(t, cfg, inst)
+	seedReverseFinding(store, inst, reverseFinding{ID: 152, Title: "Fever Pitch", Reason: ReasonQualityCutoffNotMet})
+
+	status, out := postAction(t, ts, `{"kind":"remonitor","confirm":true,"instance":"radarr-main","id":152}`)
+	if status != http.StatusOK || out.Outcome != actionOutcomePerformed {
+		t.Fatalf("status=%d outcome=%q reason=%q, want 200/performed\nlog:\n%s", status, out.Outcome, out.Reason, buf.String())
+	}
+	fake.mu.Lock()
+	writes := append([]string(nil), fake.writes...)
+	fake.mu.Unlock()
+	if len(writes) != 1 {
+		t.Fatalf("writes = %v, want exactly one", writes)
+	}
+	if !strings.HasSuffix(writes[0], "/api/v3/movie/152") {
+		t.Errorf("the one write was %q, want it to name movie 152 and nothing else", writes[0])
+	}
+	log := buf.String()
+	for _, want := range []string{"msg=action", "source=gui", "kind=remonitor", "outcome=performed"} {
+		if !strings.Contains(log, want) {
+			t.Errorf("audit line is missing %q; log:\n%s", want, log)
+		}
+	}
+	snap := store.snapshot()
+	if len(snap.Instances[0].LastActions) == 0 || snap.Instances[0].LastActions[0].Action != ActionRemonitor {
+		t.Errorf("the re-monitor must appear in lastActions; got %+v", snap.Instances[0].LastActions)
+	}
+}
+
+// TestAction_Remonitor_RefusesAnItemThatIsAlreadyMonitored is rule 3 on the
+// *arr side — the exact staleness the brief names ("movie already monitored").
+func TestAction_Remonitor_RefusesAnItemThatIsAlreadyMonitored(t *testing.T) {
+	fake := newArrFake(t)
+	inst := remonitorFixture(t, fake)
+	// Somebody re-monitored it in Radarr between the sweep and the click.
+	fake.movies = strings.Replace(fake.movies, `"id":152,"title":"Fever Pitch","monitored":false`, `"id":152,"title":"Fever Pitch","monitored":true`, 1)
+	fake.wanted["false"] = `{"page":1,"pageSize":1000,"totalRecords":0,"records":[]}`
+
+	cfg := Config{DryRun: false, GUIActions: true, ReverseScanRemonitor: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, _ := newActionFixture(t, cfg, inst)
+	seedReverseFinding(store, inst, reverseFinding{ID: 152, Title: "Fever Pitch", Reason: ReasonQualityCutoffNotMet})
+
+	status, out := postAction(t, ts, `{"kind":"remonitor","confirm":true,"instance":"radarr-main","id":152}`)
+	if status != http.StatusConflict || out.Outcome != actionOutcomeRefused {
+		t.Fatalf("status=%d outcome=%q reason=%q, want 409/refused", status, out.Outcome, out.Reason)
+	}
+	if fake.writeCount() != 0 {
+		t.Errorf("a refused re-monitor must send no write; writes=%v", fake.writes)
+	}
+}
+
+// TestAction_Remonitor_SeasonShapeMustMatchTheInstanceType keeps a Radarr
+// request carrying a season (or a Sonarr one carrying none) from reaching a
+// write path built for the other shape.
+func TestAction_Remonitor_SeasonShapeMustMatchTheInstanceType(t *testing.T) {
+	fake := newArrFake(t)
+	inst := remonitorFixture(t, fake)
+	cfg := Config{DryRun: false, GUIActions: true, ReverseScanRemonitor: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, _, _ := newActionFixture(t, cfg, inst)
+
+	status, out := postAction(t, ts, `{"kind":"remonitor","confirm":true,"instance":"radarr-main","id":152,"season":3}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (outcome %q reason %q)", status, out.Outcome, out.Reason)
+	}
+	if fake.writeCount() != 0 {
+		t.Errorf("writes = %v, want none", fake.writes)
+	}
+}
+
+// --- the merge action, end to end -------------------------------------------
+
+// TestAction_MergeCaseTwin_EndToEndOnACaseSensitiveFilesystem is the merge
+// through the endpoint, with the twin spelled the way the real bug is spelled.
+// It runs only where the filesystem can hold both spellings (see the note at
+// the top of the merge section); the merge mechanics themselves, and every
+// eligibility and refusal rule, are covered on every platform above.
+func TestAction_MergeCaseTwin_EndToEndOnACaseSensitiveFilesystem(t *testing.T) {
+	root := t.TempDir()
+	if !caseSensitiveFS(t, root) {
+		t.Skip("this filesystem is case-insensitive, so a real case-twin cannot exist to be merged")
+	}
+	fake := newArrFake(t)
+	writeActionFile(t, root, "show/Season 01/tracked.mkv", "tracked")
+	writeActionFile(t, root, "SHOW/Season 01/stray.mkv", "stray")
+	fake.series = `[{"id":3,"title":"Show","monitored":true,"tags":[],"path":"/tv/show","seasons":[]}]`
+	fake.episodeFiles["3"] = `[{"id":30,"seriesId":3,"seasonNumber":1,"path":"/tv/show/Season 01/tracked.mkv"}]`
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: fake.srv.URL, APIKey: "k",
+		MediaRootMap: map[string]string{"/tv": root}}
+
+	cfg := Config{DryRun: false, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, buf := newActionFixture(t, cfg, inst)
+	store.recordInstance(cycleKindSweep, time.Now(), inst.Name, inst.Type, cycleInstanceStats{
+		decisionsRan: true, fileReportRan: true,
+		fileReport: fileReportSnapshot{Status: "ran", CaseCollisions: 1, Findings: []fileReportFindingRecord{{
+			Kind: fileKindCaseCollision, Path: root, Display: filepath.Base(root),
+			EntryType: fileReportEntryTypeDir,
+			Names: []caseCollisionNameRecord{
+				{Name: "SHOW", Tracked: false},
+				{Name: "show", Tracked: true},
+			},
+		}}},
+	})
+
+	status, out := postAction(t, ts,
+		`{"kind":"merge-case-twin","confirm":true,"instance":"sonarr-main","path":`+jsonString(root)+`,"tracked":"show","untracked":"SHOW"}`)
+	if status != http.StatusOK || out.Outcome != actionOutcomePerformed {
+		t.Fatalf("status=%d outcome=%q reason=%q, want 200/performed\nlog:\n%s", status, out.Outcome, out.Reason, buf.String())
+	}
+	if body, err := os.ReadFile(filepath.Join(root, "show", "Season 01", "stray.mkv")); err != nil || string(body) != "stray" {
+		t.Errorf("the stray file must land under the tracked spelling: contents=%q err=%v", body, err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "SHOW")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the untracked spelling must be trash-moved (err=%v)", err)
+	}
+	if !strings.Contains(out.Operation, "SHOW") || !strings.Contains(out.Operation, "show") {
+		t.Errorf("operation = %q, want it to name both spellings", out.Operation)
+	}
+}
+
+// TestAction_MergeCaseTwin_IneligibleShapeIsRefusedWithItsReason is rule 5's
+// report-only half reaching the operator through the endpoint rather than
+// being silently button-less.
+func TestAction_MergeCaseTwin_IneligibleShapeIsRefusedWithItsReason(t *testing.T) {
+	root := t.TempDir()
+	fake := newArrFake(t)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: fake.srv.URL, APIKey: "k",
+		MediaRootMap: map[string]string{"/tv": root}}
+	cfg := Config{DryRun: false, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, _ := newActionFixture(t, cfg, inst)
+	store.recordInstance(cycleKindSweep, time.Now(), inst.Name, inst.Type, cycleInstanceStats{
+		decisionsRan: true, fileReportRan: true,
+		fileReport: fileReportSnapshot{Status: "ran", CaseCollisions: 1, Findings: []fileReportFindingRecord{{
+			Kind: fileKindCaseCollision, Path: root, Display: "d", EntryType: fileReportEntryTypeDir,
+			Names: []caseCollisionNameRecord{{Name: "SHOW"}, {Name: "show"}}, // neither tracked
+		}}},
+	})
+
+	status, out := postAction(t, ts,
+		`{"kind":"merge-case-twin","confirm":true,"instance":"sonarr-main","path":`+jsonString(root)+`,"tracked":"show","untracked":"SHOW"}`)
+	if status != http.StatusConflict || out.Outcome != actionOutcomeRefused {
+		t.Fatalf("status=%d outcome=%q, want 409/refused", status, out.Outcome)
+	}
+	if !strings.Contains(out.Reason, "neither spelling") {
+		t.Errorf("reason = %q, want the eligibility reason a row would show", out.Reason)
+	}
+}

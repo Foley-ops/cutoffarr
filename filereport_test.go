@@ -4752,3 +4752,35 @@ func TestFileReportSnapshotFrom_CarriesSizeToTheWireForFileFindingsOnly(t *testi
 		t.Errorf("case-collision Size = %d, want 0: it names a directory, not a file", snap.Findings[1].Size)
 	}
 }
+
+// TestEvaluateFileReportRoot_TrashIsNeverWalked is [v2.2] rule 4's other half,
+// and without it the action system would eat its own tail: a file the human
+// trashed lands under <root>/.cutoffarr-trash, is by construction not tracked
+// by the *arr, and would come straight back on the next sweep as an ORPHAN —
+// with a button offering to trash it again, into a second stamp directory,
+// forever. The trash is pruned from descent exactly like the Plex extras
+// folders are.
+func TestEvaluateFileReportRoot_TrashIsNeverWalked(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureFiles(t, dir,
+		filepath.Join("Movie", "Movie.mkv"),
+		filepath.Join(trashDirName, "2026-08-13T09:04:05Z", "Movie", "already-trashed.mkv"),
+	)
+	root := mediaRoot{arrPath: "/movies", diskPath: dir}
+	set := instanceTrackedSet{
+		files:        map[string]bool{filepath.Join(dir, "Movie", "Movie.mkv"): true},
+		folders:      map[string]string{filepath.Join(dir, "Movie"): "Movie"},
+		seriesFolder: map[string]bool{},
+	}
+	logger, _ := newFileReportTestLogger(slog.LevelInfo)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "radarr-main", Type: "radarr"}, root, set)
+
+	if outcome.skipped {
+		t.Fatal("the root was skipped; the trash directory must not disturb the walk at all")
+	}
+	for _, f := range outcome.findings {
+		if strings.Contains(f.diskPath, trashDirName) {
+			t.Errorf("the file report reported %s (kind %s): a trashed file must never come back as a finding, or the action system would offer to trash it again forever", f.diskPath, f.kind)
+		}
+	}
+}

@@ -1084,6 +1084,23 @@ func evaluateFileReportRoot(ctx context.Context, logger *slog.Logger, itemLevel 
 		filePath := cleanArrPath(path.Join(root.diskPath, rel))
 
 		if d.IsDir() {
+			// [v2.2] The trash is pruned from descent, exactly like the Plex
+			// extras folders are, and it is pruned FIRST — before the
+			// case-collision pre-scan, before any classification — because
+			// nothing inside it is a fact about the library at all.
+			//
+			// Without this the action system eats its own tail: a file a human
+			// trashed lands under <root>/.cutoffarr-trash, is by construction
+			// no longer tracked by the *arr, and comes back on the very next
+			// sweep as an ORPHAN carrying a button offering to trash it again,
+			// into a second stamp directory, forever. It also keeps the trash
+			// out of every count and every heuristic, so a large trash can
+			// never flatter a half-mounted root into looking healthy.
+			//
+			// rel == "." is the root itself and is never this directory.
+			if d.Name() == trashDirName {
+				return fs.SkipDir
+			}
 			if excludeDirs[filePath] {
 				// [v2.1] This directory's own name collided with a
 				// sibling's, decided at its PARENT's pre-scan below (never
