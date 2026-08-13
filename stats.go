@@ -46,10 +46,21 @@ const (
 // version number.
 var buildVersion = "dev"
 
-// actionRecord is one confirmed write this project made — the forward
-// pass's "unmonitor" or the reverse pass's "remonitor" — kept for
-// instanceStatsView.LastActions. Season is nil for a Radarr movie (movies
-// have no seasons) and set for a Sonarr season.
+// actionRecord is one thing this project did, or was asked to do, to one item
+// — the forward pass's "unmonitor", the reverse pass's "remonitor", or [v2.2] a
+// human-clicked action (actions.go) — kept for instanceStatsView.LastActions.
+// Season is nil for a Radarr movie (movies have no seasons) and set for a
+// Sonarr season.
+//
+// Outcome is [v2.2] what happened, in the action system's own five-value
+// vocabulary (performed / rehearsed / refused / disabled / failed), and it is
+// set ONLY on a human-clicked action. It is what makes brief item 9's "every
+// action … appears in lastActions" safe to honor literally: a rehearsal or a
+// refusal in this list is not a write claimed, it is a click answered, and the
+// field says which. Its ABSENCE means the record is one of the daemon's own
+// writes, which are appended only where the write landed — see the write
+// passes' own call sites (decision.go, sonarr_writer.go, reverse.go), which
+// have meant "confirmed write" since the first one and still do.
 //
 // Time is left zero by every write-path call site that builds one: it is
 // filled in by statsStore.recordInstance, uniformly, from the SAME clock
@@ -58,12 +69,13 @@ var buildVersion = "dev"
 // stacks deep for a value that exists to be glanced at, not audited to the
 // millisecond.
 type actionRecord struct {
-	Time   time.Time `json:"time"`
-	Action string    `json:"action"`
-	ID     int       `json:"id"`
-	Title  string    `json:"title"`
-	Season *int      `json:"season,omitempty"`
-	Reason string    `json:"reason"`
+	Time    time.Time `json:"time"`
+	Action  string    `json:"action"`
+	Outcome string    `json:"outcome,omitempty"`
+	ID      int       `json:"id"`
+	Title   string    `json:"title"`
+	Season  *int      `json:"season,omitempty"`
+	Reason  string    `json:"reason"`
 }
 
 // reverseFinding is one reverse-scan finding, radarr or sonarr shaped. Only

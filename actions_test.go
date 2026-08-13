@@ -936,43 +936,50 @@ func TestAction_Trash_PerformsTheMoveLogsItAndRecordsItInLastActions(t *testing.
 	}
 }
 
-// TestAction_OnlyPerformedActionsReachLastActions pins the one place where this
-// implementation reads brief item 9 NARROWLY, so that the narrowing is a
-// decision with a test rather than an accident nobody notices.
+// TestAction_EveryActionAppearsInLastActionsCarryingItsOutcome is brief item 9
+// read literally, which is the controller's ruling on the round-3 escalation:
+// "every action (rehearsed, performed, refused) logs msg=action ... AND appears
+// in lastActions".
 //
-// Item 9 says every action "logs msg=action ... and appears in lastActions". The
-// log half is unconditional and is asserted all over this file, for rehearsals,
-// refusals, disablements and failures alike. The lastActions half is not:
-// lastActions has meant "writes that actually landed" since the daemon's own
-// first write (cycleInstanceStats.actions), the dashboard renders it under that
-// meaning, and the API contract states it — so a rehearsal listed there would
-// make the one table an operator trusts to say what changed start listing things
-// that did not happen. dry_run's own contract ("always empty in dry-run") says
-// the same thing from the other side.
+// The reason the literal reading is the right one is the operator's question.
+// lastActions is the one list a human reads to answer "what did I do through
+// this dashboard"; if it holds only what landed, then every rehearsal and every
+// refusal exists solely in stdout, and the audit trail for actions is split
+// across two places with the GUI-visible half silently incomplete. What makes
+// that safe is that each record now CARRIES its outcome, so a listed rehearsal
+// can never be mistaken for a write: the list says what happened, in the same
+// vocabulary the response and the log line use.
 //
-// It is pinned in BOTH directions because either drift is a lie: a performed
-// action missing from the list, or a rehearsed/refused one appearing in it.
-func TestAction_OnlyPerformedActionsReachLastActions(t *testing.T) {
-	// A rehearsal: every check runs, nothing is written, nothing is recorded.
-	t.Run("a rehearsed action is audited but never listed", func(t *testing.T) {
+// Every outcome is asserted in both places at once — the log line and the
+// record — because the whole point is that they cannot diverge.
+func TestAction_EveryActionAppearsInLastActionsCarryingItsOutcome(t *testing.T) {
+	// A rehearsal: every check runs, nothing is written, and the record says so.
+	t.Run("a rehearsed action is audited and listed as rehearsed", func(t *testing.T) {
 		fake := newArrFake(t)
 		_, dupPath, inst := radarrFileFixture(t, fake)
 		cfg := Config{DryRun: true, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
 		_, ts, store, buf := newActionFixture(t, cfg, inst)
-		seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "d", Size: 10})
+		seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "Movies/x/d.mkv", Size: 10})
 
 		status, out := postAction(t, ts, `{"kind":"trash","confirm":true,"instance":"radarr-main","path":`+jsonString(dupPath)+`,"finding":"duplicate","size":10}`)
 		if status != http.StatusOK || out.Outcome != actionOutcomeRehearsed {
 			t.Fatalf("status=%d outcome=%q reason=%q, want 200/rehearsed", status, out.Outcome, out.Reason)
 		}
 		assertActionAudited(t, buf, "trash", actionOutcomeRehearsed, dupPath)
-		if acts := store.snapshot().Instances[0].LastActions; len(acts) != 0 {
-			t.Errorf("lastActions = %+v, want empty: a rehearsal moved nothing, and lastActions is the one list that says what actually changed", acts)
+		rec := assertOneListedAction(t, store, ActionTrash, actionOutcomeRehearsed)
+		if rec.Title != "Movies/x/d.mkv" {
+			t.Errorf("lastActions[0].Title = %q, want the finding's own display path", rec.Title)
+		}
+		// The file is still where it was: a listed rehearsal must never be a
+		// performed one.
+		if body, err := os.ReadFile(dupPath); err != nil || string(body) != "0123456789" {
+			t.Errorf("the file must be untouched by a rehearsal: contents=%q err=%v", body, err)
 		}
 	})
 
-	// A refusal: the finding is stale, so nothing happened and nothing is listed.
-	t.Run("a refused action is audited but never listed", func(t *testing.T) {
+	// A refusal: the finding is stale, so nothing happened — and the list says
+	// that too, rather than being silent about the click.
+	t.Run("a refused action is audited and listed as refused", func(t *testing.T) {
 		fake := newArrFake(t)
 		_, dupPath, inst := radarrFileFixture(t, fake)
 		cfg := Config{DryRun: false, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
@@ -988,14 +995,32 @@ func TestAction_OnlyPerformedActionsReachLastActions(t *testing.T) {
 			t.Fatalf("status=%d outcome=%q, want 409/refused", status, out.Outcome)
 		}
 		assertActionAudited(t, buf, "trash", actionOutcomeRefused, dupPath)
-		if acts := store.snapshot().Instances[0].LastActions; len(acts) != 0 {
-			t.Errorf("lastActions = %+v, want empty: cutoffarr declined, so nothing changed", acts)
+		rec := assertOneListedAction(t, store, ActionTrash, actionOutcomeRefused)
+		if !strings.Contains(rec.Reason, "not the file you confirmed") {
+			t.Errorf("lastActions[0].Reason = %q, want the same sentence the operator was answered with", rec.Reason)
 		}
 	})
 
-	// The control, without which the two assertions above would also pass on an
-	// implementation that never recorded anything at all.
-	t.Run("a performed action is listed", func(t *testing.T) {
+	// A disabled switch is an answer too, and it is the one an operator is most
+	// likely to be looking for an explanation of.
+	t.Run("a disabled action is audited and listed as disabled", func(t *testing.T) {
+		fake := newArrFake(t)
+		_, dupPath, inst := radarrFileFixture(t, fake)
+		cfg := Config{DryRun: false, GUIActions: false, ExclusionTag: "cutoffarr-exclude"}
+		_, ts, store, buf := newActionFixture(t, cfg, inst)
+		seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "d", Size: 10})
+
+		status, out := postAction(t, ts, `{"kind":"trash","confirm":true,"instance":"radarr-main","path":`+jsonString(dupPath)+`,"finding":"duplicate","size":10}`)
+		if status != http.StatusForbidden || out.Outcome != actionOutcomeDisabled {
+			t.Fatalf("status=%d outcome=%q, want 403/disabled", status, out.Outcome)
+		}
+		assertActionAudited(t, buf, "trash", actionOutcomeDisabled, dupPath)
+		assertOneListedAction(t, store, ActionTrash, actionOutcomeDisabled)
+	})
+
+	// The control the two non-performed cases need: an implementation that
+	// recorded everything with a constant outcome would pass them and fail here.
+	t.Run("a performed action is listed as performed", func(t *testing.T) {
 		fake := newArrFake(t)
 		_, dupPath, inst := radarrFileFixture(t, fake)
 		cfg := Config{DryRun: false, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
@@ -1005,11 +1030,65 @@ func TestAction_OnlyPerformedActionsReachLastActions(t *testing.T) {
 		if status, out := postAction(t, ts, `{"kind":"trash","confirm":true,"instance":"radarr-main","path":`+jsonString(dupPath)+`,"finding":"duplicate","size":10}`); status != http.StatusOK || out.Outcome != actionOutcomePerformed {
 			t.Fatalf("status=%d outcome=%q reason=%q, want 200/performed", status, out.Outcome, out.Reason)
 		}
-		acts := store.snapshot().Instances[0].LastActions
-		if len(acts) != 1 || acts[0].Action != ActionTrash {
-			t.Fatalf("lastActions = %+v, want exactly one %s record", acts, ActionTrash)
-		}
+		assertOneListedAction(t, store, ActionTrash, actionOutcomePerformed)
 	})
+}
+
+// TestAction_ARequestThatNamesNothingRealIsNeverListed is the other half of the
+// literal reading, and the reason it is safe to record refusals at all: an
+// action is a thing a human did to a finding on a configured instance. A request
+// naming an instance this daemon has never heard of, or a kind it does not
+// implement, is not an action — recording it would let anything that can reach
+// the port invent instances in the operator's own stats table, and would put a
+// value outside the documented four-token vocabulary into `action`.
+//
+// The log still carries both, which is where an unrecognized request belongs.
+func TestAction_ARequestThatNamesNothingRealIsNeverListed(t *testing.T) {
+	fake := newArrFake(t)
+	_, dupPath, inst := radarrFileFixture(t, fake)
+	cfg := Config{DryRun: false, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, buf := newActionFixture(t, cfg, inst)
+	seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "d", Size: 10})
+
+	for _, body := range []string{
+		`{"kind":"trash","confirm":true,"instance":"a-radarr-nobody-configured","path":` + jsonString(dupPath) + `,"finding":"duplicate","size":10}`,
+		`{"kind":"delete-everything","confirm":true,"instance":"radarr-main","path":` + jsonString(dupPath) + `,"finding":"duplicate","size":10}`,
+	} {
+		if status, out := postAction(t, ts, body); status != http.StatusBadRequest {
+			t.Fatalf("status=%d outcome=%q, want 400 for %s", status, out.Outcome, body)
+		}
+	}
+	snap := store.snapshot()
+	if len(snap.Instances) != 1 {
+		t.Fatalf("instances = %+v, want only the one configured instance: no request may invent one", snap.Instances)
+	}
+	if acts := snap.Instances[0].LastActions; len(acts) != 0 {
+		t.Errorf("lastActions = %+v, want empty: neither request named an action on a finding", acts)
+	}
+	if !strings.Contains(buf.String(), "outcome=refused") {
+		t.Errorf("both requests must still be audited; log:\n%s", buf.String())
+	}
+}
+
+// assertOneListedAction asserts that the store holds exactly one GUI action for
+// its one instance, with the kind and outcome given, and returns it.
+func assertOneListedAction(t *testing.T, store *statsStore, action, outcome string) actionRecord {
+	t.Helper()
+	snap := store.snapshot()
+	if len(snap.Instances) != 1 {
+		t.Fatalf("instances = %+v, want exactly one", snap.Instances)
+	}
+	acts := snap.Instances[0].LastActions
+	if len(acts) != 1 {
+		t.Fatalf("lastActions = %+v, want exactly one record: every action, whatever its outcome, is one line in the list an operator reads to answer \"what did I do here\"", acts)
+	}
+	if acts[0].Action != action || acts[0].Outcome != outcome {
+		t.Fatalf("lastActions[0] = %+v, want action %q outcome %q", acts[0], action, outcome)
+	}
+	if acts[0].Time.IsZero() {
+		t.Errorf("lastActions[0].Time is zero; every record is stamped by the store")
+	}
+	return acts[0]
 }
 
 // --- staleness refusals -----------------------------------------------------
@@ -2209,7 +2288,8 @@ func TestAction_Remonitor_SonarrPerformsExactlyOneSeasonWrite(t *testing.T) {
 // The honest answer to that is "this instance no longer reports the item as
 // wrongly unmonitored", and it must be told apart from the ambiguous zero the
 // round-2 fix separated out (a pass that never completed). Nothing may be
-// written, and nothing may be recorded.
+// written; the refusal is listed as a refusal (item 9), which is a different
+// claim from a write and must not read as one.
 func TestAction_Remonitor_SonarrSeasonThatIsNoLongerAFindingIsAnsweredHonestly(t *testing.T) {
 	fake := newArrFake(t)
 	inst := sonarrRemonitorFixture(t, fake, false)
@@ -2234,8 +2314,12 @@ func TestAction_Remonitor_SonarrSeasonThatIsNoLongerAFindingIsAnsweredHonestly(t
 	if fake.writeCount() != 0 {
 		t.Errorf("a season that is no longer a finding must never be written: %v", fake.writes)
 	}
-	if acts := store.snapshot().Instances[0].LastActions; len(acts) != 0 {
-		t.Errorf("lastActions = %+v, want empty: nothing was written", acts)
+	rec := assertOneListedAction(t, store, ActionRemonitor, actionOutcomeRefused)
+	if rec.ID != 9 || rec.Season == nil || *rec.Season != 1 {
+		t.Errorf("lastActions[0] = %+v, want it to name series 9 season 1 — the item the button named", rec)
+	}
+	if !strings.Contains(rec.Reason, "no longer reports") {
+		t.Errorf("lastActions[0].Reason = %q, want the same answer the operator got", rec.Reason)
 	}
 }
 

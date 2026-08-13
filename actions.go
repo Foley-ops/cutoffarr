@@ -714,7 +714,15 @@ func (a *actionRunner) refuse(req actionRequest, outcome, operation, reason stri
 //
 // extra carries outcome-specific attrs (the partial-merge counts) alongside the
 // fixed vocabulary; nil for every other call.
+//
+// It is also where the action reaches lastActions, and that is deliberate:
+// item 9 asks for one line AND one listed record for every action, so the two
+// are produced by one call rather than by two conventions that can drift. An
+// exit that forgets to audit is already impossible (refuse audits as it builds,
+// and every other exit is an explicit audit + return); folding the record in
+// here makes "logged but not listed" impossible in the same way.
 func (a *actionRunner) audit(req actionRequest, outcome, operation, detail string, extra ...any) {
+	a.recordAction(req, outcome, detail)
 	if a.logger == nil {
 		return
 	}
@@ -750,29 +758,76 @@ func (a *actionRunner) audit(req actionRequest, outcome, operation, detail strin
 	a.logger.Info("action", attrs...)
 }
 
-// recordAction folds a performed GUI action into the stats store's
-// lastActions, so the same table that shows the daemon's own writes shows what
-// a human did through it. Rehearsals and refusals are deliberately NOT
-// recorded: lastActions has always meant "writes that actually landed"
-// (cycleInstanceStats.actions' own rule), and a rehearsal that appeared there
-// would make the one list an operator trusts to say what changed start
-// listing things that did not.
+// recordAction folds a GUI action — WHATEVER its outcome — into the stats
+// store's lastActions, so the same table that shows the daemon's own writes
+// shows what a human did through it and what came of it.
 //
-// This is the ONE place this implementation reads brief item 9 narrowly, and
-// the narrowing is deliberate, stated, and pinned in both directions by
-// TestAction_OnlyPerformedActionsReachLastActions. Item 9's sentence is "every
-// action (rehearsed, performed, refused) logs msg=action ... and appears in
-// lastActions": the log half is honored unconditionally (audit, called from
-// every exit including refuse), and the lastActions half is honored for what
-// landed. The alternative reading contradicts three standing contracts at once
-// — lastActions' own meaning, the README's "always empty in dry-run", and the
-// rule that this program never reports an action it did not take — so it is
-// flagged for the controller rather than silently taken either way.
-func (a *actionRunner) recordAction(inst Instance, rec actionRecord) {
-	if a.stats == nil {
+// This is brief item 9 read literally ("every action (rehearsed, performed,
+// refused) logs msg=action … and appears in lastActions"), which is the
+// controller's ruling on the round-3 escalation. Recording only what landed
+// left the one list an operator reads to answer "what did I do through this
+// dashboard" silent about every rehearsal and every refusal, with that half of
+// the audit trail living only in stdout — the split item 9 was written against.
+// What makes it safe is actionRecord.Outcome: a listed rehearsal states that it
+// rehearsed, so nothing here can be read as a write that did not happen. The
+// daemon's own write records are unchanged and still carry no outcome, which is
+// how a client tells the two apart.
+//
+// Two requests are deliberately NOT recorded, because neither is an action:
+//
+//   - one naming an instance this daemon has not been configured with. The
+//     store CREATES an instance entry for a name it has not seen (a human may
+//     click before the first sweep completes), so recording these would let
+//     anything that can reach the port invent instances in the operator's own
+//     stats.
+//   - one naming a kind outside actionKinds, which would put a value outside
+//     the documented four-token `action` vocabulary onto the wire.
+//
+// Both are still audited to the log, which is where an unrecognized request
+// belongs. Pinned by TestAction_ARequestThatNamesNothingRealIsNeverListed.
+func (a *actionRunner) recordAction(req actionRequest, outcome, detail string) {
+	if a.stats == nil || !actionKinds[req.Kind] {
 		return
 	}
+	inst, ok := a.instanceByName(req.Instance)
+	if !ok {
+		return
+	}
+	rec := actionRecord{
+		Action:  req.Kind,
+		Outcome: outcome,
+		Title:   a.actionTitle(inst, req),
+		Reason:  detail,
+	}
+	// The item identifiers belong to the re-monitor shape only: on a file action
+	// they are whatever the request happened to carry, and a record naming
+	// "movie 0" — or a movie id a trash request invented — is worse than no
+	// identifier at all.
+	if req.Kind == ActionRemonitor {
+		rec.ID, rec.Season = req.ID, req.Season
+	}
 	a.stats.recordGUIAction(inst.Name, inst.Type, a.now(), rec)
+}
+
+// actionTitle is the human-readable subject of a recorded action, taken from
+// what CUTOFFARR reported rather than from what the request claimed — the same
+// rule the operation sentences follow. It reads the last completed sweep's own
+// snapshot (in memory; no *arr call, no walk), so it costs a refusal nothing.
+func (a *actionRunner) actionTitle(inst Instance, req actionRequest) string {
+	switch req.Kind {
+	case ActionTrash:
+		if f, ok := reportedFinding(a.storedSnapshotFor(inst.Name), req.Finding, req.Path); ok && f.Display != "" {
+			return f.Display
+		}
+		return req.Path
+	case ActionMergeCaseTwin:
+		if f, ok := reportedTwinFinding(a.storedSnapshotFor(inst.Name), req.Path, req.Tracked, req.Untracked); ok && f.Display != "" {
+			return f.Display
+		}
+		return req.Path
+	default:
+		return a.reverseFindingTitle(inst, req)
+	}
 }
 
 // --- live re-derivation (rule 3, the file half) -----------------------------
@@ -1069,7 +1124,6 @@ func (a *actionRunner) trash(ctx context.Context, inst Instance, req actionReque
 		}
 	}
 	a.audit(req, actionOutcomePerformed, operation, "moved to "+dest)
-	a.recordAction(inst, actionRecord{Action: ActionTrash, Title: reported.Display, Reason: "moved to " + dest})
 	return actionResponse{
 		Outcome: actionOutcomePerformed, Kind: req.Kind, Operation: operation,
 		Message: "Moved to " + dest + " — nothing was deleted; move it back by hand if this was wrong.",
@@ -1180,7 +1234,6 @@ func (a *actionRunner) mergeTwin(ctx context.Context, inst Instance, req actionR
 		msg += fmt.Sprintf(" %d file(s) already existed under the tracked spelling and were moved to the trash instead — listed below.", len(res.collided))
 	}
 	a.audit(req, actionOutcomePerformed, operation, msg)
-	a.recordAction(inst, actionRecord{Action: ActionMergeCaseTwin, Title: reported.Display, Reason: msg})
 	return actionResponse{
 		Outcome: actionOutcomePerformed, Kind: req.Kind, Operation: operation,
 		Message: msg, Items: res.collided, Trash: res.trashedDir, status: http.StatusOK,
@@ -1388,12 +1441,14 @@ func (a *actionRunner) remonitorOutcome(inst Instance, req actionRequest, operat
 		return a.refuse(req, actionOutcomeRefused, operation,
 			fmt.Sprintf("the evaluation of this item could not be completed or trusted this run, so nothing was written to %s. The log line for this action names what went wrong; nothing about the finding has changed.", inst.Name))
 
+	// The pass's own rev.actions are not re-recorded here: audit records the
+	// action from the request that asked for it, which is the same item (the
+	// scope narrowed to exactly one) named the way the button named it. Two
+	// records for one click would double-count the one list that answers "what
+	// did I do".
 	case rev.remonitored > 0:
 		msg := fmt.Sprintf("Re-monitored in %s. The next sweep will treat it like any other monitored item.", inst.Name)
 		a.audit(req, actionOutcomePerformed, operation, msg)
-		for _, rec := range rev.actions {
-			a.recordAction(inst, rec)
-		}
 		return actionResponse{Outcome: actionOutcomePerformed, Kind: req.Kind, Operation: operation, Message: msg, status: http.StatusOK}
 
 	case rev.echoUnverified > 0:

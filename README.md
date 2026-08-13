@@ -846,15 +846,35 @@ script, a status-page widget, whatever) without ever loading the HTML:
   "last sweep incomplete — &lt;reason&gt;" badge on that instance's shelf
   card; every other number on the card is left exactly as it last was.
 
-  `lastActions` holds up to the last 50 changes cutoffarr actually made, and
-  its `action` field has four values: `unmonitor`/`remonitor` are the
-  daemon's own writes in the two directions, and `trash`/`merge-case-twin`
-  (v2.2) are the file moves a human performed through
+  `lastActions` holds up to the last 50 entries in this instance's action
+  trail, and its `action` field has four values: `unmonitor`/`remonitor` are
+  the daemon's own writes in the two directions, and `trash`/
+  `merge-case-twin` (v2.2) are the file operations a human asked for through
   [`POST /api/action`](#acting-on-findings). Switch on all four — a client
   that knows only the two write tokens will meet the other two the first time
-  somebody clicks a button. It is always empty in dry-run, and holds only
-  what LANDED: a rehearsed or refused action is audited in the log but never
-  listed here, because a rehearsal is not an action taken.
+  somebody clicks a button.
+
+  `outcome` (v2.2) is what came of it, and reading it is not optional:
+
+  - **Absent** — one of the daemon's own writes, which are recorded only
+    where the write landed. This is the whole of `lastActions` on a
+    deployment where nobody has clicked anything, and it is still always
+    empty in dry-run, because a dry-run sweep writes nothing.
+  - **`performed`/`rehearsed`/`refused`/`disabled`/`failed`** — a
+    human-clicked action and the answer it got, in the same vocabulary
+    `POST /api/action` answers with. **Only `performed` changed anything.**
+    Every click is listed, whatever its answer, so the one list an operator
+    reads to answer "what did I do through this dashboard" is not silent
+    about the rehearsals and the refusals (brief item 9); `reason` carries
+    the same sentence the operator was answered with, and `title` names the
+    finding as cutoffarr reported it. A client that renders these as changes
+    will be lying about a dry-run deployment, where every click is a
+    `rehearsed` record and nothing on disk moved.
+
+  A request naming an instance this daemon has no configuration for, or a
+  kind it does not implement, is never listed at all (it is not an action on
+  a finding — it is logged and refused), so nothing a caller sends can invent
+  an instance here.
 
 - **`POST /api/scan`** — queues one full-library sweep (the same
   `fullLibraryScope`/reverse/file-report shape the reconciliation sweep and
@@ -1074,9 +1094,13 @@ Every action — performed, rehearsed or refused — writes one line:
 level=INFO msg=action source=gui kind=trash outcome=performed instance=radarr-main path=/data/media/Movies/... operation="Move to trash — ..." detail="moved to /data/media/Movies/.cutoffarr-trash/..."
 ```
 
-Performed actions also appear in the dashboard's `lastActions` list, alongside
-the writes cutoffarr made on its own — the same table, so "what changed" has
-one place to look.
+Every action also appears in that instance's `lastActions` list, alongside the
+writes cutoffarr made on its own — the same table, so "what happened here" has
+one place to look. Each one carries its `outcome`, so a rehearsal and a refusal
+are listed as what they are and can never be read as a change: on a `dry_run:
+true` deployment, every click you make shows up there as `rehearsed`, and
+nothing on disk or in the `*arr` moved. See
+[`GET /api/stats`](#the-web-dashboard) for the field.
 
 ## FAQ
 
