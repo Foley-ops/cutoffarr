@@ -967,11 +967,12 @@ func TestWebUIPage_FileReportShowsRootRelativeDisplayPathWithFullPathAsTitle(t *
 // breaks mid-word (dupli-cate) in its narrow column" fix: the kind cell must
 // opt out of table.findings td's page-wide word-break: break-word (below)
 // via its own class, and that class must reserve enough width to hold
-// "duplicate" — the longer of the two kind values — on one line.
+// "case-collision" — [v2.1] now the longest of the three kind values (14
+// characters, surpassing "duplicate"'s 9) — on one line.
 func TestWebUIPage_FileReportKindCellDoesNotWrapMidWord(t *testing.T) {
 	page := string(webUIPage)
 
-	if !strings.Contains(page, `td = el("td", "kind"); text(td, r.f.kind || "");`) {
+	if !strings.Contains(page, `td = el("td", "kind");`) {
 		t.Error("renderFileReport's kind cell is not built with the \"kind\" class")
 	}
 
@@ -985,10 +986,94 @@ func TestWebUIPage_FileReportKindCellDoesNotWrapMidWord(t *testing.T) {
 	}
 	rule := page[start : start+end]
 	if !strings.Contains(rule, "white-space: nowrap") {
-		t.Error("table.findings td.kind does not set white-space: nowrap — \"duplicate\" can still wrap (and break) mid-word")
+		t.Error("table.findings td.kind does not set white-space: nowrap — \"case-collision\" can still wrap (and break) mid-word")
 	}
-	if !strings.Contains(rule, "min-width") {
-		t.Error("table.findings td.kind reserves no min-width — the auto-sized column can still come out narrower than \"duplicate\" itself")
+	if !strings.Contains(rule, "min-width: 14ch") {
+		t.Error("table.findings td.kind does not reserve 14ch — the auto-sized column can still come out narrower than \"case-collision\" itself")
+	}
+}
+
+// TestWebUIPage_FileReportKindCellUsesClayChipStyling pins [v2.1]'s "renders
+// the kind with the existing chip styling (clay)" requirement: the kind
+// cell's text is wrapped in the page's OWN existing badge/badge-hunt chip
+// (the same clay-toned pill .shelf-unreachable and the dry-run/live badge
+// already use), not a bespoke new visual element — see the CSS token
+// comment's own "never introduced fresh" rule.
+func TestWebUIPage_FileReportKindCellUsesClayChipStyling(t *testing.T) {
+	page := string(webUIPage)
+
+	start := strings.Index(page, "function renderFileReport(")
+	if start == -1 {
+		t.Fatal("page has no renderFileReport function")
+	}
+	end := strings.Index(page[start:], "\n  function render(data)")
+	if end == -1 {
+		t.Fatal("could not find the end of renderFileReport (render(data) must follow it)")
+	}
+	body := page[start : start+end]
+
+	if !strings.Contains(body, `"badge badge-hunt"`) {
+		t.Error("renderFileReport's kind cell does not reuse the existing badge/badge-hunt (clay) chip styling")
+	}
+}
+
+// TestWebUIPage_FileReportCaseCollisionNoticeExplainsActionability pins
+// [v2.1]'s "pluralized copy in the panel's operator voice explaining the
+// actionability" requirement: when the file-clutter panel is showing any
+// case-collision rows, it must say what a case-twin IS and what to DO about
+// it (merge or rename), in the same plain, second-person-free "operator
+// voice" the panel's other copy ("No clutter found...", "not configured")
+// already uses — matching PLURALIZED to the count, the same way the
+// reverse-scan panel's own notice pluralizes "item"/"items".
+func TestWebUIPage_FileReportCaseCollisionNoticeExplainsActionability(t *testing.T) {
+	page := string(webUIPage)
+
+	start := strings.Index(page, "function renderFileReport(")
+	if start == -1 {
+		t.Fatal("page has no renderFileReport function")
+	}
+	end := strings.Index(page[start:], "\n  function render(data)")
+	if end == -1 {
+		t.Fatal("could not find the end of renderFileReport (render(data) must follow it)")
+	}
+	body := page[start : start+end]
+
+	if !strings.Contains(body, "differing only by case") {
+		t.Error("renderFileReport never explains what a case-collision finding IS (\"differing only by case\")")
+	}
+	if !strings.Contains(body, "merge or rename") {
+		t.Error("renderFileReport never explains the actionability of a case-collision finding (\"merge or rename\")")
+	}
+	if !strings.Contains(body, `=== 1 ? "" : "s"`) && !strings.Contains(body, `== 1 ? "" : "s"`) {
+		t.Error("renderFileReport's case-collision notice does not pluralize its copy to the count, unlike the rest of this page's own notices")
+	}
+}
+
+// TestWebUIPage_FileReportRowsAreNeverFilteredByKind pins that [v2.1]'s new
+// case-collision kind flows through renderFileReport's row-building loop
+// exactly like duplicate/orphan already do: rows.push is the loop's very
+// FIRST statement, unconditional, never gated behind a kind check that
+// could silently drop a kind (e.g. case-collision) from pagination —
+// paginateRows (shared with the reverse-scan panel) sees and pages every
+// finding pushed here like any other row, per the binding requirement
+// ("Pagination covers them like any row"). Any per-kind counting the loop
+// also does (e.g. tallying case-collisions for the notice below) must come
+// AFTER the push, never instead of it.
+func TestWebUIPage_FileReportRowsAreNeverFilteredByKind(t *testing.T) {
+	page := string(webUIPage)
+
+	start := strings.Index(page, "function renderFileReport(")
+	if start == -1 {
+		t.Fatal("page has no renderFileReport function")
+	}
+	end := strings.Index(page[start:], "\n  function render(data)")
+	if end == -1 {
+		t.Fatal("could not find the end of renderFileReport (render(data) must follow it)")
+	}
+	body := page[start : start+end]
+
+	if !strings.Contains(body, "j++) {\n          rows.push({ instance: inst.name, f: findings[j] });") {
+		t.Error("rows.push is not the row-building loop's own first, unconditional statement — a kind-based filter or reordering may have crept in ahead of it")
 	}
 }
 

@@ -362,13 +362,25 @@
      right for a long path but was breaking "duplicate" mid-word ("dupli-
      cate") whenever the auto-sized column came out narrower than the word
      itself. nowrap stops that outright; min-width reserves enough room for
-     "duplicate" (the longer of the two kind values, 9 characters) at this
-     table's own 12px mono size — 1ch is one monospace glyph's width, so 9ch
-     fits it exactly, with the cell's own right padding (above) as the only
-     breathing room needed after it. */
+     "case-collision" — [v2.1] now the longest of the three kind values, 14
+     characters, surpassing "duplicate"'s 9 — at this table's own 12px mono
+     size — 1ch is one monospace glyph's width, so 14ch fits it exactly,
+     with the cell's own right padding (above) as the only breathing room
+     needed after it. */
   table.findings td.kind {
     white-space: nowrap;
-    min-width: 9ch;
+    min-width: 14ch;
+  }
+
+  /* [v2.1] The kind cell's own chip: reuses .badge/.badge-hunt verbatim
+     (the SAME clay pill the dry-run/live badge and .shelf-unreachable
+     already use — "never introduced fresh", this file's own token-comment
+     rule) rather than inventing a second pill component just for a table
+     cell. .badge already sets white-space: nowrap/uppercase/mono; nothing
+     extra is needed here beyond fitting inside td.kind's own reserved
+     width above. */
+  table.findings td.kind .badge {
+    font-size: 10px;
   }
 
   .findings-scroll { overflow-x: auto; }
@@ -388,6 +400,17 @@
   ul.status-notices li { padding: 3px 0; }
   ul.status-notices li.status-off { color: var(--ink-faint); }
   ul.status-notices li.status-skipped { color: var(--hunt); }
+
+  /* [v2.1] The case-collision actionability notice — same mono/12px/hunt
+     (clay) treatment as .shelf-sub's own "N picked up on the reverse pass"
+     line, since both are the same kind of fact: not an alarm, just
+     something the operator should know is sitting there actionable. */
+  .case-collision-notice {
+    margin: 0 0 14px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--hunt);
+  }
 
   /* Client-side pagination for the reverse-scan / file-clutter tables
      (findings-scroll's own tables, above) — both panels can carry hundreds
@@ -1035,6 +1058,11 @@
     var notices = [];
     var anyRan = false;
     var offCount = 0, skippedCount = 0;
+    // caseCollisionCount is [v2.1]: counted alongside rows (never a second
+    // pass, never a filter on rows itself — see
+    // TestWebUIPage_FileReportRowsAreNeverFilteredByKind) purely to decide
+    // whether the explanatory notice below is shown, and how it pluralizes.
+    var caseCollisionCount = 0;
     for (var i = 0; i < instances.length; i++) {
       var inst = instances[i];
       var fr = inst.fileReport || {};
@@ -1044,6 +1072,7 @@
         var findings = fr.findings || [];
         for (var j = 0; j < findings.length; j++) {
           rows.push({ instance: inst.name, f: findings[j] });
+          if (findings[j].kind === "case-collision") caseCollisionCount++;
         }
       } else if (status === "skipped") {
         notices.push({ instance: inst.name, status: "skipped" });
@@ -1083,6 +1112,21 @@
       body.appendChild(list);
     }
 
+    // [v2.1] The case-collision actionability notice: shown whenever this
+    // panel is currently displaying any case-collision rows, in the SAME
+    // operator voice as the panel's other copy ("No clutter found...",
+    // "not configured") — plain statement of fact, no second person,
+    // pluralized to the count exactly like the reverse-scan panel's own
+    // notice pluralizes "item"/"items" above. This explains what a
+    // case-twin IS and what to DO about it once, above the table, rather
+    // than repeating the same sentence on every row.
+    if (caseCollisionCount > 0) {
+      var ccNotice = el("p", "case-collision-notice");
+      text(ccNotice, caseCollisionCount + " case-twin name collision" + (caseCollisionCount === 1 ? "" : "s") +
+        " found — two names differing only by case; the *arr tracks at most one spelling, so merge or rename to resolve.");
+      body.appendChild(ccNotice);
+    }
+
     resetPagerIfCountChanged(filePager, rows.length);
 
     if (rows.length === 0) {
@@ -1108,7 +1152,17 @@
         var count = r.f.count ? String(r.f.count) : "—";
         var td;
         td = el("td"); text(td, r.instance); tr.appendChild(td);
-        td = el("td", "kind"); text(td, r.f.kind || ""); tr.appendChild(td);
+        // [v2.1] The kind cell renders its text inside a chip — reusing the
+        // page's OWN existing badge/badge-hunt clay pill (see this file's
+        // token comment: "never introduced fresh") — rather than as bare
+        // text, so duplicate/orphan/case-collision read as the same kind
+        // of small, scannable label the dry-run/live and UNREACHABLE
+        // badges already are.
+        td = el("td", "kind");
+        var kindChip = el("span", "badge badge-hunt");
+        text(kindChip, r.f.kind || "");
+        td.appendChild(kindChip);
+        tr.appendChild(td);
         td = el("td"); text(td, group); tr.appendChild(td);
         // Path-display GUI fix: the cell shows the path relative to its mapped
         // root (display) — never the full cutoffarr-side disk path (path),
