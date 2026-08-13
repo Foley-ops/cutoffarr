@@ -413,6 +413,52 @@ func TestMergeCaseTwinDir_RefusesWhenTheTrackedSpellingIsNotADirectory(t *testin
 	}
 }
 
+// TestMergeCaseTwinDir_APartialMergeReportsEverythingItAlreadyMoved is the one
+// failure in this phase that leaves a library HALF-MOVED, and it had no test at
+// any level. mergeCaseTwinDir deliberately does not roll back (see its own
+// comment): what it does instead is return the result ALONGSIDE the error, and
+// everything the operator is told — the "(N file(s) had already been moved and
+// were left where they now are)" sentence, the 502, the ERROR line's moved=/
+// collided= attrs — is built from that result. If this returned a bare error, or
+// an empty result, the operator would be left with a half-moved library and a
+// message that named none of it.
+//
+// The walk fails on the SECOND season because its destination parent is a plain
+// file, which is a state no *arr creates but any hand-edit can: the point is a
+// mid-walk failure after a completed move, not which syscall reports it.
+func TestMergeCaseTwinDir_APartialMergeReportsEverythingItAlreadyMoved(t *testing.T) {
+	root := t.TempDir()
+	writeActionFile(t, root, "untracked-spelling/Season 01/a.mkv", "A")
+	writeActionFile(t, root, "untracked-spelling/Season 02/b.mkv", "B")
+	writeActionFile(t, root, "tracked-spelling/Season 01/keep.mkv", "keep")
+	// The obstruction: Season 02 exists under the tracked spelling as a FILE.
+	writeActionFile(t, root, "tracked-spelling/Season 02", "not a directory")
+	tracked := filepath.Join(root, "tracked-spelling")
+	untracked := filepath.Join(root, "untracked-spelling")
+
+	res, err := mergeCaseTwinDir(root, untracked, tracked, time.Date(2026, 8, 13, 9, 4, 5, 0, time.UTC))
+	if err == nil {
+		t.Fatal("mergeCaseTwinDir reported success; the second season could not be merged")
+	}
+	if len(res.moved) != 1 || !strings.HasSuffix(res.moved[0], filepath.Join("Season 01", "a.mkv")) {
+		t.Fatalf("moved = %v, want exactly the one file that DID move: a failure that reports nothing moved is how a half-moved library goes unnoticed", res.moved)
+	}
+	// "Left where they now are" has to be literally true — the caller's message
+	// says so and nothing rolls it back.
+	if body, err := os.ReadFile(filepath.Join(tracked, "Season 01", "a.mkv")); err != nil || string(body) != "A" {
+		t.Errorf("the file that moved must still be under the tracked spelling: contents=%q err=%v", body, err)
+	}
+	if body, err := os.ReadFile(filepath.Join(untracked, "Season 02", "b.mkv")); err != nil || string(body) != "B" {
+		t.Errorf("the file the walk failed on must be untouched: contents=%q err=%v", body, err)
+	}
+	if res.trashedDir != "" {
+		t.Errorf("trashedDir = %q, want empty: a directory that still holds files is never trashed", res.trashedDir)
+	}
+	if _, err := os.Lstat(untracked); err != nil {
+		t.Errorf("the untracked spelling must still be where it was (err=%v)", err)
+	}
+}
+
 // TestDirIsEmptyOfFiles_TellsAnEmptyTreeFromOneThatStillHoldsSomething is the
 // post-condition mergeCaseTwinDir checks before trashing the emptied source
 // directory. It is a defensive re-check of a state the walk immediately above
@@ -1911,6 +1957,81 @@ func TestAction_MergeCaseTwin_EndToEndOnACaseSensitiveFilesystem(t *testing.T) {
 	}
 	if !strings.Contains(out.Operation, "SHOW") || !strings.Contains(out.Operation, "show") {
 		t.Errorf("operation = %q, want it to name both spellings", out.Operation)
+	}
+}
+
+// TestAction_MergeCaseTwin_APartialFailureIsA502LoggedAtErrorWithItsCounts is
+// the endpoint half of the half-moved-library case, and the loudest answer this
+// phase can give. It runs where a real case twin can exist, for the same reason
+// the test above does; the merge mechanics of a partial failure are covered on
+// every platform by TestMergeCaseTwinDir_APartialMergeReportsEverythingItAlreadyMoved.
+//
+// Three files, three fates, one click: stray.mkv moves, tracked.mkv collides
+// (its copy goes to the trash, and it is itemized on the wire), and the second
+// season cannot be merged at all because its destination parent is a plain file.
+// Everything an operator would need in that moment has to be in the answer and
+// in the log: the outcome is `failed` and not `refused` (cutoffarr TRIED —
+// nothing here is a decision it made), the status is 502, the message says how
+// many files are already on the other side, and the line carries moved= and
+// collided= at ERROR, because a library left half-moved must not be a line an
+// INFO-level deployment never sees.
+func TestAction_MergeCaseTwin_APartialFailureIsA502LoggedAtErrorWithItsCounts(t *testing.T) {
+	root := t.TempDir()
+	if !caseSensitiveFS(t, root) {
+		t.Skip("this filesystem is case-insensitive, so a real case-twin cannot exist to be half-merged")
+	}
+	fake := newArrFake(t)
+	writeActionFile(t, root, "show/Season 01/tracked.mkv", "the tracked copy")
+	writeActionFile(t, root, "SHOW/Season 01/tracked.mkv", "the untracked copy")
+	writeActionFile(t, root, "SHOW/Season 01/stray.mkv", "stray")
+	writeActionFile(t, root, "SHOW/Season 02/second.mkv", "second")
+	// The obstruction, mid-walk and after a completed move.
+	writeActionFile(t, root, "show/Season 02", "not a directory")
+	fake.series = `[{"id":3,"title":"Show","monitored":true,"tags":[],"path":"/tv/show","seasons":[]}]`
+	fake.episodeFiles["3"] = `[{"id":30,"seriesId":3,"seasonNumber":1,"path":"/tv/show/Season 01/tracked.mkv"}]`
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: fake.srv.URL, APIKey: "k",
+		MediaRootMap: map[string]string{"/tv": root}}
+
+	cfg := Config{DryRun: false, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, buf := newActionFixture(t, cfg, inst)
+	seedTwinFindings(store, inst,
+		twinFinding(root, caseCollisionNameRecord{Name: "SHOW"}, caseCollisionNameRecord{Name: "show", Tracked: true}))
+
+	status, out := postAction(t, ts,
+		`{"kind":"merge-case-twin","confirm":true,"instance":"sonarr-main","path":`+jsonString(root)+`,"tracked":"show","untracked":"SHOW"}`)
+	if status != http.StatusBadGateway || out.Outcome != actionOutcomeFailed {
+		t.Fatalf("status=%d outcome=%q reason=%q, want 502/failed\nlog:\n%s", status, out.Outcome, out.Reason, buf.String())
+	}
+	if !strings.Contains(out.Message, "1 file(s) had already been moved and were left where they now are") {
+		t.Errorf("message = %q, want it to say how much of the library is already on the other side", out.Message)
+	}
+	if len(out.Items) != 1 || !strings.Contains(out.Items[0], "tracked.mkv") {
+		t.Errorf("items = %v, want the one collision itemized: a failure does not excuse the response from saying which file went to the trash", out.Items)
+	}
+	log := buf.String()
+	if !strings.Contains(log, "level=ERROR msg=action") {
+		t.Errorf("a half-moved library must be greppable at ERROR; log:\n%s", log)
+	}
+	for _, want := range []string{"source=gui", "kind=merge-case-twin", "outcome=failed", "moved=1", "collided=1"} {
+		if !strings.Contains(log, want) {
+			t.Errorf("the failure line is missing %q; log:\n%s", want, log)
+		}
+	}
+	// The partial state itself: what moved stayed moved, what did not is still
+	// where it was, and nothing was trashed to tidy up after the failure.
+	if body, err := os.ReadFile(filepath.Join(root, "show", "Season 01", "stray.mkv")); err != nil || string(body) != "stray" {
+		t.Errorf("the file that moved must still be under the tracked spelling: contents=%q err=%v", body, err)
+	}
+	if body, err := os.ReadFile(filepath.Join(root, "show", "Season 01", "tracked.mkv")); err != nil || string(body) != "the tracked copy" {
+		t.Errorf("the tracked copy must never be overwritten, failure or not: contents=%q err=%v", body, err)
+	}
+	if body, err := os.ReadFile(filepath.Join(root, "SHOW", "Season 02", "second.mkv")); err != nil || string(body) != "second" {
+		t.Errorf("the file the walk failed on must be untouched: contents=%q err=%v", body, err)
+	}
+	// And the operator's own list says a click happened and what came of it.
+	rec := assertOneListedAction(t, store, ActionMergeCaseTwin, actionOutcomeFailed)
+	if !strings.Contains(rec.Reason, "already been moved") {
+		t.Errorf("lastActions[0].Reason = %q, want the same answer the operator got", rec.Reason)
 	}
 }
 
