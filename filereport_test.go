@@ -4143,6 +4143,52 @@ func TestEvaluateFileReportRoot_HeuristicDDoesNotFireOnCollisionOnlyUntrackedRoo
 	}
 }
 
+// TestEvaluateFileReportRoot_HeuristicDIgnoresNonZeroCollisionEvidence is
+// round-3's [v2.1 review] discriminating regression test for a gap in
+// TestEvaluateFileReportRoot_HeuristicDDoesNotFireOnCollisionOnlyUntrackedRoot
+// (immediately above): that test's poster.jpg/Poster.jpg fixture is a
+// non-video FILE collision, which the v2.2 evidentiary-weight narrowing
+// (filereport.go's `for f := range subFiles { if videoExtensions[...] {
+// collisionEvidence++ } }` loop) deliberately gives NO weight — so that
+// fixture always produces `collisionEvidence == 0`, identically under
+// today's correct `videoFilesSeen`-only heuristic (d) AND under the
+// original, already-fixed `videoFilesSeen += excluded` bug. It therefore
+// only ever caught that first bug, never the natural "collapse the two
+// counters back together" regression a future reader might reintroduce as
+// `videoFilesSeen += collisionEvidence` — plausible because collisionEvidence
+// and videoFilesSeen are both incremented in the same d.IsDir() branch and
+// look redundant. This fixture — a colliding SUBDIRECTORY pair (the untracked
+// root's ONLY content) — takes the OTHER path into collisionEvidence
+// (`collisionEvidence += len(subDirs)`, filereport.go:1082), which carries
+// full evidentiary weight regardless of extension, so collisionEvidence > 0
+// here. Under a `videoFilesSeen += collisionEvidence` re-merge this root
+// would trip heuristic (d) at filereport.go:1207 and falsely abort with a
+// misleading media_root_map WARN, even though today's separated-counter code
+// correctly completes it as ran.
+func TestEvaluateFileReportRoot_HeuristicDIgnoresNonZeroCollisionEvidence(t *testing.T) {
+	dir := t.TempDir()
+	withFakeDirLister(t, map[string][]fs.DirEntry{
+		dir: {fakeDir("Show A"), fakeDir("show a")},
+	})
+	root := mediaRoot{arrPath: "/tv", diskPath: dir}
+	set := instanceTrackedSet{files: map[string]bool{}, folders: map[string]string{}}
+	logger, buf := newFileReportTestLogger(slog.LevelDebug)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "sonarr-main", Type: "sonarr"}, root, set)
+
+	if outcome.skipped {
+		t.Fatalf("a root this instance tracks nothing under, whose only content is a colliding SUBDIRECTORY pair (real, non-zero collisionEvidence, unlike the poster.jpg/Poster.jpg sibling test above), must complete as ran (binding controller resolution 3), never abort under heuristic (d): %+v\n%s", outcome, buf.String())
+	}
+	var collisions int
+	for _, f := range outcome.findings {
+		if f.kind == fileKindCaseCollision {
+			collisions++
+		}
+	}
+	if collisions != 1 {
+		t.Errorf("case-collision findings = %d, want 1", collisions)
+	}
+}
+
 // TestEvaluateFileReportRoot_HeuristicCCountsVideoExtensionFileCollisionEvidence
 // is the discriminating regression test for the per-FILE half of
 // collisionEvidence (the `for f := range subFiles { if

@@ -1196,6 +1196,45 @@ func TestWebUIPage_FileClutterHeaderDistinguishesCleanFromNotChecked(t *testing.
 	}
 }
 
+// TestWebUIPage_FileClutterHeaderNamesEveryFindingKind is round-3's [v2.1
+// review] regression test: the panel's own collapsed <summary> — the exact
+// text a glancing operator sees without expanding anything — still read
+// "File clutter — duplicates & orphans (N)" even after case-collision
+// findings became a THIRD kind this same panel renders. fileCountText (the
+// number inside that summary) is `rows.length` over every finding pushed
+// into `rows`, which now includes every case-collision row alongside
+// duplicates/orphans — so an instance with 0 duplicates, 0 orphans and 3
+// case-twins rendered "duplicates & orphans (3)", a count that contradicts
+// its own label. This is the same "the number means something other than
+// what the label says" failure TestWebUIPage_FileClutterHeaderDistinguishes
+// CleanFromNotChecked (above) exists to prevent for the off/skipped
+// qualifier — here pinning the label itself so it can never again omit a
+// kind renderFileReport's row builder actually emits.
+func TestWebUIPage_FileClutterHeaderNamesEveryFindingKind(t *testing.T) {
+	page := string(webUIPage)
+	start := strings.Index(page, "<summary>File clutter")
+	if start == -1 {
+		t.Fatal("page has no File clutter panel <summary>")
+	}
+	end := strings.Index(page[start:], "</summary>")
+	if end == -1 {
+		t.Fatal("File clutter panel <summary> has no closing tag")
+	}
+	summary := page[start : start+end]
+	// duplicate, orphan, and case-collision are the only three kinds
+	// renderFileReport's row builder ever pushes into `rows` (see
+	// fileKindDuplicate/fileKindOrphan/fileKindCaseCollision in
+	// filereport.go) — every one of them must be named in the heading that
+	// counts them, in the panel's own established copy for each ("case-twin"
+	// is the operator-facing term used everywhere else on this panel, e.g.
+	// the actionability notice below).
+	for _, want := range []string{"duplicates", "orphans", "case-twin"} {
+		if !strings.Contains(summary, want) {
+			t.Errorf("File clutter panel <summary> %q is missing %q; the heading must name every finding kind the panel can display, not just the first two", summary, want)
+		}
+	}
+}
+
 // TestWebUIPage_ScanNowChecksResponseOkAndSurfacesStatus is round-3's
 // regression test for the Scan-now click handler's sibling bug to the one
 // round 2 fixed on refresh(): the POST's response was never checked for

@@ -463,13 +463,13 @@ to the walk, regardless of what it points to.
 ```
 level=INFO msg="file-report finding" kind=duplicate instance=radarr-main root=/data/media/Movies path="/data/media/Movies/Some Film (2020)/Some Film (2020) (2).mkv" title="Some Film (2020)" groupCount=1
 level=INFO msg="file-report finding" kind=orphan instance=radarr-main root=/data/media/Movies path="/data/media/Movies/Stray Folder/something.mkv"
-level=INFO msg="file report" instance=radarr-main type=radarr fileReport=ran duplicates=1 orphans=1 fileSkipReasons="none"
+level=INFO msg="file report" instance=radarr-main type=radarr fileReport=ran duplicates=1 orphans=1 caseCollisions=0 fileSkipReasons="none"
 ```
 
 Exactly like reverse-scan findings, individual `file-report finding` lines
 print in full on the startup scan and on `--once`, and demote to `debug` on
 the daemon's repeating reconciliation sweeps — where the summary's
-`duplicates=N orphans=N` is what stays visible.
+`duplicates=N orphans=N caseCollisions=N` is what stays visible.
 
 `fileReport` on that summary line is always one of three values, and the
 three are deliberately never confusable with each other:
@@ -481,9 +481,9 @@ three are deliberately never confusable with each other:
   trusted this cycle (see below) and was aborted with its own `WARN` naming
   it. `duplicates`/`orphans` still reflect whatever roots *did* complete —
   one root's problem never hides another root's real findings.
-- **`ran`** — every configured root completed. `duplicates=0 orphans=0` is a
-  real, positive statement that the report ran and found nothing, not
-  silence.
+- **`ran`** — every configured root completed. `duplicates=0 orphans=0
+  caseCollisions=0` is a real, positive statement that the report ran and
+  found nothing, not silence.
 
 ### Multi-episode files
 
