@@ -1357,15 +1357,91 @@ var actionsFileEntryPointsAllowedOutside = map[string]map[string]bool{
 //     only bare identifiers are checked. main.go's own top-level `run` is
 //     therefore not a hit against actionRunner.run, which is a method.
 //   - a METHOD can only be reached through a selector, so only `x.name` is
-//     checked — EXCEPT where some other file declares a field or method of that
-//     name itself, which makes the selector genuinely ambiguous to an audit
-//     working without type information (reverseOptions.remonitor, read as
+//     checked — EXCEPT where THE FILE BEING SCANNED declares a field or method
+//     of that name itself, which makes the selector genuinely ambiguous to an
+//     audit working without type information (reverseOptions.remonitor, read as
 //     opts.remonitor all over reverse.go, is the live example). That exemption
 //     is derived from the tree, not hand-listed, so it cannot quietly grow to
 //     cover a real caller: a file would have to declare a field named `run` of
 //     its own before it could call the runner's.
+//
+// THE EXEMPTION IS PER-FILE, and that is the round-4 review fix. It used to be
+// one global set built from every other non-test file at once, which meant
+// reverse.go's `remonitor` field exempted the name `remonitor` EVERYWHERE: the
+// re-monitor executor — the one that composes an *arr write — could be called
+// as `r.remonitor(ctx, inst, req)` from daemon.go's sweep loop (which is already
+// allowed to name newActionRunner) with this audit staying green. Exactly the
+// hole the round-3 rewrite was written to close, left open for one name. Scoped
+// to the declaring file, reverse.go keeps its exemption and every other file
+// inherits nothing.
 func TestTree_ExecutorsAreReachableOnlyFromTheActionEndpoint(t *testing.T) {
 	const source = "actions.go"
+	for _, v := range actionEntryPointViolations(t, source, nonTestGoFilesExcept(t, source)) {
+		t.Error(v)
+	}
+}
+
+// TestTree_ExecutorReachabilityAuditCatchesASweepThatCallsTheRemonitorExecutor
+// is the mutation check for the audit above, run against SYNTHETIC files rather
+// than by editing daemon.go, so the property is proved on every run instead of
+// once by hand in a review round.
+//
+// The first case is the hole the round-4 review found, and it is scanned
+// ALONGSIDE THE REAL TREE, because the tree is where the ambiguity comes from: a
+// synthetic daemon.go on its own declares no `remonitor` and would be caught by
+// either version of this audit. It is the real reverse.go, in the same scan,
+// that used to exempt the name everywhere.
+//
+// The second case is that exemption, which must keep working: reverse.go's own
+// reverseOptions.remonitor is read as opts.remonitor in four places and is not a
+// call to anything in actions.go.
+func TestTree_ExecutorReachabilityAuditCatchesASweepThatCallsTheRemonitorExecutor(t *testing.T) {
+	const source = "actions.go"
+	dir := t.TempDir()
+
+	// A daemon.go that wires the runner (allowed) and then drives the re-monitor
+	// executor from its sweep loop (never allowed).
+	sweeping := writeActionFile(t, dir, "daemon.go", `package main
+
+import "context"
+
+func (d *daemon) sweepInstance(ctx context.Context, inst Instance, req actionRequest) {
+	a := newActionRunner(d.cfg, d.logger, d.stats)
+	a.remonitor(ctx, inst, req)
+}
+`)
+	got := actionEntryPointViolations(t, source, append(nonTestGoFilesExcept(t, source), sweeping))
+	if len(got) != 1 || !strings.Contains(got[0], "remonitor") {
+		t.Errorf("violations = %v, want exactly one naming remonitor: a sweep that reaches the re-monitor executor — the executor that composes an *arr write — is precisely what this audit exists to catch", got)
+	}
+
+	// The legitimate ambiguity, in the file that owns it.
+	declaring := writeActionFile(t, dir, "reverse.go", `package main
+
+type reverseOptions struct {
+	enabled   bool
+	remonitor bool
+}
+
+func wouldWrite(opts reverseOptions) bool {
+	return opts.enabled && opts.remonitor
+}
+`)
+	if got := actionEntryPointViolations(t, source, []string{declaring}); len(got) != 0 {
+		t.Errorf("violations = %v, want none: a file reading a field IT declares is not calling anything in %s", got, source)
+	}
+}
+
+// actionEntryPointViolations is the audit body, returning one message per
+// violation instead of failing, so the same code can be run against the real
+// tree and against a synthetic file whose violation is the point.
+//
+// The allowlist is consulted by BASE NAME so a synthetic "daemon.go" carries
+// exactly the permissions the real one has — every .go file in this package
+// lives in the package directory, so base names are already unique across the
+// scanned set.
+func actionEntryPointViolations(t *testing.T, source string, others []string) []string {
+	t.Helper()
 	fset := token.NewFileSet()
 	parsed, err := parser.ParseFile(fset, source, nil, 0)
 	if err != nil {
@@ -1397,17 +1473,20 @@ func TestTree_ExecutorsAreReachableOnlyFromTheActionEndpoint(t *testing.T) {
 		}
 	}
 
-	others := nonTestGoFilesExcept(t, source)
-	ambiguous := selectorNamesDeclaredIn(t, fset, others)
+	var violations []string
 	for _, path := range others {
 		file, parseErr := parser.ParseFile(fset, path, nil, 0)
 		if parseErr != nil {
 			t.Fatalf("parsing %s: %v", path, parseErr)
 		}
+		// Per-file: only the names THIS file declares can make a selector in it
+		// ambiguous. See the test's own comment for why this is not global.
+		ambiguous := selectorNamesDeclaredIn(t, fset, []string{path})
+		allowed := actionsFileEntryPointsAllowedOutside[filepath.Base(path)]
 		selectors, declarations := identRoles(file)
 		ast.Inspect(file, func(n ast.Node) bool {
 			id, ok := n.(*ast.Ident)
-			if !ok || declarations[id.Pos()] || actionsFileEntryPointsAllowedOutside[path][id.Name] {
+			if !ok || declarations[id.Pos()] || allowed[id.Name] {
 				return true
 			}
 			switch {
@@ -1416,11 +1495,12 @@ func TestTree_ExecutorsAreReachableOnlyFromTheActionEndpoint(t *testing.T) {
 			default:
 				return true
 			}
-			t.Errorf("%s:%d references %s, which %s declares: the action system must stay reachable ONLY from the action endpoint handler in webui.go, and a sweep, webhook, reconciliation or startup path that can reach any part of it would make the owner's human-acts ruling false",
-				path, fset.Position(id.Pos()).Line, id.Name, source)
+			violations = append(violations, fmt.Sprintf("%s:%d references %s, which %s declares: the action system must stay reachable ONLY from the action endpoint handler in webui.go, and a sweep, webhook, reconciliation or startup path that can reach any part of it would make the owner's human-acts ruling false",
+				path, fset.Position(id.Pos()).Line, id.Name, source))
 			return true
 		})
 	}
+	return violations
 }
 
 // nonTestGoFilesExcept lists this package's non-test .go files, minus the one
