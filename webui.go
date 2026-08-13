@@ -185,11 +185,29 @@ func (s *webUIServer) handleAction(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(body)
 	}
 
+	// Both exits below LOG, and that is a review fix. They are the only two
+	// answers this endpoint gives without reaching the runner — which owns the
+	// audit line for everything else, including the cross-site refusal — so
+	// until this round they were the only two ways to poke the one
+	// unauthenticated endpoint in this program that can move files and leave no
+	// trace at all, at any level. That hid two very different things behind the
+	// same silence: a burst of malformed probes against the port, and an
+	// operator's "I click the button and nothing happens" on a deployment that
+	// never wired an action system. WARN for both: neither is a normal event on
+	// a working deployment, and Debug is invisible on every deployment that
+	// does not opt into it, which is all of them.
 	if s.actions == nil {
+		const reason = "this cutoffarr has no action system wired, so no finding can be acted on from here"
+		// msg=action, with the audit line's own vocabulary, so the one grep an
+		// operator is told to use finds this too. There is no runner to name a
+		// kind or an instance, and inventing either would be worse than the
+		// three attrs that are actually known.
+		s.logWarn("action", "source", "gui", "outcome", actionOutcomeDisabled,
+			"status", http.StatusForbidden, "detail", reason)
 		writeJSON(http.StatusForbidden, actionResponse{
 			Outcome: actionOutcomeDisabled,
-			Message: "this cutoffarr has no action system wired, so no finding can be acted on from here",
-			Reason:  "this cutoffarr has no action system wired, so no finding can be acted on from here",
+			Message: reason,
+			Reason:  reason,
 		})
 		return
 	}
@@ -202,6 +220,13 @@ func (s *webUIServer) handleAction(w http.ResponseWriter, r *http.Request) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
 		reason := fmt.Sprintf("the action request could not be read as JSON: %v", err)
+		// NOT msg=action: nothing here parsed, so there is no kind, no
+		// instance and no item — calling it an action would put a line in the
+		// audit vocabulary that names nothing. The error itself is the payload,
+		// since "unknown field" and "unexpected EOF" mean quite different
+		// things about who is talking to this port.
+		s.logWarn("an action request could not be read", "source", "gui",
+			"status", http.StatusBadRequest, "error", err)
 		writeJSON(http.StatusBadRequest, actionResponse{Outcome: actionOutcomeRefused, Message: reason, Reason: reason})
 		return
 	}
@@ -236,7 +261,15 @@ func (s *webUIServer) handleAction(w http.ResponseWriter, r *http.Request) {
 		// Not fatal: an http.ResponseWriter that cannot carry a deadline (a
 		// test recorder, a future middleware) still serves the request
 		// correctly, it just inherits the server's own timeout.
-		s.logDebug("the action response deadline could not be extended", "error", err)
+		//
+		// WARN, not Debug — review fix. "Not fatal" is not the same as "not
+		// worth saying": inheriting the server's own 30s WriteTimeout is
+		// exactly the mid-action connection teardown this deadline exists to
+		// prevent, on a request that may be renaming files, and at Debug it
+		// was invisible on every deployment that does not opt into debug
+		// logging. If this ever fires in production it is the first thing
+		// anyone investigating a truncated action needs to see.
+		s.logWarn("the action response deadline could not be extended, so this action falls back to the server's own write timeout and may be cut off mid-flight", "error", err)
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), actionDeadline)
 	defer cancel()
@@ -249,10 +282,17 @@ func (s *webUIServer) handleAction(w http.ResponseWriter, r *http.Request) {
 	writeJSON(code, resp)
 }
 
-// logDebug is the nil-safe logger this file's handlers use for the one or two
-// lines that are diagnostics rather than events.
-func (s *webUIServer) logDebug(msg string, args ...any) {
+// logWarn is the nil-safe logger this file's handlers use. Every line it
+// carries is about the action endpoint, and every one of them is a thing that
+// does not happen on a working deployment — a click answered before the runner
+// was reached, a body nothing could parse, a deadline that would not set — so
+// they share one level rather than being spread across three.
+//
+// Nil-safe because a webUIServer is legitimately constructed without a logger
+// (every pre-v2.2 test helper does), and a missing logger must never be the
+// reason an action endpoint panics.
+func (s *webUIServer) logWarn(msg string, args ...any) {
 	if s.logger != nil {
-		s.logger.Debug(msg, args...)
+		s.logger.Warn(msg, args...)
 	}
 }

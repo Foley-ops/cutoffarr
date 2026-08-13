@@ -1674,6 +1674,100 @@ func TestWebUIHandler_Stats_NoActionRunnerReportsBothSwitchesOff(t *testing.T) {
 	}
 }
 
+// TestActionEndpoint_TheTwoExitsBeforeTheRunnerAreLogged closes the one hole in
+// rule 9's coverage of this endpoint: handleAction has two exits that answer
+// WITHOUT reaching the runner, and neither used to write a log line at any
+// level, while every exit the runner owns produces a full msg=action line.
+//
+// On the one unauthenticated endpoint in this program that can move files, that
+// silence hid two very different things at once — a burst of malformed probes
+// against the port, and an operator's "I click the button and nothing happens"
+// on a deployment where no action system is wired at all. Both are now one line
+// each, at WARN, carrying the status that was actually returned.
+func TestActionEndpoint_TheTwoExitsBeforeTheRunnerAreLogged(t *testing.T) {
+	const body = `{"kind":"trash","confirm":true,"instance":"radarr-main","path":"/x","finding":"duplicate","size":10}`
+
+	t.Run("no action system wired", func(t *testing.T) {
+		logger, buf := newActionTestLogger()
+		store := newStatsStore(true)
+		ts := httptest.NewServer(newWebUIHandler(&webUIServer{
+			stats: store, scan: newScanCoordinator(), logger: logger,
+		}))
+		t.Cleanup(ts.Close)
+
+		status, out := postAction(t, ts, body)
+		if status != http.StatusForbidden || out.Outcome != actionOutcomeDisabled {
+			t.Fatalf("status=%d outcome=%q, want 403/disabled", status, out.Outcome)
+		}
+		log := buf.String()
+		for _, want := range []string{"level=WARN", "msg=action", "source=gui", "outcome=" + actionOutcomeDisabled, "status=403"} {
+			if !strings.Contains(log, want) {
+				t.Errorf("the no-runner exit's log line is missing %q; an operator whose buttons do nothing must be able to find out why from the log. Log:\n%s", want, log)
+			}
+		}
+	})
+
+	t.Run("a body that cannot be read", func(t *testing.T) {
+		logger, buf := newActionTestLogger()
+		store := newStatsStore(true)
+		ts := httptest.NewServer(newWebUIHandler(&webUIServer{
+			stats: store, scan: newScanCoordinator(), logger: logger,
+			actions: newActionRunner(Config{GUIActions: true}, logger, store),
+		}))
+		t.Cleanup(ts.Close)
+
+		status, out := postAction(t, ts, `{not json`)
+		if status != http.StatusBadRequest || out.Outcome != actionOutcomeRefused {
+			t.Fatalf("status=%d outcome=%q, want 400/refused", status, out.Outcome)
+		}
+		log := buf.String()
+		for _, want := range []string{"level=WARN", "source=gui", "status=400", "error="} {
+			if !strings.Contains(log, want) {
+				t.Errorf("the undecodable-body exit's log line is missing %q; a burst of malformed probes at this endpoint must not be invisible. Log:\n%s", want, log)
+			}
+		}
+	})
+}
+
+// TestWebUIServer_ADeadlineThatCannotBeSetIsNotADebugLine is the second half of
+// the same finding. If SetWriteDeadline fails in production the action silently
+// reverts to the server's 30s WriteTimeout — the exact mid-move connection
+// teardown actionDeadline exists to prevent, on a request that may be renaming
+// files — and at Debug that reverting is invisible on every deployment that
+// does not run with debug logging, which is all of them.
+func TestWebUIServer_ADeadlineThatCannotBeSetIsNotADebugLine(t *testing.T) {
+	src := webUIGoSource(t)
+	call := strings.Index(src, "SetWriteDeadline(")
+	if call == -1 {
+		t.Fatal("webui.go no longer sets a write deadline on the action response")
+	}
+	// The if-block the failure is handled in, whatever length its comment
+	// grows to: from the call to the first line that closes it at one tab.
+	block := src[call:]
+	if end := strings.Index(block, "\n\t}\n"); end != -1 {
+		block = block[:end]
+	}
+	if strings.Contains(block, ".Debug(") || strings.Contains(block, "logDebug(") {
+		t.Errorf("the deadline failure is still logged at Debug, where a production deployment never sees it:\n%s", block)
+	}
+	if !strings.Contains(block, "logWarn(") {
+		t.Errorf("the deadline failure must be logged at Warn; got:\n%s", block)
+	}
+}
+
+// webUIGoSource reads webui.go itself. The two properties above are about the
+// LEVEL a line is emitted at on a path that needs a real ResponseWriter failure
+// to reach, which no httptest recorder can be made to produce reliably; the
+// source is where the level is decided and is therefore what is pinned.
+func webUIGoSource(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile("webui.go")
+	if err != nil {
+		t.Fatalf("reading webui.go: %v", err)
+	}
+	return string(b)
+}
+
 // --- [v2.2] GUI action structural pins --------------------------------------
 
 // TestWebUIPage_ActionButtonsStateTheirExactOperation is rule 2, pinned
