@@ -1429,3 +1429,104 @@ func readRepoFileForActions(t *testing.T, name string) string {
 	}
 	return string(b)
 }
+
+// --- the Sonarr shape -------------------------------------------------------
+
+// TestActionScope_NarrowsToTheOneItemAndSeason is what stops a season button
+// from re-monitoring a whole series. The scope's `seasons` map is the second
+// level of narrowing (the same one a webhook uses), and without it a click on
+// "Show season 2" would hand the reverse pass every eligible season of that
+// series.
+func TestActionScope_NarrowsToTheOneItemAndSeason(t *testing.T) {
+	movie := actionScope(152, nil)
+	if len(movie.ids) != 1 || movie.ids[0] != 152 {
+		t.Errorf("ids = %v, want exactly [152]", movie.ids)
+	}
+	if movie.seasons != nil {
+		t.Errorf("seasons = %v, want nil for a Radarr movie", movie.seasons)
+	}
+	if movie.origin != scopeOriginGUIAction {
+		t.Errorf("origin = %q, want %q", movie.origin, scopeOriginGUIAction)
+	}
+	if movie.itemLevel != slog.LevelInfo {
+		t.Errorf("itemLevel = %v, want Info: a human is watching this one run", movie.itemLevel)
+	}
+
+	season := 2
+	got := actionScope(9, &season)
+	if !got.containsSeason(9, 2) {
+		t.Error("the scope must contain the season the button named")
+	}
+	for _, other := range []int{1, 3} {
+		if got.containsSeason(9, other) {
+			t.Errorf("the scope contains season %d as well; a click on one season must never re-monitor the rest of the series", other)
+		}
+	}
+}
+
+// TestAction_Remonitor_SonarrDispatchesTheSeasonPathAndWritesNothingWhenStale
+// exercises the Sonarr branch end to end through the endpoint. The series here
+// has no unmonitored-and-failing season, so the correct outcome is a refusal
+// with no write at all — which is also the strongest thing to assert about a
+// path whose failure mode would be writing to the wrong shape.
+func TestAction_Remonitor_SonarrDispatchesTheSeasonPathAndWritesNothingWhenStale(t *testing.T) {
+	fake := newArrFake(t)
+	fake.series = `[{"id":9,"title":"Show","monitored":true,"tags":[],"path":"/tv/Show",
+	  "seasons":[{"seasonNumber":1,"monitored":true,"statistics":{"episodeFileCount":1,"totalEpisodeCount":1}}]}]`
+	fake.episodeFiles["9"] = `[{"id":90,"seriesId":9,"seasonNumber":1,"path":"/tv/Show/Show.S01E01.mkv"}]`
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: fake.srv.URL, APIKey: "k"}
+
+	cfg := Config{DryRun: false, GUIActions: true, ReverseScanRemonitor: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, _ := newActionFixture(t, cfg, inst)
+	season := 1
+	seedReverseFinding(store, inst, reverseFinding{SeriesID: 9, Series: "Show", Season: &season, Reason: ReasonQualityCutoffNotMet})
+
+	status, out := postAction(t, ts, `{"kind":"remonitor","confirm":true,"instance":"sonarr-main","id":9,"season":1}`)
+	if status != http.StatusConflict || out.Outcome != actionOutcomeRefused {
+		t.Fatalf("status=%d outcome=%q reason=%q, want 409/refused: this season is monitored and complete, so it is not a finding", status, out.Outcome, out.Reason)
+	}
+	if !strings.Contains(out.Operation, "season 1") || !strings.Contains(out.Operation, "series 9") {
+		t.Errorf("operation = %q, want it to name the season and the series id", out.Operation)
+	}
+	if fake.writeCount() != 0 {
+		t.Errorf("a refused Sonarr re-monitor must send no write; writes=%v", fake.writes)
+	}
+}
+
+// TestAction_Remonitor_SonarrWithoutASeasonIsRejectedBeforeAnyFetch is the
+// mirror of the Radarr shape guard: a Sonarr finding always names a season,
+// so a request without one is malformed rather than "the whole series".
+func TestAction_Remonitor_SonarrWithoutASeasonIsRejectedBeforeAnyFetch(t *testing.T) {
+	fake := newArrFake(t)
+	inst := Instance{Name: "sonarr-main", Type: "sonarr", URL: fake.srv.URL, APIKey: "k"}
+	cfg := Config{DryRun: false, GUIActions: true, ReverseScanRemonitor: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, _, _ := newActionFixture(t, cfg, inst)
+
+	status, _ := postAction(t, ts, `{"kind":"remonitor","confirm":true,"instance":"sonarr-main","id":9}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", status)
+	}
+	if fake.writeCount() != 0 {
+		t.Errorf("writes = %v, want none", fake.writes)
+	}
+}
+
+// TestAction_TrashAndMerge_NeverWriteToTheArr is the boundary between the two
+// halves of this phase, asserted directly: a file action re-READS the *arr to
+// re-derive its finding, and must never write to it. The re-derivation is a
+// full library read, so "it made no requests" would be the wrong assertion —
+// "it made no non-GET requests" is the right one.
+func TestAction_TrashAndMerge_NeverWriteToTheArr(t *testing.T) {
+	fake := newArrFake(t)
+	_, dupPath, inst := radarrFileFixture(t, fake)
+	cfg := Config{DryRun: false, GUIActions: true, ReverseScanRemonitor: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, _ := newActionFixture(t, cfg, inst)
+	seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "d", Size: 10})
+
+	if status, out := postAction(t, ts, `{"kind":"trash","confirm":true,"instance":"radarr-main","path":`+jsonString(dupPath)+`,"finding":"duplicate","size":10}`); status != http.StatusOK {
+		t.Fatalf("status=%d outcome=%q reason=%q", status, out.Outcome, out.Reason)
+	}
+	if fake.writeCount() != 0 {
+		t.Errorf("a trash action wrote to the *arr: %v — file actions are §2.2-silent by construction", fake.writes)
+	}
+}
