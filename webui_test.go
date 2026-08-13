@@ -1077,6 +1077,46 @@ func TestWebUIPage_FileReportRowsAreNeverFilteredByKind(t *testing.T) {
 	}
 }
 
+// TestWebUIPage_FileReportCaseCollisionRowRendersNamesAndEntryType pins
+// [FIX, v2.2]: a case-collision finding never sets group/count (duplicate-
+// only fields), so without a dedicated branch every collision row rendered
+// group="—" and count="—" — byte-identical to any other collision found in
+// the same directory, and never showing the colliding NAMES themselves, the
+// only actionable part of the finding (and the one thing the panel's own
+// notice tells the operator to go inspect). The group cell must render
+// entryType plus every colliding name (marking which one is tracked), and
+// the count cell must render the group's own size — both derived from
+// r.f.entryType/r.f.names, never from the duplicate-only r.f.group/r.f.count.
+func TestWebUIPage_FileReportCaseCollisionRowRendersNamesAndEntryType(t *testing.T) {
+	page := string(webUIPage)
+
+	start := strings.Index(page, "function renderFileReport(")
+	if start == -1 {
+		t.Fatal("page has no renderFileReport function")
+	}
+	end := strings.Index(page[start:], "\n  function render(data)")
+	if end == -1 {
+		t.Fatal("could not find the end of renderFileReport (render(data) must follow it)")
+	}
+	body := page[start : start+end]
+
+	if !strings.Contains(body, `r.f.kind === "case-collision"`) {
+		t.Fatal("renderFileReport's row builder has no dedicated case-collision branch")
+	}
+	if !strings.Contains(body, "r.f.entryType") {
+		t.Error("the case-collision row branch never reads r.f.entryType")
+	}
+	if !strings.Contains(body, "r.f.names") {
+		t.Error("the case-collision row branch never reads r.f.names")
+	}
+	if !strings.Contains(body, `n.tracked ? " (tracked)" : ""`) {
+		t.Error("the case-collision row branch never marks which colliding name is tracked")
+	}
+	if !strings.Contains(body, "names.length") {
+		t.Error("the case-collision row branch's count does not come from the group's own size (names.length)")
+	}
+}
+
 // TestWebUIPage_RefreshSurfacesAFailedPollExplicitly pins the "a dead
 // dashboard must never be pixel-identical to a healthy one" fix: refresh()
 // must check the response's ok status (a 5xx, or an HTML error page from a

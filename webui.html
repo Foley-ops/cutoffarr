@@ -1150,6 +1150,23 @@
         var tr = el("tr");
         var group = r.f.group || "—";
         var count = r.f.count ? String(r.f.count) : "—";
+        // [FIX, v2.2] a case-collision finding never sets group/count
+        // (those are duplicate-only fields — see fileReportFindingRecord's
+        // own doc comment), so without this branch every collision row
+        // rendered as instance | [CASE-COLLISION] | — | <dir> | — :
+        // byte-identical to any other collision found in the SAME
+        // directory, and never showing the one thing the notice above
+        // tells the operator to act on — the colliding NAMES themselves.
+        // entryType/names carry exactly that (already in the API), so put
+        // them in the group/count cells instead of the unused duplicate
+        // fields.
+        if (r.f.kind === "case-collision") {
+          var names = r.f.names || [];
+          group = (r.f.entryType || "") + ": " + names.map(function (n) {
+            return n.name + (n.tracked ? " (tracked)" : "");
+          }).join(" | ");
+          count = String(names.length);
+        }
         var td;
         td = el("td"); text(td, r.instance); tr.appendChild(td);
         // [v2.1] The kind cell renders its text inside a chip — reusing the

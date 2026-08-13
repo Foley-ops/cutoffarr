@@ -814,8 +814,8 @@ type fileReportFinding struct {
 // an incomplete result is never returned as if it were the whole truth), or
 // the classification of every file it found.
 //
-// seenTracked/seenSkippedByRule/seenSkippedUntrusted plus
-// len(findings-by-kind) are the five identity-term counters
+// seenTracked/seenSkippedByRule/seenSkippedUntrusted/seenCaseTwinExcluded
+// plus len(findings-by-kind) are the six identity-term counters
 // assertFileReportIdentity (filereport_test.go) checks always add up to the
 // number of files the walk actually visited.
 type fileReportRootOutcome struct {
@@ -827,6 +827,17 @@ type fileReportRootOutcome struct {
 	seenTracked          int
 	seenSkippedByRule    int
 	seenSkippedUntrusted int
+
+	// seenCaseTwinExcluded is [FIX, v2.2] the sixth identity term: every
+	// REAL on-disk FILE the walk's own real traversal visits and finds
+	// excluded by a case-collision increments this once — see the
+	// excludeFiles branch in evaluateFileReportRoot's walkFn for where and
+	// why. A colliding DIRECTORY never contributes here: fs.SkipDir means
+	// nothing inside it is ever visited at all, so its contents were never
+	// part of totalFilesOnDisk in the first place (assertFileReportIdentity
+	// treats that case by the caller simply not counting them, rather than
+	// needing a term of its own).
+	seenCaseTwinExcluded int
 }
 
 // errFileReportShutdown is fs.WalkDir's abort signal for a context
@@ -973,6 +984,23 @@ func evaluateFileReportRoot(ctx context.Context, logger *slog.Logger, itemLevel 
 	outcome.skipReasons = map[string]int{}
 	videoFilesSeen := 0
 
+	// collisionEvidence is [FIX, v2.2] deliberately SEPARATE from
+	// videoFilesSeen — see the d.IsDir() branch below for where it is
+	// incremented and why. It feeds ONLY heuristic (c)'s "this root is not
+	// simply empty/unmounted" gate, never heuristic (d)'s "the walk found
+	// real video files here" trigger: the two heuristics ask different
+	// questions (c: "is there ANY sign of life here", d: "did we find real
+	// VIDEO content under a root this instance tracks nothing at all
+	// under") and a case-collision — evidence the LISTING succeeded and
+	// returned real, distinctly-named entries — only answers the first one.
+	// Feeding it into videoFilesSeen (which heuristic (d) also reads) used
+	// to make a root whose ONLY content was a colliding pair look, to
+	// heuristic (d), exactly like "the walk found real video files here" —
+	// aborting a root binding controller resolution 3 requires complete as
+	// fileReport=ran (collisions are FINDINGS, not abort causes). See
+	// TestEvaluateFileReportRoot_HeuristicDDoesNotFireOnCollisionOnlyUntrackedRoot.
+	collisionEvidence := 0
+
 	// excludeDirs/excludeFiles are [v2.1] populated by caseCollisionsInDir's
 	// pre-scan of a directory's own children the moment walkFn is called for
 	// THAT DIRECTORY itself — strictly before fs.WalkDir ever calls walkFn
@@ -1019,29 +1047,44 @@ func evaluateFileReportRoot(ctx context.Context, logger *slog.Logger, itemLevel 
 			outcome.findings = append(outcome.findings, findings...)
 			if excluded > 0 {
 				outcome.skipReasons[FileSkipReasonCaseTwin] += excluded
-				// [FIX, v2.1] Counted here, ONCE per directory's pre-scan,
+				// [FIX, v2.2] Counted here, ONCE per directory's pre-scan,
 				// as proof toward heuristic (c) ("this root is not simply
-				// empty/unmounted") — not per individual file visit below,
+				// empty/unmounted") ONLY — never toward videoFilesSeen,
+				// which heuristic (d) also reads (see collisionEvidence's
+				// own doc comment above for why the two must stay
+				// separate). Not per individual file visit below either,
 				// since a colliding SUBDIRECTORY is never individually
 				// visited at all (fs.SkipDir prevents fs.WalkDir from ever
 				// reaching anything inside it), so there is no later
-				// per-file moment to count it at. Without this, a root
-				// whose only tracked file happens to sit inside a
-				// case-colliding folder — or IS itself a case-colliding
-				// file — would see videoFilesSeen stay at 0 while
-				// len(tracked) > 0, tripping heuristic (c)'s
+				// per-file moment to count it at. Without SOME evidence
+				// here, a root whose only tracked file happens to sit
+				// inside a case-colliding folder — or IS itself a
+				// case-colliding file — would see videoFilesSeen stay at 0
+				// while len(tracked) > 0, tripping heuristic (c)'s
 				// "zero video files of any kind" abort and turning binding
 				// controller resolution 3's own required outcome
 				// ("a root whose only irregularities are detected
 				// collisions completes with fileReport=ran") into a false
-				// "skipped". Successfully LISTING a directory and finding
-				// 2+ real, distinctly-named entries in it is at least as
-				// strong evidence the root is live and properly mounted as
-				// finding one video file would be — arguably stronger,
-				// since a half-mounted share typically fails the listing
-				// itself (heuristic (a)) rather than returning specific
-				// named entries that then happen to collide.
-				videoFilesSeen += excluded
+				// "skipped".
+				//
+				// [FIX, v2.2] Narrowed to the SAME evidentiary weight
+				// classifyFileReportPath's own wrong-extension rule already
+				// accepts (line ~1092's "a wrong-extension file (a poster,
+				// an nfo) proves nothing about whether real media exists
+				// here"): every colliding DIRECTORY counts (successfully
+				// listing 2+ distinctly-named subdirectories is real
+				// evidence of a live, properly mounted share, regardless of
+				// what turns out to be inside them), but a colliding FILE
+				// counts only when its name carries a recognized video
+				// extension — a poster.jpg/Poster.jpg or .nfo/.NFO twin
+				// proves nothing about whether real media exists here, same
+				// as a single wrong-extension file never did.
+				collisionEvidence += len(subDirs)
+				for f := range subFiles {
+					if videoExtensions[strings.ToLower(path.Ext(f))] {
+						collisionEvidence++
+					}
+				}
 			}
 			for k := range subDirs {
 				excludeDirs[k] = true
@@ -1055,13 +1098,22 @@ func evaluateFileReportRoot(ctx context.Context, logger *slog.Logger, itemLevel 
 		if excludeFiles[filePath] {
 			// [v2.1] Excluded at this file's own containing directory's
 			// pre-scan, above — already counted under FileSkipReasonCaseTwin
-			// AND toward videoFilesSeen there (see the pre-scan's own
-			// comment on why), and already represented by the
-			// case-collision finding that pre-scan produced. Never
-			// classified as tracked/duplicate/orphan/skipped-* (binding
-			// controller resolution 3: "excluded from ... duplicate/orphan
-			// classification") — this second visit, from fs.WalkDir's own
-			// real traversal, contributes nothing further.
+			// (and, when its extension qualifies, toward collisionEvidence
+			// there — see the pre-scan's own comment on why), and already
+			// represented by the case-collision finding that pre-scan
+			// produced. Never classified as tracked/duplicate/orphan/
+			// skipped-* (binding controller resolution 3: "excluded from
+			// ... duplicate/orphan classification").
+			//
+			// [FIX, v2.2] outcome.seenCaseTwinExcluded is the sixth
+			// assertFileReportIdentity term: incremented once per REAL
+			// on-disk file THIS visit — fs.WalkDir's own real traversal —
+			// finds excluded, not once per synthesized name in the
+			// pre-scan's own group above (an injected-lister test's group
+			// can include a PHANTOM name that never exists on disk and this
+			// real traversal therefore never visits at all, so counting
+			// there would overcount against totalFilesOnDisk).
+			outcome.seenCaseTwinExcluded++
 			return nil
 		}
 
@@ -1114,8 +1166,14 @@ func evaluateFileReportRoot(ctx context.Context, logger *slog.Logger, itemLevel 
 	// anywhere on the walk is the same "this looks unmounted" signal as (b),
 	// caught here for the case where the specific tracked files sampled by
 	// (b) happen not to be the ones missing (a small sample, or files under a
-	// subtree heuristic (b) did not walk).
-	if len(tracked) > 0 && videoFilesSeen == 0 {
+	// subtree heuristic (b) did not walk). [FIX, v2.2] Also gated on
+	// collisionEvidence == 0 — a directory listing that succeeded and
+	// returned real, distinctly-named (if colliding) entries is itself
+	// evidence this root is not simply empty/unmounted, exactly as one real
+	// video file would be (see collisionEvidence's own doc comment, above,
+	// for why this is intentionally NOT the same counter heuristic (d)
+	// reads below).
+	if len(tracked) > 0 && videoFilesSeen == 0 && collisionEvidence == 0 {
 		return warnAbort("file report: mount-problem heuristic aborted this root: it tracks files but the walk found zero video files of any kind",
 			"trackedUnderRoot", len(tracked))
 	}
@@ -1127,7 +1185,12 @@ func evaluateFileReportRoot(ctx context.Context, logger *slog.Logger, itemLevel 
 	// real video files anyway is not evidence of a legitimate empty or
 	// unmanaged root (a genuinely empty/unmanaged root has nothing to walk
 	// in the first place, which is exactly why this is gated on
-	// videoFilesSeen > 0). It is evidence THIS SPECIFIC root has a
+	// videoFilesSeen > 0 — [FIX, v2.2] real classified video files ONLY,
+	// deliberately excluding collisionEvidence: a root whose only content
+	// is a detected case-twin pair must complete as fileReport=ran per
+	// binding controller resolution 3, never abort here as if it were a
+	// media_root_map misconfiguration). It is evidence THIS SPECIFIC root
+	// has a
 	// media_root_map problem the instance-wide guard cannot see, because
 	// every one of the instance's OTHER tracked paths mapped fine: a key
 	// typo/case-mismatch on just this one root, or the same per-instance
