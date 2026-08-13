@@ -772,6 +772,12 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// always a real (possibly empty) slice, and rev.actions is the reverse
 	// pass's zero value (nil) whenever reverse.enabled was false above.
 	stats.actions = append(forwardActions, rev.actions...)
+	// [v2.2] The reverse pass's raw per-cycle counters, carried out whole for
+	// the ONE caller that needs to explain a single item's outcome to a human
+	// waiting on an HTTP response (actions.go's re-monitor executor, which
+	// runs this engine scoped to one item). statsStore ignores it entirely —
+	// see cycleInstanceStats.reverse's own doc comment.
+	stats.reverse = rev
 
 	// Phase 11, the fifth and last pass: the duplicate & orphan file report.
 	// Runs after the forward AND reverse passes (binding controller
@@ -2619,6 +2625,8 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// Combined here, once, regardless of which passes ran — see the Radarr
 	// twin's identical comment.
 	stats.actions = append(forwardActions, rev.actions...)
+	// [v2.2] See the Radarr twin's identical comment.
+	stats.reverse = rev
 
 	// Phase 11, the fifth and last pass — see the Radarr twin for the shape
 	// and the reasoning. Unlike Radarr, Sonarr's tracked set costs its own

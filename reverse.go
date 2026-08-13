@@ -225,6 +225,19 @@ type reverseCounts struct {
 	echoUnverified int
 	withheld       int
 
+	// withheldReason is [v2.2] the reason the most recently withheld item was
+	// withheld, in the words the operator should read. It exists for exactly
+	// one caller — the GUI re-monitor action (actions.go), which drives this
+	// same pass scoped to ONE item and therefore has at most one withheld item
+	// to explain — and it is deliberately not part of any log line or summary:
+	// the whole-library passes already log every withholding at the moment it
+	// happens, with the full per-item attrs, and folding a "last reason" into
+	// a summary line would misrepresent N different withholdings as one.
+	//
+	// A pass that withheld nothing leaves it empty, which is the only state
+	// the action path treats as "there is nothing to explain".
+	withheldReason string
+
 	// movieFindings and seasonFindings are Phase 12's addition: the SAME
 	// findings the counters above already tally, kept as data rather than
 	// only as a count. Nothing here changes what runRadarr/runSonarr decide,
@@ -800,6 +813,7 @@ func (c *reverseCounts) record(logger *slog.Logger, attrs []any, written bool, e
 		// the PUT, and has already been logged at debug. The ONLY remaining
 		// (false, nil) case, exactly as on the forward paths.
 		c.withheld++
+		c.withheldReason = "dry_run is on, so the write was withheld at the §2.1 gate immediately before the PUT"
 	default:
 		c.remonitored++
 		logger.Info("remonitor", attrs...)
@@ -816,6 +830,7 @@ func (c *reverseCounts) record(logger *slog.Logger, attrs []any, written bool, e
 func (p reversePass) remonitorMovies(ctx context.Context, findings []movieDecision, rev reverseWriteContext, c *reverseCounts) {
 	if reason := reverseWriteGateBlockReason(p.cc); reason != "" {
 		c.withheld += len(findings)
+		c.withheldReason = reason
 		if len(findings) > 0 {
 			// One line per instance per cycle, not per item: "nothing was
 			// written" and "nothing needed writing" must never look the same,
@@ -836,6 +851,7 @@ func (p reversePass) remonitorMovies(ctx context.Context, findings []movieDecisi
 		// finishes.
 		if ctx.Err() != nil {
 			c.withheld++
+			c.withheldReason = "shutdown was requested before this item's write began"
 			if !shutdownNoted {
 				shutdownNoted = true
 				p.logger.Info("shutdown requested: the remaining reverse-scan writes for this instance are withheld and the next cycle will revisit them",
@@ -916,6 +932,7 @@ func verifySeasonStillAReverseFinding(ctx context.Context, logger *slog.Logger, 
 func (p reversePass) remonitorSeasons(ctx context.Context, findings []reverseSeasonFinding, rev reverseWriteContext, c *reverseCounts) {
 	if reason := reverseWriteGateBlockReason(p.cc); reason != "" {
 		c.withheld += len(findings)
+		c.withheldReason = reason
 		if len(findings) > 0 {
 			attrs := []any{"instance", p.inst.Name, "type", p.inst.Type, "crossCheck", p.cc.status}
 			attrs = append(attrs, p.cc.logAttrs()...)
@@ -940,6 +957,7 @@ func (p reversePass) remonitorSeasons(ctx context.Context, findings []reverseSea
 		// series retired between the scan and the write is caught.
 		if !f.seriesMonitored {
 			c.withheld++
+			c.withheldReason = "this season's series is not monitored, so re-monitoring the season would fight a deliberate retirement of the whole show"
 			p.logger.Log(ctx, p.itemLevel, "reverse-scan finding withheld: its series is not monitored, so re-monitoring this season would fight a deliberate retirement of the whole show; reporting it is all this cycle will do",
 				append(append([]any(nil), attrs...), "seriesMonitored", false)...)
 			continue
@@ -947,6 +965,7 @@ func (p reversePass) remonitorSeasons(ctx context.Context, findings []reverseSea
 
 		if ctx.Err() != nil {
 			c.withheld++
+			c.withheldReason = "shutdown was requested before this item's write began"
 			if !shutdownNoted {
 				shutdownNoted = true
 				p.logger.Info("shutdown requested: the remaining reverse-scan writes for this instance are withheld and the next cycle will revisit them",

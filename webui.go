@@ -3,6 +3,7 @@ package main
 import (
 	_ "embed"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 )
@@ -38,6 +39,18 @@ type webUIServer struct {
 	stats  *statsStore
 	scan   *scanCoordinator
 	logger *slog.Logger
+
+	// actions is [v2.2] the human-clicked action system's single-flight
+	// executor (actions.go). It is the ONE field on this struct that can cause
+	// anything in the world to change, and handleAction below is the ONLY
+	// place it is ever touched — which is what makes the owner's ruling
+	// structurally true rather than merely intended: no sweep, webhook or
+	// reconciliation path has a reference to it at all.
+	//
+	// Nil is a supported state and means "this deployment has no action
+	// system wired" (every pre-v2.2 test constructs a webUIServer without it).
+	// The handler answers such a request with a 403 rather than panicking.
+	actions *actionRunner
 }
 
 // newWebUIHandler builds the mux serving the dashboard and its two
@@ -58,6 +71,7 @@ func newWebUIHandler(s *webUIServer) http.Handler {
 	mux.HandleFunc("GET /{$}", s.handleIndex)
 	mux.HandleFunc("GET /api/stats", s.handleStats)
 	mux.HandleFunc("POST /api/scan", s.handleScan)
+	mux.HandleFunc("POST /api/action", s.handleAction)
 	return mux
 }
 
@@ -114,4 +128,58 @@ func (s *webUIServer) handleScan(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": status})
+}
+
+// handleAction is v2.2's whole action surface, and — this is the property the
+// owner's ruling rests on — the only path in this program from which an
+// executor can be reached at all.
+//
+// It does three things and delegates everything else: refuse a body it cannot
+// read (400), refuse when no action system is wired (403), and hand the parsed
+// request to the single-flight runner, which owns every switch check, every
+// re-verification, every refusal and the audit line for all of them. The
+// runner chooses the status code along with the outcome, because the two must
+// never be able to disagree.
+//
+// A note on what is NOT here: no rate limit, no authentication. This page has
+// never had either (plan §8: "Authentication on the GUI (LAN tool; document
+// that)"), and v2.2 does not change the threat model so much as make it worth
+// restating, which the README's "Acting on findings" section does plainly:
+// anything that can reach this port can click these buttons, so the port
+// belongs on a LAN you trust, and gui_actions stays false until you have
+// decided that it is.
+func (s *webUIServer) handleAction(w http.ResponseWriter, r *http.Request) {
+	writeJSON := func(code int, body any) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(code)
+		_ = json.NewEncoder(w).Encode(body)
+	}
+
+	if s.actions == nil {
+		writeJSON(http.StatusForbidden, actionResponse{
+			Outcome: actionOutcomeDisabled,
+			Message: "this cutoffarr has no action system wired, so no finding can be acted on from here",
+			Reason:  "this cutoffarr has no action system wired, so no finding can be acted on from here",
+		})
+		return
+	}
+
+	// A bounded reader, because this body is a few hundred bytes of JSON and
+	// the listener is reachable by whatever can route to the container — the
+	// same reasoning behind the server's own timeouts (daemon.go).
+	var req actionRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		reason := fmt.Sprintf("the action request could not be read as JSON: %v", err)
+		writeJSON(http.StatusBadRequest, actionResponse{Outcome: actionOutcomeRefused, Message: reason, Reason: reason})
+		return
+	}
+
+	resp := s.actions.run(r.Context(), req)
+	code := resp.status
+	if code == 0 {
+		code = http.StatusOK
+	}
+	writeJSON(code, resp)
 }

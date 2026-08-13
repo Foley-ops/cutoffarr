@@ -111,11 +111,20 @@ type caseCollisionNameRecord struct {
 // type"), both omitted for a duplicate or orphan the same way Group/Count
 // are omitted for anything that isn't a duplicate.
 type fileReportFindingRecord struct {
-	Kind      string                    `json:"kind"`
-	Group     string                    `json:"group,omitempty"`
-	Path      string                    `json:"path"`
-	Display   string                    `json:"display"`
-	Count     int                       `json:"count,omitempty"`
+	Kind    string `json:"kind"`
+	Group   string `json:"group,omitempty"`
+	Path    string `json:"path"`
+	Display string `json:"display"`
+	Count   int    `json:"count,omitempty"`
+
+	// Size is [v2.2] the file's size in bytes — duplicate/orphan only, and
+	// omitted when unknown or not applicable (a case-collision finding names a
+	// directory). See fileReportFinding.size (filereport.go) for why it exists
+	// at all: the action button must state its exact operation including how
+	// big the file it would move is, and the trash executor re-stats against
+	// this exact number before acting.
+	Size int64 `json:"size,omitempty"`
+
 	EntryType string                    `json:"entryType,omitempty"`
 	Names     []caseCollisionNameRecord `json:"names,omitempty"`
 }
@@ -196,6 +205,21 @@ type cycleInstanceStats struct {
 	// nothing).
 	reverseRan      bool
 	reverseFindings []reverseFinding
+
+	// reverse is [v2.2] the reverse pass's own raw counters for this cycle,
+	// carried out of the engine untouched. Nothing in stats.go reads it and
+	// it is never serialized: statsStore.recordInstance folds in
+	// reverseRan/reverseSkipped/reverseFindings exactly as before and ignores
+	// this field completely.
+	//
+	// It exists for the GUI re-monitor action (actions.go), which drives this
+	// very engine SCOPED TO ONE ITEM and then has to tell a human, in an HTTP
+	// response, which of the five outcomes that one item got — re-monitored,
+	// refused, withheld (and why), a failed write, or an unverifiable echo.
+	// Those five are precisely what these counters already distinguish, and
+	// re-deriving them from the log or from the findings slice would be
+	// guessing at a distinction the engine already made exactly.
+	reverse reverseCounts
 
 	// reverseSkipped mirrors reverseRan's sibling half: true when this cycle
 	// DID attempt the reverse pass (reverse.enabled) but the pass itself
@@ -565,6 +589,7 @@ func fileReportSnapshotFrom(c fileReportCounts) fileReportSnapshot {
 	for _, f := range c.findings {
 		rec := fileReportFindingRecord{
 			Kind: f.kind, Group: f.group, Path: f.diskPath, Display: f.displayPath, Count: f.groupCount,
+			Size: f.size,
 		}
 		if f.kind == fileKindCaseCollision {
 			// [v2.1] entryType/names are case-collision-only — see
@@ -657,4 +682,48 @@ func cloneInstanceStatsView(v instanceStatsView) instanceStatsView {
 	}
 
 	return out
+}
+
+// recordGUIAction folds one PERFORMED human-clicked action (actions.go) into
+// an instance's lastActions, so the one table an operator reads to answer
+// "what changed" shows what they did through cutoffarr alongside what
+// cutoffarr did on its own.
+//
+// It is deliberately separate from recordInstance rather than an extra field
+// on cycleInstanceStats: a GUI action is not a cycle. It has no library
+// totals, no decision pass, no reverse status and no file report, and routing
+// it through recordInstance would mean either inventing those values or
+// teaching that method a second meaning for every one of its three-state
+// fidelity rules. This touches LastActions and nothing else, for the same
+// reason recordUnreachable touches only LastCycleStatus.
+//
+// Like recordInstance it creates the instance's entry if this is the first
+// thing that has ever named it (a human can click a button on a dashboard
+// before any sweep has completed), and it prepends — newest first — so the
+// GUI needs no client-side sort.
+func (s *statsStore) recordGUIAction(name, typ string, at time.Time, rec actionRecord) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	v, ok := s.byName[name]
+	if !ok {
+		v = &instanceStatsView{
+			Name:            name,
+			Type:            typ,
+			ReverseStatus:   "off",
+			ReverseFindings: []reverseFinding{},
+			FileReport:      fileReportSnapshot{Status: "off", Findings: []fileReportFindingRecord{}},
+			LastActions:     []actionRecord{},
+		}
+		s.byName[name] = v
+		s.order = append(s.order, name)
+	}
+	v.Type = typ
+
+	rec.Time = at
+	merged := append([]actionRecord{rec}, v.LastActions...)
+	if len(merged) > maxLastActions {
+		merged = merged[:maxLastActions]
+	}
+	v.LastActions = merged
 }

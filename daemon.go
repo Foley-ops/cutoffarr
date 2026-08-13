@@ -514,7 +514,20 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 	// TestDaemon_ComposedMux_RouteTable, which failed with 301 before this
 	// line existed and passes with it.
 	topMux.HandleFunc("/webhook", http.NotFound)
-	topMux.Handle("/", newWebUIHandler(&webUIServer{stats: d.stats, scan: d.scan, logger: logger}))
+	// [v2.2] The action runner is CONSTRUCTED here and handed to the web UI
+	// server, which is the only thing that ever calls it. Constructing it is
+	// not the same as being able to act through it: this file holds no
+	// reference to it afterwards, and nothing in the daemon's loop, its
+	// webhook path or its sweeps can reach an executor — see actions.go's
+	// header and TestTree_ExecutorsAreReachableOnlyFromTheActionEndpoint.
+	//
+	// It is built unconditionally, gui_actions true or false, so that a
+	// disabled deployment answers POST /api/action with the honest 403 that
+	// NAMES the missing switch rather than a 403 that means "no such feature".
+	topMux.Handle("/", newWebUIHandler(&webUIServer{
+		stats: d.stats, scan: d.scan, logger: logger,
+		actions: newActionRunner(cfg, logger, d.stats),
+	}))
 
 	srv := &http.Server{
 		// Timeouts, because this listener is reachable by whatever can route to

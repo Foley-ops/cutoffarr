@@ -292,3 +292,27 @@ func (h demotingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 func (h demotingHandler) WithGroup(name string) slog.Handler {
 	return demotingHandler{inner: h.inner.WithGroup(name), to: h.to}
 }
+
+// scopeOriginGUIAction is [v2.2] the origin of a scope narrowed by a human
+// clicking one finding's button. It joins --only-id and webhook in the same
+// message-text-only role: nothing branches on it, it exists so the two
+// messages that have to tell a human why the item they named produced nothing
+// can say WHERE the narrowing came from.
+const scopeOriginGUIAction = "gui action"
+
+// actionScope is the scope one GUI re-monitor action runs under: exactly the
+// item the button named, reported at INFO because a human is watching this one
+// run — the same reasoning onlyIDScope uses, for the same situation.
+//
+// season is nil for a Radarr movie and set for a Sonarr season, and it narrows
+// the write set one level further exactly as a webhook's own season list does:
+// clicking one season's button must never re-monitor that series' other
+// seasons, even though the evaluation still reads the whole library (the
+// full-evidence rule is unchanged — only reporting and writing are narrowed).
+func actionScope(id int, season *int) evalScope {
+	s := evalScope{ids: []int{id}, origin: scopeOriginGUIAction, itemLevel: slog.LevelInfo}
+	if season != nil {
+		s.seasons = map[int][]int{id: {*season}}
+	}
+	return s
+}

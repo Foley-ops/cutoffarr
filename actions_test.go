@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -536,4 +541,528 @@ func TestTwinMergeEligibility_TheShapesThatGetAButtonAndTheShapesThatDoNot(t *te
 			}
 		})
 	}
+}
+
+// --- the executors, the switches, and the endpoint --------------------------
+
+// arrFake is one httptest *arr covering every endpoint the action executors
+// can reach: the tag list (exclusion-tag resolution), the library, Sonarr's
+// per-series episode files, the quality profiles, the wanted/cutoff pages in
+// both directions, and — for the re-monitor path — the per-movie fetch and the
+// one PUT this project is ever allowed to make.
+//
+// It records every write it received so a test can assert the strongest thing
+// there is to assert about a rehearsal or a refusal: that NOTHING was written.
+type arrFake struct {
+	srv    *httptest.Server
+	mu     sync.Mutex
+	writes []string
+	movies string // JSON array for GET /api/v3/movie
+	series string
+	// wanted maps the monitored filter value ("", "false") to a wanted/cutoff
+	// page body.
+	wanted       map[string]string
+	episodeFiles map[string]string
+	movieByID    map[string]string
+	movieFiles   map[string]string
+}
+
+func newArrFake(t *testing.T) *arrFake {
+	t.Helper()
+	f := &arrFake{
+		movies: "[]", series: "[]",
+		wanted:       map[string]string{},
+		episodeFiles: map[string]string{},
+		movieByID:    map[string]string{},
+		movieFiles:   map[string]string{},
+	}
+	mux := http.NewServeMux()
+	write := func(w http.ResponseWriter, body string) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}
+	mux.HandleFunc("/api/v3/system/status", func(w http.ResponseWriter, r *http.Request) {
+		write(w, `{"version":"5.0.0.0"}`)
+	})
+	mux.HandleFunc("/api/v3/qualityprofile", func(w http.ResponseWriter, r *http.Request) {
+		write(w, `[{"id":1,"name":"HD","cutoff":2,"items":[{"quality":{"id":1,"name":"720p"},"allowed":true},{"quality":{"id":2,"name":"1080p"},"allowed":true}],"upgradeAllowed":true,"cutoffFormatScore":0}]`)
+	})
+	mux.HandleFunc("/api/v3/tag", func(w http.ResponseWriter, r *http.Request) { write(w, `[]`) })
+	mux.HandleFunc("/api/v3/movie", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		body := f.movies
+		f.mu.Unlock()
+		write(w, body)
+	})
+	mux.HandleFunc("/api/v3/movie/", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/api/v3/movie/")
+		if r.Method != http.MethodGet {
+			f.mu.Lock()
+			f.writes = append(f.writes, r.Method+" "+r.URL.Path)
+			body := f.movieByID[id]
+			f.mu.Unlock()
+			write(w, strings.Replace(body, `"monitored":false`, `"monitored":true`, 1))
+			return
+		}
+		f.mu.Lock()
+		body, ok := f.movieByID[id]
+		f.mu.Unlock()
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		write(w, body)
+	})
+	mux.HandleFunc("/api/v3/moviefile", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		body, ok := f.movieFiles[r.URL.Query().Get("movieId")]
+		f.mu.Unlock()
+		if !ok {
+			body = `[]`
+		}
+		write(w, body)
+	})
+	mux.HandleFunc("/api/v3/wanted/cutoff", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		body, ok := f.wanted[r.URL.Query().Get("monitored")]
+		f.mu.Unlock()
+		if !ok {
+			body = `{"page":1,"pageSize":1000,"totalRecords":0,"records":[]}`
+		}
+		write(w, body)
+	})
+	mux.HandleFunc("/api/v3/series", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		body := f.series
+		f.mu.Unlock()
+		write(w, body)
+	})
+	mux.HandleFunc("/api/v3/episodefile", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		body, ok := f.episodeFiles[r.URL.Query().Get("seriesId")]
+		f.mu.Unlock()
+		if !ok {
+			body = `[]`
+		}
+		write(w, body)
+	})
+	mux.HandleFunc("/api/v3/episode", func(w http.ResponseWriter, r *http.Request) { write(w, `[]`) })
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			f.mu.Lock()
+			f.writes = append(f.writes, r.Method+" "+r.URL.Path)
+			f.mu.Unlock()
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	f.srv = httptest.NewServer(mux)
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+func (f *arrFake) writeCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.writes)
+}
+
+// radarrFileFixture builds a media root on disk plus the matching Radarr
+// library JSON: one tracked movie file and one duplicate beside it.
+func radarrFileFixture(t *testing.T, fake *arrFake) (root string, dupPath string, inst Instance) {
+	t.Helper()
+	root = t.TempDir()
+	writeActionFile(t, root, "Some Movie (2019)/Some Movie (2019).mkv", "tracked")
+	dupPath = writeActionFile(t, root, "Some Movie (2019)/ETRG.Sample.mkv", "0123456789")
+	fake.movies = `[{"id":7,"title":"Some Movie","monitored":true,"hasFile":true,"qualityProfileId":1,"tags":[],
+	  "path":"/movies/Some Movie (2019)",
+	  "movieFile":{"id":70,"path":"/movies/Some Movie (2019)/Some Movie (2019).mkv","quality":{"quality":{"id":2,"name":"1080p"}},"qualityCutoffNotMet":false}}]`
+	inst = Instance{Name: "radarr-main", Type: "radarr", URL: fake.srv.URL, APIKey: "k",
+		MediaRootMap: map[string]string{"/movies": root}}
+	return root, dupPath, inst
+}
+
+// newActionFixture wires a runner and an endpoint over one instance, with the
+// stats store already holding the finding a button would have been rendered
+// from — which is what makes the request in these tests a realistic one.
+func newActionFixture(t *testing.T, cfg Config, inst Instance) (*actionRunner, *httptest.Server, *statsStore, *strings.Builder) {
+	t.Helper()
+	logger, buf := newActionTestLogger()
+	store := newStatsStore(cfg.DryRun)
+	cfg.Instances = []Instance{inst}
+	runner := newActionRunner(cfg, logger, store)
+	ts := httptest.NewServer(newWebUIHandler(&webUIServer{stats: store, scan: newScanCoordinator(), logger: logger, actions: runner}))
+	t.Cleanup(ts.Close)
+	return runner, ts, store, buf
+}
+
+// seedFileFinding puts one duplicate/orphan finding into the store, exactly as
+// a completed sweep would have.
+func seedFileFinding(store *statsStore, inst Instance, rec fileReportFindingRecord) {
+	store.recordInstance(cycleKindSweep, time.Now(), inst.Name, inst.Type, cycleInstanceStats{
+		decisionsRan:  true,
+		fileReportRan: true,
+		fileReport: fileReportSnapshot{
+			Status: "ran", Duplicates: 1, Findings: []fileReportFindingRecord{rec},
+		},
+	})
+}
+
+func postAction(t *testing.T, ts *httptest.Server, body string) (int, actionResponse) {
+	t.Helper()
+	resp, err := http.Post(ts.URL+"/api/action", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /api/action: %v", err)
+	}
+	defer resp.Body.Close()
+	var out actionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decoding the action response: %v", err)
+	}
+	return resp.StatusCode, out
+}
+
+// --- the switch matrix ------------------------------------------------------
+
+// TestAction_GUIActionsFalse_Is403AndNamesTheSwitchWithoutTouchingAnything is
+// rule 7's default state, and the one every deployment starts in. The refusal
+// must NAME the switch: "the page never lies about which switch is missing",
+// and an operator who has set dry_run: false and still sees nothing happen
+// needs to be told it is the other flag.
+func TestAction_GUIActionsFalse_Is403AndNamesTheSwitchWithoutTouchingAnything(t *testing.T) {
+	fake := newArrFake(t)
+	root, dupPath, inst := radarrFileFixture(t, fake)
+	cfg := Config{DryRun: false, GUIActions: false, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, _ := newActionFixture(t, cfg, inst)
+	seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "d", Size: 10})
+
+	status, out := postAction(t, ts, `{"kind":"trash","confirm":true,"instance":"radarr-main","path":`+jsonString(dupPath)+`,"finding":"duplicate","size":10}`)
+	if status != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", status)
+	}
+	if out.Outcome != actionOutcomeDisabled {
+		t.Errorf("outcome = %q, want %q", out.Outcome, actionOutcomeDisabled)
+	}
+	if !strings.Contains(out.Reason, "gui_actions") {
+		t.Errorf("the refusal must name the switch that is off; got %q", out.Reason)
+	}
+	if _, err := os.Lstat(dupPath); err != nil {
+		t.Errorf("the file must not have been touched: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, trashDirName)); err == nil {
+		t.Error("a disabled action must not even create the trash directory")
+	}
+}
+
+// TestAction_DryRun_RehearsesTheTrashWithFullReVerificationAndMovesNothing is
+// rule 7's rehearsal semantics. The distinction that matters: a rehearsal is
+// not "the switch is off", it is the action having done ALL of its
+// verification and stopped at the last possible moment, so the response can
+// say what WOULD happen — including the destination path.
+func TestAction_DryRun_RehearsesTheTrashWithFullReVerificationAndMovesNothing(t *testing.T) {
+	fake := newArrFake(t)
+	_, dupPath, inst := radarrFileFixture(t, fake)
+	cfg := Config{DryRun: true, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, buf := newActionFixture(t, cfg, inst)
+	seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "d", Size: 10})
+
+	status, out := postAction(t, ts, `{"kind":"trash","confirm":true,"instance":"radarr-main","path":`+jsonString(dupPath)+`,"finding":"duplicate","size":10}`)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %+v", status, out)
+	}
+	if out.Outcome != actionOutcomeRehearsed {
+		t.Fatalf("outcome = %q, want %q (reason %q)", out.Outcome, actionOutcomeRehearsed, out.Reason)
+	}
+	if out.Trash == "" || !strings.Contains(out.Trash, trashDirName) {
+		t.Errorf("a rehearsal must say where the file WOULD go; trash=%q", out.Trash)
+	}
+	if _, err := os.Lstat(dupPath); err != nil {
+		t.Errorf("a rehearsal must move nothing: %v", err)
+	}
+	if !strings.Contains(buf.String(), "source=gui") || !strings.Contains(buf.String(), "outcome=rehearsed") {
+		t.Errorf("a rehearsal must still produce the loud audit line; log was:\n%s", buf.String())
+	}
+	if fake.writeCount() != 0 {
+		t.Errorf("a file action must never write to the *arr; writes=%v", fake.writes)
+	}
+}
+
+// TestAction_Trash_PerformsTheMoveLogsItAndRecordsItInLastActions is the whole
+// point of the phase, end to end.
+func TestAction_Trash_PerformsTheMoveLogsItAndRecordsItInLastActions(t *testing.T) {
+	fake := newArrFake(t)
+	root, dupPath, inst := radarrFileFixture(t, fake)
+	cfg := Config{DryRun: false, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, buf := newActionFixture(t, cfg, inst)
+	seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "Movies/Some Movie (2019)/ETRG.Sample.mkv", Size: 10})
+
+	status, out := postAction(t, ts, `{"kind":"trash","confirm":true,"instance":"radarr-main","path":`+jsonString(dupPath)+`,"finding":"duplicate","size":10}`)
+	if status != http.StatusOK || out.Outcome != actionOutcomePerformed {
+		t.Fatalf("status=%d outcome=%q reason=%q, want 200/performed", status, out.Outcome, out.Reason)
+	}
+	if _, err := os.Lstat(dupPath); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the file is still at its original path (err=%v)", err)
+	}
+	body, err := os.ReadFile(out.Trash)
+	if err != nil || string(body) != "0123456789" {
+		t.Errorf("the file must be readable in the trash at %s: contents=%q err=%v", out.Trash, body, err)
+	}
+	if !strings.HasPrefix(out.Trash, filepath.Join(root, trashDirName)) {
+		t.Errorf("trash path %q is not under the root's own trash directory", out.Trash)
+	}
+	// The operation the response echoes must be the operation the button
+	// stated, so the page can prove they match.
+	if !strings.Contains(out.Operation, "Move to trash") || !strings.Contains(out.Operation, "ETRG.Sample.mkv") {
+		t.Errorf("operation = %q, want it to state the exact operation and name the file", out.Operation)
+	}
+	log := buf.String()
+	for _, want := range []string{"msg=action", "source=gui", "kind=trash", "outcome=performed", dupPath} {
+		if !strings.Contains(log, want) {
+			t.Errorf("audit line is missing %q; log was:\n%s", want, log)
+		}
+	}
+	snap := store.snapshot()
+	if len(snap.Instances) != 1 || len(snap.Instances[0].LastActions) == 0 {
+		t.Fatalf("the action must appear in lastActions; got %+v", snap.Instances)
+	}
+	if got := snap.Instances[0].LastActions[0].Action; got != ActionTrash {
+		t.Errorf("lastActions[0].Action = %q, want %q", got, ActionTrash)
+	}
+}
+
+// --- staleness refusals -----------------------------------------------------
+
+// TestAction_Trash_RefusesAPathNoSweepEverReportedAsAFinding is the guard that
+// bounds this endpoint's power to exactly what a completed sweep classified as
+// clutter. Without it, "path" is an arbitrary filesystem argument handed to a
+// rename by anything that can reach the LAN port.
+func TestAction_Trash_RefusesAPathNoSweepEverReportedAsAFinding(t *testing.T) {
+	fake := newArrFake(t)
+	root, dupPath, inst := radarrFileFixture(t, fake)
+	cfg := Config{DryRun: false, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, _ := newActionFixture(t, cfg, inst)
+	seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "d", Size: 10})
+
+	tracked := filepath.Join(root, "Some Movie (2019)", "Some Movie (2019).mkv")
+	status, out := postAction(t, ts, `{"kind":"trash","confirm":true,"instance":"radarr-main","path":`+jsonString(tracked)+`,"finding":"duplicate","size":7}`)
+	if status != http.StatusConflict || out.Outcome != actionOutcomeRefused {
+		t.Fatalf("status=%d outcome=%q, want 409/refused for a path that is not a reported finding", status, out.Outcome)
+	}
+	if _, err := os.Lstat(tracked); err != nil {
+		t.Errorf("the tracked file must be untouched: %v", err)
+	}
+}
+
+// TestAction_Trash_RefusesWhenTheFileIsAlreadyGone is rule 3's plainest case: a
+// human clicking a button on a dashboard that has been open since before they
+// cleaned up by hand.
+func TestAction_Trash_RefusesWhenTheFileIsAlreadyGone(t *testing.T) {
+	fake := newArrFake(t)
+	_, dupPath, inst := radarrFileFixture(t, fake)
+	cfg := Config{DryRun: false, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, _ := newActionFixture(t, cfg, inst)
+	seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "d", Size: 10})
+	if err := os.Rename(dupPath, dupPath+".moved-by-a-human"); err != nil {
+		t.Fatalf("simulating a hand cleanup: %v", err)
+	}
+
+	status, out := postAction(t, ts, `{"kind":"trash","confirm":true,"instance":"radarr-main","path":`+jsonString(dupPath)+`,"finding":"duplicate","size":10}`)
+	if status != http.StatusConflict || out.Outcome != actionOutcomeRefused {
+		t.Fatalf("status=%d outcome=%q reason=%q, want 409/refused", status, out.Outcome, out.Reason)
+	}
+}
+
+// TestAction_Trash_RefusesWhenTheFileIsNoLongerTheSizeTheButtonPromised is why
+// fileReportFinding.size exists. A file REPLACED at the same path passes every
+// existence check there is; the size is the cheapest fact that catches it.
+func TestAction_Trash_RefusesWhenTheFileIsNoLongerTheSizeTheButtonPromised(t *testing.T) {
+	fake := newArrFake(t)
+	_, dupPath, inst := radarrFileFixture(t, fake)
+	cfg := Config{DryRun: false, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, _ := newActionFixture(t, cfg, inst)
+	seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "d", Size: 10})
+
+	// The button was rendered against a 10-byte file; the request says so.
+	// What is on disk now is a different, larger file at the same path.
+	if err := os.WriteFile(dupPath, []byte("a much larger replacement file"), 0o644); err != nil {
+		t.Fatalf("replacing the fixture: %v", err)
+	}
+	status, out := postAction(t, ts, `{"kind":"trash","confirm":true,"instance":"radarr-main","path":`+jsonString(dupPath)+`,"finding":"duplicate","size":10}`)
+	if status != http.StatusConflict || out.Outcome != actionOutcomeRefused {
+		t.Fatalf("status=%d outcome=%q reason=%q, want 409/refused", status, out.Outcome, out.Reason)
+	}
+	if !strings.Contains(out.Reason, "size") {
+		t.Errorf("the refusal must say the size no longer matches; got %q", out.Reason)
+	}
+	if _, err := os.Lstat(dupPath); err != nil {
+		t.Errorf("the replacement file must be untouched: %v", err)
+	}
+}
+
+// TestAction_Trash_ReadOnlyRootRefusesNamingTheMountAndTheFix is rule 8 through
+// the endpoint: the DEFAULT deployment's answer, because the compose example
+// mounts media :ro on purpose.
+func TestAction_Trash_ReadOnlyRootRefusesNamingTheMountAndTheFix(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: a 0555 directory is still writable")
+	}
+	fake := newArrFake(t)
+	root, dupPath, inst := radarrFileFixture(t, fake)
+	cfg := Config{DryRun: false, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, _ := newActionFixture(t, cfg, inst)
+	seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "d", Size: 10})
+
+	if err := os.Chmod(root, 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(root, 0o755) })
+
+	status, out := postAction(t, ts, `{"kind":"trash","confirm":true,"instance":"radarr-main","path":`+jsonString(dupPath)+`,"finding":"duplicate","size":10}`)
+	if status != http.StatusConflict || out.Outcome != actionOutcomeRefused {
+		t.Fatalf("status=%d outcome=%q, want 409/refused on a read-only root", status, out.Outcome)
+	}
+	if !strings.Contains(out.Reason, root) || !strings.Contains(out.Reason, "read-only") {
+		t.Errorf("the refusal must name the mount and the cause; got %q", out.Reason)
+	}
+}
+
+// --- endpoint validation ----------------------------------------------------
+
+func TestActionEndpoint_ValidationAndMethodConventions(t *testing.T) {
+	fake := newArrFake(t)
+	_, dupPath, inst := radarrFileFixture(t, fake)
+	cfg := Config{DryRun: false, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
+	_, ts, store, _ := newActionFixture(t, cfg, inst)
+	seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "d", Size: 10})
+
+	t.Run("GET is 405", func(t *testing.T) {
+		resp, err := http.Get(ts.URL + "/api/action")
+		if err != nil {
+			t.Fatalf("GET: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("status = %d, want 405", resp.StatusCode)
+		}
+	})
+
+	for _, tc := range []struct{ name, body, wantIn string }{
+		{"malformed JSON", `{not json`, "could not be read"},
+		{"unknown kind", `{"kind":"delete-everything","confirm":true,"instance":"radarr-main"}`, "delete-everything"},
+		{"missing confirm", `{"kind":"trash","instance":"radarr-main","path":"/x","finding":"duplicate"}`, "confirm"},
+		{"unknown instance", `{"kind":"trash","confirm":true,"instance":"nope","path":"/x","finding":"duplicate"}`, "nope"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, out := postAction(t, ts, tc.body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (outcome %q reason %q)", status, out.Outcome, out.Reason)
+			}
+			if !strings.Contains(out.Reason, tc.wantIn) {
+				t.Errorf("reason = %q, want it to contain %q", out.Reason, tc.wantIn)
+			}
+		})
+	}
+}
+
+// --- single-flight ----------------------------------------------------------
+
+// TestActionRunner_SerializesActions is the "never concurrent with each other"
+// half of the endpoint contract. Two file moves interleaving is how a merge
+// and a trash of the same tree produce a state neither one described.
+func TestActionRunner_SerializesActions(t *testing.T) {
+	fake := newArrFake(t)
+	_, dupPath, inst := radarrFileFixture(t, fake)
+	cfg := Config{DryRun: true, GUIActions: true, ExclusionTag: "cutoffarr-exclude"}
+	runner, _, store, _ := newActionFixture(t, cfg, inst)
+	seedFileFinding(store, inst, fileReportFindingRecord{Kind: fileKindDuplicate, Path: dupPath, Display: "d", Size: 10})
+
+	var mu sync.Mutex
+	inFlight, maxInFlight := 0, 0
+	runner.observe = func() {
+		mu.Lock()
+		inFlight++
+		if inFlight > maxInFlight {
+			maxInFlight = inFlight
+		}
+		mu.Unlock()
+		time.Sleep(2 * time.Millisecond)
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+	}
+
+	req := actionRequest{Kind: ActionTrash, Confirm: true, Instance: inst.Name, Path: dupPath, Finding: fileKindDuplicate, Size: 10}
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runner.run(context.Background(), req)
+		}()
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if maxInFlight != 1 {
+		t.Errorf("maxInFlight = %d, want 1: actions must be serialized through a single-flight executor", maxInFlight)
+	}
+}
+
+// --- the structural pin the whole ruling rests on ---------------------------
+
+// TestTree_ExecutorsAreReachableOnlyFromTheActionEndpoint is the pin that keeps
+// the owner's ruling true no matter what any later phase does: the ruling
+// permits a HUMAN to act, and it is only honest if no autonomous code path can
+// reach an executor at all.
+//
+// The check is structural rather than aspirational: the executor entry points
+// are named, and no non-test file other than actions.go itself and the one HTTP
+// handler file may so much as mention them.
+func TestTree_ExecutorsAreReachableOnlyFromTheActionEndpoint(t *testing.T) {
+	executors := []string{"moveToTrash(", "mergeCaseTwinDir(", "probeRootWritable(", ".run(", "newActionRunner("}
+	allowed := map[string]map[string]bool{
+		// actions.go declares them all, and calls them from its own executors.
+		"actions.go": {"moveToTrash(": true, "mergeCaseTwinDir(": true, "probeRootWritable(": true, ".run(": true, "newActionRunner(": true},
+		// webui.go holds the ONE handler, and it may call the runner and
+		// nothing else. daemon.go may construct it (wiring is not acting).
+		"webui.go":  {".run(": true},
+		"daemon.go": {"newActionRunner(": true},
+	}
+	err := filepath.WalkDir(".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if p != "." && strings.HasPrefix(d.Name(), ".") {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		name := filepath.ToSlash(p)
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			return nil
+		}
+		src, readErr := os.ReadFile(p)
+		if readErr != nil {
+			return readErr
+		}
+		body := string(src)
+		for _, ex := range executors {
+			if strings.Contains(body, ex) && !allowed[name][ex] {
+				t.Errorf("%s names %s: the action executors must stay reachable ONLY from the action endpoint handler — a sweep, webhook, reconciliation or startup path that can reach one would make the owner's human-acts ruling false", name, ex)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking the tree: %v", err)
+	}
+}
+
+func jsonString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
 }

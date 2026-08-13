@@ -4681,3 +4681,74 @@ func TestRunRadarrFileReport_CaseCollisionOnlyRootStillReportsRan(t *testing.T) 
 		t.Errorf("duplicates=%d orphans=%d, want 0/0", c.duplicates, c.orphans)
 	}
 }
+
+// --- [v2.2] finding size ----------------------------------------------------
+
+// TestEvaluateFileReportRoot_DuplicateAndOrphanFindingsCarryTheirFileSize is
+// v2.2's one addition to the finding itself. Two things need it and neither
+// can get it anywhere else:
+//
+//   - The button has to STATE its exact operation (action constitution rule 2:
+//     "Move to trash — TV_Shows/…/ETRG.Sample.mkv (12 MB)"), and "how big is
+//     the thing I am about to move" is the single most useful fact a human
+//     has for telling a stray sample from the actual episode.
+//   - The trash executor re-stats the file and refuses if it no longer matches
+//     what the button promised (rule 3). Without a size, "matches" degrades to
+//     "a file still exists at this path", which a REPLACED file passes.
+//
+// It is read from the walk's own fs.DirEntry, only for the two finding kinds,
+// so a tracked or skipped file costs nothing extra.
+func TestEvaluateFileReportRoot_DuplicateAndOrphanFindingsCarryTheirFileSize(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureFiles(t, dir, filepath.Join("Movie", "Movie.mkv"))
+	dupPath := filepath.Join(dir, "Movie", "Movie extra.mkv")
+	if err := os.WriteFile(dupPath, []byte("0123456789"), 0o644); err != nil {
+		t.Fatalf("writing duplicate fixture: %v", err)
+	}
+	orphanPath := filepath.Join(dir, "Elsewhere", "stray.mkv")
+	if err := os.MkdirAll(filepath.Dir(orphanPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(orphanPath, []byte("012345"), 0o644); err != nil {
+		t.Fatalf("writing orphan fixture: %v", err)
+	}
+
+	root := mediaRoot{arrPath: "/movies", diskPath: dir}
+	set := instanceTrackedSet{
+		files:        map[string]bool{filepath.Join(dir, "Movie", "Movie.mkv"): true},
+		folders:      map[string]string{filepath.Join(dir, "Movie"): "Movie"},
+		seriesFolder: map[string]bool{},
+	}
+	logger, _ := newFileReportTestLogger(slog.LevelInfo)
+	outcome := evaluateFileReportRoot(context.Background(), logger, slog.LevelInfo, Instance{Name: "radarr-main", Type: "radarr"}, root, set)
+
+	bySize := map[string]int64{}
+	for _, f := range outcome.findings {
+		bySize[f.diskPath] = f.size
+	}
+	if bySize[dupPath] != 10 {
+		t.Errorf("duplicate finding size = %d, want 10", bySize[dupPath])
+	}
+	if bySize[orphanPath] != 6 {
+		t.Errorf("orphan finding size = %d, want 6", bySize[orphanPath])
+	}
+}
+
+// TestFileReportSnapshotFrom_CarriesSizeToTheWireForFileFindingsOnly pins that
+// the size reaches the JSON a button is built from, and that a case-collision
+// finding — which names a DIRECTORY, not a file — does not pretend to have one.
+func TestFileReportSnapshotFrom_CarriesSizeToTheWireForFileFindingsOnly(t *testing.T) {
+	snap := fileReportSnapshotFrom(fileReportCounts{
+		configured: true,
+		findings: []fileReportFinding{
+			{kind: fileKindDuplicate, diskPath: "/d/a.mkv", displayPath: "d/a.mkv", size: 4242},
+			{kind: fileKindCaseCollision, diskPath: "/d", displayPath: "d", entryType: fileReportEntryTypeDir},
+		},
+	})
+	if snap.Findings[0].Size != 4242 {
+		t.Errorf("duplicate Size = %d, want 4242", snap.Findings[0].Size)
+	}
+	if snap.Findings[1].Size != 0 {
+		t.Errorf("case-collision Size = %d, want 0: it names a directory, not a file", snap.Findings[1].Size)
+	}
+}

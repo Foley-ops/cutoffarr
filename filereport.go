@@ -835,6 +835,27 @@ type fileReportFinding struct {
 	folder     string // groupKey's real key (duplicates only) — see its doc comment.
 	groupCount int
 
+	// size is [v2.2] the file's size in bytes, read from the walk's own
+	// fs.DirEntry and set for duplicate/orphan findings only (a case-collision
+	// finding names a containing DIRECTORY, which has no meaningful size).
+	//
+	// Two things depend on it, and neither can get it anywhere else. The
+	// action button has to state its exact operation ("Move to trash —
+	// TV_Shows/…/ETRG.Sample.mkv (12 MB)"), and size is the single most
+	// useful fact for telling a stray sample from the real episode. And the
+	// trash executor re-stats the file before acting and refuses if it no
+	// longer matches what the button promised — without a size, "matches"
+	// weakens to "something still exists at this path", which a REPLACED file
+	// passes.
+	//
+	// Best-effort: fs.DirEntry.Info() can fail for a file that vanished
+	// between the directory listing and this call, and that benign race must
+	// not abort a whole root's report (the completeness contract treats a walk
+	// error as fatal to the root). Such a finding carries 0, which the action
+	// path reads as "no promise was made about the size" and which the GUI
+	// renders without a size rather than as "0 B".
+	size int64
+
 	// entryType/names are [v2.1] case-collision-only: which kind of entry
 	// collided (fileReportEntryTypeDir/fileReportEntryTypeFile, or
 	// fileReportEntryTypeMixed for a cross-type twin — a directory beside a
@@ -1166,10 +1187,14 @@ func evaluateFileReportRoot(ctx context.Context, logger *slog.Logger, itemLevel 
 			outcome.findings = append(outcome.findings, fileReportFinding{
 				kind: fileKindDuplicate, diskPath: filePath, displayPath: rootRelativeDisplayPath(root, rel),
 				isSeries: c.isSeries, title: c.title, group: c.group, folder: c.folder,
+				size: dirEntrySize(d),
 			})
 		case fileKindOrphan:
 			videoFilesSeen++
-			outcome.findings = append(outcome.findings, fileReportFinding{kind: fileKindOrphan, diskPath: filePath, displayPath: rootRelativeDisplayPath(root, rel)})
+			outcome.findings = append(outcome.findings, fileReportFinding{
+				kind: fileKindOrphan, diskPath: filePath, displayPath: rootRelativeDisplayPath(root, rel),
+				size: dirEntrySize(d),
+			})
 		case fileKindSkippedByRule:
 			outcome.skipReasons[c.reason]++
 			outcome.seenSkippedByRule++
@@ -1268,6 +1293,19 @@ func evaluateFileReportRoot(ctx context.Context, logger *slog.Logger, itemLevel 
 	}
 
 	return outcome
+}
+
+// dirEntrySize is [v2.2] fileReportFinding.size's best-effort reader: the
+// file's size from the walk's own directory entry, or 0 if it cannot be
+// determined. Deliberately swallows the error rather than returning it — see
+// fileReportFinding.size's own doc comment for why a benign vanished-file race
+// must not abort an entire root's report over a display detail.
+func dirEntrySize(d fs.DirEntry) int64 {
+	info, err := d.Info()
+	if err != nil {
+		return 0
+	}
+	return info.Size()
 }
 
 // groupKey identifies a duplicate finding's display group uniquely enough to
