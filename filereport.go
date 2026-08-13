@@ -172,6 +172,23 @@ func mapArrPathToDisk(p string, root mediaRoot) (string, bool) {
 	return cleanArrPath(root.diskPath + suffix), true
 }
 
+// rootRelativeDisplayPath renders a file's ON-SCREEN path relative to its
+// mapped root — the root's own last path segment, then rel (the file's path
+// relative to root.diskPath, exactly as fs.WalkDir already handed
+// evaluateFileReportRoot's walk function — reused here rather than
+// re-derived a second time by trimming diskPath). The full disk path
+// (fileReportFinding.diskPath) can carry a long, host-specific prefix — a
+// scratch-directory mount on a dev laptop, a deeply nested share on the
+// server — that a human operator glancing at the GUI does not need to see
+// to know which file a finding is about; "Movies/Some Title/file.mkv" reads
+// the same regardless of what that root happens to be mounted under. rel is
+// always a slash-separated fs.FS path (io/fs's own contract, independent of
+// host OS), so path.Join — not filepath.Join — is correct here, matching
+// this file's own path.Clean-not-filepath.Clean convention above.
+func rootRelativeDisplayPath(root mediaRoot, rel string) string {
+	return path.Join(path.Base(root.diskPath), rel)
+}
+
 // mapArrPathToAnyRoot maps p against every configured root, returning the
 // disk-side path from whichever root matches. When more than one root's
 // arr-side prefix matches (overlapping roots — not a configuration this
@@ -540,6 +557,15 @@ type fileReportFinding struct {
 	kind     string // fileKindDuplicate or fileKindOrphan
 	diskPath string
 
+	// displayPath is diskPath rendered relative to its mapped root — see
+	// rootRelativeDisplayPath. diskPath is still what gets logged (binding
+	// controller resolution 7: "root and path, both CUTOFFARR-side / disk
+	// paths") and still travels to the API's own `path` field; displayPath
+	// exists only so a client (the GUI) has something short enough to put
+	// on screen without a scratch-directory-length prefix, without having
+	// to re-derive it itself from `path` and a root it doesn't have.
+	displayPath string
+
 	isSeries   bool
 	title      string
 	group      string
@@ -732,11 +758,12 @@ func evaluateFileReportRoot(ctx context.Context, logger *slog.Logger, itemLevel 
 		case fileKindDuplicate:
 			videoFilesSeen++
 			outcome.findings = append(outcome.findings, fileReportFinding{
-				kind: fileKindDuplicate, diskPath: filePath, isSeries: c.isSeries, title: c.title, group: c.group, folder: c.folder,
+				kind: fileKindDuplicate, diskPath: filePath, displayPath: rootRelativeDisplayPath(root, rel),
+				isSeries: c.isSeries, title: c.title, group: c.group, folder: c.folder,
 			})
 		case fileKindOrphan:
 			videoFilesSeen++
-			outcome.findings = append(outcome.findings, fileReportFinding{kind: fileKindOrphan, diskPath: filePath})
+			outcome.findings = append(outcome.findings, fileReportFinding{kind: fileKindOrphan, diskPath: filePath, displayPath: rootRelativeDisplayPath(root, rel)})
 		case fileKindSkippedByRule:
 			outcome.skipReasons[c.reason]++
 			outcome.seenSkippedByRule++

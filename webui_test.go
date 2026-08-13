@@ -935,6 +935,63 @@ func TestWebUIPage_FileReportRendersThreeStateStatus(t *testing.T) {
 	}
 }
 
+// TestWebUIPage_FileReportShowsRootRelativeDisplayPathWithFullPathAsTitle
+// pins the "full cutoffarr-side path overhangs the file-clutter row" fix: the
+// path cell's visible text must come from the finding's root-relative
+// `display` field (falling back to `path` for a daemon that predates it,
+// never the reverse — `display` is always the shorter, screen-sized one),
+// and the cell's `title` attribute must carry the untruncated `path` so the
+// full path is still available on hover.
+func TestWebUIPage_FileReportShowsRootRelativeDisplayPathWithFullPathAsTitle(t *testing.T) {
+	page := string(webUIPage)
+
+	start := strings.Index(page, "function renderFileReport(")
+	if start == -1 {
+		t.Fatal("page has no renderFileReport function")
+	}
+	end := strings.Index(page[start:], "\n  function render(data)")
+	if end == -1 {
+		t.Fatal("could not find the end of renderFileReport (render(data) must follow it)")
+	}
+	body := page[start : start+end]
+
+	if !strings.Contains(body, `text(td, r.f.display || r.f.path || "")`) {
+		t.Error("renderFileReport's path cell does not render r.f.display (falling back to r.f.path) as its visible text")
+	}
+	if !strings.Contains(body, `td.title = r.f.path || "";`) {
+		t.Error("renderFileReport's path cell does not set its title attribute to the full r.f.path for a hover")
+	}
+}
+
+// TestWebUIPage_FileReportKindCellDoesNotWrapMidWord pins the "duplicate
+// breaks mid-word (dupli-cate) in its narrow column" fix: the kind cell must
+// opt out of table.findings td's page-wide word-break: break-word (below)
+// via its own class, and that class must reserve enough width to hold
+// "duplicate" — the longer of the two kind values — on one line.
+func TestWebUIPage_FileReportKindCellDoesNotWrapMidWord(t *testing.T) {
+	page := string(webUIPage)
+
+	if !strings.Contains(page, `td = el("td", "kind"); text(td, r.f.kind || "");`) {
+		t.Error("renderFileReport's kind cell is not built with the \"kind\" class")
+	}
+
+	start := strings.Index(page, "table.findings td.kind {")
+	if start == -1 {
+		t.Fatal("page has no table.findings td.kind CSS rule")
+	}
+	end := strings.Index(page[start:], "}")
+	if end == -1 {
+		t.Fatal("could not find the end of the table.findings td.kind rule")
+	}
+	rule := page[start : start+end]
+	if !strings.Contains(rule, "white-space: nowrap") {
+		t.Error("table.findings td.kind does not set white-space: nowrap — \"duplicate\" can still wrap (and break) mid-word")
+	}
+	if !strings.Contains(rule, "min-width") {
+		t.Error("table.findings td.kind reserves no min-width — the auto-sized column can still come out narrower than \"duplicate\" itself")
+	}
+}
+
 // TestWebUIPage_RefreshSurfacesAFailedPollExplicitly pins the "a dead
 // dashboard must never be pixel-identical to a healthy one" fix: refresh()
 // must check the response's ok status (a 5xx, or an HTML error page from a

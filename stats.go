@@ -83,15 +83,22 @@ type reverseFinding struct {
 }
 
 // fileReportFindingRecord is one duplicate or orphan finding, matching the
-// API contract's `{kind, group, path, count?}`. Group is empty for an
-// orphan (fileReportFinding never sets one for fileKindOrphan — see
+// API contract's `{kind, group, path, display, count?}`. Group is empty for
+// an orphan (fileReportFinding never sets one for fileKindOrphan — see
 // filereport.go); Count is the duplicate group's size and is omitted
 // (rather than printed as a misleading 0) for an orphan, which has no group.
+// Path is the full cutoffarr-side (disk) path — the same one
+// logFileReportFinding already logs — kept verbatim for a client that wants
+// it (e.g. a hover title); Display is that same file's path relative to its
+// mapped root (rootRelativeDisplayPath, filereport.go), always present and
+// always shorter, for a client that wants something screen-sized instead of
+// a possibly long, host-specific mount prefix.
 type fileReportFindingRecord struct {
-	Kind  string `json:"kind"`
-	Group string `json:"group,omitempty"`
-	Path  string `json:"path"`
-	Count int    `json:"count,omitempty"`
+	Kind    string `json:"kind"`
+	Group   string `json:"group,omitempty"`
+	Path    string `json:"path"`
+	Display string `json:"display"`
+	Count   int    `json:"count,omitempty"`
 }
 
 // fileReportSnapshot is one instance's Phase 11 file report, as of the last
@@ -531,7 +538,7 @@ func fileReportSnapshotFrom(c fileReportCounts) fileReportSnapshot {
 	findings := make([]fileReportFindingRecord, 0, len(c.findings))
 	for _, f := range c.findings {
 		findings = append(findings, fileReportFindingRecord{
-			Kind: f.kind, Group: f.group, Path: f.diskPath, Count: f.groupCount,
+			Kind: f.kind, Group: f.group, Path: f.diskPath, Display: f.displayPath, Count: f.groupCount,
 		})
 	}
 	return fileReportSnapshot{Status: c.state(), Duplicates: c.duplicates, Orphans: c.orphans, Findings: findings}
