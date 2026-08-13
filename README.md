@@ -900,6 +900,14 @@ to:
 | `Merge "X" into "Y" [tracked]` | a case-twin block | Moves the untracked spelling's contents into the tracked spelling, then trash-moves the emptied folder. |
 | `Re-monitor — <title> (movie N)` | a reverse-scan row | Sets `monitored: true` on that one item, through the same gated write path the reverse scan itself uses. |
 
+A button performs **the one operation it names, and only that one**. A
+re-monitor click drives the reverse half of the decision engine and nothing
+else: the forward pass still *evaluates* (its cross-check is what authorizes
+the write), but it composes no write at all on this path, so a click on
+"Re-monitor" can never end in an unmonitor — not even for an item that was
+re-monitored and upgraded since the row was drawn, which is exactly the stale
+tab this section is about.
+
 There is exactly one bulk action, **Re-monitor all N**, and that is
 deliberate: a re-monitor flips a flag the next sweep would respect anyway,
 where moving many files on one click is a different decision that has not been
@@ -963,8 +971,18 @@ Concretely, an action refuses when:
   under the decision is sound. The refusal quotes the gate's own reason;
 - the media root is mounted read-only (see below).
 
-Refusals are answers, not silence: the row shows the reason in clay, and the
-log carries a line for it.
+And when the evaluation itself could not be completed or trusted — the library
+read failed, the exclusion tag could not be resolved, the reverse pass's own
+wanted/cutoff set came back short — the answer says so. It never reports "there
+was nothing to do", which would be a claim about your library derived from a
+pass that never looked at it.
+
+Refusals are answers, not silence: the row shows the reason in clay, the log
+carries a line for it, and the row keeps that answer on screen — a repaint or
+the 30-second poll does not wipe it while the finding is still being reported.
+A `failed` outcome — cutoffarr tried and something outside it broke — is logged
+at `ERROR`, not `INFO`, because the next step for it is to go and look at your
+server.
 
 ### The switches, and what each one means
 
@@ -977,6 +995,13 @@ log carries a line for it.
 
 The page never guesses which switch is missing — `/api/stats` reports both,
 and the disabled button's own text names the one that is off.
+
+"Rehearsed" is claimed only when `dry_run` really is the only thing stopping
+the write. A re-monitor that would have been refused anyway — the cross-check
+gate blocked the instance, the season's series is unmonitored, a shutdown was
+requested — answers with **that** reason under `dry_run: true`, exactly as it
+does under `dry_run: false`. A rehearsal that promised a write turning the flag
+off would not produce is the one thing this page must never say.
 
 One honest detail about rehearsals: a rehearsed **file** action does create the
 empty `.cutoffarr-trash` directory, because attempting that create is the only

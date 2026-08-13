@@ -1191,7 +1191,86 @@
   //     on", which is true and one config line away.
   //   - The row updates from the RESPONSE, not from a hopeful assumption and
   //     not by waiting for the next sweep: performed strikes the row through,
-  //     refused leaves a clay note, rehearsed an amber one.
+  //     refused leaves a clay note, rehearsed an amber one — and it KEEPS
+  //     that state across repaints (see actionOutcomes), because the two
+  //     renderers rebuild their tables from scratch on a 30s timer and a
+  //     result that survives for at most one poll has not satisfied "without
+  //     waiting for the next sweep" at all.
+
+  // actionOutcomes is that memory: finding identity -> the last response this
+  // page got for it. It exists because renderReverse and renderFileReport both
+  // begin with body.textContent = "" and refresh() calls render(data) every
+  // POLL_MS, so without it the strike-through, the refusal note and the merge's
+  // itemized collisions were all wiped within 30 seconds — and the row came
+  // back from the STILL-STALE snapshot with a fully live "Move to trash — …"
+  // button for a file that is already in the trash. The second click is safely
+  // refused by the server, so that was misleading rather than dangerous, but
+  // "the action did not work" is exactly the wrong thing for the page to say
+  // about an action that did.
+  //
+  // The identity is what a REBUILT row can be matched on: instance + kind +
+  // path for a file action, instance + id + season for a re-monitor. Entries
+  // live until the finding stops appearing in a snapshot (pruneActionOutcomes),
+  // which is the honest end of their life: while the server still reports the
+  // finding, what this page last heard about it is still the freshest thing
+  // anybody knows.
+  var actionOutcomes = {};
+
+  // actionKey builds that identity from the very body the button would POST,
+  // so the key and the request can never describe different findings.
+  function actionKey(body) {
+    if (!body || !body.kind) return "";
+    if (body.kind === "remonitor") {
+      var season = (body.season === undefined || body.season === null) ? "-" : String(body.season);
+      return body.instance + "|remonitor|" + (body.id || 0) + "|" + season;
+    }
+    if (body.kind === "merge-case-twin") {
+      return body.instance + "|merge-case-twin|" + (body.path || "") + "|" + (body.tracked || "") + "|" + (body.untracked || "");
+    }
+    return body.instance + "|" + body.kind + "|" + (body.path || "");
+  }
+
+  function rememberActionOutcome(body, resp) {
+    var key = actionKey(body);
+    if (key) actionOutcomes[key] = resp;
+  }
+
+  function rememberedActionOutcome(body) {
+    var key = actionKey(body);
+    return key ? actionOutcomes[key] : null;
+  }
+
+  // pruneActionOutcomes drops everything the current snapshot no longer
+  // reports. It is built from the DATA rather than from the buttons that were
+  // rendered, deliberately: both finding tables are paginated, so a run keyed
+  // on "which buttons did we just build" would forget every outcome on a page
+  // the operator happened to be scrolled away from.
+  function pruneActionOutcomes(instances) {
+    var live = {};
+    for (var i = 0; i < instances.length; i++) {
+      var inst = instances[i];
+      var rf = inst.reverseFindings || [];
+      for (var j = 0; j < rf.length; j++) {
+        live[actionKey(reverseActionBody({ instance: inst.name, f: rf[j] }))] = true;
+      }
+      var fr = (inst.fileReport && inst.fileReport.findings) || [];
+      for (var k = 0; k < fr.length; k++) {
+        var f = fr[k];
+        if (f.kind === "case-collision") {
+          var elig = twinEligibility(f);
+          live[actionKey({
+            kind: "merge-case-twin", instance: inst.name, path: f.path || "",
+            tracked: elig.tracked || "", untracked: elig.untracked || ""
+          })] = true;
+        } else {
+          live[actionKey({ kind: "trash", instance: inst.name, path: f.path || "" })] = true;
+        }
+      }
+    }
+    for (var key in actionOutcomes) {
+      if (Object.prototype.hasOwnProperty.call(actionOutcomes, key) && !live[key]) delete actionOutcomes[key];
+    }
+  }
 
   // actionSwitches mirrors the two config flags GET /api/stats reports, so a
   // button's disabled state is always the daemon's own answer rather than
@@ -1265,6 +1344,26 @@
     wrap.appendChild(btn);
     wrap.appendChild(note);
 
+    // A row REBUILT by a poll (or by a pager click) re-applies whatever this
+    // page last heard about this exact finding, before anything else is
+    // decided about the button. A performed action also keeps the button
+    // disabled: the operation is done, and re-arming it would read as "that
+    // did not work". Every other outcome leaves the button live, because a
+    // refusal or a failure is a thing an operator may legitimately retry once
+    // they have fixed its cause — the note tells them what that cause was.
+    var remembered = rememberedActionOutcome(opts.body);
+    if (remembered) {
+      btn.title = opts.label;
+      // Still disabled if the deployment (or this twin's shape) says so: an
+      // outcome this page remembers is a fact about the past, never an
+      // authorization for a second click.
+      btn.disabled = remembered.outcome === "performed" ||
+        !!(opts.ineligible || actionDisabledReason(opts.kind));
+      renderActionOutcome(note, opts.container, remembered);
+      if (!btn.disabled) attachActionClick(btn, note, opts);
+      return wrap;
+    }
+
     // An ineligible finding (rule 5's report-only twin shapes) is disabled
     // for a reason that has nothing to do with the switches, and that reason
     // wins: it is about THIS finding, not about the deployment.
@@ -1277,6 +1376,14 @@
     }
 
     btn.title = opts.label;
+    attachActionClick(btn, note, opts);
+    return wrap;
+  }
+
+  // attachActionClick is the confirm-then-POST half of buildActionButton,
+  // shared with the remembered-outcome path above so a retryable row's button
+  // behaves identically to a freshly rendered one.
+  function attachActionClick(btn, note, opts) {
     btn.addEventListener("click", function () {
       // The confirm gate. It re-shows the FULL operation — the same string
       // the button carries and the server will echo back — so the last thing
@@ -1291,13 +1398,21 @@
       text(note, "working…");
       note.className = "action-note";
       postAction(opts.body)
-        .then(function (res) { renderActionOutcome(note, opts.container, res.body); })
+        .then(function (res) {
+          rememberActionOutcome(opts.body, res.body);
+          renderActionOutcome(note, opts.container, res.body);
+          if (!res.body || res.body.outcome !== "performed") btn.disabled = false;
+        })
         .catch(function () {
+          // Deliberately NOT remembered: a network failure establishes
+          // nothing about whether the action ran, and a memory that survived
+          // repaints would keep asserting that non-answer over whatever the
+          // next poll's data says.
           note.className = "action-note action-note-refused";
           text(note, "cutoffarr could not be reached, so nothing is known about whether anything happened — check the log before clicking again");
+          btn.disabled = false;
         });
     });
-    return wrap;
   }
 
   // reverseActionLabel is the re-monitor button's exact operation, matching
@@ -1338,6 +1453,15 @@
   // the writes are serialized by the same single-flight executor, and the
   // worst case is a flag flipped on something that will be flipped back by
   // the next sweep.
+  //
+  // Its summary survives its own rerender through bulkRemonitorSummary, for
+  // the same reason the per-row outcomes survive a poll: the completion used
+  // to write the summary into `note` and then call rerender(), whose first act
+  // is body.textContent = "" — destroying the sentence in the same tick, so
+  // the operator never saw it at all and the repaint came back from the stale
+  // findings looking exactly as it had before the click.
+  var bulkRemonitorSummary = null;
+
   function buildBulkRemonitor(rows, rerender) {
     var wrap = el("div", "bulk-actions");
     var label = "Re-monitor all " + rows.length + " reverse-scan finding" + (rows.length === 1 ? "" : "s");
@@ -1347,6 +1471,11 @@
     var note = el("span", "action-note");
     wrap.appendChild(btn);
     wrap.appendChild(note);
+
+    if (bulkRemonitorSummary) {
+      note.className = "action-note action-note-" + bulkRemonitorSummary.tone;
+      text(note, bulkRemonitorSummary.text);
+    }
 
     var reason = actionDisabledReason("remonitor");
     if (reason) {
@@ -1364,27 +1493,46 @@
         (actionSwitches.dryRun ? "dry_run is on, so every one of these will be REHEARSED only." : "Each one is re-verified against fresh data before it is written."))) return;
 
       btn.disabled = true;
-      var performed = 0, refused = 0;
+      bulkRemonitorSummary = null;
+      // Three counters, not two. A 502 `failed` and a network error are NOT
+      // refusals: "refused" means cutoffarr decided not to, and one of these
+      // means it tried and something outside it broke — which is the operator's
+      // cue to go and look at their server. Collapsing them asserted a decision
+      // where the outcome is genuinely unknown.
+      var performed = 0, declined = 0, unknown = 0;
       // Strictly sequential: the server serializes actions anyway, and firing
       // N requests at a single-flight executor would only queue them inside
       // its lock while this page had no idea which one it was waiting on.
       var i = 0;
       function step() {
         if (i >= rows.length) {
-          note.className = "action-note " + (refused ? "action-note-refused" : "action-note-done");
-          text(note, performed + " answered yes, " + refused + " were refused or rehearsed — reloading the findings.");
+          var summary = performed + " answered yes, " + declined + " were refused or rehearsed";
+          if (unknown > 0) summary += ", " + unknown + " failed or unknown — check the log";
+          bulkRemonitorSummary = {
+            tone: (declined || unknown) ? "refused" : "done",
+            text: summary + " — reloading the findings."
+          };
+          // The per-row outcomes were remembered as each answer arrived, so
+          // this repaint brings every row back carrying its own result, and
+          // buildBulkRemonitor re-applies the summary above from the same
+          // memory rather than writing into a note it is about to destroy.
           rerender();
           return;
         }
         text(note, "working on " + (i + 1) + " of " + rows.length + "…");
-        postAction(reverseActionBody(rows[i]))
+        var body = reverseActionBody(rows[i]);
+        postAction(body)
           .then(function (res) {
-            if (res.body && res.body.outcome === "performed") performed++; else refused++;
+            var outcome = res.body && res.body.outcome;
+            if (outcome === "performed") performed++;
+            else if (outcome === "refused" || outcome === "rehearsed" || outcome === "disabled") declined++;
+            else unknown++;
+            if (outcome) rememberActionOutcome(body, res.body);
             i++;
             step();
           })
           .catch(function () {
-            refused++;
+            unknown++;
             i++;
             step();
           });
@@ -1688,6 +1836,12 @@
     }
     text(document.getElementById("lastSwept"), "last swept " + fmtRelative(latest));
     text(document.getElementById("versionLabel"), "· " + (data.version || "dev"));
+
+    // [v2.2] Before the three renderers rebuild their tables from scratch:
+    // forget what this page was told about findings this snapshot no longer
+    // reports (the click worked and the sweep has caught up), and keep
+    // everything else so the rows come back carrying their outcomes.
+    pruneActionOutcomes(instances);
 
     renderInstances(instances);
     renderReverse(instances);

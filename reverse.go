@@ -192,6 +192,19 @@ func scopedReverseOptions(cfg Config) reverseOptions {
 	return reverseOptions{enabled: cfg.ReverseScanRemonitor, remonitor: cfg.ReverseScanRemonitor}
 }
 
+// withheldByDryRunReason is the §2.1 dry-run gate's own withholding reason —
+// the one reason in this file that turning dry_run OFF actually overcomes.
+//
+// It is a named constant because the GUI action path has to tell it apart from
+// every other withholding by identity (reverseCounts.withheldReason ==
+// withheldByDryRunReason), and only that one may be reported to an operator as
+// "rehearsed — with dry_run: false this would re-monitor the item". The others
+// — the cross-check write gate, a Sonarr season whose series is unmonitored, a
+// shutdown — are refusals that dry_run has nothing to do with, and reporting
+// any of them as a successful rehearsal promises a write that would never
+// happen (round-2 review).
+const withheldByDryRunReason = "dry_run is on, so the write was withheld at the §2.1 gate immediately before the PUT"
+
 // reverseCounts is one instance's reverse-scan accounting for one cycle.
 //
 // findings is what the report-only default produces. The five write counters
@@ -236,6 +249,13 @@ type reverseCounts struct {
 	//
 	// A pass that withheld nothing leaves it empty, which is the only state
 	// the action path treats as "there is nothing to explain".
+	//
+	// Round-2 review fix: the action path must also tell the ONE withholding
+	// that turning dry_run off would overcome apart from the several it would
+	// not (a blocked cross-check write gate, a Sonarr season under an
+	// unmonitored series, a shutdown). It does that by comparing this string
+	// against withheldByDryRunReason rather than by consulting cfg.DryRun,
+	// which is why that reason is a shared constant and not a literal.
 	withheldReason string
 
 	// movieFindings and seasonFindings are Phase 12's addition: the SAME
@@ -813,7 +833,7 @@ func (c *reverseCounts) record(logger *slog.Logger, attrs []any, written bool, e
 		// the PUT, and has already been logged at debug. The ONLY remaining
 		// (false, nil) case, exactly as on the forward paths.
 		c.withheld++
-		c.withheldReason = "dry_run is on, so the write was withheld at the §2.1 gate immediately before the PUT"
+		c.withheldReason = withheldByDryRunReason
 	default:
 		c.remonitored++
 		logger.Info("remonitor", attrs...)

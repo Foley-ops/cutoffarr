@@ -737,7 +737,20 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
 
 	var forwardActions []actionRecord
-	unmonitoredCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount := runWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun, &forwardActions)
+	var unmonitoredCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount int
+	if scope.suppressesForwardWrites() {
+		// [v2.2] A human-clicked re-monitor drives the REVERSE half and nothing
+		// else — see evalScope.noForwardWrites. The pass is not called at all
+		// rather than called and gated: a gate is a condition someone can
+		// weaken, while an uncomposed write cannot fire however the gates below
+		// it are refactored. The forward EVALUATION above still ran in full, so
+		// the cross-check the reverse gate consults rests on exactly the
+		// evidence it always has.
+		logger.Info("forward writes are suppressed for this run: it was started by a human clicking one finding's button, and the only write it may make is the one that button named",
+			append([]any{"instance", inst.Name, "type", inst.Type, "origin", scope.origin}, scope.summaryAttrs()...)...)
+	} else {
+		unmonitoredCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount = runWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun, &forwardActions)
+	}
 
 	var rev reverseCounts
 	if reverse.enabled {
@@ -2604,7 +2617,15 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
 
 	var forwardActions []actionRecord
-	unmonitoredCount, recoveredWriteCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount := runSonarrWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun, &forwardActions)
+	var unmonitoredCount, recoveredWriteCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount int
+	if scope.suppressesForwardWrites() {
+		// [v2.2] See the Radarr twin's identical comment, and
+		// evalScope.noForwardWrites.
+		logger.Info("forward writes are suppressed for this run: it was started by a human clicking one finding's button, and the only write it may make is the one that button named",
+			append([]any{"instance", inst.Name, "type", inst.Type, "origin", scope.origin}, scope.summaryAttrs()...)...)
+	} else {
+		unmonitoredCount, recoveredWriteCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount = runSonarrWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun, &forwardActions)
+	}
 
 	var rev reverseCounts
 	if reverse.enabled {

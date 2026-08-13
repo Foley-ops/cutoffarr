@@ -642,13 +642,26 @@ func (a *actionRunner) refuse(req actionRequest, outcome, operation, reason stri
 	}
 }
 
-// audit is rule 9: every action — rehearsed, performed or refused — produces
-// one line, at INFO, carrying the source, the kind, the outcome, and the full
+// audit is rule 9: every action — rehearsed, performed, refused or failed —
+// produces one line carrying the source, the kind, the outcome, and the full
 // paths/ids involved. INFO and not DEBUG because these are the only lines in
 // this program that describe something a HUMAN did through cutoffarr, and a
 // deployment that has actions switched on wants them in the same place it
 // reads its writes.
-func (a *actionRunner) audit(req actionRequest, outcome, operation, detail string) {
+//
+// One outcome is louder, and it is the round-2 fix: `failed` is the outcome
+// that exists to mean "cutoffarr tried and something OUTSIDE it broke — go look
+// at your server", so it logs at ERROR. For file actions this line is the only
+// log the failure produces at all, including the worst state this phase can
+// reach: a case-twin merge that renamed N files and then errored, which
+// mergeTwin deliberately does not roll back. At INFO that left an operator's
+// library half-moved with nothing above INFO saying so. The attr vocabulary is
+// unchanged — one msg=action line, same keys — so the level is the only thing
+// that moves and every existing grep still matches.
+//
+// extra carries outcome-specific attrs (the partial-merge counts) alongside the
+// fixed vocabulary; nil for every other call.
+func (a *actionRunner) audit(req actionRequest, outcome, operation, detail string, extra ...any) {
 	if a.logger == nil {
 		return
 	}
@@ -675,6 +688,11 @@ func (a *actionRunner) audit(req actionRequest, outcome, operation, detail strin
 	}
 	if detail != "" {
 		attrs = append(attrs, "detail", detail)
+	}
+	attrs = append(attrs, extra...)
+	if outcome == actionOutcomeFailed {
+		a.logger.Error("action", attrs...)
+		return
 	}
 	a.logger.Info("action", attrs...)
 }
@@ -762,6 +780,48 @@ func reportedFinding(snap fileReportSnapshot, kind, path string) (fileReportFind
 	}
 	for _, f := range snap.Findings {
 		if f.Kind == kind && f.Path == path {
+			return f, true
+		}
+	}
+	return fileReportFindingRecord{}, false
+}
+
+// reportedTwinFinding is reportedFinding for a CASE-TWIN, and it needs its own
+// function because a twin is not identified by its path.
+//
+// caseCollisionsInDir emits one finding per collision GROUP, and every group
+// found in one directory carries that same directory as its Path — so a TV root
+// holding "Show"/"show" beside "Foo"/"foo" produces two findings with identical
+// Path. Every series folder is a sibling in one root, so that is the ordinary
+// shape of a real library, not a corner case. Matching on Path alone (round-2
+// review) resolved both the authorization gate and the live re-derivation to
+// whichever group the walk happened to list first, which meant the second
+// twin's button could do nothing but refuse at gate 3 with "<inst> now tracks
+// X and not Y" — telling the operator the world had changed when it had not,
+// and leaving that twin unmergeable forever.
+//
+// The identity is therefore the path PLUS the pair of spellings the button
+// named: the group is the one whose Names contain both, compared exactly
+// (case-sensitively — these names differ only in case, so a fold-insensitive
+// comparison would defeat the entire purpose).
+func reportedTwinFinding(snap fileReportSnapshot, path, tracked, untracked string) (fileReportFindingRecord, bool) {
+	if snap.Status != "ran" {
+		return fileReportFindingRecord{}, false
+	}
+	for _, f := range snap.Findings {
+		if f.Kind != fileKindCaseCollision || f.Path != path {
+			continue
+		}
+		sawTracked, sawUntracked := false, false
+		for _, n := range f.Names {
+			if n.Name == tracked {
+				sawTracked = true
+			}
+			if n.Name == untracked {
+				sawUntracked = true
+			}
+		}
+		if sawTracked && sawUntracked {
 			return f, true
 		}
 	}
@@ -882,9 +942,36 @@ func (a *actionRunner) trash(ctx context.Context, inst Instance, req actionReque
 
 	// Gate 3 — the promise the button made. A file REPLACED at the same path
 	// passes every existence check there is; the size is what catches it.
-	if req.Size > 0 && fresh.Size != req.Size {
+	//
+	// The comparison is against reported.Size — the LAST COMPLETED SWEEP's
+	// number, which is also what built the operation string this response
+	// echoes back — and not against req.Size. Round-2 review fix: this used to
+	// read `if req.Size > 0 && …`, which made the whole gate optional at the
+	// CLIENT's discretion. A request that simply omitted the field moved a file
+	// that had been replaced at that path since the sweep, while the echoed
+	// operation still read "Move to trash — …/ETRG.Sample.mkv (10 B)": the
+	// response proving an operation on a file that no longer existed. An
+	// untrusted request must never be able to disable a safety check by leaving
+	// a field out.
+	//
+	// A sweep that recorded NO size refuses rather than skipping the check, for
+	// the same reason: "there is nothing to compare against" is not a licence to
+	// move a file, it is the state in which the promise cannot be kept.
+	if reported.Size <= 0 {
 		return a.refuse(req, actionOutcomeRefused, operation,
-			fmt.Sprintf("the file at %s is now %s, not the %s the button described — its size changed, so it is not the file you confirmed. Nothing was moved.", req.Path, humanSize(fresh.Size), humanSize(req.Size)))
+			fmt.Sprintf("%s's last completed sweep recorded no size for %s (it could not be stat'd, or it is a zero-byte file), so cutoffarr cannot establish that the file there now is the one the button described. Move it by hand if that is what you want.", inst.Name, req.Path))
+	}
+	if fresh.Size != reported.Size {
+		return a.refuse(req, actionOutcomeRefused, operation,
+			fmt.Sprintf("the file at %s is now %s, not the %s the button described — its size changed, so it is not the file you confirmed. Nothing was moved.", req.Path, humanSize(fresh.Size), humanSize(reported.Size)))
+	}
+	// req.Size, when the page sent it, is an ADDITIONAL equality check rather
+	// than the gate itself: it catches a page whose row had drifted from the
+	// snapshot the server is authorizing against, which is a different fault
+	// from the file changing and deserves its own sentence.
+	if req.Size > 0 && req.Size != reported.Size {
+		return a.refuse(req, actionOutcomeRefused, operation,
+			fmt.Sprintf("this request describes a %s file at %s, but %s's last completed sweep reported %s there — the row this button came from is out of date. Re-run the scan and try again from a fresh row.", humanSize(req.Size), req.Path, inst.Name, humanSize(reported.Size)))
 	}
 
 	info, err := os.Lstat(req.Path)
@@ -938,12 +1025,14 @@ func twinOperationText(untracked, tracked string) string {
 func (a *actionRunner) mergeTwin(ctx context.Context, inst Instance, req actionRequest) actionResponse {
 	operation := twinOperationText(req.Untracked, req.Tracked)
 
-	// Gate 1 — authorization: the containing directory must be a case-twin
-	// finding a completed sweep reported for this instance.
-	reported, ok := reportedFinding(a.storedSnapshotFor(inst.Name), fileKindCaseCollision, req.Path)
+	// Gate 1 — authorization: the two spellings this button named must be a
+	// case-twin group a completed sweep reported for this instance, in this
+	// directory. Identified by path AND both names — see reportedTwinFinding
+	// for why the path alone is not an identity.
+	reported, ok := reportedTwinFinding(a.storedSnapshotFor(inst.Name), req.Path, req.Tracked, req.Untracked)
 	if !ok {
 		return a.refuse(req, actionOutcomeRefused, operation,
-			fmt.Sprintf("%s is not a case-twin that %s's last completed sweep reported, so cutoffarr will not merge anything there. Re-run the scan and try again from a fresh row.", req.Path, inst.Name))
+			fmt.Sprintf("%q and %q in %s are not a case-twin that %s's last completed sweep reported, so cutoffarr will not merge anything there. Re-run the scan and try again from a fresh row.", req.Untracked, req.Tracked, req.Path, inst.Name))
 	}
 	if el := twinMergeEligibility(reported); !el.ok {
 		return a.refuse(req, actionOutcomeRefused, operation, el.reason)
@@ -967,10 +1056,10 @@ func (a *actionRunner) mergeTwin(ctx context.Context, inst Instance, req actionR
 	if err != nil {
 		return a.refuse(req, actionOutcomeRefused, operation, err.Error())
 	}
-	fresh, ok := reportedFinding(live, fileKindCaseCollision, req.Path)
+	fresh, ok := reportedTwinFinding(live, req.Path, req.Tracked, req.Untracked)
 	if !ok {
 		return a.refuse(req, actionOutcomeRefused, operation,
-			fmt.Sprintf("%s no longer holds a case-twin as of a fresh check of %s — it may already have been merged or renamed. Nothing was moved.", req.Path, inst.Name))
+			fmt.Sprintf("%s no longer holds a case-twin spelled %q/%q as of a fresh check of %s — it may already have been merged or renamed. Nothing was moved.", req.Path, req.Untracked, req.Tracked, inst.Name))
 	}
 	el := twinMergeEligibility(fresh)
 	if !el.ok {
@@ -1011,7 +1100,11 @@ func (a *actionRunner) mergeTwin(ctx context.Context, inst Instance, req actionR
 			// has just proved it is meeting conditions it did not expect.
 			detail = fmt.Sprintf("%v (%d file(s) had already been moved and were left where they now are)", err, len(res.moved))
 		}
-		a.audit(req, actionOutcomeFailed, operation, detail)
+		// The counts ride on the ERROR line as attrs of their own, not only
+		// inside the prose: this is the one failure in the phase that leaves a
+		// library HALF-MOVED, and "how many files are already on the other side"
+		// is the first thing the operator this line is written for needs.
+		a.audit(req, actionOutcomeFailed, operation, detail, "moved", len(res.moved), "collided", len(res.collided))
 		return actionResponse{
 			Outcome: actionOutcomeFailed, Kind: req.Kind, Operation: operation,
 			Message: detail, Reason: detail, Items: res.collided, status: http.StatusBadGateway,
@@ -1061,10 +1154,26 @@ func remonitorOperationText(title string, id int, season *int, typ string) strin
 //
 // The scope is narrowed to this one id (and, for Sonarr, this one season)
 // exactly as --only-id narrows it, so the reverse pass evaluates and writes
-// that item and no other. The FORWARD pass of the same cycle is scoped
-// identically and is, in practice, a no-op on a re-monitor target: the item is
-// unmonitored (that is what made it a finding), and the forward write path
-// refuses an already-unmonitored item at its own pre-write check.
+// that item and no other.
+//
+// THE FORWARD WRITE PASS IS SUPPRESSED OUTRIGHT, and the reasoning that used to
+// stand here instead is the round-2 CRITICAL this replaces. It argued the
+// forward pass was "in practice a no-op on a re-monitor target: the item is
+// unmonitored, that is what made it a finding". Both halves fail on a stale
+// tab, which is the ordinary case rule 3 exists for: the operator re-monitors
+// the item in Radarr themselves, an upgrade lands, and the week-old button they
+// then click runs a forward pass that finds a monitored item at cutoff and PUTs
+// monitored:false on it — the exact inverse of the operation the button named,
+// after which this function reported that there was nothing to do.
+//
+// So the engine runs under a scope that composes no forward write at all
+// (evalScope.noForwardWrites, set by actionScope), and the item's current state
+// is checked against the fresh library read BEFORE the engine is entered at all
+// (radarrRemonitorTargetRefusal). Two independent guards, because "a human
+// clicked a button that said Re-monitor" must never end in an unmonitor
+// however this code is later refactored. What is NOT reduced is the evidence:
+// the forward EVALUATION still runs in full and still feeds the cross-check the
+// reverse write gate consults.
 //
 // The cross-check gate is deliberately NOT bypassed for a human click. It asks
 // "did this instance's data agree with itself this cycle", which is a question
@@ -1098,11 +1207,17 @@ func (a *actionRunner) remonitor(ctx context.Context, inst Instance, req actionR
 		if !dataOK {
 			return a.refuse(req, actionOutcomeRefused, operation, fmt.Sprintf("%s's library could not be read just now, so nothing was written", inst.Name))
 		}
+		if reason := radarrRemonitorTargetRefusal(inst, movies, req.ID); reason != "" {
+			return a.refuse(req, actionOutcomeRefused, operation, reason)
+		}
 		result = runRadarrDecisionEngine(ctx, a.logger, inst, movies, wantedIDs, a.cfg.ExclusionTag, scope, a.cfg.DryRun, reverse, fileReportOptions{})
 	case "sonarr":
 		series, wantedEpisodeIDs, wantedSeasons, dataOK := inspectSonarrLibrary(ctx, a.logger, inst)
 		if !dataOK {
 			return a.refuse(req, actionOutcomeRefused, operation, fmt.Sprintf("%s's library could not be read just now, so nothing was written", inst.Name))
+		}
+		if reason := sonarrRemonitorTargetRefusal(inst, series, req.ID, req.Season); reason != "" {
+			return a.refuse(req, actionOutcomeRefused, operation, reason)
 		}
 		result = runSonarrDecisionEngine(ctx, a.logger, inst, series, wantedEpisodeIDs, wantedSeasons, a.cfg.ExclusionTag, scope, a.cfg.DryRun, reverse, fileReportOptions{})
 	default:
@@ -1112,14 +1227,103 @@ func (a *actionRunner) remonitor(ctx context.Context, inst Instance, req actionR
 	return a.remonitorOutcome(inst, req, operation, result)
 }
 
+// radarrRemonitorTargetRefusal and its Sonarr twin are rule 3 stated in the
+// button's OWN vocabulary, against the fresh library read the executor has just
+// paid for: the brief names "movie already monitored" as a must-refuse, and an
+// item that is already monitored must be told apart from an item that is fine
+// for some other reason.
+//
+// Without them the already-monitored case fell through the whole engine to
+// remonitorOutcome's default branch, which answers "no longer reports this item
+// as wrongly unmonitored, so there was nothing to do" — true, but it names
+// neither the state nor the reason, and it is the same sentence a pass that
+// never evaluated anything produces. Checking here costs nothing (the library
+// is already in hand) and refuses BEFORE the engine runs at all, which is the
+// second, independent guard against a scoped engine run doing anything to an
+// item whose state has moved on: evalScope.noForwardWrites is the first.
+//
+// An item whose "monitored" key is ABSENT is refused too, and deliberately.
+// This whole project treats that absence as untrusted input rather than a
+// state (§2.6, and the engines' own rule 1), and "we could not read whether it
+// is already monitored" is not a licence to write to it.
+func radarrRemonitorTargetRefusal(inst Instance, movies []movieListElement, id int) string {
+	for _, m := range movies {
+		if m.ID == nil || *m.ID != id {
+			continue
+		}
+		switch {
+		case m.Monitored == nil:
+			return fmt.Sprintf("%s's copy of movie %d does not report whether it is monitored at all, and cutoffarr never writes to an item whose current state it could not read. Nothing was changed.", inst.Name, id)
+		case *m.Monitored:
+			return fmt.Sprintf("movie %d is already monitored in %s — somebody, or %s itself, has already done this. Nothing was changed.", id, inst.Name, inst.Name)
+		}
+		return ""
+	}
+	return fmt.Sprintf("%s's library no longer contains movie %d, so there is nothing to re-monitor. Re-run the scan to see the current state.", inst.Name, id)
+}
+
+// sonarrRemonitorTargetRefusal is the season twin. It checks the SEASON's own
+// monitored flag — the only thing a re-monitor ever writes — and says nothing
+// about the series' flag, which binding controller resolution 3 makes the
+// reverse pass's business and which is never written in either direction.
+//
+// seasonPtr is the request's own field rather than a dereferenced int: the
+// shape guard above already establishes it is non-nil for a Sonarr instance,
+// and taking the pointer means a future edit that moves either check cannot
+// turn this into a nil dereference inside an HTTP handler.
+func sonarrRemonitorTargetRefusal(inst Instance, series []seriesElement, id int, seasonPtr *int) string {
+	if seasonPtr == nil {
+		return fmt.Sprintf("this request named no season, and a Sonarr re-monitor always names one; nothing was changed in %s", inst.Name)
+	}
+	season := *seasonPtr
+	for _, s := range series {
+		if s.ID == nil || *s.ID != id {
+			continue
+		}
+		if s.Seasons == nil {
+			return fmt.Sprintf("%s's copy of series %d carries no seasons array, so whether season %d is already monitored could not be read. Nothing was changed.", inst.Name, id, season)
+		}
+		for _, se := range *s.Seasons {
+			if se.SeasonNumber == nil || *se.SeasonNumber != season {
+				continue
+			}
+			switch {
+			case se.Monitored == nil:
+				return fmt.Sprintf("%s does not report whether season %d of series %d is monitored at all, and cutoffarr never writes to an item whose current state it could not read. Nothing was changed.", inst.Name, season, id)
+			case *se.Monitored:
+				return fmt.Sprintf("season %d of series %d is already monitored in %s — somebody, or %s itself, has already done this. Nothing was changed.", season, id, inst.Name, inst.Name)
+			}
+			return ""
+		}
+		return fmt.Sprintf("%s's copy of series %d no longer has a season %d, so there is nothing to re-monitor. Re-run the scan to see the current state.", inst.Name, id, season)
+	}
+	return fmt.Sprintf("%s's library no longer contains series %d, so there is nothing to re-monitor. Re-run the scan to see the current state.", inst.Name, id)
+}
+
 // remonitorOutcome maps the scoped pass's own counters onto the response. The
 // pass ran over exactly one item, so exactly one counter moved, and each of
 // them already means something precise — which is why the outcome is read from
 // them rather than re-derived from the log or guessed from the findings slice.
+//
+// The first case is not a counter at all, and that is the round-2 fix: ZERO
+// counters is ambiguous between "the pass evaluated this item and found
+// nothing to do" and "the pass never happened". §2.6's warn-and-skip returns
+// (the quality-profile fetch failed, the exclusion tag could not be resolved)
+// leave decisionsRan false; a reverse pass whose unmonitored wanted/cutoff set
+// could not be fetched completely, or that a shutdown cut short, sets skipped.
+// Both used to fall through to the default branch and be answered with the
+// positive claim that the instance no longer reports the item as wrongly
+// unmonitored — a statement about library state derived from a pass that never
+// looked, which is exactly what §2.6 forbids and which invites an operator to
+// conclude the finding resolved itself.
 func (a *actionRunner) remonitorOutcome(inst Instance, req actionRequest, operation string, result cycleInstanceStats) actionResponse {
 	rev := result.reverse
 
 	switch {
+	case !result.decisionsRan || result.reverseSkipped || rev.skipped:
+		return a.refuse(req, actionOutcomeRefused, operation,
+			fmt.Sprintf("the evaluation of this item could not be completed or trusted this run, so nothing was written to %s. The log line for this action names what went wrong; nothing about the finding has changed.", inst.Name))
+
 	case rev.remonitored > 0:
 		msg := fmt.Sprintf("Re-monitored in %s. The next sweep will treat it like any other monitored item.", inst.Name)
 		a.audit(req, actionOutcomePerformed, operation, msg)
@@ -1143,7 +1347,23 @@ func (a *actionRunner) remonitorOutcome(inst Instance, req actionRequest, operat
 		a.audit(req, actionOutcomeRefused, operation, msg)
 		return actionResponse{Outcome: actionOutcomeRefused, Kind: req.Kind, Operation: operation, Message: msg, Reason: msg, status: http.StatusConflict}
 
-	case rev.withheld > 0 && a.cfg.DryRun:
+	// A rehearsal is claimed for exactly ONE withholding: the §2.1 dry-run gate
+	// immediately before the PUT. It is matched by the reason's own identity
+	// rather than by consulting cfg.DryRun, and that is the round-2 fix.
+	//
+	// `withheld > 0 && a.cfg.DryRun` used to be tested first, and withheld is
+	// incremented by three other causes that dry_run has nothing to do with —
+	// the cross-check write gate blocking the instance, a Sonarr season whose
+	// series is unmonitored (a permanent report-only rule), and a shutdown. On
+	// the DEFAULT deployment (dry_run: true) all three answered "Rehearsed only
+	// … with dry_run: false this would re-monitor the item", which is the
+	// opposite of the truth: with dry_run false that same click is refused. The
+	// page's one job is never to lie about which switch is missing.
+	//
+	// cfg.DryRun is still required, so the impossible combination (that reason,
+	// dry_run off) falls through to the refusal below and states the reason
+	// rather than announcing a rehearsal nobody asked for.
+	case rev.withheld > 0 && rev.withheldReason == withheldByDryRunReason && a.cfg.DryRun:
 		msg := "Rehearsed only — dry_run is on. Everything was re-verified against fresh data and the write was withheld at the last moment; with dry_run: false this would re-monitor the item."
 		a.audit(req, actionOutcomeRehearsed, operation, msg)
 		return actionResponse{Outcome: actionOutcomeRehearsed, Kind: req.Kind, Operation: operation, Message: msg, status: http.StatusOK}
@@ -1156,9 +1376,12 @@ func (a *actionRunner) remonitorOutcome(inst Instance, req actionRequest, operat
 		return a.refuse(req, actionOutcomeRefused, operation, "Nothing was written: "+reason)
 
 	default:
-		// The pass produced no outcome for this item at all, which means it
-		// never became a finding under a fresh evaluation — the commonest
-		// reason being that the *arr, or a human, already re-monitored it.
+		// The pass ran, could be trusted (the first case above ruled out
+		// everything else), and produced no outcome for this item — so it never
+		// became a finding under a fresh evaluation. The commonest reason,
+		// already-monitored, is caught and named before the engine even runs
+		// (radarrRemonitorTargetRefusal), so what reaches here is an item that
+		// is still unmonitored but no longer fails the criteria.
 		return a.refuse(req, actionOutcomeRefused, operation,
 			fmt.Sprintf("%s no longer reports this item as wrongly unmonitored, so there was nothing to do. Re-run the scan to see the current state.", inst.Name))
 	}

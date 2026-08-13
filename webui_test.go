@@ -1836,3 +1836,52 @@ func TestWebUIPage_TrashButtonSendsTheFindingsIdentifyingFields(t *testing.T) {
 		}
 	}
 }
+
+// TestWebUIPage_ActionOutcomesSurviveARepaint is the round-2 IMPORTANT on the
+// front end: renderFileReport and renderReverse each begin by clearing their
+// table (body.textContent = ""), and refresh() calls render(data) on a 30s
+// timer. Every trace of an action's result — the strike-through, the clay
+// refusal note, the merge's itemized collisions — was therefore wiped within
+// one poll, and the row came back from the still-stale snapshot with a fully
+// live "Move to trash — …" button for a file that is already in the trash.
+//
+// The brief requires the row to update from the response "without waiting for
+// the next sweep"; holding that state for at most one poll does not satisfy it,
+// and a re-armed button reads to the operator as "the action did not work".
+func TestWebUIPage_ActionOutcomesSurviveARepaint(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, "var actionOutcomes") {
+		t.Fatal("the page keeps no memory of what a click answered, so every repaint erases it")
+	}
+	if !strings.Contains(page, "function actionKey(") {
+		t.Error("there is no per-finding identity to key an outcome by; instance+kind+path / instance+id+season is what a rebuilt row has to match on")
+	}
+	if !strings.Contains(page, "rememberedActionOutcome(") {
+		t.Error("a rebuilt row never consults the remembered outcome, so the button re-arms and the note is gone")
+	}
+	if !strings.Contains(page, "pruneActionOutcomes(") {
+		t.Error("remembered outcomes are never dropped, so a row keeps its strike-through after the finding stops appearing in the snapshot")
+	}
+}
+
+// TestWebUIPage_BulkRemonitorSummarySurvivesItsOwnRerender is the same rule for
+// the one bulk action: buildBulkRemonitor wrote its summary into `note` and
+// then called rerender(), whose first act is body.textContent = "" — destroying
+// the summary in the same tick, so it was never visible at all.
+func TestWebUIPage_BulkRemonitorSummarySurvivesItsOwnRerender(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, "bulkRemonitorSummary") {
+		t.Fatal("the bulk summary is not kept anywhere, so the rerender that follows it destroys it in the same tick")
+	}
+}
+
+// TestWebUIPage_BulkRemonitorNeverCallsAFailureARefusal is the honesty half of
+// the same finding: the loop counted a 502 `failed` and a network error
+// identically to a refusal ("N answered yes, M were refused or rehearsed"),
+// asserting a decision where the outcome is genuinely unknown.
+func TestWebUIPage_BulkRemonitorNeverCallsAFailureARefusal(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, "failed or unknown") {
+		t.Error("a failed or unreachable bulk item is still reported as refused; those are different outcomes and one of them means go and look at the server")
+	}
+}

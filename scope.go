@@ -72,7 +72,37 @@ type evalScope struct {
 	// msg=would-unmonitor). Never applied to summaries, warnings, or write
 	// lines.
 	itemLevel slog.Level
+
+	// noForwardWrites is [v2.2] the one field in this struct that anything
+	// branches on beyond item membership, and it is the structural half of the
+	// re-monitor action's constitution rule 2 ("performs the one operation the
+	// button named").
+	//
+	// A GUI action runs the whole decision engine scoped to the item a human
+	// clicked, because rule 6 mandates driving the EXISTING gated write path
+	// rather than a second copy of it. But the engine has TWO write halves, and
+	// the button named only one of them: a re-monitor click must drive the
+	// reverse pass and nothing else. Left unset, the FORWARD write pass ran
+	// first over that same scoped item, and on a stale tab whose item had since
+	// been re-monitored and upgraded it PUT monitored:false on it — the exact
+	// inverse of the operation the button offered, reported afterwards as
+	// "there was nothing to do" (round-2 review, CRITICAL).
+	//
+	// So this suppresses the forward write pass — composing no write call at
+	// all, the same way reverseOptions.remonitor false composes none in the
+	// other direction — while leaving the forward EVALUATION, the cross-check
+	// it feeds, and the reverse gate that consults that cross-check exactly as
+	// they were. Nothing an action does may rest on less evidence than a sweep
+	// does; it may only do less.
+	//
+	// Zero value false: every sweep, webhook, --once and startup path keeps the
+	// forward write pass it has always had, without naming this field.
+	noForwardWrites bool
 }
+
+// suppressesForwardWrites reports whether this scope forbids the forward write
+// pass outright. See the field.
+func (s evalScope) suppressesForwardWrites() bool { return s.noForwardWrites }
 
 // fullLibraryScope is an unnarrowed evaluation reporting at level.
 func fullLibraryScope(level slog.Level) evalScope {
@@ -297,20 +327,27 @@ func (h demotingHandler) WithGroup(name string) slog.Handler {
 // clicking one finding's button. It joins --only-id and webhook in the same
 // message-text-only role: nothing branches on it, it exists so the two
 // messages that have to tell a human why the item they named produced nothing
-// can say WHERE the narrowing came from.
+// can say WHERE the narrowing came from. (What DOES branch for a GUI action is
+// noForwardWrites, a field of its own, precisely so a reworded origin string
+// can never change a write decision.)
 const scopeOriginGUIAction = "gui action"
 
 // actionScope is the scope one GUI re-monitor action runs under: exactly the
 // item the button named, reported at INFO because a human is watching this one
-// run — the same reasoning onlyIDScope uses, for the same situation.
+// run — the same reasoning onlyIDScope uses, for the same situation — and with
+// the forward write pass suppressed outright.
 //
 // season is nil for a Radarr movie and set for a Sonarr season, and it narrows
 // the write set one level further exactly as a webhook's own season list does:
 // clicking one season's button must never re-monitor that series' other
 // seasons, even though the evaluation still reads the whole library (the
 // full-evidence rule is unchanged — only reporting and writing are narrowed).
+//
+// noForwardWrites is set here and only here, and it is what makes a
+// "Re-monitor" click structurally incapable of unmonitoring the item it names.
+// See the field's own doc comment for the failure it closes.
 func actionScope(id int, season *int) evalScope {
-	s := evalScope{ids: []int{id}, origin: scopeOriginGUIAction, itemLevel: slog.LevelInfo}
+	s := evalScope{ids: []int{id}, origin: scopeOriginGUIAction, itemLevel: slog.LevelInfo, noForwardWrites: true}
 	if season != nil {
 		s.seasons = map[int][]int{id: {*season}}
 	}
