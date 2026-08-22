@@ -36,6 +36,14 @@ FROM --platform=$BUILDPLATFORM golang:1.23.6-alpine AS build
 # ARGs it in.
 ARG TARGETARCH
 
+# VERSION is the release tag (release.yml passes --build-arg
+# VERSION=${{ github.ref_name }}, a strict vX.Y.Z per that workflow's own tag
+# filter). Defaulted to "dev" — the SAME default stats.go's own buildVersion
+# var already carries — so a plain `docker build .` with no build-arg (a
+# local/dev build) still produces a binary that honestly reports "dev"
+# rather than an empty or stale string.
+ARG VERSION=dev
+
 WORKDIR /src
 
 # Dependency layer first, so a source-only change does not re-download modules.
@@ -61,7 +69,13 @@ COPY . .
 # -trimpath strips local filesystem paths out of the binary; -s -w drop the
 # symbol table and DWARF, which is most of the size difference and costs only
 # stack-trace symbol names in a panic (the panic's own message and goroutine
-# dump survive).
+# dump survive). -X main.buildVersion=${VERSION} stamps the ARG above into
+# the exact package-qualified var GET /api/stats reports (stats.go's own
+# buildVersion, "var buildVersion = \"dev\"") — the same -ldflags "-X
+# main.buildVersion=vX.Y.Z" that var's own doc comment already anticipated,
+# before anything in the release pipeline actually set it. A local `go build`
+# with no ldflags at all is untouched by any of this: it still links
+# buildVersion's own "dev" default, exactly as before.
 #
 # The tests are run in CI, not here: a build stage that runs them makes every
 # image build slower and every test failure look like a Docker problem.
@@ -73,7 +87,7 @@ COPY . .
 # anything else, and TARGETOS would only add a second unused build arg.
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build \
         -trimpath \
-        -ldflags "-s -w" \
+        -ldflags "-s -w -X main.buildVersion=${VERSION}" \
         -o /out/cutoffarr .
 
 # --- final stage -------------------------------------------------------------

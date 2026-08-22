@@ -10,15 +10,20 @@ import (
 	"testing"
 )
 
-// container_test.go keeps the two packaging artifacts honest against the code
-// they package.
+// container_test.go keeps the packaging artifacts honest against the code
+// they package: the Dockerfile and docker-compose.example.yml, and — since
+// the VERSION build-arg threaded version stamping through both —
+// .github/workflows/release.yml's own build-push step, the one other place
+// that ARG's real value ever gets supplied.
 //
-// Both are documentation in the sense that nothing in the Go build reads them —
-// which is exactly why they rot. A Dockerfile pinned to a Go version the module
-// no longer builds under, a CMD pointing at a config path the flag default
-// moved away from, a published port that stopped being the default: each is
-// invisible until someone deploys. These tests are cheap and they fail at the
-// moment the drift is introduced rather than at the moment it is deployed.
+// All of them are documentation in the sense that nothing in the Go build
+// reads them — which is exactly why they rot. A Dockerfile pinned to a Go
+// version the module no longer builds under, a CMD pointing at a config path
+// the flag default moved away from, a published port that stopped being the
+// default, a release workflow that quietly stopped passing a build-arg the
+// Dockerfile depends on: each is invisible until someone deploys. These
+// tests are cheap and they fail at the moment the drift is introduced rather
+// than at the moment it is deployed.
 
 func readRepoFile(t *testing.T, name string) string {
 	t.Helper()
@@ -119,6 +124,35 @@ func TestDockerfile_CrossBuildsForTARGETARCH(t *testing.T) {
 	}
 }
 
+// TestDockerfile_VersionArgIsDeclaredInBuildStageBeforeItsUseAndDefaultsToDev
+// is real version stamping's own structural pin, mirroring
+// TestDockerfile_CrossBuildsForTARGETARCH's ordering check immediately
+// above: ARG VERSION must be declared inside the BUILD stage (after "AS
+// build"), before the go build line that actually consumes it via
+// -X main.buildVersion=${VERSION} — a bare mention anywhere else in the file
+// (a comment, the final stage) would satisfy a plain substring check without
+// wiring anything. It must also default to "dev": release.yml's own tag
+// filter guarantees --build-arg VERSION is always a real vX.Y.Z on a
+// release build, but a local `docker build .` with no build-arg at all must
+// still produce a binary that honestly reports "dev" — the exact default
+// stats.go's own buildVersion var falls back to when no -X flag touches it
+// at all (a plain `go build`, no Docker involved).
+func TestDockerfile_VersionArgIsDeclaredInBuildStageBeforeItsUseAndDefaultsToDev(t *testing.T) {
+	dockerfile := readRepoFile(t, "Dockerfile")
+	stripped := uncommented(dockerfile)
+
+	if !strings.Contains(stripped, "ARG VERSION=dev") {
+		t.Errorf(`Dockerfile must declare "ARG VERSION=dev" OUTSIDE a comment, defaulting to the same "dev" stats.go's buildVersion var falls back to:\n%s`, dockerfile)
+	}
+
+	argIdx := strings.Index(stripped, "ARG VERSION=dev")
+	buildIdx := strings.Index(stripped, "AS build")
+	useIdx := strings.Index(stripped, "-X main.buildVersion=${VERSION}")
+	if argIdx == -1 || buildIdx == -1 || useIdx == -1 || !(buildIdx < argIdx && argIdx < useIdx) {
+		t.Errorf("ARG VERSION must be declared inside the build stage, before the go build line that consumes it via -X main.buildVersion=${VERSION}:\n%s", dockerfile)
+	}
+}
+
 // TestDockerfile_FinalStageIsDistrolessNonRootAndStaticallyLinked pins the
 // three properties that make the image what the plan asked for: nothing in it
 // but the binary, never running as root, and no libc dependency (which is what
@@ -142,7 +176,18 @@ func TestDockerfile_FinalStageIsDistrolessNonRootAndStaticallyLinked(t *testing.
 		"USER nonroot",
 		"CGO_ENABLED=0",
 		"-trimpath",
-		`-ldflags "-s -w"`,
+		// The exact flags string this used to pin, `-ldflags "-s -w"`, no
+		// longer appears verbatim: real version stamping appended
+		// -X main.buildVersion=${VERSION} inside the SAME quoted flags
+		// string, which moves -s -w's own closing quote further right. Two
+		// substrings instead of one keeps this meaningful rather than
+		// weakening it to "-ldflags is present somewhere" — -s -w must
+		// still be there (size/symbol stripping did not get dropped
+		// alongside the version flag), and the version flag itself must
+		// name the ACTUAL var (stats.go's main.buildVersion) via the shell
+		// build-arg the Dockerfile's own ARG VERSION declares.
+		"-s -w",
+		"-X main.buildVersion=${VERSION}",
 		`ENTRYPOINT ["/cutoffarr"]`,
 	} {
 		if !strings.Contains(stripped, want) {
@@ -174,6 +219,40 @@ func TestDockerfile_DefaultsMatchTheProgramsOwnDefaults(t *testing.T) {
 	wantExpose := "EXPOSE " + strconv.Itoa(defaultWebhookPort)
 	if !strings.Contains(dockerfile, wantExpose) {
 		t.Errorf("EXPOSE must name the default webhook port (%s):\n%s", wantExpose, dockerfile)
+	}
+}
+
+// TestReleaseWorkflow_PassesVersionBuildArgFromTheReleaseTag is real version
+// stamping's other half: the Dockerfile's ARG VERSION (TestDockerfile_Version
+// ArgIsDeclaredInBuildStageBeforeItsUseAndDefaultsToDev, above) only ever
+// gets a real value from whoever invokes `docker build`, and the one release
+// pipeline this project has is release.yml's build-and-push job. Without
+// this build-arg, every published image would silently keep building with
+// VERSION defaulted to "dev" — the Dockerfile side of the fix would be
+// entirely inert, and GET /api/stats would keep reporting "dev" in
+// production exactly as before, with every other test in this file still
+// green.
+func TestReleaseWorkflow_PassesVersionBuildArgFromTheReleaseTag(t *testing.T) {
+	workflow := readRepoFile(t, ".github/workflows/release.yml")
+
+	if !strings.Contains(workflow, "build-args:") {
+		t.Fatalf("release.yml's build-push step never sets build-args — the Dockerfile's ARG VERSION has no way to receive a real value:\n%s", workflow)
+	}
+	if !strings.Contains(workflow, "VERSION=${{ github.ref_name }}") {
+		t.Errorf(`release.yml never passes "VERSION=${{ github.ref_name }}" — the published image would keep building with VERSION defaulted to "dev":\n%s`, workflow)
+	}
+
+	// build-args must be part of the SAME build-push-action step that
+	// actually builds and pushes the image, not merely present somewhere
+	// else in the file (a stray mention in a comment, or on an unrelated
+	// step) — checked the same way TestDockerfile_CrossBuildsForTARGETARCH
+	// pins ARG TARGETARCH's own position, by requiring the three markers to
+	// appear in the right relative order.
+	stepIdx := strings.Index(workflow, "uses: docker/build-push-action@")
+	argsIdx := strings.Index(workflow, "build-args:")
+	versionIdx := strings.Index(workflow, "VERSION=${{ github.ref_name }}")
+	if stepIdx == -1 || argsIdx == -1 || versionIdx == -1 || !(stepIdx < argsIdx && argsIdx < versionIdx) {
+		t.Errorf("build-args: VERSION=${{ github.ref_name }} must be part of the docker/build-push-action step itself:\n%s", workflow)
 	}
 }
 

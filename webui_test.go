@@ -1913,6 +1913,125 @@ func TestWebUIPage_ActionButtonsUseTheEstablishedTokens(t *testing.T) {
 	}
 }
 
+// TestWebUIPage_PathColumnHasWidthPriorityOverTheActionCell is the
+// user-reported, screenshot-confirmed fix: the file-clutter table's PATH
+// cell — the row's actual payload — used to have no width floor of its own,
+// so [v2.2]'s action column (a trash button whose label runs to 60+
+// characters, "Move to trash — <path> (<size>)") took whatever room it
+// wanted from auto table layout, starving path down to a column a few
+// characters wide. td's page-wide word-break: break-word (table.findings td)
+// then had no natural break point left at that width and fell back to
+// breaking every few letters ("mov/ies/At/lan/tis"). The fix gives path a
+// min-width floor regardless of what the action cell wants, prefers
+// breaking at the path's own "/" separators (word-break: normal, the
+// default line-breaking algorithm's own break-after-"/" rule) over
+// per-letter breaking, and caps the action cell so it can never again grow
+// at path's expense — truncating with an ellipsis instead (pinned in
+// .action-btn's own overflow/text-overflow/white-space, already required by
+// TestWebUIPage_FileReportKindCellDoesNotWrapMidWord's sibling rules).
+func TestWebUIPage_PathColumnHasWidthPriorityOverTheActionCell(t *testing.T) {
+	page := string(webUIPage)
+
+	start := strings.Index(page, "table.findings td.path {")
+	if start == -1 {
+		t.Fatal("page has no table.findings td.path CSS rule")
+	}
+	end := strings.Index(page[start:], "}")
+	if end == -1 {
+		t.Fatal("could not find the end of the table.findings td.path rule")
+	}
+	pathRule := page[start : start+end]
+	if !strings.Contains(pathRule, "min-width") {
+		t.Error("table.findings td.path has no min-width — the action cell's long label can still crush it to a few characters wide")
+	}
+	if !strings.Contains(pathRule, "word-break: normal") {
+		t.Error("table.findings td.path never overrides the page-wide word-break: break-word — a crushed column would still fall back to per-letter breaking instead of breaking at \"/\" separators")
+	}
+	if !strings.Contains(pathRule, "overflow-wrap: break-word") {
+		t.Error("table.findings td.path has no overflow-wrap: break-word fallback for a single path segment too long to fit on its own")
+	}
+
+	actionStart := strings.Index(page, "table.findings td.action-cell {")
+	if actionStart == -1 {
+		t.Fatal("page has no table.findings td.action-cell CSS rule")
+	}
+	actionEnd := strings.Index(page[actionStart:], "}")
+	if actionEnd == -1 {
+		t.Fatal("could not find the end of the table.findings td.action-cell rule")
+	}
+	actionRule := page[actionStart : actionStart+actionEnd]
+	if !strings.Contains(actionRule, "max-width") {
+		t.Error("table.findings td.action-cell has no max-width — it can still grow to fit its longest possible label at the path column's expense")
+	}
+
+	// .action-btn's own truncation (already required for the button not to
+	// blow past whatever width the now-capped cell gives it).
+	btnStart := strings.Index(page, ".action-btn {")
+	if btnStart == -1 {
+		t.Fatal("page has no .action-btn CSS rule")
+	}
+	btnEnd := strings.Index(page[btnStart:], "}")
+	btnRule := page[btnStart : btnStart+btnEnd]
+	for _, want := range []string{"overflow: hidden", "text-overflow: ellipsis", "white-space: nowrap"} {
+		if !strings.Contains(btnRule, want) {
+			t.Errorf(".action-btn is missing %q — a capped action-cell would clip the label with no ellipsis, or wrap it instead of truncating it", want)
+		}
+	}
+}
+
+// TestWebUIPage_ActionButtonTruncationNeverAffectsConfirmOrTitleText pins the
+// other half of the same fix's invariant: the action cell's CSS truncation
+// (above) is purely visual. Both the button's title attribute (the hover/
+// touch-accessible fallback) and the confirm() prompt attachActionClick
+// shows before anything fires must keep reading the FULL, untruncated
+// opts.label the button was built from — never btn.textContent/innerText,
+// which the ellipsis CSS makes an unreliable stand-in for the real label the
+// moment truncation actually kicks in. TestWebUIPage_EveryActionGoesThrough
+// AConfirmGate already pins the confirm prompt's own opts.label source; this
+// pins the title attribute's source too and rules out the DOM-read footgun
+// for both.
+func TestWebUIPage_ActionButtonTruncationNeverAffectsConfirmOrTitleText(t *testing.T) {
+	page := string(webUIPage)
+
+	start := strings.Index(page, "function buildActionButton(")
+	if start == -1 {
+		t.Fatal("page has no buildActionButton")
+	}
+	end := strings.Index(page[start:], "\n  function attachActionClick(")
+	if end == -1 {
+		t.Fatal("could not find the end of buildActionButton (attachActionClick must follow it)")
+	}
+	buildFn := page[start : start+end]
+
+	for _, want := range []string{
+		`btn.title = reason || opts.label;`,
+		`btn.title = reason;`,
+		`btn.title = opts.label;`,
+	} {
+		if !strings.Contains(buildFn, want) {
+			t.Errorf("buildActionButton is missing %q — a disabled/remembered/live button could end up with no title, or one derived from something other than opts.label/the disabled reason", want)
+		}
+	}
+
+	clickStart := strings.Index(page, "function attachActionClick(")
+	if clickStart == -1 {
+		t.Fatal("page has no attachActionClick function")
+	}
+	clickEnd := strings.Index(page[clickStart:], "\n  function reverseActionLabel(")
+	if clickEnd == -1 {
+		t.Fatal("could not find the end of attachActionClick (reverseActionLabel must follow it)")
+	}
+	clickFn := page[clickStart : clickStart+clickEnd]
+	if !strings.Contains(clickFn, "opts.label + ") {
+		t.Error("attachActionClick's confirm prompt is not built from opts.label")
+	}
+	for _, banned := range []string{"btn.textContent", "btn.innerText"} {
+		if strings.Contains(clickFn, banned) {
+			t.Errorf("attachActionClick reads %q — the confirm prompt must never be built from the button's own (possibly CSS-truncated) rendered text", banned)
+		}
+	}
+}
+
 // TestWebUIPage_TrashButtonSendsTheFindingsIdentifyingFields pins that the
 // request carries what the server needs to re-derive the finding and to check
 // the promise the button made — in particular the size, without which a file

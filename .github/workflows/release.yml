@@ -95,6 +95,15 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          # VERSION reaches the Dockerfile's own ARG VERSION (default "dev"),
+          # which its build stage stamps into the binary via
+          # -X main.buildVersion=${VERSION} — so GET /api/stats reports the
+          # exact tag that triggered this workflow (the tag filter above
+          # already guarantees github.ref_name is a strict vX.Y.Z here)
+          # instead of the "dev" every un-stamped build still honestly falls
+          # back to.
+          build-args: |
+            VERSION=${{ github.ref_name }}
           tags: |
             ${{ steps.image.outputs.name }}:${{ github.ref_name }}
             ${{ steps.image.outputs.name }}:latest

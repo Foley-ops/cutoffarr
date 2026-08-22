@@ -355,7 +355,42 @@
 
   table.findings tr:last-child td { border-bottom: none; }
 
-  table.findings td.path { color: var(--ink-faint); }
+  /* User-reported (screenshot-confirmed), file-clutter panel only: once
+     [v2.2]'s action column joined this row, its long trash-button label
+     ("Move to trash — <path> (<size>)") had no width cap of its own (see
+     td.action-cell below) and auto table layout gave it whatever room it
+     asked for — which it took from the path cell, the row's actual
+     payload, squeezing it down to a column a few characters wide. td's own
+     word-break: break-word (above) then had nowhere natural left to break
+     at all and fell back to breaking every few letters ("mov/ies/At/lan/
+     tis"). min-width gives the path column its own floor regardless of
+     what the action cell wants; word-break: normal (overriding the
+     page-wide rule) plus overflow-wrap: break-word prefers breaking at the
+     path's own "/" separators — a real break opportunity under normal
+     line-breaking — and only breaks mid-word as a last resort, for a
+     single segment that is still too long on its own (never per-letter). */
+  table.findings td.path {
+    color: var(--ink-faint);
+    min-width: 220px;
+    word-break: normal;
+    overflow-wrap: break-word;
+  }
+
+  /* The action cell is the OTHER half of the same fix: it must never be
+     allowed to grow to fit its own longest possible label (a trash
+     button's can run to 60+ characters — the path again, plus a size) at
+     the path column's expense. max-width caps what auto table layout will
+     ever give this column; .action-btn's own overflow: hidden/
+     text-overflow: ellipsis/max-width: 100% (below) is what actually turns
+     an oversized label into an ellipsis once that cap bites. Truncation is
+     purely visual: the button's title attribute and the click handler's
+     confirm() prompt both read the SAME full, untruncated opts.label the
+     button was built from (buildActionButton/attachActionClick below),
+     never the rendered/clipped text — see
+     TestWebUIPage_ActionConfirmPromptUsesFullLabelNeverTruncatedDOMText. */
+  table.findings td.action-cell {
+    max-width: 200px;
+  }
 
   /* File-clutter panel only (findingsTable's other caller, the reverse-scan
      panel, has no kind column): td's own word-break: break-word above is
