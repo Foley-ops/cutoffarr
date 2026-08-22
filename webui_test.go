@@ -196,6 +196,68 @@ func TestWebUIHandler_Stats_CaseCollisionWireFieldsRawJSONSpelling(t *testing.T)
 	}
 }
 
+// TestWebUIHandler_Stats_ReclaimableBytesWireFieldsRawJSONSpelling is
+// reclaimableBytes/unsizedFindings' own regression test in
+// TestWebUIHandler_Stats_CaseCollisionWireFieldsRawJSONSpelling's own style
+// (same gap: every other test decodes the response back into the SAME Go
+// struct it was encoded from, so a typo'd or accidentally `,omitempty`'d
+// struct tag would break webui.html's literal reads AND the README's own
+// contract with a fully green suite). Asserts the RAW bytes: both keys are
+// present at the top level of fileReport (never nested, never renamed), and
+// reclaimableBytes is present even at its zero value — omitempty on an int64
+// would silently vanish the one value every "nothing to reclaim" instance
+// legitimately has.
+func TestWebUIHandler_Stats_ReclaimableBytesWireFieldsRawJSONSpelling(t *testing.T) {
+	s := newStatsStore(false)
+	s.recordInstance(cycleKindSweep, time.Now(), "radarr-main", "radarr", cycleInstanceStats{
+		total: 10, decisionsRan: true, fileReportRan: true,
+		fileReport: fileReportSnapshot{
+			Status: "ran", Duplicates: 1, Orphans: 1, ReclaimableBytes: 1500000000, UnsizedFindings: 1,
+			Findings: []fileReportFindingRecord{
+				{Kind: "duplicate", Path: "/x/a", Display: "a", Size: 1500000000},
+				{Kind: "orphan", Path: "/x/b", Display: "b"},
+			},
+		},
+	})
+	ts, _ := newTestWebUIServer(t, s)
+
+	resp, err := http.Get(ts.URL + "/api/stats")
+	if err != nil {
+		t.Fatalf("GET /api/stats: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	body := string(raw)
+
+	if !strings.Contains(body, `"reclaimableBytes":1500000000`) {
+		t.Errorf(`raw JSON missing "reclaimableBytes":1500000000 (wire-spelled key):%s`, raw)
+	}
+	if !strings.Contains(body, `"unsizedFindings":1`) {
+		t.Errorf(`raw JSON missing "unsizedFindings":1 (wire-spelled key):%s`, raw)
+	}
+
+	// A SECOND instance with nothing to reclaim: reclaimableBytes=0 must
+	// still be printed, never omitted — an operator with a genuinely clean
+	// library must see "0", not have the field silently disappear the way
+	// an int64 with `,omitempty` would.
+	s.recordInstance(cycleKindSweep, time.Now(), "radarr-clean", "radarr", cycleInstanceStats{
+		total: 5, decisionsRan: true, fileReportRan: true,
+		fileReport: fileReportSnapshot{Status: "ran", Findings: []fileReportFindingRecord{}},
+	})
+	resp2, err := http.Get(ts.URL + "/api/stats")
+	if err != nil {
+		t.Fatalf("GET /api/stats (second poll): %v", err)
+	}
+	defer resp2.Body.Close()
+	raw2, _ := io.ReadAll(resp2.Body)
+	if !strings.Contains(string(raw2), `"reclaimableBytes":0`) {
+		t.Errorf(`a clean instance's "reclaimableBytes":0 must be printed explicitly, not omitted:%s`, raw2)
+	}
+	if !strings.Contains(string(raw2), `"unsizedFindings":0`) {
+		t.Errorf(`a clean instance's "unsizedFindings":0 must be printed explicitly, not omitted:%s`, raw2)
+	}
+}
+
 // TestWebUIHandler_Stats_FileReportThreeStatesSurviveDistinctlyToTheClient
 // is the binding Phase 11 carry-forward, exercised end to end through the
 // REAL HTTP handler's JSON encoding rather than only statsStore's own Go
@@ -2029,6 +2091,192 @@ func TestWebUIPage_ActionButtonTruncationNeverAffectsConfirmOrTitleText(t *testi
 		if strings.Contains(clickFn, banned) {
 			t.Errorf("attachActionClick reads %q — the confirm prompt must never be built from the button's own (possibly CSS-truncated) rendered text", banned)
 		}
+	}
+}
+
+// TestWebUIPage_HumanSizeFormatsUpToTB pins [wasted-storage totals]'s
+// extension to the ONE size formatter this page has: a library-wide
+// aggregate routinely reaches into the TB range in a way a single file's
+// own size (humanSize's original reason for existing, a trash button
+// label) realistically never does. The GB branch's own toFixed(1) — the
+// exact tie-rounding actions.go's own humanSize doc comment requires the
+// two sides to agree on — is untouched; TB is the same pattern one
+// threshold up, not a second, differently-rounded formatter.
+func TestWebUIPage_HumanSizeFormatsUpToTB(t *testing.T) {
+	page := string(webUIPage)
+
+	start := strings.Index(page, "function humanSize(")
+	if start == -1 {
+		t.Fatal("page has no humanSize function")
+	}
+	end := strings.Index(page[start:], "\n  }")
+	if end == -1 {
+		t.Fatal("could not find the end of humanSize")
+	}
+	fn := page[start : start+end]
+
+	if !strings.Contains(fn, "1099511627776") {
+		t.Error("humanSize never checks against 1099511627776 (1 TB in bytes) — an aggregate in the TB range would still render as some number of GB")
+	}
+	if !strings.Contains(fn, `" TB"`) {
+		t.Error(`humanSize never returns a " TB" suffix`)
+	}
+	if strings.Count(fn, "toFixed(1)") != 2 {
+		t.Errorf(`humanSize must round GB and TB with the SAME toFixed(1) tie-rounding (matching actions.go's own math.Round), found %d toFixed(1) call(s)`, strings.Count(fn, "toFixed(1)"))
+	}
+}
+
+// TestWebUIPage_FileReportHeaderAggregatesReclaimableBytesAcrossInstances
+// pins [wasted-storage totals]'s panel-header contract: the total is the
+// SUM of every ran instance's OWN fileReport.reclaimableBytes/
+// unsizedFindings (stats.go's already-correct, already case-collision-
+// excluding aggregation) — never re-derived a second time from individual
+// finding sizes here — rendered via the SAME humanSize every trash button
+// label already uses, with a "~" prefix marking it as an approximation, and
+// an "(+N unsized)" suffix that appears ONLY when some duplicate/orphan
+// finding had no size to add to the sum.
+func TestWebUIPage_FileReportHeaderAggregatesReclaimableBytesAcrossInstances(t *testing.T) {
+	page := string(webUIPage)
+
+	start := strings.Index(page, "function renderFileReport(")
+	if start == -1 {
+		t.Fatal("page has no renderFileReport function")
+	}
+	end := strings.Index(page[start:], "\n  function render(data)")
+	if end == -1 {
+		t.Fatal("could not find the end of renderFileReport (render(data) must follow it)")
+	}
+	body := page[start : start+end]
+
+	if !strings.Contains(body, "aggregateReclaimableBytes += fr.reclaimableBytes || 0;") {
+		t.Error("renderFileReport never sums fr.reclaimableBytes across ran instances")
+	}
+	if !strings.Contains(body, "aggregateUnsizedFindings += fr.unsizedFindings || 0;") {
+		t.Error("renderFileReport never sums fr.unsizedFindings across ran instances")
+	}
+	if !strings.Contains(body, `fileCountText += " · ~" + humanSize(aggregateReclaimableBytes);`) {
+		t.Error(`the header total never appends " · ~" + humanSize(aggregateReclaimableBytes)`)
+	}
+	if !strings.Contains(body, `fileCountText += " (+" + aggregateUnsizedFindings + " unsized)";`) {
+		t.Error(`the header total never appends the "(+N unsized)" suffix`)
+	}
+	// The unsized suffix must be conditional (only when > 0), not unconditional.
+	suffixIdx := strings.Index(body, `" (+" + aggregateUnsizedFindings + " unsized)"`)
+	if suffixIdx == -1 {
+		t.Fatal("could not locate the unsized suffix to check its guard")
+	}
+	if !strings.Contains(body[:suffixIdx], "if (aggregateUnsizedFindings > 0)") {
+		t.Error(`the "(+N unsized)" suffix is not gated on aggregateUnsizedFindings > 0`)
+	}
+	// The whole size segment must be gated on there being at least one
+	// duplicate/orphan finding (rows.length) — never shown for an
+	// instance whose only findings are case-collisions, which contribute
+	// nothing to reclaimableBytes at all.
+	sizeIdx := strings.Index(body, `" · ~" + humanSize(aggregateReclaimableBytes)`)
+	if sizeIdx == -1 {
+		t.Fatal("could not locate the size segment to check its guard")
+	}
+	if !strings.Contains(body[:sizeIdx], "if (rows.length > 0)") {
+		t.Error("the header's size segment is not gated on rows.length > 0")
+	}
+}
+
+// TestWebUIPage_FileReportSubtotalsLineOmitsZeroKindsAndUsesSharedFormatter
+// pins [wasted-storage totals]'s per-kind subtotals line: buildFileReport
+// Subtotals sums duplicate/orphan bytes SEPARATELY by kind (never the
+// combined reclaimableBytes total the header uses — that number cannot be
+// split back apart by kind), counts case-twins as a bare count (no size —
+// a case-collision names a directory, not a file), formats every count with
+// toLocaleString (thousands separators) and every size with the SAME
+// humanSize the header/trash-button labels use, and omits a kind entirely
+// when its own count is zero rather than printing a meaningless "orphans 0
+// · size unknown".
+func TestWebUIPage_FileReportSubtotalsLineOmitsZeroKindsAndUsesSharedFormatter(t *testing.T) {
+	page := string(webUIPage)
+
+	start := strings.Index(page, "function buildFileReportSubtotals(")
+	if start == -1 {
+		t.Fatal("page has no buildFileReportSubtotals function")
+	}
+	end := strings.Index(page[start:], "\n  function renderFileReport(")
+	if end == -1 {
+		t.Fatal("could not find the end of buildFileReportSubtotals (renderFileReport must follow it)")
+	}
+	fn := page[start : start+end]
+
+	for _, want := range []string{
+		`f.kind === "duplicate"`,
+		`f.kind === "orphan"`,
+		"dupCount.toLocaleString()",
+		"orphanCount.toLocaleString()",
+		"collisions.length.toLocaleString()",
+		"humanSize(dupBytes)",
+		"humanSize(orphanBytes)",
+		"if (dupCount > 0)",
+		"if (orphanCount > 0)",
+		"if (collisions.length > 0)",
+	} {
+		if !strings.Contains(fn, want) {
+			t.Errorf("buildFileReportSubtotals is missing %q", want)
+		}
+	}
+	if strings.Contains(fn, "~") {
+		t.Error(`buildFileReportSubtotals must not use the header total's own "~" approximation prefix — its own figures are exact sums, not a library-wide approximation`)
+	}
+
+	if !strings.Contains(page, "var subtotals = buildFileReportSubtotals(rows, collisions);") {
+		t.Error("renderFileReport never calls buildFileReportSubtotals")
+	}
+}
+
+// TestWebUIPage_SizeColumnIsPresentRightAlignedAndNarrow pins the table's own
+// new SIZE column: present in the file-clutter table's headers, right-
+// aligned and width-bounded so it cannot become a third column competing
+// with the path cell or the action cell for space (the exact regression
+// class TestWebUIPage_PathColumnHasWidthPriorityOverTheActionCell exists to
+// catch for those other two), and "—" (matching how the group/count cells
+// already spell "nothing here" in this table) rather than humanSize's own
+// prose-friendly "size unknown" for an absent/zero size — the widest
+// possible value is exactly what a deliberately narrow column must avoid.
+func TestWebUIPage_SizeColumnIsPresentRightAlignedAndNarrow(t *testing.T) {
+	page := string(webUIPage)
+
+	if !strings.Contains(page, `["instance", "kind", "group", "path", "size", "count", "action"]`) {
+		t.Error(`the file-clutter table's headers no longer include "size" in the expected position`)
+	}
+	if !strings.Contains(page, `var sizeText = r.f.size > 0 ? humanSize(r.f.size) : "—";`) {
+		t.Error(`renderFileReport's row builder does not compute sizeText as humanSize(r.f.size) or "—"`)
+	}
+	if !strings.Contains(page, `td = el("td", "size"); text(td, sizeText); tr.appendChild(td);`) {
+		t.Error(`renderFileReport's row builder never appends a td.size cell holding sizeText`)
+	}
+
+	start := strings.Index(page, "table.findings td.size {")
+	if start == -1 {
+		t.Fatal("page has no table.findings td.size CSS rule")
+	}
+	end := strings.Index(page[start:], "}")
+	if end == -1 {
+		t.Fatal("could not find the end of the table.findings td.size rule")
+	}
+	rule := page[start : start+end]
+	if !strings.Contains(rule, "text-align: right") {
+		t.Error("table.findings td.size is not right-aligned")
+	}
+	if !strings.Contains(rule, "width:") {
+		t.Error("table.findings td.size has no width constraint — it could grow to compete with the path/action cells for space")
+	}
+}
+
+// TestWebUIPage_HeaderTotalTooltipStatesTheTrashModelHonestly pins the copy
+// rule: the header total must never let "reclaimable" read as "already
+// reclaimed" — per Nothing is ever deleted (docs/REFERENCE.md), a trash
+// action renames a file into .cutoffarr-trash rather than freeing its disk
+// space, so the total's own tooltip says so explicitly.
+func TestWebUIPage_HeaderTotalTooltipStatesTheTrashModelHonestly(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, `<span id="fileCount" title="reclaimed only after you empty .cutoffarr-trash">`) {
+		t.Error(`#fileCount is missing the title="reclaimed only after you empty .cutoffarr-trash" tooltip`)
 	}
 }
 

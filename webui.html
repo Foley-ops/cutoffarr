@@ -392,6 +392,22 @@
     max-width: 200px;
   }
 
+  /* [wasted-storage totals] The size column: right-aligned (a number reads
+     right-to-left against the decimal point, the same reason "count" ends
+     the row rather than sitting beside "group"), and deliberately narrow —
+     its own longest realistic content ("999.9 TB", "size unknown" is never
+     used here, only "—" — see renderFileReport's own sizeText) is a handful
+     of characters, nowhere near path's or the action cell's own width
+     pressure. Fixed at a small width rather than left to auto-size, so it
+     never becomes a third column competing with path/action-cell for the
+     row's space — the whole point of both of THOSE rules, just re-stated
+     for a column added after them. */
+  table.findings td.size {
+    text-align: right;
+    white-space: nowrap;
+    width: 72px;
+  }
+
   /* File-clutter panel only (findingsTable's other caller, the reverse-scan
      panel, has no kind column): td's own word-break: break-word above is
      right for a long path but was breaking "duplicate" mid-word ("dupli-
@@ -485,6 +501,19 @@
   .case-collision-tracked {
     color: var(--alert);
     margin-left: 0.5em;
+  }
+
+  /* [wasted-storage totals] The per-kind subtotals line: unlike
+     .case-collision-notice above (amber — an actionable fact worth a
+     call-out) this is quiet, informational restating of numbers the table
+     below states in full — ink-dim, the same quiet tone .pager-position's
+     "a–b of n" line already uses for the same reason, not a color that
+     competes with the case-collision notice's own amber for attention. */
+  .file-report-subtotals {
+    margin: 0 0 14px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-dim);
   }
 
   /* Client-side pagination for the reverse-scan / file-clutter tables
@@ -659,7 +688,7 @@
   </details>
 
   <details class="panel">
-    <summary>File clutter — duplicates, orphans &amp; case-twins (<span id="fileCount">0</span>)</summary>
+    <summary>File clutter — duplicates, orphans &amp; case-twins (<span id="fileCount" title="reclaimed only after you empty .cutoffarr-trash">0</span>)</summary>
     <div class="panel-body findings-scroll" id="fileBody">
       <p class="empty">No clutter found. Every tracked file is exactly where it should be.</p>
     </div>
@@ -1492,15 +1521,28 @@
     return body;
   }
 
-  // humanSize mirrors the server's own humanSize: the trash button has to
-  // state how big the file it would move is, and the two must not disagree
-  // about the number a human reads before confirming.
+  // humanSize mirrors the server's own humanSize (actions.go): the trash
+  // button has to state how big the file it would move is, and the two must
+  // not disagree about the number a human reads before confirming — the GB
+  // branch's toFixed(1) rounds a tenth-boundary tie AWAY FROM ZERO, exactly
+  // matching actions.go's own math.Round-then-format for the same reason
+  // (that comment's own doc explains why %.1f alone would disagree).
+  //
+  // This is also [wasted-storage totals] the ONE size formatter the File
+  // clutter panel's header total and per-kind subtotals line share — never
+  // a second, header-only formatter — so a library-wide aggregate (which a
+  // single file's own size branch above never needed to reach) renders with
+  // the SAME rounding rule the button label already uses. The TB branch
+  // exists only for that: a per-file trash button realistically never
+  // reaches it, but summed across a real library's duplicates and orphans,
+  // an aggregate routinely does.
   function humanSize(n) {
     if (!n || n <= 0) return "size unknown";
     if (n < 1024) return n + " B";
     if (n < 1048576) return Math.round(n / 1024) + " KB";
     if (n < 1073741824) return Math.round(n / 1048576) + " MB";
-    return (n / 1073741824).toFixed(1) + " GB";
+    if (n < 1099511627776) return (n / 1073741824).toFixed(1) + " GB";
+    return (n / 1099511627776).toFixed(1) + " TB";
   }
 
   // buildBulkRemonitor is the ONE bulk action this phase has. File actions
@@ -1693,6 +1735,42 @@
     return { ok: true, tracked: tracked[0], untracked: untracked[0] };
   }
 
+  // buildFileReportSubtotals is the wasted-storage feature's one-line
+  // per-kind breakdown, rendered above the table: "duplicates N · SIZE —
+  // orphans N · SIZE — case-twins N". A kind with zero findings is left out
+  // of the line entirely (never printed as a meaningless "orphans 0 ·
+  // size unknown") — the same "never manufacture a confusing zero" instinct
+  // this panel's off/skipped qualifiers already follow. Counts use
+  // toLocaleString for thousands separators (2,831, not 2831) since this is
+  // the one place on the page a count can plausibly run that high; SIZE is
+  // humanSize, the SAME formatter the header total (renderFileReport) and
+  // every trash button label already use — never a second formatter, and
+  // deliberately without the header total's own "~" prefix: per-kind
+  // figures here are exact sums over sized findings, not the header's own
+  // library-wide approximation.
+  function buildFileReportSubtotals(rows, collisions) {
+    var dupCount = 0, dupBytes = 0, orphanCount = 0, orphanBytes = 0;
+    for (var i = 0; i < rows.length; i++) {
+      var f = rows[i].f;
+      if (f.kind === "duplicate") {
+        dupCount++;
+        if (f.size > 0) dupBytes += f.size;
+      } else if (f.kind === "orphan") {
+        orphanCount++;
+        if (f.size > 0) orphanBytes += f.size;
+      }
+    }
+    var segments = [];
+    if (dupCount > 0) segments.push("duplicates " + dupCount.toLocaleString() + " · " + humanSize(dupBytes));
+    if (orphanCount > 0) segments.push("orphans " + orphanCount.toLocaleString() + " · " + humanSize(orphanBytes));
+    if (collisions.length > 0) segments.push("case-twins " + collisions.length.toLocaleString());
+    if (segments.length === 0) return null;
+
+    var p = el("p", "file-report-subtotals");
+    text(p, segments.join(" — "));
+    return p;
+  }
+
   // renderFileReport is status-aware: fileReport.status is ran|skipped|off
   // per instance (the API contract's own three-way vocabulary), and only a
   // "ran" instance's zero findings mean "no clutter". A "skipped" instance
@@ -1723,12 +1801,22 @@
     // that same guarantee for the header even though rows.push itself is no
     // longer unconditional.
     var totalFindingCount = 0;
+    // aggregateReclaimableBytes/aggregateUnsizedFindings [wasted-storage
+    // totals] sum each RAN instance's own fileReport.reclaimableBytes/
+    // unsizedFindings (stats.go's own aggregation, already excluding
+    // case-collisions and already correct about absent sizes) rather than
+    // re-deriving the same numbers a second time from individual finding
+    // sizes here — one source of truth, computed once, server-side.
+    var aggregateReclaimableBytes = 0;
+    var aggregateUnsizedFindings = 0;
     for (var i = 0; i < instances.length; i++) {
       var inst = instances[i];
       var fr = inst.fileReport || {};
       var status = fr.status;
       if (status === "ran") {
         anyRan = true;
+        aggregateReclaimableBytes += fr.reclaimableBytes || 0;
+        aggregateUnsizedFindings += fr.unsizedFindings || 0;
         var findings = fr.findings || [];
         for (var j = 0; j < findings.length; j++) {
           totalFindingCount++;
@@ -1759,6 +1847,23 @@
       if (offCount > 0) qualifiers.push(offCount + " not configured");
       if (skippedCount > 0) qualifiers.push(skippedCount + " not checked");
       fileCountText = totalFindingCount + " · " + qualifiers.join(", ");
+    }
+    // [wasted-storage totals] The aggregate reclaimable size, gated on
+    // rows.length (the exact count of duplicate+orphan findings across
+    // every ran instance — this is what the total is EVEN ABOUT) so an
+    // instance whose only findings are case-collisions never shows a
+    // "~size unknown" that has nothing to do with a name defect. "~"
+    // marks it as an approximation (a human-rounded sum across every
+    // instance) the same way the reverse/file-clutter panels already use
+    // "·" to separate independent facts on one line; "(+N unsized)"
+    // appends only when some duplicate/orphan finding had no size to add,
+    // so the total can say what it could not count instead of quietly
+    // under-reporting.
+    if (rows.length > 0) {
+      fileCountText += " · ~" + humanSize(aggregateReclaimableBytes);
+      if (aggregateUnsizedFindings > 0) {
+        fileCountText += " (+" + aggregateUnsizedFindings + " unsized)";
+      }
     }
     text(document.getElementById("fileCount"), fileCountText);
     body.textContent = "";
@@ -1792,6 +1897,13 @@
       body.appendChild(buildCaseCollisionBlock(collisions));
     }
 
+    // [wasted-storage totals] The per-kind subtotals line, above the table:
+    // null when there is nothing to show a kind's own line for (every count
+    // is zero — the panel is about to render its "No clutter found" empty
+    // state instead, further down).
+    var subtotals = buildFileReportSubtotals(rows, collisions);
+    if (subtotals) body.appendChild(subtotals);
+
     resetPagerIfCountChanged(filePager, rows.length);
 
     if (rows.length === 0) {
@@ -1813,12 +1925,20 @@
     }
     var page = paginateRows(rows, filePager);
     body.appendChild(findingsTable(
-      ["instance", "kind", "group", "path", "count", "action"],
+      ["instance", "kind", "group", "path", "size", "count", "action"],
       page.pageRows,
       function (r) {
         var tr = el("tr");
         var group = r.f.group || "—";
         var count = r.f.count ? String(r.f.count) : "—";
+        // [wasted-storage totals] "—" for an absent/zero size, matching how
+        // group/count above already spell "nothing here" in this same
+        // table — not humanSize's own "size unknown" fallback, which reads
+        // fine inside a sentence (the trash button's label) but would be
+        // the widest possible value in what the row grid needs to stay a
+        // narrow, fixed-ish column (case-collision-free rows only: those
+        // findings never reach this row builder — see rows.push above).
+        var sizeText = r.f.size > 0 ? humanSize(r.f.size) : "—";
         var td;
         td = el("td"); text(td, r.instance); tr.appendChild(td);
         // [v2.1] The kind cell renders its text inside a chip — reusing the
@@ -1847,6 +1967,7 @@
         text(td, r.f.display || r.f.path || "");
         td.title = r.f.path || "";
         tr.appendChild(td);
+        td = el("td", "size"); text(td, sizeText); tr.appendChild(td);
         td = el("td"); text(td, count); tr.appendChild(td);
         // [v2.2] The trash button. Clay, because it moves a file; its label
         // states the exact operation including the size, which is the single
