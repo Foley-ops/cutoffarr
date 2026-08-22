@@ -1813,19 +1813,33 @@ func TestDaemon_StartupScanAndReconciliationSweep_BothRunTheReverseScan(t *testi
 	if !strings.Contains(startup, `msg="reverse-scan finding"`) || !strings.Contains(startup, "reverseFindings=1") {
 		t.Fatalf("the startup scan must run the reverse scan and report it in full:\n%s", startup)
 	}
-	// FLAKE FIX: the loop computes its first sweep deadline from the clock as it
-	// enters, asynchronously, AFTER the startup scan returns. Advancing the fake
-	// clock before that happens moves time forward past a timer that does not
-	// exist yet, and the sweep then never fires — reproducible under load (this
-	// test failed 3 runs in 15 on a busy machine, on this branch's own HEAD).
-	// Waiting for the loop to announce its schedule is the synchronization point
-	// every other sweep test in this suite already uses.
+	// FLAKE FIX, round 2: the loop computes its first sweep deadline from the
+	// clock as it enters, asynchronously, AFTER the startup scan returns, and
+	// this eventually() waits for the ONE log line that announces it —
+	// written once, at the very top of loop(), before the for-loop's first
+	// iteration even begins. That proves nextReconcile has been COMPUTED, but
+	// NOT that d.clock.NewTimer(wait) has actually been CALLED: that happens
+	// several lines later, on that same first iteration, after the loop's own
+	// queue/scan checks. A single unretried Advance can still land in that
+	// remaining sliver — before the timer is armed — computing its target
+	// from a now the clock has already moved past, so the sweep silently
+	// never fires within this test's own timeout (this is the CI failure
+	// this round fixes: "timed out waiting for 1 occurrence(s) of
+	// 'reconciliation sweep complete'" at the 5s ceiling; reproduced locally
+	// with a 50ms artificial delay inserted between daemon.go's
+	// d.clock.Now() read and its d.clock.NewTimer(wait) call — the test
+	// failed identically, at the same 5.01s mark). This is the exact race
+	// documented on advanceClockUntilReconciliationSweepFires
+	// (filereport_test.go) and the SAME rework applies here: retry Advance
+	// (safe — it is idempotent) until the sweep it triggers actually
+	// completes, rather than racing a single Advance against a wall-clock
+	// timeout.
 	eventually(t, "the reconciliation schedule to be announced", func() bool {
 		return strings.Contains(h.out.String(), "reconciliation sweep scheduled")
 	})
 
 	mark := h.mark()
-	h.clock.Advance(time.Hour)
+	advanceClockUntilReconciliationSweepFires(t, h, mark, time.Hour)
 	h.awaitLogCount("reconciliation sweep complete", 1)
 	sweep := h.since(mark)
 	h.stop()
@@ -2144,13 +2158,17 @@ func TestDaemon_IdleCycleWithReverseFindings_StaysWithinTheNoiseBudget(t *testin
 		return strings.Contains(h.out.String(), "reconciliation sweep scheduled")
 	})
 
+	// See advanceClockUntilReconciliationSweepFires' own doc comment
+	// (filereport_test.go) for why a single, unretried Advance here can
+	// still race the daemon's own timer registration — for BOTH sweeps
+	// below, not only the first.
 	mark := h.mark()
-	h.clock.Advance(time.Hour)
+	advanceClockUntilReconciliationSweepFires(t, h, mark, time.Hour)
 	h.awaitLogCount("reconciliation sweep complete", 1)
 	cycle2 := h.since(mark)
 
 	mark3 := h.mark()
-	h.clock.Advance(time.Hour)
+	advanceClockUntilReconciliationSweepFires(t, h, mark3, time.Hour)
 	h.awaitLogCount("reconciliation sweep complete", 2)
 	cycle3 := h.since(mark3)
 	h.stop()

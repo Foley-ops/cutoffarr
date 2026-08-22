@@ -685,17 +685,25 @@ func TestDaemon_ReconciliationTicker_FiresTheFullSweepOnSchedule(t *testing.T) {
 	h := startDaemon(t, writeDaemonConfig(t, "radarr", fake.srv.URL, true, "info", "1h", "45s"))
 	h.waitReady()
 	// The loop computes its first deadline from the clock as it enters; waiting
-	// for it to say so is the synchronization point, not a sleep.
+	// for it to say so is the synchronization point, not a sleep. It is not
+	// the WHOLE synchronization, though — see
+	// advanceClockUntilReconciliationSweepFires' own doc comment
+	// (filereport_test.go) for the remaining race a single, unretried Advance
+	// can still lose.
 	eventually(t, "the reconciliation schedule to be announced", func() bool {
 		return strings.Contains(h.out.String(), "reconciliation sweep scheduled")
 	})
 	mark := h.mark()
 
-	h.clock.Advance(time.Hour)
+	advanceClockUntilReconciliationSweepFires(t, h, mark, time.Hour)
 	h.awaitLogCount("reconciliation sweep complete", 1)
 
-	// And again: the sweep re-arms itself rather than firing once.
-	h.clock.Advance(time.Hour)
+	// And again: the sweep re-arms itself rather than firing once. A fresh
+	// mark, since the FIRST sweep's own "reconciliation sweep complete" is
+	// already in the log by now — reusing the same mark would let this
+	// second wait return immediately without ever re-triggering anything.
+	mark2 := h.mark()
+	advanceClockUntilReconciliationSweepFires(t, h, mark2, time.Hour)
 	h.awaitLogCount("reconciliation sweep complete", 2)
 	h.stop()
 
@@ -755,7 +763,11 @@ func TestDaemon_DryRun_MakesZeroWriteRequestsAcrossEveryKindOfCycle(t *testing.T
 		return strings.Contains(h.out.String(), "reconciliation sweep scheduled")
 	})
 
-	h.clock.Advance(time.Hour)
+	// See advanceClockUntilReconciliationSweepFires' own doc comment
+	// (filereport_test.go) for why a single, unretried Advance here can
+	// still race the daemon's own timer registration.
+	mark := h.mark()
+	advanceClockUntilReconciliationSweepFires(t, h, mark, time.Hour)
 	h.awaitLogCount("reconciliation sweep complete", 1)
 
 	h.post("radarr-main", downloadMoviePayload)
@@ -838,8 +850,11 @@ func TestDaemon_SecondCycleWithNothingChanged_LogsSummariesOnlyAtInfo(t *testing
 		t.Fatalf("the startup scan should have written the eligible season:\n%s", startup)
 	}
 
+	// See advanceClockUntilReconciliationSweepFires' own doc comment
+	// (filereport_test.go) for why a single, unretried Advance here can
+	// still race the daemon's own timer registration.
 	mark := h.mark()
-	h.clock.Advance(time.Hour)
+	advanceClockUntilReconciliationSweepFires(t, h, mark, time.Hour)
 	h.awaitLogCount("reconciliation sweep complete", 1)
 	// The cycle's own output, captured BEFORE the shutdown: the shutdown lines
 	// are the daemon stopping, not the cycle running, and folding them in would
@@ -987,8 +1002,11 @@ func TestDaemon_IdleCycleWithAnInconclusiveCrossCheck_StaysWithinTheNoiseBudget(
 		return strings.Contains(h.out.String(), "reconciliation sweep scheduled")
 	})
 
+	// See advanceClockUntilReconciliationSweepFires' own doc comment
+	// (filereport_test.go) for why a single, unretried Advance here can
+	// still race the daemon's own timer registration.
 	mark := h.mark()
-	h.clock.Advance(time.Hour)
+	advanceClockUntilReconciliationSweepFires(t, h, mark, time.Hour)
 	h.awaitLogCount("reconciliation sweep complete", 1)
 	cycle2 := h.since(mark)
 	h.stop()
@@ -1066,7 +1084,17 @@ func TestDaemon_IdleCycleWithAWebUIPoller_StaysByteIdenticalToNoPoller(t *testin
 		}
 
 		mark := h.mark()
-		h.clock.Advance(time.Hour)
+		// See advanceClockUntilReconciliationSweepFires' own doc comment
+		// (filereport_test.go) for why a single, unretried Advance can still
+		// race the daemon's own timer registration. Retried here until the
+		// sweep has actually BEGUN rather than until it COMPLETES: the
+		// poll=true branch below needs the sweep already inside its library
+		// read (blocked on the onRequest hook), which happens before
+		// completion — advanceClockUntil is the same fix, keyed to whichever
+		// log line the caller is actually waiting on.
+		advanceClockUntil(t, h, time.Hour, func() bool {
+			return strings.Contains(h.since(mark), "reconciliation sweep beginning")
+		})
 
 		if poll {
 			select {
@@ -1142,8 +1170,11 @@ func TestDaemon_ExclusionTagNotDefined_IsSaidOnEveryCycleNotOnlyTheFirst(t *test
 		t.Fatalf("the startup scan must say the exclusion tag is inert:\n%s", h.out.String())
 	}
 
+	// See advanceClockUntilReconciliationSweepFires' own doc comment
+	// (filereport_test.go) for why a single, unretried Advance here can
+	// still race the daemon's own timer registration.
 	mark := h.mark()
-	h.clock.Advance(time.Hour)
+	advanceClockUntilReconciliationSweepFires(t, h, mark, time.Hour)
 	h.awaitLogCount("reconciliation sweep complete", 1)
 	cycle2 := h.since(mark)
 	h.stop()
@@ -1170,7 +1201,10 @@ func TestDaemon_ReconciliationCycleAtDebug_StillSaysEverything(t *testing.T) {
 	})
 	mark := h.mark()
 
-	h.clock.Advance(time.Hour)
+	// See advanceClockUntilReconciliationSweepFires' own doc comment
+	// (filereport_test.go) for why a single, unretried Advance here can
+	// still race the daemon's own timer registration.
+	advanceClockUntilReconciliationSweepFires(t, h, mark, time.Hour)
 	h.awaitLogCount("reconciliation sweep complete", 1)
 	h.stop()
 
@@ -1310,7 +1344,17 @@ func TestDaemon_ReconciliationSweepAbandonedOnShutdown_DoesNotCompleteOrRearm(t 
 
 	mark := h.mark()
 	armed.Store(true)
-	h.clock.Advance(time.Hour)
+	// See advanceClockUntilReconciliationSweepFires' own doc comment
+	// (filereport_test.go) for why a single, unretried Advance here can
+	// still race the daemon's own timer registration. This sweep is cut
+	// short by design (the onRequest hook cancels mid-evaluation) and never
+	// logs "reconciliation sweep complete", so the retry is keyed to
+	// "reconciliation sweep beginning" instead — the fact the test already
+	// asserts on below, and the earliest point a lost Advance would prevent
+	// entirely.
+	advanceClockUntil(t, h, time.Hour, func() bool {
+		return strings.Contains(h.since(mark), "reconciliation sweep beginning")
+	})
 
 	if code := h.awaitExit(); code != 0 {
 		t.Fatalf("exit code = %d, want 0:\n%s", code, h.out.String())

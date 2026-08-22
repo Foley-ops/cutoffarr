@@ -2892,38 +2892,63 @@ instances:
 	return path
 }
 
-// advanceClockUntilReconciliationSweepFires is the [FIX] shared helper this
-// project's own root-cause analysis (originally documented inline here)
-// already called for: waitReady()/awaitLogCount("reconciliation sweep
-// scheduled") close most, but not all, of the race window between the
-// startup scan finishing and d.loop()'s first iteration actually reaching
-// its own clock.NewTimer(wait) call (daemon.go). A single unretried
-// h.clock.Advance can land in that last sliver — before the timer is
-// armed — and the sweep it was meant to trigger then silently never fires,
-// because nextReconcile ends up computed from the ALREADY-advanced clock
-// value, unreachable by that one Advance call.
+// advanceClockUntil is the [FIX] shared helper this project's own root-cause
+// analysis (originally documented inline, on this function's own prior,
+// single-purpose form) already called for: waitReady()/awaitLogCount
+// ("reconciliation sweep scheduled") close most, but not all, of the race
+// window between the startup scan finishing and d.loop()'s first iteration
+// actually reaching its own clock.NewTimer(wait) call (daemon.go) — that log
+// line is written once, at the very top of loop(), before the for-loop's
+// first iteration even begins, so it proves nextReconcile has been
+// COMPUTED, never that NewTimer has actually been CALLED some lines later
+// on that same first pass. A single unretried h.clock.Advance can land in
+// that remaining sliver — before the timer is armed — and whatever it was
+// meant to trigger then silently never fires, because the timer's target
+// ends up computed from the ALREADY-advanced clock value, unreachable by
+// that one Advance call.
 //
 // Retrying Advance is safe: it is idempotent (it only ever moves the fake
 // clock further forward and fires whatever is already due), so whichever
-// attempt lands after loop() has actually armed its timer wins. This was
-// previously written out only in
-// TestDaemon_StartupScanAndReconciliationSweep_BothRunTheFileReport, while
-// its sibling TestDaemon_IdleCycleWithFileReportFindings_StaysWithinTheNoiseBudget
-// used a single, unretried Advance for both of its sweeps — the exact gap
-// this helper closes by giving every reconciliation-sweep test the same
-// hardening.
-func advanceClockUntilReconciliationSweepFires(t *testing.T, h *daemonHarness, mark int, step time.Duration) {
+// attempt lands after loop() has actually armed its timer wins. cond
+// reports the awaited state generically — most callers want
+// advanceClockUntilReconciliationSweepFires' own "reconciliation sweep
+// complete", but a test whose sweep is deliberately interrupted before
+// completing (e.g. by a shutdown mid-sweep) needs a different signal, such
+// as "reconciliation sweep beginning".
+//
+// This was previously written out only in
+// TestDaemon_StartupScanAndReconciliationSweep_BothRunTheFileReport, under
+// the name advanceClockUntilReconciliationSweepFires and hardcoded to that
+// one substring, while its sibling
+// TestDaemon_IdleCycleWithFileReportFindings_StaysWithinTheNoiseBudget used
+// a single, unretried Advance for both of its sweeps — the exact gap that
+// version closed by giving every reconciliation-sweep test in filereport_test.go
+// the same hardening. Generalized here so reverse_test.go and daemon_test.go's
+// own reconciliation-sweep tests — audited and found using the same
+// unretried, pre-rework pattern — can share the identical fix rather than
+// each growing a slightly different copy of it.
+func advanceClockUntil(t *testing.T, h *daemonHarness, step time.Duration, cond func() bool) {
 	t.Helper()
 	for attempt := 0; attempt < 5; attempt++ {
 		h.clock.Advance(step)
 		deadline := time.Now().Add(200 * time.Millisecond)
 		for time.Now().Before(deadline) {
-			if strings.Contains(h.since(mark), "reconciliation sweep complete") {
+			if cond() {
 				return
 			}
 			time.Sleep(2 * time.Millisecond)
 		}
 	}
+}
+
+// advanceClockUntilReconciliationSweepFires is advanceClockUntil specialized
+// to the common case — see that function's own doc comment for the race
+// this closes and why retrying is safe.
+func advanceClockUntilReconciliationSweepFires(t *testing.T, h *daemonHarness, mark int, step time.Duration) {
+	t.Helper()
+	advanceClockUntil(t, h, step, func() bool {
+		return strings.Contains(h.since(mark), "reconciliation sweep complete")
+	})
 }
 
 func TestDaemon_StartupScanAndReconciliationSweep_BothRunTheFileReport(t *testing.T) {
