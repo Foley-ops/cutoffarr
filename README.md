@@ -17,8 +17,8 @@ monitored and your indexers keep getting asked about it, forever.
 cutoffarr runs alongside your *arrs, asks them which items have fully met their
 own quality profile requirements, and sets those items to **unmonitored** so the
 searching stops. It changes exactly one field (`monitored`) on movies, seasons,
-and episodes. It never deletes, moves, renames, or imports anything, and it
-never touches profiles, tags, or files.
+and episodes. It never deletes, moves, renames, or imports anything on its own,
+and it never touches profiles, tags, or files.
 
 It also watches the other direction: a reverse scan flags items that are
 *unmonitored but shouldn't be* (the accidental unmonitor you did six months
@@ -99,7 +99,7 @@ code ever drifts:
   [`TestTree_BansFilesystemMutationAPIsEverywhere`](filereport_test.go).
 - **An airing season can never be unmonitored.** The single most important
   Sonarr rule, pinned end-to-end:
-  [`TestRun_SonarrInstance_AiringSeason_ReportLineCarriesMandatedReasonString_NeverWouldUnmonitor`](sonarr_test.go).
+  [`TestRun_Sonarr_AiringSeason_NeverUnmonitored`](sonarr_test.go).
 
 Beyond those: every decision is logged with its reason; anything the API
 returns that looks partial, malformed, or ambiguous makes cutoffarr skip that
@@ -123,8 +123,9 @@ treat it as a LAN tool.
 test enforces that. File actions (which you click, per item, with the switches
 on) move files into `.cutoffarr-trash/`, which is never auto-pruned.
 
-**Is this unmonitorr / unmonitarr?** No — those unmonitor based on Plex
-playback. cutoffarr unmonitors based on your quality profiles' own criteria.
+**Is this unmonitorr / unmonitarr?** No — unmonitorr unmonitors after Plex
+playback, and unmonitarr unmonitors based on release-group filtering. cutoffarr
+unmonitors when your quality profiles' own criteria say an item is finished.
 
 **Why does it say nothing is done?** Your profile's "Upgrade Until Custom
 Format Score" is the finish line. If it's set to an unreachable number

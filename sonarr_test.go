@@ -1621,7 +1621,7 @@ instances:
 	}
 }
 
-// TestRun_SonarrInstance_AiringSeason_ReportLineCarriesMandatedReasonString_NeverWouldUnmonitor
+// TestRun_Sonarr_AiringSeason_NeverUnmonitored
 // is the IMPORTANT review fix: every prior airing-guard test (evaluateSeries'
 // TestEvaluateSeries_AiringSeason_NeverWouldUnmonitor_EvenWhenCompleteAndCutoffMet
 // and its siblings) compared d.reason against the ReasonSeasonNotFullyAired
@@ -1638,7 +1638,7 @@ instances:
 // isolated report line (via reportLineWithMsg, sonarr_decision_test.go)
 // contains the literal reason string, and that no would-unmonitor line ever
 // appears for this season.
-func TestRun_SonarrInstance_AiringSeason_ReportLineCarriesMandatedReasonString_NeverWouldUnmonitor(t *testing.T) {
+func TestRun_Sonarr_AiringSeason_NeverUnmonitored(t *testing.T) {
 	fake := newStatefulSonarrFake(t,
 		[]*statefulSonarrSeries{
 			{id: 1, title: "Airing Show", monitored: true, profileID: 1, tags: []int{},
