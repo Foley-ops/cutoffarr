@@ -151,12 +151,23 @@ type fileReportFindingRecord struct {
 // whenever Status is ran or skipped, and — like them — left untouched by a
 // cycle that never ran the file report (recordInstance's three-state
 // fidelity rule).
+// ReclaimableBytes/UnsizedFindings are the wasted-storage total the GUI
+// header/subtotals aggregate across every instance: the sum of Size over
+// this instance's duplicate+orphan findings, and how many of them had no
+// usable Size to add to that sum. Case-collision findings never contribute
+// to either — a case-twin names a directory, not a file, and is a naming
+// defect to fix, never a byte pile to reclaim (see fileReportSnapshotFrom).
+// Both are always present (including 0) exactly when Duplicates/Orphans/
+// CaseCollisions are — computed together, in the same pass over the same
+// findings, so the four can never drift apart.
 type fileReportSnapshot struct {
-	Status         string                    `json:"status"`
-	Duplicates     int                       `json:"duplicates"`
-	Orphans        int                       `json:"orphans"`
-	CaseCollisions int                       `json:"caseCollisions"`
-	Findings       []fileReportFindingRecord `json:"findings"`
+	Status           string                    `json:"status"`
+	Duplicates       int                       `json:"duplicates"`
+	Orphans          int                       `json:"orphans"`
+	CaseCollisions   int                       `json:"caseCollisions"`
+	ReclaimableBytes int64                     `json:"reclaimableBytes"`
+	UnsizedFindings  int                       `json:"unsizedFindings"`
+	Findings         []fileReportFindingRecord `json:"findings"`
 }
 
 // cycleInstanceStats is what one call to runRadarrDecisionEngine or
@@ -510,11 +521,13 @@ func (s *statsStore) recordInstance(kind string, at time.Time, name, typ string,
 		findings := make([]fileReportFindingRecord, len(cs.fileReport.Findings))
 		copy(findings, cs.fileReport.Findings)
 		v.FileReport = fileReportSnapshot{
-			Status:         cs.fileReport.Status,
-			Duplicates:     cs.fileReport.Duplicates,
-			Orphans:        cs.fileReport.Orphans,
-			CaseCollisions: cs.fileReport.CaseCollisions,
-			Findings:       findings,
+			Status:           cs.fileReport.Status,
+			Duplicates:       cs.fileReport.Duplicates,
+			Orphans:          cs.fileReport.Orphans,
+			CaseCollisions:   cs.fileReport.CaseCollisions,
+			ReclaimableBytes: cs.fileReport.ReclaimableBytes,
+			UnsizedFindings:  cs.fileReport.UnsizedFindings,
+			Findings:         findings,
 		}
 	}
 
@@ -612,6 +625,12 @@ func (s *statsStore) snapshot() statsResponse {
 // things about the same cycle.
 func fileReportSnapshotFrom(c fileReportCounts) fileReportSnapshot {
 	findings := make([]fileReportFindingRecord, 0, len(c.findings))
+	// reclaimableBytes/unsizedFindings are accumulated in this SAME pass over
+	// c.findings, rather than a second one, so they can never see a
+	// different set of findings than the Findings slice built alongside
+	// them — see fileReportSnapshot's own doc comment for the wire contract.
+	var reclaimableBytes int64
+	var unsizedFindings int
 	for _, f := range c.findings {
 		rec := fileReportFindingRecord{
 			Kind: f.kind, Group: f.group, Path: f.diskPath, Display: f.displayPath, Count: f.groupCount,
@@ -629,11 +648,26 @@ func fileReportSnapshotFrom(c fileReportCounts) fileReportSnapshot {
 			for i, n := range f.names {
 				rec.Names[i] = caseCollisionNameRecord{Name: n.name, Tracked: n.tracked}
 			}
+		} else if f.size > 0 {
+			// Duplicate or orphan, with a usable size: this is the "wasted
+			// storage" a human would actually reclaim by acting on the
+			// finding. A case-collision names a directory, not a file — it
+			// is a naming defect, never a byte pile — so it is excluded
+			// here unconditionally, not merely by virtue of usually having
+			// no size set.
+			reclaimableBytes += f.size
+		} else {
+			// Duplicate or orphan, but size is absent/0 (unstat'able, or a
+			// genuine zero-byte file) — counted so the total can say how
+			// much of itself it could not count, rather than silently
+			// under-reporting.
+			unsizedFindings++
 		}
 		findings = append(findings, rec)
 	}
 	return fileReportSnapshot{
 		Status: c.state(), Duplicates: c.duplicates, Orphans: c.orphans, CaseCollisions: c.caseCollisions,
+		ReclaimableBytes: reclaimableBytes, UnsizedFindings: unsizedFindings,
 		Findings: findings,
 	}
 }

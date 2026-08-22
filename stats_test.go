@@ -647,6 +647,84 @@ func TestFileReportSnapshotFrom_ConvertsCaseCollisionFindingWithNamesAndEntryTyp
 	}
 }
 
+// TestFileReportSnapshotFrom_AggregatesReclaimableBytesAndUnsizedFindings
+// pins the wasted-storage aggregation's whole contract: ReclaimableBytes is
+// the sum of Size over duplicate+orphan findings ONLY (a sized case-twin —
+// which never happens in practice, caseCollisionsInDir never sets one — is
+// excluded by KIND here, not merely because it usually happens to be zero),
+// and UnsizedFindings counts a dup/orphan finding whose Size is absent/0 so
+// the total can be honest about what it could not count, rather than
+// silently under-reporting.
+func TestFileReportSnapshotFrom_AggregatesReclaimableBytesAndUnsizedFindings(t *testing.T) {
+	c := fileReportCounts{
+		configured: true, duplicates: 2, orphans: 1, caseCollisions: 1,
+		findings: []fileReportFinding{
+			{kind: fileKindDuplicate, diskPath: "/movies/A/A (2).mkv", size: 1_000_000_000},
+			{kind: fileKindDuplicate, diskPath: "/movies/B/B (2).mkv", size: 500_000_000},
+			{kind: fileKindOrphan, diskPath: "/movies/Untracked/stray.mkv"}, // size absent
+			// Defensively set — production code never does this — to prove
+			// the exclusion is BY KIND, not an accident of usually being 0.
+			{kind: fileKindCaseCollision, diskPath: "/movies/Show", size: 999},
+		},
+	}
+	snap := fileReportSnapshotFrom(c)
+	wantBytes := int64(1_000_000_000 + 500_000_000)
+	if snap.ReclaimableBytes != wantBytes {
+		t.Errorf("ReclaimableBytes = %d, want %d (the two sized duplicates only — the case-collision's own size must never contribute)", snap.ReclaimableBytes, wantBytes)
+	}
+	if snap.UnsizedFindings != 1 {
+		t.Errorf("UnsizedFindings = %d, want 1 (only the size-absent orphan; the sized case-collision must not count as sized OR unsized — it is excluded entirely)", snap.UnsizedFindings)
+	}
+}
+
+// TestFileReportSnapshotFrom_ZeroByteFindingCountsAsUnsizedNotAsZeroBytes
+// pins the size<=0 boundary explicitly: a genuine zero-byte file and an
+// unstat'able one are indistinguishable in fileReportFinding.size (both 0),
+// and BOTH must count as unsized rather than silently contributing a
+// truthful-looking "0 bytes reclaimed" to the sum.
+func TestFileReportSnapshotFrom_ZeroByteFindingCountsAsUnsizedNotAsZeroBytes(t *testing.T) {
+	c := fileReportCounts{
+		configured: true, duplicates: 1,
+		findings: []fileReportFinding{
+			{kind: fileKindDuplicate, diskPath: "/movies/A/A (2).mkv", size: 0},
+		},
+	}
+	snap := fileReportSnapshotFrom(c)
+	if snap.ReclaimableBytes != 0 {
+		t.Errorf("ReclaimableBytes = %d, want 0", snap.ReclaimableBytes)
+	}
+	if snap.UnsizedFindings != 1 {
+		t.Errorf("UnsizedFindings = %d, want 1 — a zero-byte/unstat'able finding must be counted as unsized", snap.UnsizedFindings)
+	}
+}
+
+// TestStatsStore_RecordInstance_PropagatesReclaimableBytesAndUnsizedFindings
+// guards a real bug this same change introduced and fixed before it ever
+// shipped: v.FileReport in recordInstance is rebuilt FIELD BY FIELD from
+// cs.fileReport (never a whole-struct copy), so a new fileReportSnapshot
+// field added anywhere else — including ReclaimableBytes/UnsizedFindings —
+// is silently dropped back to its zero value on every recorded cycle unless
+// that field literal is updated too. Both TestFileReportSnapshotFrom_*
+// above pin the CONVERSION; this pins that the STORE actually keeps what
+// conversion produced.
+func TestStatsStore_RecordInstance_PropagatesReclaimableBytesAndUnsizedFindings(t *testing.T) {
+	s := newStatsStore(false)
+	s.recordInstance(cycleKindSweep, time.Now(), "radarr-main", "radarr", cycleInstanceStats{
+		total: 10, decisionsRan: true, fileReportRan: true,
+		fileReport: fileReportSnapshot{
+			Status: "ran", Duplicates: 1, ReclaimableBytes: 42, UnsizedFindings: 3,
+			Findings: []fileReportFindingRecord{{Kind: "duplicate", Path: "/x", Display: "x", Size: 42}},
+		},
+	})
+	got := s.snapshot().Instances[0]
+	if got.FileReport.ReclaimableBytes != 42 {
+		t.Errorf("FileReport.ReclaimableBytes = %d, want 42 — recordInstance's field-by-field rebuild dropped it", got.FileReport.ReclaimableBytes)
+	}
+	if got.FileReport.UnsizedFindings != 3 {
+		t.Errorf("FileReport.UnsizedFindings = %d, want 3 — recordInstance's field-by-field rebuild dropped it", got.FileReport.UnsizedFindings)
+	}
+}
+
 func TestRadarrReverseFindings_ConvertsMovieDecisions(t *testing.T) {
 	out := radarrReverseFindings([]movieDecision{{id: 7, title: "Accidental", reason: ReasonQualityCutoffNotMet}})
 	if len(out) != 1 {

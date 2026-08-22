@@ -750,7 +750,7 @@ script, a status-page widget, whatever) without ever loading the HTML:
         "reverseStatus": "ran",
         "reverseAsOf": "2026-03-01T12:00:00Z",
         "reverseFindings": [],
-        "fileReport": { "status": "ran", "duplicates": 0, "orphans": 1, "caseCollisions": 0, "findings": [] },
+        "fileReport": { "status": "ran", "duplicates": 0, "orphans": 1, "caseCollisions": 0, "reclaimableBytes": 0, "unsizedFindings": 0, "findings": [] },
         "lastActions": [],
         "lastCycleStatus": { "status": "ok" }
       }
@@ -794,6 +794,25 @@ script, a status-page widget, whatever) without ever loading the HTML:
   with "clean". `caseCollisions` is always present (including `0`) whenever
   `fileReport.status` is `ran` or `skipped`, the same as `duplicates`/
   `orphans`.
+
+  `reclaimableBytes` and `unsizedFindings` are the same wasted-storage total
+  the dashboard's own File clutter panel header aggregates across every
+  instance: `reclaimableBytes` is the sum of `size` (below) over this
+  instance's `duplicate` and `orphan` findings ONLY — a `case-collision`
+  never contributes, even if one somehow carried a `size`, because it names
+  a directory, not a file: it is a naming defect to fix, never a byte pile
+  to reclaim. `unsizedFindings` counts how many of those same duplicate/
+  orphan findings had no usable `size` to add to that sum (unstat'able, or a
+  genuine zero-byte file), so the total can say honestly what it could not
+  count instead of quietly under-reporting. Both are always present
+  (including `0`) exactly when `duplicates`/`orphans`/`caseCollisions` are,
+  computed in the same pass over the same findings so the four numbers can
+  never drift apart. "Reclaimable" is a claim about what trashing every
+  listed file WOULD free, not a claim that it already has been: per
+  [Nothing is ever deleted](#nothing-is-ever-deleted), a trash action
+  renames the file into `.cutoffarr-trash` rather than freeing its disk
+  space, so the dashboard's own header total says as much — the bytes are
+  reclaimed only once you empty that folder yourself.
 
   Each `fileReport.findings` item is `{"kind": "duplicate"|"orphan"|
   "case-collision", "group": "...", "path": "...", "display": "...", "count":
