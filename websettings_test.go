@@ -213,6 +213,58 @@ func TestWebUIPage_ValidationRecordDocumentedInTokenBlock(t *testing.T) {
 	}
 }
 
+// TestWebUIPage_MutedInkTextMeetsWCAGAA pins the brief's binding "text at
+// WCAG AA via the ink tokens (spot-check the muted inks)" clause.
+// --ink-faint measures ~3.0:1 in light mode (~2.9:1 dark) — below AA's
+// 4.5:1 for normal text — so it must never color text a reader needs in
+// order to use the page. [v0.3.0 review fix, round 3] Three call sites that
+// DO carry primary/required text used --ink-faint: a findings row's own
+// path (table.findings td.path — the findings tables' real payload), the
+// write-safety switches' own required "config-file-only" explanation
+// (.switch-why — brief item 2's "one sentence each stating they are
+// config-file-only and why"), and each settings group's own label
+// (.settings-group legend/h3). All three now use --ink-dim instead, which
+// clears AA (4.5:1+) against both --panel and --bg in both modes. The token
+// block's own leading comment documents this AA-scope split beside the CVD
+// exemptions already there.
+func TestWebUIPage_MutedInkTextMeetsWCAGAA(t *testing.T) {
+	page := string(webUIPage)
+
+	pathRule := jsBracedBlockAfter(t, page, "table.findings td.path {")
+	if strings.Contains(pathRule, "var(--ink-faint)") {
+		t.Errorf("table.findings td.path still colors a finding's own path (the findings tables' real payload) with --ink-faint, which fails WCAG AA (~3.0:1 light / ~2.9:1 dark):\n%s", pathRule)
+	}
+	if !strings.Contains(pathRule, "var(--ink-dim)") {
+		t.Errorf("table.findings td.path never falls back to --ink-dim (AA-compliant in both modes):\n%s", pathRule)
+	}
+
+	switchWhyRule := jsBracedBlockAfter(t, page, ".switch-why {")
+	if strings.Contains(switchWhyRule, "var(--ink-faint)") {
+		t.Errorf(".switch-why (the write-safety switches' own required config-file-only explanation) still uses --ink-faint, which fails WCAG AA:\n%s", switchWhyRule)
+	}
+	if !strings.Contains(switchWhyRule, "var(--ink-dim)") {
+		t.Errorf(".switch-why never falls back to --ink-dim (AA-compliant in both modes):\n%s", switchWhyRule)
+	}
+
+	legendRule := jsBracedBlockAfter(t, page, ".settings-group legend, .settings-group h3 {")
+	if strings.Contains(legendRule, "var(--ink-faint)") {
+		t.Errorf(".settings-group legend/h3 still uses --ink-faint, which fails WCAG AA:\n%s", legendRule)
+	}
+	if !strings.Contains(legendRule, "var(--ink-dim)") {
+		t.Errorf(".settings-group legend/h3 never falls back to --ink-dim (AA-compliant in both modes):\n%s", legendRule)
+	}
+
+	tokenStart := strings.Index(page, ":root {")
+	styleStart := strings.Index(page, "<style>")
+	if tokenStart == -1 || styleStart == -1 || tokenStart < styleStart {
+		t.Fatal("could not locate the token block's own leading comment")
+	}
+	comment := page[styleStart:tokenStart]
+	if !strings.Contains(comment, "MUTED-INK TEXT AA SCOPE") {
+		t.Error("the token block's leading comment never documents the muted-ink AA scope split (--ink-dim for required text, --ink-faint reserved for de-emphasized/inactive states)")
+	}
+}
+
 // TestWebUIPage_MarkVsSurfaceContrastTokensAreDistinctPerMode is a
 // lightweight sanity pin that the light and dark mark tokens are actually
 // DIFFERENT values (not an accidental duplicate/inversion bug) — the real
@@ -385,21 +437,70 @@ func TestWebUIPage_SettingsDialogIsANativeDialogWithFocusHandling(t *testing.T) 
 // TestWebUIPage_SettingsDialogReloadsFromStorageBeforeRenderingOnOpen pins a
 // cross-tab correctness requirement: `settings` in memory is only ever
 // mutated by THIS tab's own onSettingsChange, so the gear button's click
-// handler must re-read localStorage (via the non-throwing loadSettings())
-// immediately before reflecting it onto the form — otherwise a second tab
-// open on the same origin shows its own stale copy forever, and changing
-// just one radio there would silently overwrite whatever a DIFFERENT tab had
-// written to the other four settings keys in between.
+// handler must check localStorage for a GENUINE change immediately before
+// reflecting it onto the form — otherwise a second tab open on the same
+// origin shows its own stale copy forever, and changing just one radio there
+// would silently overwrite whatever a DIFFERENT tab had written to the other
+// four settings keys in between.
+//
+// [v0.3.0 review fix, round 3] This used to call the ALWAYS-succeeds
+// loadSettings() unconditionally, which cannot tell "storage is blocked"
+// from "nothing chosen yet" apart — both return the same all-defaults
+// object. With storage blocked, that discarded every choice made this
+// session (e.g. Light) the moment the panel was reopened, even though the
+// choice was still visibly in force on the page — see readStoredSettings'
+// own comment in webui.html for the full repro. The fix must (1) use
+// readStoredSettings(), which returns null rather than an all-defaults
+// object when nothing genuine was read, (2) only adopt its result — and only
+// re-push it onto the PAGE via applySettings() — inside a guard over that
+// result, and (3) never unconditionally reassign `settings` from storage.
 func TestWebUIPage_SettingsDialogReloadsFromStorageBeforeRenderingOnOpen(t *testing.T) {
 	page := string(webUIPage)
 	clickBlock := jsBracedBlockAfter(t, page, `settingsBtn.addEventListener("click", function () {`)
-	if !strings.Contains(clickBlock, "settings = loadSettings()") {
-		t.Errorf("the gear button's click handler never reloads settings from storage before opening the dialog, so a second tab would show a stale panel and could clobber another tab's changes on its next edit:\n%s", clickBlock)
+
+	if strings.Contains(clickBlock, "settings = loadSettings()") {
+		t.Errorf(`the click handler still unconditionally assigns settings = loadSettings() — on a browser with storage blocked, loadSettings() returns the same all-defaults object "nothing chosen yet" would also return, silently discarding every choice made this session the moment the panel reopens:\n%s`, clickBlock)
 	}
-	reload := strings.Index(clickBlock, "settings = loadSettings()")
-	render := strings.Index(clickBlock, "renderSettingsForm()")
-	if reload == -1 || render == -1 || reload > render {
-		t.Errorf("settings must be reloaded from storage BEFORE renderSettingsForm() reflects it onto the dialog's radios:\n%s", clickBlock)
+	if !strings.Contains(clickBlock, "readStoredSettings()") {
+		t.Fatalf("the gear button's click handler never calls readStoredSettings(), so it cannot tell a genuine cross-tab change from storage merely failing to read:\n%s", clickBlock)
+	}
+
+	ifBlock := jsBracedBlockAfter(t, clickBlock, "if (stored) {")
+	if !strings.Contains(ifBlock, "settings = stored") {
+		t.Errorf(`readStoredSettings()'s result is never adopted into settings inside its own "if (stored)" guard, so it either overwrites settings unconditionally (reintroducing the storage-blocked bug) or is never adopted at all:\n%s`, clickBlock)
+	}
+	if !strings.Contains(ifBlock, "applySettings(settings)") {
+		t.Errorf(`a genuine cross-tab settings change is adopted into the in-memory settings object but never re-applied to the PAGE via applySettings() — the dialog would show, say, "Light" while the page itself keeps rendering dark until some unrelated radio here happens to get clicked:\n%s`, ifBlock)
+	}
+
+	readAt := strings.Index(clickBlock, "readStoredSettings()")
+	renderAt := strings.Index(clickBlock, "renderSettingsForm()")
+	if readAt == -1 || renderAt == -1 || readAt > renderAt {
+		t.Errorf("settings must be checked against storage BEFORE renderSettingsForm() reflects it onto the dialog's radios:\n%s", clickBlock)
+	}
+}
+
+// TestWebUIPage_ApplySettingsBundlesEveryLoadTimeEffect pins the shared
+// helper the gear button's click handler (see the test above) uses to
+// re-push a genuinely cross-tab-changed settings object onto the PAGE, not
+// just the dialog's own radios — the same four effects the initial load
+// applies inline (kept inline there rather than routed through this
+// function, for the variable-declaration-ordering reason applySettings'
+// own comment in webui.html explains).
+func TestWebUIPage_ApplySettingsBundlesEveryLoadTimeEffect(t *testing.T) {
+	page := string(webUIPage)
+	body := jsBracedBlockAfter(t, page, "function applySettings(")
+	for _, want := range []string{
+		"applyTheme(",
+		"applyMotion(",
+		"VALID_POLL_MS.indexOf(",
+		"POLL_MS = ",
+		"VALID_PAGE_SIZES.indexOf(",
+		"DEFAULT_PAGE_SIZE = ",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("applySettings never contains %q — a genuine cross-tab settings change adopted by the gear button's click handler would not fully take effect on the page:\n%s", want, body)
+		}
 	}
 }
 
@@ -853,6 +954,15 @@ func TestWebUIPage_PollCadenceSettingWiredWithoutAffectingScanningTighten(t *tes
 // overrides still work per session" sentence as an actual mechanism: a
 // manual per-panel size click marks that pager touched, and a later
 // settings-driven default change only reaches an UNTOUCHED pager.
+//
+// [v0.3.0 review fix, round 3] Extended with the assertion that the reset
+// itself is gated on the default having ACTUALLY changed
+// (settings.pageSize !== previousPageSize), not merely on
+// VALID_PAGE_SIZES.indexOf(settings.pageSize) being valid — which is true
+// for every settings object the radios can ever produce, so on its own it
+// used to run (and reset any untouched pager to page 1) on EVERY settings
+// change, including Theme/Motion/Refresh-cadence changes that have nothing
+// to do with page size.
 func TestWebUIPage_PageSizeSettingFeedsPagerDefaultsButPerSectionOverridesPersist(t *testing.T) {
 	page := string(webUIPage)
 	if !strings.Contains(page, "DEFAULT_PAGE_SIZE = 25") {
@@ -876,6 +986,77 @@ func TestWebUIPage_PageSizeSettingFeedsPagerDefaultsButPerSectionOverridesPersis
 	sizeHandler := pageFunctionBody(t, "makeSizeClickHandler")
 	if !strings.Contains(sizeHandler, "pager.touched = true") {
 		t.Error("a manual per-section page-size click never marks that pager as touched, so a later settings change could still clobber it")
+	}
+
+	// The OLD value must be captured BEFORE `settings = next` overwrites it —
+	// otherwise there is nothing left to compare against to tell "the
+	// default actually changed" from "some other setting changed instead".
+	assignAt := strings.Index(body, "settings = next;")
+	if assignAt == -1 {
+		t.Fatal("onSettingsChange no longer assigns settings = next; — cannot locate where the prior pageSize must be captured")
+	}
+	before := body[:assignAt]
+	if !regexp.MustCompile(`\bprev\w*\s*=\s*settings\.pageSize\b`).MatchString(before) {
+		t.Errorf("onSettingsChange never captures the OLD settings.pageSize before overwriting `settings` — the page-size reset block cannot tell an actual default change from an unrelated settings change (e.g. Theme):\n%s", before)
+	}
+
+	// The DEFAULT_PAGE_SIZE assignment's own guard must compare against that
+	// captured previous value.
+	sizeAssignAt := strings.Index(body, "DEFAULT_PAGE_SIZE = settings.pageSize")
+	if sizeAssignAt == -1 {
+		t.Fatal("DEFAULT_PAGE_SIZE = settings.pageSize not found in onSettingsChange body")
+	}
+	ifAt := strings.LastIndex(body[:sizeAssignAt], "if (")
+	if ifAt == -1 {
+		t.Fatal("could not find the if-guard preceding the DEFAULT_PAGE_SIZE assignment")
+	}
+	closeParen := strings.Index(body[ifAt:], ") {")
+	if closeParen == -1 {
+		t.Fatal("could not find the end of the DEFAULT_PAGE_SIZE guard's condition")
+	}
+	cond := body[ifAt : ifAt+closeParen]
+	if !regexp.MustCompile(`\bprev\w*`).MatchString(cond) {
+		t.Errorf("the page-size block's guard never compares against a captured previous value, so it runs — and resets any untouched pager to page 1 — on EVERY settings change, not only when the page-size default actually changed:\n%s", cond)
+	}
+}
+
+// TestWebUIPage_TimestampsSettingChangeTriggersFullRepaint pins that
+// onSettingsChange actually repaints the page when the Timestamps setting
+// changes, the way it already does for theme, motion and (as of the fix
+// above) page size. [v0.3.0 review fix, round 3] fmtTimestamp is read LIVE
+// by six separate call sites (last-swept, each shelf card's "as of", both
+// renderStaleBanner branches, the reverse panel's staleness notice, and
+// showDisconnected's "showing data from") that onSettingsChange otherwise
+// never touches, so a relative<->absolute change used to sit invisible on
+// screen until the next successful poll — up to the operator's own cadence
+// setting later, or never while the backend stayed unreachable.
+func TestWebUIPage_TimestampsSettingChangeTriggersFullRepaint(t *testing.T) {
+	body := pageFunctionBody(t, "onSettingsChange")
+
+	assignAt := strings.Index(body, "settings = next;")
+	if assignAt == -1 {
+		t.Fatal("onSettingsChange no longer assigns settings = next; — cannot locate where the prior timestamps setting must be captured")
+	}
+	before := body[:assignAt]
+	if !regexp.MustCompile(`\bprev\w*\s*=\s*settings\.timestamps\b`).MatchString(before) {
+		t.Errorf("onSettingsChange never captures the OLD settings.timestamps before overwriting `settings` — a repaint triggered on every settings change (not just a timestamps change) would cost an extra network round-trip for nothing:\n%s", before)
+	}
+
+	refreshAt := strings.Index(body, "refresh();")
+	if refreshAt == -1 {
+		t.Fatalf("onSettingsChange never calls refresh() — a Timestamps change would not repaint last-swept, the shelf cards' \"as of\", the warm-start banner, or the disconnected badge's \"showing data from\" until the next poll on its own schedule:\n%s", body)
+	}
+	ifAt := strings.LastIndex(body[:refreshAt], "if (")
+	if ifAt == -1 {
+		t.Fatalf("refresh() in onSettingsChange is not guarded by an if — it would run on EVERY settings change, not only a timestamps change:\n%s", body)
+	}
+	closeParen := strings.Index(body[ifAt:], ") {")
+	if closeParen == -1 {
+		t.Fatal("could not find the end of the refresh() guard's condition")
+	}
+	cond := body[ifAt : ifAt+closeParen]
+	if !strings.Contains(cond, "timestamps") || !regexp.MustCompile(`\bprev\w*`).MatchString(cond) {
+		t.Errorf("the refresh() guard never compares settings.timestamps against a captured previous value:\n%s", cond)
 	}
 }
 

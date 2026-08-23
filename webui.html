@@ -74,7 +74,20 @@
          segments of the SAME mark (one bar, one chip, one bordered group) —
          sharing a PAGE is fine (the dry-run badge is amber, the UNREACHABLE
          badge is clay, and they never touch), sharing a segment boundary is
-         not. */
+         not.
+
+     MUTED-INK TEXT AA SCOPE [v0.3.0 review fix, round 3]: --ink-dim clears
+     WCAG AA (4.5:1 normal text) against both --panel and --bg, in both
+     modes. --ink-faint does not (about 3.0:1 light, about 2.9:1 dark) and is
+     reserved for de-emphasized, non-primary text where WCAG's inactive-UI
+     allowance applies — a struck-through completed action row, an "off"
+     status notice, a disabled label — never for text a reader needs in
+     order to use the page. table.findings td.path (a finding's own path —
+     the findings tables' real payload), .switch-why (the write-safety
+     switches' own required explanation) and .settings-group legend/h3 (each
+     settings group's own label) all use --ink-dim for exactly that reason;
+     every other --ink-faint use on this page predates this scope note and
+     is a genuinely de-emphasized/inactive state. */
   :root {
     --bg: #0F1517;
     --panel: #1A2427;
@@ -347,7 +360,11 @@
     font-size: 11px;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: var(--ink-faint);
+    /* [v0.3.0 review fix, round 3] --ink-dim, not --ink-faint: this label is
+       read to use the panel (it names every settings group), not a
+       de-emphasized/inactive state — see the token block's own "MUTED-INK
+       TEXT AA SCOPE" note. */
+    color: var(--ink-dim);
     padding: 0;
     margin: 0 0 8px;
   }
@@ -375,7 +392,12 @@
   .switches-list li:last-child { border-bottom: none; }
   .switch-name { color: var(--ink); margin-right: 8px; }
   .switch-state { color: var(--ink-dim); }
-  .switch-why { margin: 4px 0 0; color: var(--ink-faint); font-size: 11px; }
+  /* [v0.3.0 review fix, round 3] --ink-dim, not --ink-faint: this is the
+     write-safety switches' own required explanation (brief item 2's "one
+     sentence each stating they are config-file-only and why"), not a
+     de-emphasized state — see the token block's own "MUTED-INK TEXT AA
+     SCOPE" note. */
+  .switch-why { margin: 4px 0 0; color: var(--ink-dim); font-size: 11px; }
 
   #settingsCloseBtn {
     margin-top: 18px;
@@ -770,7 +792,12 @@
      line-breaking — and only breaks mid-word as a last resort, for a
      single segment that is still too long on its own (never per-letter). */
   table.findings td.path {
-    color: var(--ink-faint);
+    /* [v0.3.0 review fix, round 3] --ink-dim, not --ink-faint: a finding's
+       path is the row's own actual payload, not a de-emphasized state — see
+       the token block's own "MUTED-INK TEXT AA SCOPE" note. Matches the
+       general `table.findings td` rule above; named explicitly rather than
+       simply dropped so this stays deliberate if that rule ever changes. */
+    color: var(--ink-dim);
     min-width: 220px;
     word-break: normal;
     overflow-wrap: break-word;
@@ -1248,24 +1275,55 @@
   var VALID_POLL_MS = [10000, 30000, 60000];
   var VALID_PAGE_SIZES = [10, 25, 50, "all"];
 
-  // loadSettings never THROWS and never returns a partial object: a reader
-  // whose browser blocks storage, or whose stored JSON predates a field this
-  // version added, still gets every key DEFAULT_SETTINGS defines.
-  function loadSettings() {
-    var out = {};
-    var k;
-    for (k in DEFAULT_SETTINGS) out[k] = DEFAULT_SETTINGS[k];
+  // readStoredSettings returns the settings object actually found in
+  // localStorage — merged onto DEFAULT_SETTINGS the same way loadSettings
+  // (below) does — or null when nothing GENUINE was read: storage
+  // blocked/threw, the key was never written, or its value did not parse to
+  // a JSON object. [v0.3.0 review fix, round 3] This is the piece
+  // loadSettings itself cannot provide: loadSettings folds "storage is
+  // blocked" and "nothing chosen yet" into the same all-defaults return,
+  // which is exactly right for the ONE caller that needs a settings object
+  // no matter what (the initial page load — System/relative/etc. is a
+  // perfectly good answer to "nothing is stored yet"). It is exactly WRONG
+  // for the settings dialog's own gear-button click handler below, which
+  // must be able to tell those two cases apart: on a browser with storage
+  // blocked, adopting loadSettings()'s all-defaults return there silently
+  // discarded every choice made this session the moment the panel was
+  // reopened, even though the choice was still visibly in force on the page
+  // (pick Light with storage blocked, reopen the panel: Theme snapped back
+  // to "System" while <html> stayed data-theme="light", and the next
+  // unrelated radio click then read "system" off the form and reverted the
+  // page for real). readStoredSettings is the one that can answer honestly.
+  function readStoredSettings() {
     try {
       var raw = localStorage.getItem(SETTINGS_KEY);
-      if (raw) {
-        var parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === "object") {
-          for (k in DEFAULT_SETTINGS) {
-            if (Object.prototype.hasOwnProperty.call(parsed, k)) out[k] = parsed[k];
-          }
-        }
+      if (!raw) return null;
+      var parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") return null;
+      var out = {};
+      var k;
+      for (k in DEFAULT_SETTINGS) out[k] = DEFAULT_SETTINGS[k];
+      for (k in DEFAULT_SETTINGS) {
+        if (Object.prototype.hasOwnProperty.call(parsed, k)) out[k] = parsed[k];
       }
-    } catch (e) { /* storage blocked or corrupt: the defaults above stand */ }
+      return out;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // loadSettings never THROWS and never returns a partial object: a reader
+  // whose browser blocks storage, or whose stored JSON predates a field this
+  // version added, still gets every key DEFAULT_SETTINGS defines. Delegates
+  // the actual read to readStoredSettings; "nothing was there" and "storage
+  // is blocked" both fall back to the same defaults here, which is correct
+  // for every caller EXCEPT the settings dialog's reopen handler (see
+  // readStoredSettings' own comment — it calls readStoredSettings directly).
+  function loadSettings() {
+    var stored = readStoredSettings();
+    if (stored) return stored;
+    var out = {};
+    for (var k in DEFAULT_SETTINGS) out[k] = DEFAULT_SETTINGS[k];
     return out;
   }
 
@@ -1316,6 +1374,33 @@
     } else {
       document.documentElement.removeAttribute("data-motion");
     }
+  }
+
+  // applySettings pushes ALL FOUR load-time effects of a settings object onto
+  // the page at once: applyTheme/applyMotion (the two DOM attributes) and the
+  // two guarded module-level defaults, POLL_MS and DEFAULT_PAGE_SIZE, this
+  // file reads elsewhere. [v0.3.0 review fix, round 3] Exists so the gear
+  // button's click handler (below) can re-push a genuinely cross-tab-changed
+  // settings object onto the PAGE, not just the dialog's own radios — without
+  // this, a real change from another tab sat invisible on screen (the dialog
+  // showing "Light" over a still-dark page) until some unrelated radio here
+  // happened to get clicked. The initial load just below does NOT call this:
+  // POLL_MS and DEFAULT_PAGE_SIZE do not have their real default values yet
+  // at this point in the script — their own `var POLL_MS = 30000;`/
+  // `var DEFAULT_PAGE_SIZE = 25;` lines run LATER, each immediately followed
+  // by its own guarded settings-driven assignment (see each one's "order
+  // matters" comment) — so calling applySettings here would have its
+  // POLL_MS/DEFAULT_PAGE_SIZE assignments promptly clobbered back to 30000/25
+  // by those later `var` initializers. applyTheme/applyMotion apply inline
+  // at load instead, which is safe because they don't share that ordering
+  // dependency. By the time anything LATER in this script can call
+  // applySettings — including the click handler below — every one of those
+  // `var` initializers has already run, so no such hazard applies there.
+  function applySettings(s) {
+    applyTheme(s.theme);
+    applyMotion(s.motion);
+    if (VALID_POLL_MS.indexOf(s.pollMs) !== -1) POLL_MS = s.pollMs;
+    if (VALID_PAGE_SIZES.indexOf(s.pageSize) !== -1) DEFAULT_PAGE_SIZE = s.pageSize;
   }
 
   var settings = loadSettings();
@@ -3153,19 +3238,21 @@
 
   // renderSettingsForm reflects the CURRENT settings object onto the dialog's
   // own radios. It is called once at load and again every time the gear
-  // button opens the dialog; the click handler below re-reads settings from
-  // localStorage (loadSettings()) immediately before calling this, so a
-  // control changed from another tab in the meantime is picked up as of the
-  // moment THIS dialog opens. That is not live cross-tab sync, though: there
-  // is no `storage` event listener, so a change made in another tab WHILE
-  // this dialog is already open, or before it is ever opened this load, is
-  // not reflected on screen — only the next open (or a reload) will show it.
-  // Because onSettingsChange re-reads every radio group and writes the whole
-  // object back as one blob, the re-read-on-open above also closes the
-  // window where an untouched setting from another tab could otherwise be
-  // silently overwritten: without it, changing just one radio here would
-  // resave all five keys from whatever this tab last loaded, discarding any
-  // change another tab made to the other four in between.
+  // button opens the dialog; the click handler below checks localStorage for
+  // a GENUINE change (readStoredSettings(), not loadSettings() — see that
+  // function's own comment) immediately before calling this, so a control
+  // changed from another tab in the meantime is picked up — and re-applied to
+  // the page itself, not just this form — as of the moment THIS dialog opens.
+  // That is not live cross-tab sync, though: there is no `storage` event
+  // listener, so a change made in another tab WHILE this dialog is already
+  // open, or before it is ever opened this load, is not reflected on screen —
+  // only the next open (or a reload) will show it. Because onSettingsChange
+  // re-reads every radio group and writes the whole object back as one blob,
+  // the re-check-on-open above also closes the window where an untouched
+  // setting from another tab could otherwise be silently overwritten: without
+  // it, changing just one radio here would resave all five keys from whatever
+  // this tab last loaded, discarding any change another tab made to the other
+  // four in between.
   function renderSettingsForm() {
     setRadioValue("settingTheme", settings.theme);
     setRadioValue("settingPollMs", settings.pollMs);
@@ -3182,8 +3269,23 @@
   // and is then applied to whichever of reversePager/filePager the operator
   // has NOT already resized this session (pager.touched) — a per-section
   // override, once made, keeps winning even after the global default
-  // changes again.
+  // changes again — but ONLY when the default itself actually changed (see
+  // previousPageSize below). timestamps forces a full repaint via refresh()
+  // when it actually changed, since fmtTimestamp is read live by six
+  // separate call sites this function does not otherwise touch.
   function onSettingsChange() {
+    // [v0.3.0 review fix, round 3] Captured BEFORE `settings = next` below
+    // overwrites them — the only way the two guarded blocks further down can
+    // tell "this particular setting actually changed" from "some OTHER radio
+    // (Theme, Motion, Refresh cadence) changed while this one stayed the
+    // same". Without this, e.g. the page-size block's own guard
+    // (`VALID_PAGE_SIZES.indexOf(settings.pageSize) !== -1`) is true for
+    // EVERY settings object the radios can ever produce, so it used to run —
+    // and silently reset any untouched pager to page 1 — on every single
+    // settings change, not only a page-size-default change.
+    var previousPageSize = settings.pageSize;
+    var previousTimestamps = settings.timestamps;
+
     var next = {
       theme: radioValue("settingTheme") || settings.theme,
       pollMs: parseInt(radioValue("settingPollMs"), 10) || settings.pollMs,
@@ -3222,26 +3324,67 @@
       schedulePoll();
     }
 
-    if (VALID_PAGE_SIZES.indexOf(settings.pageSize) !== -1) {
+    // [v0.3.0 review fix, round 3] Gated on settings.pageSize !==
+    // previousPageSize now, not merely on settings.pageSize being valid — a
+    // valid pageSize is true of every settings object the radios can ever
+    // produce, so the OLD guard ran on every settings change and
+    // unconditionally set `page = 1` on any pager the operator had not
+    // manually resized. An operator reading page 6 of the file-clutter panel
+    // who then opened Settings and picked Light (nothing to do with page
+    // size) was silently bounced back to page 1 with no message — the exact
+    // yank resetPagerIfCountChanged (above) exists to prevent, reintroduced
+    // through a different door.
+    if (settings.pageSize !== previousPageSize && VALID_PAGE_SIZES.indexOf(settings.pageSize) !== -1) {
       DEFAULT_PAGE_SIZE = settings.pageSize;
       if (!reversePager.touched) { reversePager.size = DEFAULT_PAGE_SIZE; reversePager.page = 1; }
       if (!filePager.touched) { filePager.size = DEFAULT_PAGE_SIZE; filePager.page = 1; }
       renderReverse(lastInstances);
       renderFileReport(lastInstances);
     }
+
+    // [v0.3.0 review fix, round 3] Timestamps is the one setting nothing
+    // above re-renders for: fmtTimestamp is read LIVE by six call sites
+    // (render's "last swept", updateShelfCard's per-card "as of", both
+    // renderStaleBanner branches, renderReverse's staleness notice, and
+    // showDisconnected's "showing data from"), and without an explicit
+    // repaint here a relative↔absolute change only took visible effect on
+    // the NEXT successful poll — up to the operator's OWN cadence setting
+    // later, or never while the backend stays unreachable. refresh() is the
+    // simplest full repaint: it re-fetches and re-runs render() (or
+    // showDisconnected() if the fetch itself fails, which still calls
+    // fmtTimestamp with the now-current setting), touching every one of
+    // those six sites at once — gated so an unrelated settings change never
+    // costs an extra network round-trip.
+    if (settings.timestamps !== previousTimestamps) {
+      refresh();
+    }
   }
 
   if (settingsBtn && settingsDialog) {
     settingsBtn.addEventListener("click", function () {
-      // [v0.3.0 review fix] Re-read from localStorage before reflecting onto
-      // the form: `settings` in memory is only ever written by THIS tab's own
-      // onSettingsChange, so without this line a second tab open on the same
-      // origin would show its own stale copy of the panel forever, and its
-      // next radio change would silently overwrite whatever a different tab
-      // had written to the other four keys in between. loadSettings() never
-      // throws and always returns every key, so this is safe even if storage
-      // is blocked.
-      settings = loadSettings();
+      // [v0.3.0 review fix, round 3] readStoredSettings() — NOT
+      // loadSettings() — decides whether to adopt a fresh read: `settings`
+      // in memory is only ever written by THIS tab's own onSettingsChange,
+      // so a second tab (or a storage write this page never gets a `storage`
+      // event for) could have changed any of the five keys since this tab
+      // last read them, and that genuine change must be picked up here. But
+      // loadSettings() ALWAYS succeeds — on a browser with storage blocked it
+      // quietly returns the same all-defaults object "nothing chosen yet"
+      // would also return — so calling it unconditionally here used to
+      // discard every choice made this session the moment the panel was
+      // reopened, even though the choice was still visibly in force on the
+      // page (see readStoredSettings' own comment for the full repro).
+      // readStoredSettings returns null in exactly that case, so only a
+      // GENUINE read is ever adopted; when it is, applySettings() pushes it
+      // onto the PAGE too, not just this dialog's own radios below —
+      // otherwise a real cross-tab change would sit invisible on screen (the
+      // dialog showing e.g. "Light" over a page still rendering dark) until
+      // some unrelated radio here happened to get clicked.
+      var stored = readStoredSettings();
+      if (stored) {
+        settings = stored;
+        applySettings(settings);
+      }
       renderSettingsForm();
       settingsDialog.showModal();
     });
