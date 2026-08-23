@@ -438,3 +438,165 @@ func TestDaemon_ScanProgress_IsVisibleWhileACycleRunsAndGoneWhenItEnds(t *testin
 		t.Errorf("instances = %+v, want the completed cycle's data", after.Instances)
 	}
 }
+
+// --- the page ---------------------------------------------------------------
+
+// pageFunctionBody returns the source of one top-level function in the embedded
+// page's script, from its `function name(` to the next top-level `\n  function
+// `, so a test can assert what a PARTICULAR function does rather than what the
+// 2000-line page mentions somewhere.
+func pageFunctionBody(t *testing.T, name string) string {
+	t.Helper()
+	page := string(webUIPage)
+	start := strings.Index(page, "function "+name+"(")
+	if start == -1 {
+		t.Fatalf("the page has no %s function", name)
+	}
+	rest := page[start+1:]
+	// The nearest following top-level boundary, so a function that happens to
+	// be the LAST one in the script is bounded by the bootstrap lines rather
+	// than by the whole rest of the file — a body that ran to the end of the
+	// page would make every substring assertion below meaningless.
+	end := -1
+	for _, boundary := range []string{"\n  function ", "\n  document.addEventListener(", "\n  scanBtn.addEventListener(", "\n  refresh().then("} {
+		if at := strings.Index(rest, boundary); at != -1 && (end == -1 || at < end) {
+			end = at
+		}
+	}
+	if end == -1 {
+		t.Fatalf("could not find the end of %s (no following top-level statement)", name)
+	}
+	return rest[:end]
+}
+
+// TestWebUIPage_ScanStripRendersEveryInstancesStageAndProgress pins the strip
+// itself: one row per instance the scan surface names, its stage in the page's
+// own 11px letter-spaced label style, and a bar driven by done/total.
+func TestWebUIPage_ScanStripRendersEveryInstancesStageAndProgress(t *testing.T) {
+	page := string(webUIPage)
+	for _, want := range []string{"scanStrip", "scan-strip", "scan-strip-stage", "scan-strip-bar", "scan-strip-fill"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the page is missing %q: the live progress strip needs its own element and class names to be styleable and testable", want)
+		}
+	}
+
+	body := pageFunctionBody(t, "renderScanStrip")
+	for _, want := range []string{"inProgress", "data.scan", "stage", "done", "total"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("renderScanStrip never reads %q from the scan surface:\n%s", want, body)
+		}
+	}
+	// A determinate bar when there is something to count, an indeterminate
+	// pulse when there is not: "0 of 0" and "0 of 996" are different statements
+	// and must not render alike.
+	if !strings.Contains(body, "total > 0") {
+		t.Error("renderScanStrip does not distinguish a countable stage from one with no total; an indeterminate stage must pulse rather than show a 0% bar")
+	}
+	if !strings.Contains(body, "scan-strip-indeterminate") {
+		t.Error("renderScanStrip never applies the indeterminate class for a stage with no total")
+	}
+}
+
+// TestWebUIPage_ScanStripLivesOutsideTheShelvesSoDataIsNeverBlanked is the
+// binding "scanning must never blank the page" rule, pinned structurally. The
+// strip is a SIBLING of #instances, never a child: renderInstances clears
+// #instances outright on its empty-state path, and a strip living inside it
+// would be destroyed by the very poll that is meant to be showing progress.
+func TestWebUIPage_ScanStripLivesOutsideTheShelvesSoDataIsNeverBlanked(t *testing.T) {
+	page := string(webUIPage)
+	stripAt := strings.Index(page, `id="scanStrip"`)
+	mainOpen := strings.Index(page, `<main id="instances"`)
+	mainClose := strings.Index(page, "</main>")
+	if stripAt == -1 || mainOpen == -1 || mainClose == -1 {
+		t.Fatal("the page is missing either the scan strip or the instances main element")
+	}
+	if stripAt > mainOpen && stripAt < mainClose {
+		t.Error("the scan strip is inside <main id=\"instances\">, which renderInstances clears wholesale on its empty-state path — the strip must be a sibling so a running scan can never blank what is on screen")
+	}
+	if stripAt > mainOpen {
+		t.Error("the scan strip renders below the shelves; the brief places the live progress strip above them")
+	}
+
+	// render() must not stop rendering data because a scan is running: the
+	// three renderers are called unconditionally.
+	body := pageFunctionBody(t, "render")
+	for _, call := range []string{"renderInstances(instances)", "renderReverse(instances)", "renderFileReport(instances)", "renderScanStrip(data)"} {
+		if !strings.Contains(body, call) {
+			t.Errorf("render() no longer calls %s; the existing data must stay fully visible beneath a running scan:\n%s", call, body)
+		}
+	}
+}
+
+// TestWebUIPage_PollTightensWhileScanningAndReturnsAfterwards is the poll
+// contract: 2s while a scan is running, 30s when it is not, and the
+// document.hidden pause preserved through both.
+func TestWebUIPage_PollTightensWhileScanningAndReturnsAfterwards(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, "POLL_MS = 30000") {
+		t.Error("the idle poll interval is no longer pinned at 30s")
+	}
+	if !strings.Contains(page, "POLL_SCANNING_MS = 2000") {
+		t.Error("the page does not define a 2s poll interval for while a scan is in progress")
+	}
+
+	body := pageFunctionBody(t, "schedulePoll")
+	if !strings.Contains(body, "document.hidden") {
+		t.Errorf("schedulePoll no longer pauses on document.hidden:\n%s", body)
+	}
+	if !strings.Contains(body, "POLL_SCANNING_MS") || !strings.Contains(body, "POLL_MS") {
+		t.Errorf("schedulePoll does not choose between the two intervals:\n%s", body)
+	}
+	if !strings.Contains(body, "scanInProgress") {
+		t.Errorf("schedulePoll does not consult the last snapshot's scan state to pick its interval:\n%s", body)
+	}
+}
+
+// TestWebUIPage_ScanNowButtonReflectsTheScanSurfaceNotJustItsOwnPost is the
+// user-visible half of the same fact: the button used to guess its state from
+// the POST response alone, so a sweep started by the TIMER (or by another tab)
+// left it reading "Scan now" while a scan was plainly running.
+func TestWebUIPage_ScanNowButtonReflectsTheScanSurfaceNotJustItsOwnPost(t *testing.T) {
+	body := pageFunctionBody(t, "renderScanButton")
+	if !strings.Contains(body, "scanInProgress") {
+		t.Errorf("renderScanButton does not read the scan surface:\n%s", body)
+	}
+	if !strings.Contains(body, "scanBtn.disabled") {
+		t.Errorf("renderScanButton never sets the button's disabled state:\n%s", body)
+	}
+	if !strings.Contains(body, "Scan now") {
+		t.Errorf("renderScanButton never restores the idle label:\n%s", body)
+	}
+
+	// And the refresh path must route through it rather than resetting the
+	// button behind its back — the bug being fixed.
+	refresh := pageFunctionBody(t, "refresh")
+	if !strings.Contains(refresh, "renderScanButton()") {
+		t.Errorf("refresh() no longer routes the button's state through renderScanButton, so a timer-started sweep would leave it reading \"Scan now\":\n%s", refresh)
+	}
+}
+
+// TestWebUIPage_ScanStripPulseIsDisabledUnderReducedMotion is the motion rule
+// this feature owes. The existing reduced-motion test
+// (TestWebUIPage_ReducedMotionDisablesEveryAnimatedProperty) covers every
+// `transition:`; a keyframe ANIMATION is a second kind of motion it cannot see,
+// and the indeterminate pulse is exactly that.
+func TestWebUIPage_ScanStripPulseIsDisabledUnderReducedMotion(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, "@keyframes") {
+		t.Fatal("the page defines no keyframes; the indeterminate strip has no pulse to disable")
+	}
+	start := strings.Index(page, "@media (prefers-reduced-motion: reduce)")
+	if start == -1 {
+		t.Fatal("the page has no prefers-reduced-motion block")
+	}
+	block := page[start:]
+	if end := strings.Index(block, "\n  }"); end != -1 {
+		block = block[:end]
+	}
+	if !strings.Contains(block, "animation: none") {
+		t.Errorf("the prefers-reduced-motion block never disables an animation, so the indeterminate pulse keeps running for a reader who asked for no motion:\n%s", block)
+	}
+	if !strings.Contains(block, "scan-strip-indeterminate") {
+		t.Errorf("the prefers-reduced-motion block does not name the indeterminate strip's own selector:\n%s", block)
+	}
+}

@@ -267,7 +267,13 @@
        shelf bar/marker — round-3 review fix; this selector list is the
        ENTIRE set of animated properties in this page, and must stay that
        way as the single place motion is turned off. */
-    .shelf-rest, .shelf-marker, details.panel summary::before { transition: none; }
+    .shelf-rest, .shelf-marker, details.panel summary::before, .scan-strip-fill { transition: none; }
+    /* [v0.2.0] The live scan strip's indeterminate pulse is a KEYFRAME
+       animation rather than a transition — a second kind of motion, which
+       the rule above cannot reach. Stopped here, and parked at full width:
+       a quiet full bar still reads as "working, with no count to give",
+       which is exactly what an indeterminate stage means. */
+    .scan-strip-indeterminate .scan-strip-fill { animation: none; width: 100%; }
   }
 
   .shelf-sub {
@@ -288,6 +294,134 @@
       transform: none;
       margin-bottom: 8px;
     }
+  }
+
+  /* --- [v0.2.0] the warm-start banner ------------------------------------
+     Amber (HUNT), because that is this page's "something needs your
+     attention" token and cached numbers are exactly that: real, useful, and
+     not yet confirmed by this process. Not clay (ALERT) — nothing is wrong,
+     and a dashboard that cried alarm on every restart would teach an
+     operator to ignore the colour that means a finding. It is a full-width
+     bar above the shelves rather than a badge in the header because it
+     qualifies EVERY number below it, not one of them. */
+  .stale-banner {
+    margin: 0 0 20px;
+    padding: 12px 16px;
+    border: 1px solid rgb(217 160 91 / 40%);
+    border-left: 3px solid var(--hunt);
+    border-radius: 8px;
+    background: var(--hunt-dim);
+    color: var(--hunt);
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
+  /* The per-card twin of the banner: which numbers on THIS shelf are the
+     cached ones. The two are not redundant — the first fresh cycle clears
+     instances one at a time as it reaches them, so a page can legitimately
+     be half warm and half live. Same mono/uppercase/letter-spaced treatment
+     as .shelf-type beside it, in the banner's own amber. */
+  .shelf-stale {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    color: var(--hunt);
+    white-space: nowrap;
+  }
+
+  /* --- [v0.2.0] the live scan strip --------------------------------------
+     One row per instance the running cycle has reached: its name, the
+     coarse stage it is in, a count when there is something to count, and a
+     slim amber bar. It sits above the shelves and REPLACES nothing — the
+     numbers underneath stay exactly where they were, which is the whole
+     point of the warm start it usually appears beside. */
+  .scan-strip {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-bottom: 24px;
+    padding: 14px 18px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+
+  .scan-strip-head {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+  }
+
+  .scan-strip-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+  }
+
+  .scan-strip-name {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink);
+  }
+
+  /* The stage label, in the page's own 11px letter-spaced small-caps
+     treatment (.shelf-type, table headers, .pager-position all share it) —
+     the established way this design says "a label, not a value". */
+  .scan-strip-stage {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--hunt);
+    white-space: nowrap;
+  }
+
+  .scan-strip-count {
+    margin-left: auto;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--ink-faint);
+    white-space: nowrap;
+  }
+
+  /* flex-basis 100% puts the bar on its own line under the labels at every
+     width, so a long instance name can never squeeze it to nothing. */
+  .scan-strip-bar {
+    flex: 1 1 100%;
+    position: relative;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--hunt-dim);
+    overflow: hidden;
+  }
+
+  .scan-strip-fill {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 0%;
+    background: var(--hunt);
+    transition: width 0.3s ease-out;
+  }
+
+  /* A stage with no countable total (a connectivity check, a wanted-set
+     fetch, a file walk whose size is what it is finding out) pulses instead
+     of showing a 0% bar: "0 of 0" and "0 of 996" are different statements
+     and must not look alike. Disabled under prefers-reduced-motion, above. */
+  .scan-strip-indeterminate .scan-strip-fill {
+    width: 35%;
+    animation: scan-strip-sweep 1.4s ease-in-out infinite;
+  }
+
+  @keyframes scan-strip-sweep {
+    0% { left: -35%; }
+    100% { left: 100%; }
   }
 
   /* --- reverse-scan / file-clutter panels -------------------------------- */
@@ -673,6 +807,16 @@
     </div>
   </header>
 
+  <!-- [v0.2.0] The warm-start banner and the live scan strip, both OUTSIDE
+       <main> and above it. Outside is load-bearing, not stylistic:
+       renderInstances clears #instances wholesale on its empty-state path,
+       and a strip living inside would be destroyed by the very poll that is
+       meant to be showing progress. Both start hidden and are shown only by
+       the snapshot that justifies them. -->
+  <p id="staleBanner" class="stale-banner" hidden></p>
+
+  <div id="scanStrip" class="scan-strip" hidden></div>
+
   <!-- signature element: the cutoff shelf. One horizontal shelf bar per
        instance — sage (rest) meets amber (hunt) at a 2px vertical marker
        carrying the "N / total at rest" count above it. -->
@@ -702,8 +846,27 @@
   "use strict";
 
   var POLL_MS = 30000;
+  // [v0.2.0] While a scan is actually running the page polls fifteen times
+  // faster, because that is the only window in which anything on it changes
+  // second to second (the progress strip's stages and counters). It returns to
+  // POLL_MS the moment the cycle ends, so an idle dashboard left open all day
+  // costs exactly what it always did — and document.hidden still pauses both.
+  var POLL_SCANNING_MS = 2000;
+  // How long after a manual scan request this page keeps polling fast while
+  // waiting for the daemon's loop to pick the request up. Bounded, and cleared
+  // the moment a snapshot shows a cycle actually running, so a request the
+  // daemon somehow never honors cannot leave this tab polling fast forever.
+  var SCAN_QUEUED_GRACE_MS = 30000;
   var scanBtn = document.getElementById("scanBtn");
   var pollHandle = null;
+  // scanInProgress mirrors the last snapshot's scan.inProgress: the SERVER's
+  // statement about whether a cycle is running, which is what the Scan-now
+  // button and the poll interval both key on. It was previously guessed from
+  // this tab's own POST response, so a sweep started by the timer — or by
+  // another tab — left the button reading "Scan now" while one was plainly
+  // running.
+  var scanInProgress = false;
+  var scanRequestedAt = 0;
 
   // PAGE_SIZES is the reverse-scan / file-clutter panels' shared page-size
   // menu, in display order; "all" is the one non-numeric size and turns
@@ -772,8 +935,15 @@
     // must never be silently indistinguishable from a healthy card.
     var unreachable = el("span", "badge badge-alert shelf-unreachable");
     unreachable.hidden = true;
+    // [v0.2.0] stale is the per-card half of the warm-start banner: these
+    // numbers came out of the on-disk cache, not from a cycle this process
+    // ran. Built once and hidden, like unreachable above, and shown only by
+    // the snapshot that says so.
+    var stale = el("span", "shelf-stale");
+    stale.hidden = true;
     head.appendChild(name);
     head.appendChild(kind);
+    head.appendChild(stale);
     head.appendChild(unreachable);
     card.appendChild(head);
 
@@ -796,7 +966,7 @@
 
     card.appendChild(barWrap);
 
-    card._els = { name: name, kind: kind, count: count, countNum: countNum, rest: rest, marker: marker, unreachable: unreachable, sub: null, barWrap: barWrap };
+    card._els = { name: name, kind: kind, count: count, countNum: countNum, rest: rest, marker: marker, unreachable: unreachable, stale: stale, sub: null, barWrap: barWrap };
     return card;
   }
 
@@ -865,6 +1035,22 @@
     // already the card's own .shelf-name) so the reason itself has more
     // room before wrapping (see .shelf-unreachable's white-space: normal /
     // .shelf-head's flex-wrap: wrap).
+    // [v0.2.0] The warm-start marker, and note what it does NOT touch: the
+    // count, the fill and the marker above are set unconditionally, from the
+    // cached numbers, exactly as they would be from live ones. Blanking a
+    // stale card would throw away the very data the warm start exists to put
+    // on screen; saying "as of <when>" beside it costs nothing and is the
+    // whole difference between showing a cache and pretending it is fresh.
+    // The convention is ReverseAsOf's own ("showing last complete sweep from
+    // <time>", the reverse panel): the age of the numbers, never of the
+    // attempt to refresh them.
+    if (inst.stale) {
+      text(els.stale, "as of " + fmtRelative(inst.asOf));
+      els.stale.hidden = false;
+    } else {
+      els.stale.hidden = true;
+    }
+
     var status = inst.lastCycleStatus;
     if (status && status.status === "skipped") {
       var msg = "last sweep incomplete";
@@ -1999,6 +2185,122 @@
     body.appendChild(buildPagerControls(filePager, page, function () { renderFileReport(lastInstances); }));
   }
 
+  // renderStaleBanner is the warm start's own voice. Instances whose numbers
+  // came out of the on-disk cache (statecache.go) carry stale: true and an
+  // asOf; while any of them do, the page says so above every number it is
+  // showing, and names the sweep's age in the same relative words every other
+  // timestamp on this page uses. It hides itself the moment the running cycle
+  // has refreshed every card, which is the honest end of the condition rather
+  // than a timer.
+  function renderStaleBanner(instances) {
+    var banner = document.getElementById("staleBanner");
+    var stale = 0;
+    var newest = null;
+    for (var i = 0; i < instances.length; i++) {
+      if (!instances[i].stale) continue;
+      stale++;
+      var at = instances[i].asOf;
+      if (at && (!newest || new Date(at) > new Date(newest))) newest = at;
+    }
+    if (stale === 0) {
+      banner.hidden = true;
+      text(banner, "");
+      return;
+    }
+    text(banner, "showing last sweep from " + fmtRelative(newest) +
+      " — refreshing now. These numbers were restored from cutoffarr's own cache when it started; each shelf updates as the running scan reaches it.");
+    banner.hidden = false;
+  }
+
+  // scanKindLabel names the running cycle in the API's own four-value
+  // vocabulary, so the strip can say WHICH scan is running rather than a
+  // generic "scanning". A kind this page does not know is rendered as a plain
+  // "Scan" rather than as the raw token.
+  function scanKindLabel(kind) {
+    if (kind === "startup") return "Startup scan";
+    if (kind === "webhook") return "Webhook scan";
+    if (kind === "sweep") return "Sweep";
+    return "Scan";
+  }
+
+  // renderScanStrip draws the live progress strip: one row per instance the
+  // running cycle has reached, its coarse stage, and a bar.
+  //
+  // It renders from data.scan ALONE and never from the data fields, which is
+  // what keeps a running cycle's partial work off the shelves: the server
+  // publishes progress into a surface of its own and no finding reaches
+  // `instances` until the cycle completes.
+  //
+  // Order follows the data's own (config) order where an instance is already
+  // on screen, then anything the scan names that is not — which is the cold
+  // start with no cache, where the strip is the only thing on the page.
+  function renderScanStrip(data) {
+    var strip = document.getElementById("scanStrip");
+    var scan = data.scan || {};
+    var byName = scan.instances || {};
+    if (!scan.inProgress) {
+      strip.hidden = true;
+      strip.textContent = "";
+      return;
+    }
+
+    var order = [];
+    var seen = {};
+    var instances = data.instances || [];
+    for (var i = 0; i < instances.length; i++) {
+      var name = instances[i].name;
+      if (Object.prototype.hasOwnProperty.call(byName, name) && !seen[name]) {
+        seen[name] = true;
+        order.push(name);
+      }
+    }
+    var rest = [];
+    for (var key in byName) {
+      if (Object.prototype.hasOwnProperty.call(byName, key) && !seen[key]) rest.push(key);
+    }
+    rest.sort();
+    order = order.concat(rest);
+
+    strip.textContent = "";
+    var head = el("p", "scan-strip-head");
+    text(head, scanKindLabel(scan.cycleKind) + " running");
+    strip.appendChild(head);
+
+    for (var r = 0; r < order.length; r++) {
+      var p = byName[order[r]] || {};
+      var total = p.total || 0;
+      var done = p.done || 0;
+
+      var row = el("div", "scan-strip-row");
+      var label = el("span", "scan-strip-name");
+      text(label, order[r]);
+      row.appendChild(label);
+
+      var stage = el("span", "scan-strip-stage");
+      text(stage, p.stage || "working");
+      row.appendChild(stage);
+
+      var bar = el("div", "scan-strip-bar");
+      var fill = el("div", "scan-strip-fill");
+      if (total > 0) {
+        // Determinate: the bar carries the fraction, and the count beside it
+        // carries the numbers, because a bar alone cannot say "996".
+        fill.style.width = clampPct((done / total) * 100).toFixed(1) + "%";
+        var count = el("span", "scan-strip-count");
+        text(count, done + " / " + total);
+        row.appendChild(count);
+      } else {
+        // Nothing to count — pulse rather than show a 0% bar that would read
+        // as "no progress at all".
+        bar.className = "scan-strip-bar scan-strip-indeterminate";
+      }
+      bar.appendChild(fill);
+      row.appendChild(bar);
+      strip.appendChild(row);
+    }
+    strip.hidden = false;
+  }
+
   function render(data) {
     var badge = document.getElementById("dryRunBadge");
     if (data.dryRun) {
@@ -2031,6 +2333,18 @@
     // everything else so the rows come back carrying their outcomes.
     pruneActionOutcomes(instances);
 
+    // [v0.2.0] The scan surface is captured BEFORE the renderers run, for the
+    // same reason the action switches above are: the button and the poll timer
+    // both read it. Note that the three data renderers below are called
+    // unconditionally, scan or no scan — "scanning must never blank the page"
+    // is exactly this: a running cycle adds a strip, it never takes anything
+    // away.
+    scanInProgress = !!(data.scan && data.scan.inProgress);
+
+    renderStaleBanner(instances);
+    renderScanStrip(data);
+    renderScanButton();
+
     renderInstances(instances);
     renderReverse(instances);
     renderFileReport(instances);
@@ -2061,6 +2375,17 @@
   function showDisconnected() {
     var badge = document.getElementById("dryRunBadge");
     badge.className = "badge badge-alert";
+
+    // [v0.2.0] A page that cannot reach the daemon knows nothing about
+    // whether a cycle is running, so it must claim nothing: the strip comes
+    // down and any queued-scan state of ours is forgotten. Leaving a progress
+    // bar advancing-by-implication on a dead backend would be the same lie the
+    // "first sweep in progress" placeholder was fixed for.
+    scanInProgress = false;
+    scanRequestedAt = 0;
+    var strip = document.getElementById("scanStrip");
+    strip.hidden = true;
+    strip.textContent = "";
     var since = lastSuccessAt ? fmtRelative(lastSuccessAt.toISOString()) : null;
     text(badge, since ? ("disconnected — showing data from " + since) : "disconnected — no data yet");
 
@@ -2083,8 +2408,10 @@
       .then(function (data) {
         lastSuccessAt = new Date();
         render(data);
-        scanBtn.disabled = false;
-        text(scanBtn, "Scan now");
+        // render() has already set scanInProgress from this snapshot; the
+        // button's state follows from it rather than from whatever this tab
+        // last posted.
+        renderScanButton();
       })
       .catch(function () {
         // The backend is unreachable, restarted, or answering something
@@ -2092,17 +2419,52 @@
         // Never swallowed silently: surface it, then keep retrying — the
         // next poll (or the next click) tries again on its own.
         showDisconnected();
-        scanBtn.disabled = false;
-        text(scanBtn, "Scan now");
+        renderScanButton();
       });
   }
 
   function schedulePoll() {
     if (pollHandle) clearTimeout(pollHandle);
     if (document.hidden) return;
+    // [v0.2.0] Two speeds, one timer: fast while the server says a cycle is
+    // running (or while a manual request of ours is still waiting to be picked
+    // up), the original 30s otherwise. document.hidden's pause above is
+    // untouched and governs both.
+    var wait = (scanInProgress || scanQueuedRecently()) ? POLL_SCANNING_MS : POLL_MS;
     pollHandle = setTimeout(function () {
       refresh().then(schedulePoll);
-    }, POLL_MS);
+    }, wait);
+  }
+
+  // scanQueuedRecently is the short window after this tab successfully queued
+  // a manual scan and before the daemon's loop has picked it up — during which
+  // the truthful thing to say is "queued", not "scanning" and not "scan now".
+  function scanQueuedRecently() {
+    return scanRequestedAt !== 0 && (Date.now() - scanRequestedAt) < SCAN_QUEUED_GRACE_MS;
+  }
+
+  // renderScanButton is the Scan-now button's ONE source of truth, and it is
+  // the scan surface rather than this tab's own last POST. Three states, in the
+  // order they can be true:
+  //
+  //   scanning  — the server says a cycle is running (any cycle: the startup
+  //               scan, the timer's sweep, another tab's click, ours).
+  //   queued    — we asked, and the loop has not started it yet.
+  //   idle      — nothing is running and nothing of ours is waiting.
+  function renderScanButton() {
+    if (scanInProgress) {
+      scanRequestedAt = 0;
+      scanBtn.disabled = true;
+      text(scanBtn, "Scanning…");
+      return;
+    }
+    if (scanQueuedRecently()) {
+      scanBtn.disabled = true;
+      text(scanBtn, "Queued…");
+      return;
+    }
+    scanBtn.disabled = false;
+    text(scanBtn, "Scan now");
   }
 
   document.addEventListener("visibilitychange", function () {
@@ -2133,13 +2495,19 @@
         return r.json();
       })
       .then(function (body) {
+        // [v0.2.0] The request landed, so this tab is waiting on a cycle that
+        // has not started yet — which is what keeps the button honest (and the
+        // poll fast) through the gap between the POST and the loop picking it
+        // up. renderScanButton, called by the refresh below, turns this into
+        // "Queued…" and then into "Scanning…" of its own accord once the
+        // server says a cycle is running.
+        scanRequestedAt = Date.now();
         return refresh().then(function () {
-          // refresh()'s own success path already re-enabled the button and
-          // reset it to "Scan now"; only override that when THIS click did
-          // not actually queue anything (a cycle was already running or one
-          // was already queued), so the operator learns their click landed
-          // on an in-progress scan rather than believing it started a new
-          // one.
+          // refresh() has already rendered the button from the SERVER's own
+          // scan state; only override it when this click did not queue
+          // anything (a cycle was already running, or one was already queued),
+          // so the operator learns their click landed on an in-progress scan
+          // rather than believing it started a new one.
           if (body && body.status === "already-pending") {
             text(scanBtn, "Already scanning…");
           }
@@ -2147,8 +2515,7 @@
       })
       .catch(function () {
         showDisconnected();
-        scanBtn.disabled = false;
-        text(scanBtn, "Scan now");
+        renderScanButton();
       });
   });
 

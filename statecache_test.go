@@ -1053,3 +1053,60 @@ func TestAction_OnAWarmStaleFinding_StillReVerifiesLiveAndRefusesWhenLiveDisagre
 		t.Errorf("the refusal was not audited:\n%s", buf)
 	}
 }
+
+// --- the page ---------------------------------------------------------------
+
+// TestWebUIPage_WarmStartBannerSaysWhichSweepIsOnScreenAndThatItIsRefreshing is
+// the display half of the warm start. Showing a previous run's numbers without
+// saying so would be precisely the "glance and trust these numbers" failure the
+// UNREACHABLE badge already exists to prevent — so the page carries a prominent
+// amber banner naming the sweep's age, and it goes away by itself when the
+// first fresh cycle lands.
+func TestWebUIPage_WarmStartBannerSaysWhichSweepIsOnScreenAndThatItIsRefreshing(t *testing.T) {
+	page := string(webUIPage)
+	for _, want := range []string{`id="staleBanner"`, "stale-banner", "showing last sweep from", "refreshing now"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the page is missing %q: a dashboard showing a cache must say so, in words, above the numbers", want)
+		}
+	}
+
+	body := pageFunctionBody(t, "renderStaleBanner")
+	if !strings.Contains(body, ".stale") {
+		t.Errorf("renderStaleBanner never reads an instance's stale flag:\n%s", body)
+	}
+	if !strings.Contains(body, "asOf") || !strings.Contains(body, "fmtRelative") {
+		t.Errorf("renderStaleBanner does not render asOf through the page's own relative-time formatter, the way every other timestamp on this page is rendered:\n%s", body)
+	}
+	if !strings.Contains(body, "hidden") {
+		t.Errorf("renderStaleBanner never hides the banner, so it would stay on screen after the first fresh cycle:\n%s", body)
+	}
+
+	if !strings.Contains(pageFunctionBody(t, "render"), "renderStaleBanner(instances)") {
+		t.Error("render() does not update the stale banner from each snapshot")
+	}
+}
+
+// TestWebUIPage_AWarmStaleShelfCardSaysSoOnTheCardItself is the per-instance
+// half, following ReverseAsOf's own convention (the reverse panel's "showing
+// last complete sweep from <time>" notice): the page-level banner says the
+// dashboard as a whole is warm, and the card says which numbers are the cached
+// ones — they are not always the same set, since the first fresh cycle clears
+// instances one at a time as it reaches them.
+func TestWebUIPage_AWarmStaleShelfCardSaysSoOnTheCardItself(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, "shelf-stale") {
+		t.Error("the page has no per-card stale marker class")
+	}
+	body := pageFunctionBody(t, "updateShelfCard")
+	if !strings.Contains(body, "inst.stale") {
+		t.Errorf("updateShelfCard never reads the instance's own stale flag:\n%s", body)
+	}
+	if !strings.Contains(body, "inst.asOf") {
+		t.Errorf("updateShelfCard never renders the cached numbers' own age:\n%s", body)
+	}
+	// The bar itself must keep showing the cached numbers: blanking it would
+	// throw away the very data the warm start exists to show.
+	if !strings.Contains(body, "els.rest.style.width = pctStr;") {
+		t.Errorf("updateShelfCard no longer sets the bar's width unconditionally; a stale card must still show its numbers:\n%s", body)
+	}
+}
