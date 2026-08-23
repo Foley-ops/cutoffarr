@@ -62,6 +62,21 @@ func (r *progressRecorder) count() int {
 	return len(r.seen)
 }
 
+// viewsFor returns every publish made for one stage, in order, so a test can
+// assert what a stage CLAIMED (its done/total) rather than only that it was
+// announced at all.
+func (r *progressRecorder) viewsFor(stage string) []scanProgressView {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []scanProgressView
+	for _, v := range r.seen {
+		if v.Stage == stage {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
 // --- the surface itself -----------------------------------------------------
 
 // TestStatsStore_ScanProgress_WireSpelling pins the exact JSON the page reads
@@ -375,6 +390,140 @@ func TestRunSonarrDecisionEngine_PublishesEveryStageItReaches(t *testing.T) {
 		if !containsString(rec.stages(), stage) {
 			t.Errorf("the sonarr engine never published stage %q; published: %v\n%s", stage, rec.stages(), buf.String())
 		}
+	}
+}
+
+// TestBothEngines_TheWritingStageNeverClaimsACountNothingWillAdvance is a
+// round-2 review fix, and the rule it pins is the one the wanted-set stage was
+// split out of the reverse pass to honor (reverse.go): a strip that sits on
+// "0 / 340" through the whole of a multi-minute pass looks WEDGED, and looking
+// wedged during the write pass — the one phase where the daemon is mutating the
+// user's *arrs — is the worst place in the program to look wedged.
+//
+// `writing` announced len(reported) as its total and then nothing ever counted
+// against it: runWritePass takes no scope and no progress handle, so there was
+// no call site that could. total > 0 puts the page on its DETERMINATE branch
+// (updateScanRow), which renders a 0%-wide bar and the literal text "0 / 340".
+//
+// Every other uncountable stage in this program declares total 0 and pulses
+// honestly. This one now does too. The assertion is on the TOTAL rather than on
+// the presence of the stage, because "the stage is published" was already true
+// while the bar was lying.
+func TestBothEngines_TheWritingStageNeverClaimsACountNothingWillAdvance(t *testing.T) {
+	t.Run("radarr", func(t *testing.T) {
+		fake := newRadarrFake(t, "", nil)
+		movies := []movieListElement{
+			crossCheckWitnessMovie(5, "Ordinary Monitored"),
+			unmonitoredBelowCutoffMovie(7, "Accidentally Unmonitored"),
+		}
+		store := newStatsStore(false)
+		rec := newProgressRecorder(store)
+		store.beginScan(cycleKindSweep)
+		scope := fullLibraryScope(slog.LevelInfo)
+		scope.progress = store.progressFor("radarr-main")
+
+		logger, buf := newDecisionTestLogger(slog.LevelInfo)
+		runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{5: true}, "cutoffarr-exclude",
+			scope, false, reverseOptions{}, fileReportOptions{})
+
+		assertWritingStageIsHonestlyUncountable(t, rec, buf.String())
+	})
+
+	t.Run("sonarr", func(t *testing.T) {
+		episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "]"
+		filesJSON := "[" + episodeFileJSON(500, 1, 200, false) + "]"
+		fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+		series := []seriesElement{testSeries(1, "Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
+		store := newStatsStore(false)
+		rec := newProgressRecorder(store)
+		store.beginScan(cycleKindSweep)
+		scope := fullLibraryScope(slog.LevelInfo)
+		scope.progress = store.progressFor("sonarr-main")
+
+		logger, buf := newDecisionTestLogger(slog.LevelInfo)
+		runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude",
+			scope, false, reverseOptions{}, fileReportOptions{})
+
+		assertWritingStageIsHonestlyUncountable(t, rec, buf.String())
+	})
+}
+
+// assertWritingStageIsHonestlyUncountable is the shared half of the two cases
+// above: the stage must be announced (write mode reached the pass) and every
+// publish it makes must carry total 0, so the page pulses instead of showing a
+// bar that cannot move.
+func assertWritingStageIsHonestlyUncountable(t *testing.T, rec *progressRecorder, log string) {
+	t.Helper()
+	views := rec.viewsFor(scanStageWriting)
+	if len(views) == 0 {
+		t.Fatalf("the engine never published the writing stage at all, so this test proves nothing about what it claims:\n%s", log)
+	}
+	for _, v := range views {
+		if v.Total != 0 || v.Done != 0 {
+			t.Errorf("the writing stage published %+v: a total nothing ever counts against renders as a 0%%-wide bar reading \"0 / %d\" for the whole write pass, which is the 'looks wedged' failure this project splits stages to avoid. An uncountable stage declares total 0 and pulses", v, v.Total)
+		}
+	}
+}
+
+// TestBothEngines_ARehearsalNeverPublishesTheWritingStage is the mutation guard
+// for the `if !dryRun` that wraps each of those two announcements. Without it,
+// deleting either guard — or flipping it to `if dryRun` — leaves the whole
+// suite green while a REHEARSING daemon's strip reads "writing", which is the
+// one claim this project is most careful never to make falsely.
+//
+// The two positive assertions matter as much as the negative one: without them
+// the test would pass just as well against an engine that published nothing at
+// all (a nil handle, a scope wired up wrong, a store that dropped the publishes
+// because no cycle was in progress).
+func TestBothEngines_ARehearsalNeverPublishesTheWritingStage(t *testing.T) {
+	t.Run("radarr", func(t *testing.T) {
+		fake := newRadarrFake(t, "", nil)
+		movies := []movieListElement{
+			crossCheckWitnessMovie(5, "Ordinary Monitored"),
+			unmonitoredBelowCutoffMovie(7, "Accidentally Unmonitored"),
+		}
+		store := newStatsStore(true)
+		rec := newProgressRecorder(store)
+		store.beginScan(cycleKindSweep)
+		scope := fullLibraryScope(slog.LevelInfo)
+		scope.progress = store.progressFor("radarr-main")
+
+		logger, buf := newDecisionTestLogger(slog.LevelInfo)
+		runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{5: true}, "cutoffarr-exclude",
+			scope, true, reverseOptions{}, fileReportOptions{})
+
+		assertRehearsalPublishesEverythingButWriting(t, rec, buf.String())
+	})
+
+	t.Run("sonarr", func(t *testing.T) {
+		episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "]"
+		filesJSON := "[" + episodeFileJSON(500, 1, 200, false) + "]"
+		fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+		series := []seriesElement{testSeries(1, "Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
+		store := newStatsStore(true)
+		rec := newProgressRecorder(store)
+		store.beginScan(cycleKindSweep)
+		scope := fullLibraryScope(slog.LevelInfo)
+		scope.progress = store.progressFor("sonarr-main")
+
+		logger, buf := newDecisionTestLogger(slog.LevelInfo)
+		runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude",
+			scope, true, reverseOptions{}, fileReportOptions{})
+
+		assertRehearsalPublishesEverythingButWriting(t, rec, buf.String())
+	})
+}
+
+func assertRehearsalPublishesEverythingButWriting(t *testing.T, rec *progressRecorder, log string) {
+	t.Helper()
+	got := rec.stages()
+	for _, stage := range []string{scanStageEvaluating, scanStageCrossCheck} {
+		if !containsString(got, stage) {
+			t.Fatalf("a rehearsal published no %q stage at all; published: %v — the negative assertion below would pass for the wrong reason\n%s", stage, got, log)
+		}
+	}
+	if containsString(got, scanStageWriting) {
+		t.Errorf("a DRY RUN published the %q stage; published: %v. A rehearsal composes no write at all (§2.1's gate sits immediately before each PUT), so a strip reading \"writing\" during one is a lie about the one thing this program is most careful never to lie about\n%s", scanStageWriting, got, log)
 	}
 }
 

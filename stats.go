@@ -476,8 +476,19 @@ type scanProgressView struct {
 //	               write at all (§2.1's gate sits immediately before each PUT),
 //	               so a strip reading "writing" during one would be a lie in
 //	               the one place this project is most careful not to tell one;
-//	               a rehearsal simply stays on the previous stage. (Both call
-//	               sites keep this comment SHORT for a reason —
+//	               a rehearsal simply stays on the previous stage
+//	               (TestBothEngines_ARehearsalNeverPublishesTheWritingStage).
+//	               UNCOUNTABLE, total 0, deliberately: runWritePass takes no
+//	               progress handle, so nothing can advance a counter through it,
+//	               and a total nothing advances renders as a 0%-wide bar reading
+//	               "0 / 340" for the whole of a pass that is one PUT plus an
+//	               echo verification per item — minutes, looking wedged, during
+//	               the one phase that is actually mutating the user's *arrs.
+//	               An uncountable stage pulses instead, which is what every
+//	               other uncountable stage here already does. Round-2 review
+//	               fix; TestBothEngines_TheWritingStageNeverClaimsACountNothing
+//	               WillAdvance keeps it honest. (Both call sites keep their
+//	               comment SHORT for a reason —
 //	               TestTree_BothEnginesGuardTheirForwardWritePassWithTheScope
 //	               Suppression reads a fixed window of source before each write
 //	               pass call looking for its guard.)

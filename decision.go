@@ -762,9 +762,9 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		logger.Info("forward writes are suppressed for this run: it was started by a human clicking one finding's button, and the only write it may make is the one that button named",
 			append([]any{"instance", inst.Name, "type", inst.Type, "origin", scope.origin}, scope.summaryAttrs()...)...)
 	} else {
-		// [v0.2.0] Write mode only — see scanStageWriting (stats.go).
+		// [v0.2.0] Write mode only, and uncountable — see scanStageWriting.
 		if !dryRun {
-			scope.progress.stage(scanStageWriting, len(reported))
+			scope.progress.stage(scanStageWriting, 0)
 		}
 		unmonitoredCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount = runWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun, &forwardActions)
 	}
@@ -2660,10 +2660,9 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		logger.Info("forward writes are suppressed for this run: it was started by a human clicking one finding's button, and the only write it may make is the one that button named",
 			append([]any{"instance", inst.Name, "type", inst.Type, "origin", scope.origin}, scope.summaryAttrs()...)...)
 	} else {
-		// Write mode only — see the Radarr twin for why a rehearsal must never
-		// put "writing" on the strip.
+		// Write mode only, and uncountable — see the Radarr twin.
 		if !dryRun {
-			scope.progress.stage(scanStageWriting, len(reported))
+			scope.progress.stage(scanStageWriting, 0)
 		}
 		unmonitoredCount, recoveredWriteCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount = runSonarrWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun, &forwardActions)
 	}
