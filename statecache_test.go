@@ -1616,8 +1616,8 @@ func TestWebUIPage_WarmStartBannerSaysWhichSweepIsOnScreenAndThatItIsRefreshing(
 	if !strings.Contains(body, ".stale") {
 		t.Errorf("renderStaleBanner never reads an instance's stale flag:\n%s", body)
 	}
-	if !strings.Contains(body, "asOf") || !strings.Contains(body, "fmtRelative") {
-		t.Errorf("renderStaleBanner does not render asOf through the page's own relative-time formatter, the way every other timestamp on this page is rendered:\n%s", body)
+	if !strings.Contains(body, "asOf") || !strings.Contains(body, "fmtTimestamp") {
+		t.Errorf("renderStaleBanner does not render asOf through the page's own shared timestamp formatter (fmtTimestamp, [v0.3.0]'s settings-aware wrapper around fmtRelative), the way every other timestamp on this page is rendered:\n%s", body)
 	}
 	if !strings.Contains(body, "hidden") {
 		t.Errorf("renderStaleBanner never hides the banner, so it would stay on screen after the first fresh cycle:\n%s", body)
@@ -1760,7 +1760,14 @@ var document = {
     return banner;
   }
 };
-`+pageFunctionSource(t, "text")+pageFunctionSource(t, "fmtRelative")+pageFunctionSource(t, "renderStaleBanner")+`
+// [v0.3.0] renderStaleBanner now renders its timestamp through fmtTimestamp
+// (fmtRelative's settings-aware wrapper) rather than calling fmtRelative
+// directly, so this isolated snippet has to supply the one global
+// fmtTimestamp itself reads — settings.timestamps — alongside it. "relative"
+// (the default) keeps this test's own fmtRelative-era expectations ("1d
+// ago", etc.) exactly as they were.
+var settings = { timestamps: "relative" };
+`+pageFunctionSource(t, "text")+pageFunctionSource(t, "fmtRelative")+pageFunctionSource(t, "fmtTimestamp")+pageFunctionSource(t, "renderStaleBanner")+`
 renderStaleBanner(`+string(instances)+`, true);
 console.log(JSON.stringify({ text: banner.textContent, hidden: banner.hidden }));
 `)

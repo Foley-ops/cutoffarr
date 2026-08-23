@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -622,9 +623,9 @@ func TestWebUIPage_ContainsTheSignatureShelfElement(t *testing.T) {
 		"shelf-rest",
 		"shelf-marker",
 		"shelf-count",
-		"#6FA08C", // REST sage
-		"#D9A05B", // HUNT amber
-		"#C46A5A", // ALERT clay
+		"#5FAE8C", // REST sage (DARK, [v0.3.0] identity nudge)
+		"#D4923F", // HUNT amber (DARK, [v0.3.0] identity nudge)
+		"#C4604E", // ALERT clay (DARK, [v0.3.0] identity nudge)
 		"Scan now",
 		"reverse scan",
 		"File clutter",
@@ -893,11 +894,23 @@ func TestWebUIPage_InitialShelfLabelPositioningRoutesThroughSharedUpdateFn(t *te
 	}
 }
 
-// TestWebUIPage_ScriptIsSyntacticallyValidJS runs `node --check` over the
-// embedded page's inline <script> block — the one live-code check available
-// under this project's "no browser" testing constraint. It would have caught
-// a stray syntax error in the shelf-count clamp fix (round-4 final round)
-// long before a human ever opened the page.
+// TestWebUIPage_ScriptIsSyntacticallyValidJS runs `node --check` over EVERY
+// inline <script>...</script> block in the embedded page — the one live-code
+// check available under this project's "no browser" testing constraint. It
+// would have caught a stray syntax error in the shelf-count clamp fix
+// (round-4 final round) long before a human ever opened the page.
+//
+// [v0.3.0 review fix] This used to locate its one block with a single
+// strings.Index(page, "<script>")/strings.Index(page, "</script>") pair, which
+// silently started matching the NEW pre-paint head script (webui.html:8, a
+// ~20-line theme shim) the moment it was added ahead of the ~2000-line main
+// application script — leaving the real, load-bearing IIFE completely
+// unchecked while the suite still reported this test green. Looping over
+// every <script> block, rather than reaching for LastIndex to skip straight
+// to "the last one", means a future THIRD script block cannot repeat the
+// same silent gap in either direction; the size assertion below additionally
+// guards against a future block ordering where the largest script is no
+// longer last.
 func TestWebUIPage_ScriptIsSyntacticallyValidJS(t *testing.T) {
 	nodePath, err := exec.LookPath("node")
 	if err != nil {
@@ -905,23 +918,56 @@ func TestWebUIPage_ScriptIsSyntacticallyValidJS(t *testing.T) {
 	}
 
 	page := string(webUIPage)
-	start := strings.Index(page, "<script>")
-	end := strings.Index(page, "</script>")
-	if start == -1 || end == -1 || end < start {
+	var scripts []string
+	rest := page
+	offset := 0
+	for {
+		start := strings.Index(rest, "<script>")
+		if start == -1 {
+			break
+		}
+		afterOpen := rest[start+len("<script>"):]
+		end := strings.Index(afterOpen, "</script>")
+		if end == -1 {
+			t.Fatalf("found <script> at byte %d with no matching </script>", offset+start)
+		}
+		scripts = append(scripts, afterOpen[:end])
+		consumed := start + len("<script>") + end + len("</script>")
+		rest = rest[consumed:]
+		offset += consumed
+	}
+	if len(scripts) == 0 {
 		t.Fatal("page has no <script>...</script> block to check")
 	}
-	script := page[start+len("<script>") : end]
-
-	dir := t.TempDir()
-	scriptPath := filepath.Join(dir, "webui.js")
-	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
-		t.Fatalf("could not write extracted script: %v", err)
+	if len(scripts) < 2 {
+		t.Fatalf("page has only %d <script> block(s); expected at least the pre-paint head script and the main application script", len(scripts))
 	}
 
-	cmd := exec.Command(nodePath, "--check", scriptPath)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Errorf("node --check reports a syntax error in the embedded page's script:\n%s", out)
+	dir := t.TempDir()
+	largest := 0
+	for i, script := range scripts {
+		scriptPath := filepath.Join(dir, fmt.Sprintf("webui-%d.js", i))
+		if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
+			t.Fatalf("could not write extracted script %d: %v", i, err)
+		}
+		cmd := exec.Command(nodePath, "--check", scriptPath)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Errorf("node --check reports a syntax error in <script> block %d of %d:\n%s", i+1, len(scripts), out)
+		}
+		if len(script) > largest {
+			largest = len(script)
+		}
+	}
+
+	// The main application script (fmtTimestamp, onSettingsChange, refresh,
+	// render, ...) is tens of kilobytes; the pre-paint head shim is a couple
+	// hundred bytes. If nothing checked here clears 10KB, a future refactor
+	// has likely reintroduced the same silent-skip failure mode this test
+	// exists to catch — the main script would then be split, renamed, or
+	// otherwise missed by the loop above without any test noticing.
+	if largest < 10*1024 {
+		t.Errorf("largest checked <script> block is only %d bytes; expected the main application script (fmtTimestamp, onSettingsChange, render, ...) to clear 10KB — it may not be getting checked", largest)
 	}
 }
 
@@ -1568,8 +1614,12 @@ func TestWebUIPage_ReverseOffInstancesGetANoticeNotABlankBody(t *testing.T) {
 // side (statsStore never clearing ReverseFindings on a skipped cycle) is
 // not enough if the GUI never surfaces WHEN those findings are from — this
 // pins that renderReverse reads reverseAsOf and renders the controller's own
-// wording, using the same fmtRelative helper every other timestamp on the
-// page already uses.
+// wording, using the same shared timestamp helper every other timestamp on
+// the page already uses — [v0.3.0] fmtTimestamp, which is fmtRelative's own
+// settings-aware wrapper (see fmtTimestamp's doc comment): every call site
+// that used to call fmtRelative directly for a user-facing timestamp now
+// routes through it instead, so the Timestamps setting (relative/absolute)
+// changes this notice along with every other one.
 func TestWebUIPage_ReverseSkippedNoticeShowsStalenessTimestamp(t *testing.T) {
 	page := string(webUIPage)
 
@@ -1589,8 +1639,8 @@ func TestWebUIPage_ReverseSkippedNoticeShowsStalenessTimestamp(t *testing.T) {
 	if !strings.Contains(body, "showing last complete sweep from") {
 		t.Error("renderReverse is missing the controller-mandated staleness copy \"showing last complete sweep from <time>\"")
 	}
-	if !strings.Contains(body, "fmtRelative(notice.asOf)") && !strings.Contains(body, "fmtRelative(") {
-		t.Error("the staleness notice does not render the timestamp through fmtRelative, the same relative-time helper every other timestamp on the page uses")
+	if !strings.Contains(body, "fmtTimestamp(notice.asOf)") && !strings.Contains(body, "fmtTimestamp(") {
+		t.Error("the staleness notice does not render the timestamp through fmtTimestamp, the shared timestamp helper every other timestamp on the page uses")
 	}
 }
 
