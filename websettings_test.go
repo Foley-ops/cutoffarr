@@ -24,15 +24,22 @@ import (
 // --- 1. wide layout ----------------------------------------------------
 
 // TestWebUIPage_WideLayoutFluidContainerAndInstanceGrid pins the brief's own
-// two numbers: the fluid container (min(1400px, 94vw)) and the ≥1100px
-// instance grid, while requiring the narrow (360px-and-up) flex stack to
-// stay the unconditional base rule the grid only ever overrides.
+// two numbers: the fluid container (min(1400px, max(360px, 94vw)) — the
+// inner max() is the round-5 360px floor, see the assertion below) and the
+// ≥1100px instance grid, while requiring the narrow (360px-and-up) flex
+// stack to stay the unconditional base rule the grid only ever overrides.
 func TestWebUIPage_WideLayoutFluidContainerAndInstanceGrid(t *testing.T) {
 	page := string(webUIPage)
 
 	wrapRule := jsBracedBlockAfter(t, page, ".wrap {")
-	if !strings.Contains(wrapRule, "min(1400px, 94vw)") {
-		t.Errorf(".wrap does not use the mandated fluid container width, got: %s", wrapRule)
+	// [v0.3.0 review fix, round 5] Bare min(1400px, 94vw) narrows the
+	// container below its pre-v0.3.0 width at the 360px viewport the brief's
+	// own "360px behavior unchanged" pin requires (94vw = 338.4px at 360px,
+	// a real 6% shave) — max(360px, 94vw) floors it back to exactly 360px at
+	// and below the ~383px width where 94vw first exceeds that floor on its
+	// own, while leaving every wider viewport on the unmodified formula.
+	if !strings.Contains(wrapRule, "min(1400px, max(360px, 94vw))") {
+		t.Errorf(".wrap does not use the mandated fluid container width floored at 360px, got: %s", wrapRule)
 	}
 
 	baseStart := strings.Index(page, "#instances {")
@@ -185,6 +192,43 @@ func TestWebUIPage_ThemeAttributeSwitchDefinesBothPalettes(t *testing.T) {
 	}
 }
 
+// TestWebUIPage_ColorSchemeMatchesEachThemeBlock pins a defect distinct from
+// the custom-property tokens above: this branch adds the page's first
+// UA-rendered form controls (the settings dialog's Theme/Refresh
+// cadence/etc. radios) and its first scrollable panel body, and neither is
+// styled by var(--...) — those are the browser's OWN light/dark renderings
+// of its native widgets, governed only by the CSS `color-scheme` property.
+// Without it, every radio and any overflow-y scrollbar rendered in the
+// browser's light default even while data-theme (or the OS preference) put
+// the rest of the page in dark mode. One declaration per theme block,
+// mirroring the --bg/--panel/--ink split each block already makes: dark on
+// the bare :root default and the explicit data-theme="dark" override, light
+// on the prefers-color-scheme media block and the explicit
+// data-theme="light" override.
+func TestWebUIPage_ColorSchemeMatchesEachThemeBlock(t *testing.T) {
+	page := string(webUIPage)
+
+	darkBase := jsBracedBlockAfter(t, page, ":root {")
+	if !strings.Contains(darkBase, "color-scheme: dark") {
+		t.Errorf(`bare :root never declares color-scheme: dark — UA-rendered controls (radios, scrollbars) would render in the browser's light default even though this is the DARK-mode block:%s`, darkBase)
+	}
+
+	darkOverride := jsBracedBlockAfter(t, page, `:root[data-theme="dark"] {`)
+	if !strings.Contains(darkOverride, "color-scheme: dark") {
+		t.Errorf(`:root[data-theme="dark"] never declares color-scheme: dark:%s`, darkOverride)
+	}
+
+	lightMedia := jsBracedBlockAfter(t, page, `:root:not([data-theme="dark"]) {`)
+	if !strings.Contains(lightMedia, "color-scheme: light") {
+		t.Errorf(`the prefers-color-scheme:light block's :root:not([data-theme="dark"]) never declares color-scheme: light — a system-default reader on a light OS would still get browser-native controls in dark styling:%s`, lightMedia)
+	}
+
+	lightOverride := jsBracedBlockAfter(t, page, `:root[data-theme="light"] {`)
+	if !strings.Contains(lightOverride, "color-scheme: light") {
+		t.Errorf(`:root[data-theme="light"] never declares color-scheme: light:%s`, lightOverride)
+	}
+}
+
 // TestWebUIPage_ValidationRecordDocumentedInTokenBlock pins the brief's own
 // binding requirement: since the dataviz validator is not wired into CI,
 // the CVD validation record and its two judged exemptions (including the
@@ -252,6 +296,36 @@ func TestWebUIPage_MutedInkTextMeetsWCAGAA(t *testing.T) {
 	}
 	if !strings.Contains(legendRule, "var(--ink-dim)") {
 		t.Errorf(".settings-group legend/h3 never falls back to --ink-dim (AA-compliant in both modes):\n%s", legendRule)
+	}
+
+	// [v0.3.0 review fix, round 4] Six more rules the round-3 pins above
+	// never covered, every one of them normal text a reader needs (not a
+	// de-emphasized/inactive state): the instance-type label, the live
+	// per-item progress counter, the findings tables' own column headers
+	// (without which the rows are unreadable), the notice that keeps a bare
+	// 0 count from reading as an all-clear, the pager's size/prev-next
+	// labels, and the footer's version label. The token block's own
+	// "MUTED-INK TEXT AA SCOPE" comment claims these are the complete
+	// remaining set moved to --ink-dim — pin all six so that claim stays
+	// true rather than merely documented.
+	for _, sel := range []struct {
+		name   string
+		header string
+	}{
+		{"the instance-type label", ".shelf-type {"},
+		{"the live per-item progress counter", ".scan-strip-count {"},
+		{"the findings tables' own column headers", "table.findings th {"},
+		{"the notice guarding a bare 0 count", "ul.status-notices li.status-off {"},
+		{"the pager's size/prev-next labels", ".pager-sizes, .pager-nav {"},
+		{"the footer's version label", "footer {"},
+	} {
+		rule := jsBracedBlockAfter(t, page, sel.header)
+		if strings.Contains(rule, "var(--ink-faint)") {
+			t.Errorf("%s (%s) still uses --ink-faint, which fails WCAG AA (~3.0:1 light / ~2.9:1 dark), contradicting the token block's own MUTED-INK TEXT AA SCOPE comment which claims this was moved to --ink-dim:\n%s", sel.header, sel.name, rule)
+		}
+		if !strings.Contains(rule, "var(--ink-dim)") {
+			t.Errorf("%s (%s) never falls back to --ink-dim (AA-compliant in both modes):\n%s", sel.header, sel.name, rule)
+		}
 	}
 
 	tokenStart := strings.Index(page, ":root {")
@@ -465,9 +539,19 @@ func TestWebUIPage_SettingsDialogReloadsFromStorageBeforeRenderingOnOpen(t *test
 		t.Fatalf("the gear button's click handler never calls readStoredSettings(), so it cannot tell a genuine cross-tab change from storage merely failing to read:\n%s", clickBlock)
 	}
 
-	ifBlock := jsBracedBlockAfter(t, clickBlock, "if (stored) {")
+	// [v0.3.0 review fix, round 5] The guard now also requires
+	// !settingsWritesFailing — see TestWebUIPage_AdoptOnOpenSkippedWhileStorageWritesAreFailing
+	// below for why a bare "if (stored)" is not enough: Safari private
+	// browsing (and any quota-exhausted origin) lets localStorage.getItem
+	// keep succeeding against the SAME pre-session blob every setItem since
+	// has thrown against, so readStoredSettings() alone cannot tell a
+	// genuine cross-tab change from this tab's own stale past.
+	if !strings.Contains(clickBlock, "if (stored && !settingsWritesFailing) {") {
+		t.Fatalf(`the click handler's adopt guard is not "if (stored && !settingsWritesFailing) {" — it must refuse to adopt a stored blob while this session's own writes are known to be failing:\n%s`, clickBlock)
+	}
+	ifBlock := jsBracedBlockAfter(t, clickBlock, "if (stored && !settingsWritesFailing) {")
 	if !strings.Contains(ifBlock, "settings = stored") {
-		t.Errorf(`readStoredSettings()'s result is never adopted into settings inside its own "if (stored)" guard, so it either overwrites settings unconditionally (reintroducing the storage-blocked bug) or is never adopted at all:\n%s`, clickBlock)
+		t.Errorf(`readStoredSettings()'s result is never adopted into settings inside its own guard, so it either overwrites settings unconditionally (reintroducing the storage-blocked bug) or is never adopted at all:\n%s`, clickBlock)
 	}
 	if !strings.Contains(ifBlock, "applySettings(settings)") {
 		t.Errorf(`a genuine cross-tab settings change is adopted into the in-memory settings object but never re-applied to the PAGE via applySettings() — the dialog would show, say, "Light" while the page itself keeps rendering dark until some unrelated radio here happens to get clicked:\n%s`, ifBlock)
@@ -478,6 +562,93 @@ func TestWebUIPage_SettingsDialogReloadsFromStorageBeforeRenderingOnOpen(t *test
 	if readAt == -1 || renderAt == -1 || readAt > renderAt {
 		t.Errorf("settings must be checked against storage BEFORE renderSettingsForm() reflects it onto the dialog's radios:\n%s", clickBlock)
 	}
+}
+
+// TestWebUIPage_AdoptOnOpenSkippedWhileStorageWritesAreFailing is the
+// behavioural half of the guard pinned structurally above, run under Node
+// against the gear button's own click-handler body — mirroring
+// TestWebUIPage_SaveSettingsReportsStorageFailure's node-execution pattern
+// rather than only grepping source.
+//
+// The scenario this closes: Safari private browsing (and any
+// quota-exhausted origin) lets localStorage.getItem keep succeeding against
+// the SAME pre-session blob every setItem since has thrown against — so
+// readStoredSettings() alone returns a real, parseable object
+// indistinguishable from a genuine cross-tab change. Without gating on
+// settingsWritesFailing, reopening the panel would silently revert every
+// choice made this session, on the very screen whose own
+// settingsStorageWarning banner says those choices "apply now but will not
+// survive a reload" — the page's own warning and its behavior would
+// contradict each other.
+func TestWebUIPage_AdoptOnOpenSkippedWhileStorageWritesAreFailing(t *testing.T) {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; the structural half of this pin ran above, the behavioural half needs an interpreter")
+	}
+
+	page := string(webUIPage)
+	header := `settingsBtn.addEventListener("click", function () {`
+	clickBlockRaw := jsBracedBlockAfter(t, page, header)
+	if !strings.HasPrefix(clickBlockRaw, header) || !strings.HasSuffix(clickBlockRaw, "}") {
+		t.Fatalf("could not isolate the click handler's own function body from:\n%s", clickBlockRaw)
+	}
+	body := clickBlockRaw[len(header) : len(clickBlockRaw)-1]
+
+	run := func(t *testing.T, writesFailing bool) map[string]interface{} {
+		t.Helper()
+		writesFailingLit := "false"
+		if writesFailing {
+			writesFailingLit = "true"
+		}
+		out := runPageFunctionUnderNode(t, nodePath, `
+var settings = { theme: "dark", pollMs: 30000, pageSize: 25, timestamps: "relative", motion: "system" };
+var settingsWritesFailing = `+writesFailingLit+`;
+var STORED = { theme: "light", pollMs: 30000, pageSize: 25, timestamps: "relative", motion: "system" };
+function readStoredSettings() { return STORED; }
+var appliedWith = null;
+function applySettings(s) { appliedWith = s; }
+var renderCalled = false;
+function renderSettingsForm() { renderCalled = true; }
+var settingsDialog = { showModal: function () {} };
+
+(function () {
+`+body+`
+})();
+
+console.log(JSON.stringify({ settingsTheme: settings.theme, appliedWith: appliedWith, renderCalled: renderCalled }));
+`)
+		var got map[string]interface{}
+		if err := json.Unmarshal([]byte(out), &got); err != nil {
+			t.Fatalf("could not read the click handler's effect (%v):\n%s", err, out)
+		}
+		return got
+	}
+
+	t.Run("writes healthy: a genuine stored change IS adopted", func(t *testing.T) {
+		got := run(t, false)
+		if got["settingsTheme"] != "light" {
+			t.Errorf(`settings.theme = %v, want "light" (the stored blob) — a healthy storage read should still be adopted`, got["settingsTheme"])
+		}
+		if got["appliedWith"] == nil {
+			t.Error("applySettings was never called — the adopted change never reached the page")
+		}
+		if got["renderCalled"] != true {
+			t.Error("renderSettingsForm was never called")
+		}
+	})
+
+	t.Run("writes failing: the stored blob is NOT adopted, in-session settings stand", func(t *testing.T) {
+		got := run(t, true)
+		if got["settingsTheme"] != "dark" {
+			t.Errorf(`settings.theme = %v, want "dark" (this session's own in-memory choice) — a stored read must not be adopted while this session's own writes are known to be failing, or Safari private mode silently reverts every choice made this session on reopen`, got["settingsTheme"])
+		}
+		if got["appliedWith"] != nil {
+			t.Errorf("applySettings was called with %v even though writes are failing — the stale stored blob was pushed onto the page anyway", got["appliedWith"])
+		}
+		if got["renderCalled"] != true {
+			t.Error("renderSettingsForm was never called — the dialog must still render (reflecting the in-memory, in-session settings) even when the stored-adopt is skipped")
+		}
+	})
 }
 
 // TestWebUIPage_ApplySettingsBundlesEveryLoadTimeEffect pins the shared
@@ -938,6 +1109,16 @@ func TestWebUIPage_SettingsDialogWarnsWhenStorageFails(t *testing.T) {
 		// A hardcoded `= true` (always hidden) would defeat the whole point;
 		// it must be driven by saveSettings' actual return value.
 		t.Error("settingsStorageWarning.hidden looks hardcoded rather than driven by saveSettings' return value")
+	}
+
+	// [v0.3.0 review fix, round 5] settingsWritesFailing must be driven by
+	// the SAME persisted value, alongside the warning banner — it is the
+	// gear button's own reopen handler's only way to tell a genuine
+	// cross-tab change from this tab's own stale past (Safari private
+	// browsing's getItem-works/setItem-throws split); see
+	// TestWebUIPage_AdoptOnOpenSkippedWhileStorageWritesAreFailing.
+	if !strings.Contains(body, "settingsWritesFailing = !persisted") {
+		t.Error("onSettingsChange never sets settingsWritesFailing from saveSettings' return value (via the captured `persisted` result), so the gear button's reopen handler could not tell a failing-writes session from a healthy one")
 	}
 }
 

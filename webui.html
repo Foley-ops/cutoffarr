@@ -102,6 +102,16 @@
      tr.action-performed td plus .case-collision-item.action-performed (a
      completed row struck through and left in place on purpose). */
   :root {
+    /* [v0.3.0 review fix, round 5] color-scheme tells the UA which of its
+       OWN built-in renderings (radio/checkbox controls, the overflow-y
+       scrollbar the settings dialog's body can show, form-field chrome) to
+       draw — CSS custom properties above have no effect on those, since they
+       are the browser's native widgets, not this page's own markup. Without
+       it every one of them rendered in the browser's LIGHT default even in
+       DARK mode (the default here), a visible mismatch against the settings
+       dialog's own dark panel. One value per theme block, mirroring the
+       --bg/--panel/--ink split each already makes. */
+    color-scheme: dark;
     --bg: #0F1517;
     --panel: #1A2427;
     --ink: #D8E2E0;
@@ -136,6 +146,7 @@
 
   @media (prefers-color-scheme: light) {
     :root:not([data-theme="dark"]) {
+      color-scheme: light;
       --bg: #F4F6F5;
       --panel: #FDFDFC;
       --ink: #202B28;
@@ -158,6 +169,7 @@
   }
 
   :root[data-theme="light"] {
+    color-scheme: light;
     --bg: #F4F6F5;
     --panel: #FDFDFC;
     --ink: #202B28;
@@ -179,6 +191,7 @@
   }
 
   :root[data-theme="dark"] {
+    color-scheme: dark;
     --bg: #0F1517;
     --panel: #1A2427;
     --ink: #D8E2E0;
@@ -215,13 +228,22 @@
   }
 
   /* [v0.3.0] Fluid container: the fixed 880px column wasted every viewport
-     wider than a laptop. min(1400px, 94vw) grows with the viewport up to a
-     hard 1400px ceiling (a findings table's own rows stop gaining anything
-     past that) while never touching the very edges even on an ultrawide
-     monitor. Nothing about the 360px-and-up narrow behavior changes: this is
-     still one fluid number, not a breakpoint. */
+     wider than a laptop. min(1400px, max(360px, 94vw)) grows with the
+     viewport up to a hard 1400px ceiling (a findings table's own rows stop
+     gaining anything past that) while never touching the very edges even on
+     an ultrawide monitor.
+     [v0.3.0 review fix, round 5] The inner max(360px, 94vw) is the floor: at
+     a 360px viewport, bare 94vw computes to 338.4px — a real 6% narrower
+     container than this page shipped before the fluid change, discovered by
+     re-measuring the brief's own "360px behavior unchanged" pin, which this
+     formula was violating (an EARLIER version of this comment claimed
+     otherwise; that claim was false). The floor keeps the container pinned
+     at exactly 360px at that viewport (and everywhere narrower than the
+     ~383px width at which 94vw first exceeds it on its own), matching the
+     pre-v0.3.0 width exactly, while leaving every viewport at or above that
+     crossover on the unmodified fluid formula. */
   .wrap {
-    max-width: min(1400px, 94vw);
+    max-width: min(1400px, max(360px, 94vw));
     margin: 0 auto;
     padding: 40px 24px 80px;
   }
@@ -1472,6 +1494,21 @@
   var settings = loadSettings();
   applyTheme(settings.theme);
   applyMotion(settings.motion);
+  // [v0.3.0 review fix, round 5] Tracks the SAME storage-write health
+  // settingsStorageWarning already surfaces (set alongside it in
+  // onSettingsChange, below), so the gear button's own reopen handler can
+  // consult it too. Concrete failure this closes: Safari private
+  // browsing's classic getItem-works/setItem-throws split (also hit on a
+  // quota-exhausted origin) — reads keep succeeding against the SAME
+  // pre-session stored blob every write since has failed to update, so
+  // without this flag the reopen handler's genuine-change detection
+  // (readStoredSettings() below) could not tell "another tab really changed
+  // this" from "my own writes are failing and I'm reading my own stale
+  // past" — and silently reverted every choice made this session, on the
+  // very screen whose own warning banner says those choices "apply now but
+  // will not survive a reload". Starts false: no write has been attempted
+  // yet this session, so there is nothing to distrust.
+  var settingsWritesFailing = false;
 
   var POLL_MS = 30000;
   // [v0.2.0] While a scan is actually running the page polls fifteen times
@@ -3373,6 +3410,11 @@
     // e.g. a privacy-mode toggle mid-session).
     var persisted = saveSettings(settings);
     if (settingsStorageWarning) settingsStorageWarning.hidden = persisted;
+    // [v0.3.0 review fix, round 5] Cleared the moment a write succeeds again,
+    // same as the warning banner above — see settingsWritesFailing's own
+    // declaration comment for what this gates (the gear button's reopen
+    // handler, below).
+    settingsWritesFailing = !persisted;
 
     applyTheme(settings.theme);
     applyMotion(settings.motion);
@@ -3446,8 +3488,21 @@
       // otherwise a real cross-tab change would sit invisible on screen (the
       // dialog showing e.g. "Light" over a page still rendering dark) until
       // some unrelated radio here happened to get clicked.
+      //
+      // [v0.3.0 review fix, round 5] ...unless settingsWritesFailing is set,
+      // in which case a "genuine" read is exactly what readStoredSettings()
+      // CANNOT tell apart from this tab's own stale past: Safari private
+      // browsing (and any quota-exhausted origin) lets localStorage.getItem
+      // keep succeeding against the same pre-session blob every setItem
+      // since has thrown against, so readStoredSettings would return a real,
+      // parseable object every time — just never THIS session's choices. On
+      // a healthy origin that same object is genuinely how another tab's
+      // change looks, so the flag, not the read, is what decides: skip the
+      // adopt while writes are known to be failing, and let the in-memory
+      // `settings` (and the page already rendering it) stand, matching what
+      // settingsStorageWarning is telling the operator on this exact screen.
       var stored = readStoredSettings();
-      if (stored) {
+      if (stored && !settingsWritesFailing) {
         settings = stored;
         applySettings(settings);
       }
