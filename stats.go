@@ -580,11 +580,12 @@ func newStatsStore(dryRun bool) *statsStore {
 //
 // A sweep used to be entirely invisible from the dashboard: the same numbers,
 // unchanged, for however long it took, with no way to tell a running scan from
-// a wedged one. These four methods are what a cycle says about itself WHILE it
-// runs, and they are strictly one-directional — a cycle only ever writes here,
-// and nothing that decides, writes or re-verifies anything ever reads it. There
-// is no getter on scanProgress at all, which is what makes that structural
-// rather than a convention: the type a cycle holds cannot answer a question.
+// a wedged one. These five methods (beginScan, endScan, stage, count, clear)
+// are what a cycle says about itself WHILE it runs, and they are strictly
+// one-directional — a cycle only ever writes here, and nothing that decides,
+// writes or re-verifies anything ever reads it. There is no getter on
+// scanProgress at all, which is what makes that structural rather than a
+// convention: the type a cycle holds cannot answer a question.
 
 // beginScan marks a cycle started and clears the previous one's stages. Called
 // once per cycle, from runScanCycle (daemon.go), which is the single funnel
@@ -675,7 +676,50 @@ func (p *scanProgress) count(stage string, done, total int) {
 	p.publish(scanProgressView{Stage: stage, Done: done, Total: total})
 }
 
-// publish is the one place either method touches the shared surface.
+// clear removes this instance's row from the surface. Its work in THIS cycle is
+// over — the engine returned, or the cycle gave up on it at one of §2.6's
+// warn-and-skip paths — and the stage last published describes something nobody
+// is doing any more.
+//
+// It is the third thing that touches scanByName, and the only per-INSTANCE one:
+// beginScan and endScan bracket the whole cycle, which is why, until this
+// round-3 review fix, the last stage an instance published stayed on the wire
+// (and pulsing on the page) for the entire remainder of the sweep. Two shapes
+// of that, both from an ordinary deployment: an instance skipped at its
+// connectivity check read CONNECTIVITY on the strip while its own card read
+// "last sweep incomplete" — the strip masking a warn-and-skip — and on the
+// two-instance norm, radarr sat frozen at FILE-WALK, total 0 and therefore
+// indeterminately pulsing, for the whole of sonarr's pass. Both are exactly
+// what scanView's own contract forbids: "never carries an instance the CURRENT
+// cycle has not reached: a stale entry would render as a progress bar for work
+// nobody is doing".
+//
+// Deleting rather than publishing a terminal `done` stage is deliberate: the
+// page's whole rule is that a row on the strip is work under way, and a
+// finished instance's evidence is its DATA — the shelf card recordInstance has
+// just refreshed — not a bar reading 100%.
+func (p *scanProgress) clear() {
+	if p == nil {
+		return
+	}
+	s := p.store
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Same rule as publish's: outside a running cycle this surface belongs to
+	// nobody, and a late handle must not reach into the next cycle's map.
+	if !s.scanInProgress {
+		return
+	}
+	delete(s.scanByName, p.instance)
+	p.lastStage = ""
+	p.lastDone = 0
+}
+
+// publish is the one place stage and count touch the shared surface (clear,
+// which removes rather than writes, is the only other method that does).
 //
 // A publish arriving after endScan (a late goroutine, a future refactor) is
 // DROPPED rather than resurrecting the surface: "in progress" must mean a cycle

@@ -170,7 +170,28 @@ func stateCacheDirInsideAMediaRoot(dir string, instances []Instance) (string, bo
 	if dir == "" {
 		return "", false
 	}
-	clean := cleanArrPath(filepath.ToSlash(dir))
+	// Resolved against the working directory FIRST (round-3 review fix). The
+	// media roots are absolute by validation, and ConfigDir is only
+	// filepath.Dir of whatever --config was pointed at — so
+	// `cd /data/media/Movies && cutoffarr --config config.yml` gave this
+	// function "." to compare against "/data/media/Movies", which can never
+	// match. The guard did not refuse, did not warn, and the cache landed in
+	// the user's library at the end of every sweep: the whole failure this
+	// function exists to prevent, reachable by typing a relative path.
+	//
+	// Absolutizing HERE rather than only at the one place that fills ConfigDir
+	// in is deliberate: this is the function whose answer is load-bearing, and
+	// it must be right for any caller — a Config assembled in memory, a future
+	// second source of directories — not only for LoadConfig's output. A
+	// filepath.Abs that fails (an unreadable working directory) falls back to
+	// the raw string, which is the strictly more careful of the two available
+	// wrong answers: a relative path still matches a relative root, and
+	// nothing here can invent containment that is not there.
+	resolved := dir
+	if abs, err := filepath.Abs(dir); err == nil {
+		resolved = abs
+	}
+	clean := cleanArrPath(filepath.ToSlash(resolved))
 	for _, inst := range instances {
 		for _, root := range mediaRootsFor(inst) {
 			if hasPathPrefix(clean, root.diskPath) {

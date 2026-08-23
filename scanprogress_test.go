@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -589,6 +590,136 @@ func TestDaemon_ScanProgress_IsVisibleWhileACycleRunsAndGoneWhenItEnds(t *testin
 	}
 }
 
+// holdTheSeriesRead is holdTheLibraryRead's sonarr twin (statecache_test.go):
+// it blocks the fake inside GET /api/v3/series and hands back the instant the
+// cycle got there. The two tests below need the SECOND configured instance held
+// mid-cycle while the first one's work is already over, which is the only shape
+// in which "a row goes away when that instance is done" is observable at all.
+func holdTheSeriesRead(t *testing.T, fake *statefulSonarrFake) (reached <-chan struct{}, release func()) {
+	t.Helper()
+	got := make(chan struct{}, 1)
+	gate := make(chan struct{})
+	release = sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release)
+	fake.onRequest = func(method, path string) {
+		if method == http.MethodGet && path == "/api/v3/series" {
+			select {
+			case got <- struct{}{}:
+			default:
+			}
+			<-gate
+		}
+	}
+	return got, release
+}
+
+// oneSeriesSonarrFake is the smallest stateful sonarr the two tests below need:
+// one monitored series with one aired episode that has a file. What it decides
+// is irrelevant here — it exists only to be the instance the cycle is still
+// working on while the first one's row is checked.
+func oneSeriesSonarrFake(t *testing.T) *statefulSonarrFake {
+	t.Helper()
+	return newStatefulSonarrFake(t,
+		[]*statefulSonarrSeries{
+			{id: 7, title: "The Sonarr One", monitored: true, profileID: 1, tags: []int{},
+				seasons: []statefulSonarrSeason{{number: 1, monitored: true, episodeFileCount: 1, totalEpisodeCount: 1}}},
+		},
+		[]*statefulSonarrEpisode{
+			{id: 700, seriesID: 7, seasonNumber: 1, episodeNumber: 1, monitored: true, hasFile: true, airDateUtc: pastAirDate, episodeFileID: 900},
+		},
+		[]*statefulSonarrEpisodeFile{{id: 900, seasonNumber: 1, customFormatScore: 200, qualityCutoffNotMet: false}},
+	)
+}
+
+// TestDaemon_ScanProgress_AFinishedInstancesRowIsGoneWhileTheNextOneStillRuns
+// is the two-instance half of the surface's own contract, and it is the half
+// the single-instance test above cannot see: scanView's doc comment promises
+// the map "never carries an instance the CURRENT cycle has not reached: a stale
+// entry would render as a progress bar for work nobody is doing", and until the
+// round-3 fix only beginScan and endScan ever touched the map. So on the
+// ordinary two-instance deployment, radarr's row stayed frozen at whatever
+// stage its engine happened to end on — file-walk, total 0, pulsing
+// indeterminately — for the ENTIRE duration of sonarr's pass.
+func TestDaemon_ScanProgress_AFinishedInstancesRowIsGoneWhileTheNextOneStillRuns(t *testing.T) {
+	radarr := newStatefulRadarrFake(t, []*statefulRadarrMovie{wouldUnmonitorStatefulMovie(1, "Movie")})
+	sonarr := oneSeriesSonarrFake(t)
+	reached, release := holdTheSeriesRead(t, sonarr)
+
+	h := startDaemon(t, writeTwoInstanceDaemonConfig(t, radarr.srv.URL, sonarr.srv.URL))
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the startup scan never reached the sonarr's library read:\n%s", h.out.String())
+	}
+
+	mid := getStats(t, h)
+	if !mid.Scan.InProgress {
+		t.Fatalf("scan.inProgress = false while the sonarr is held inside its library read: %+v", mid.Scan)
+	}
+	if p, ok := mid.Scan.Instances["sonarr-main"]; !ok || p.Stage != scanStageLibrary {
+		t.Errorf("scan.instances[\"sonarr-main\"] = %+v (present=%v), want stage %q: this is the instance actually being worked on", p, ok, scanStageLibrary)
+	}
+	if p, still := mid.Scan.Instances["radarr-main"]; still {
+		t.Errorf("scan.instances still carries radarr-main at stage %q after its engine returned: the strip would show a pulsing progress bar for work nobody is doing, for the whole of the sonarr's pass", p.Stage)
+	}
+
+	release()
+	h.waitReady()
+
+	after := getStats(t, h)
+	if after.Scan.InProgress || len(after.Scan.Instances) != 0 {
+		t.Errorf("scan = %+v after the cycle completed, want cleared", after.Scan)
+	}
+	if len(after.Instances) != 2 {
+		t.Errorf("instances = %+v, want both instances' completed data", after.Instances)
+	}
+}
+
+// TestDaemon_ScanProgress_AnInstanceSkippedAtConnectivityLeavesNoRowBehind is
+// the same defect's uglier face: §2.6's warn-and-skip paths. An instance whose
+// connectivity check fails publishes `connectivity` and is then abandoned, so
+// before the fix the strip announced it as CONNECTIVITY, pulsing, for the rest
+// of the sweep — on the very same page where its own card simultaneously read
+// "last sweep incomplete". The one surface whose job is to say what is
+// happening was masking the skip.
+func TestDaemon_ScanProgress_AnInstanceSkippedAtConnectivityLeavesNoRowBehind(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "the *arr is restarting", http.StatusInternalServerError)
+	}))
+	t.Cleanup(dead.Close)
+	sonarr := oneSeriesSonarrFake(t)
+	reached, release := holdTheSeriesRead(t, sonarr)
+
+	h := startDaemon(t, writeTwoInstanceDaemonConfig(t, dead.URL, sonarr.srv.URL))
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the startup scan never reached the sonarr's library read:\n%s", h.out.String())
+	}
+
+	mid := getStats(t, h)
+	if p, still := mid.Scan.Instances["radarr-main"]; still {
+		t.Errorf("scan.instances still carries radarr-main at stage %q after its connectivity check failed and the cycle moved on: the strip must never claim work is under way for an instance this cycle has given up on", p.Stage)
+	}
+	if _, ok := mid.Scan.Instances["sonarr-main"]; !ok {
+		t.Errorf("scan.instances = %+v, want the instance actually being worked on", mid.Scan.Instances)
+	}
+	// The contradiction the strip was papering over: the card already says the
+	// sweep could not reach this instance.
+	var radarrCard *instanceStatsView
+	for i := range mid.Instances {
+		if mid.Instances[i].Name == "radarr-main" {
+			radarrCard = &mid.Instances[i]
+		}
+	}
+	if radarrCard == nil || radarrCard.LastCycleStatus.Status != cycleStatusSkipped {
+		t.Fatalf("radarr-main's card = %+v, want a skipped cycle status: the fixture's whole point is that the two surfaces disagreed", radarrCard)
+	}
+
+	release()
+	h.waitReady()
+}
+
 // --- the page ---------------------------------------------------------------
 
 // pageFunctionBody returns the source of one top-level function in the embedded
@@ -647,6 +778,26 @@ func TestWebUIPage_ScanStripRendersEveryInstancesStageAndProgress(t *testing.T) 
 	}
 	if !strings.Contains(body, "scan-strip-indeterminate") {
 		t.Error("the strip renderer never applies the indeterminate class for a stage with no total")
+	}
+
+	// Round-3 review fix — the same hole the banner's own test had, and the
+	// same one round 2 closed for schedulePoll and renderScanButton. The
+	// assertions above are vocabulary: they require the literal "inProgress" to
+	// appear SOMEWHERE in the renderer. Inverting `if (!scan.inProgress)` — a
+	// progress strip on an idle dashboard, and no strip at all during a sweep —
+	// left every one of them green. Which state carries which behavior is the
+	// contract.
+	strip := pageFunctionBody(t, "renderScanStrip")
+	idle := jsBracedBlockAfter(t, strip, "if (!scan.inProgress)")
+	if !strings.Contains(idle, "strip.hidden = true") {
+		t.Errorf("the `!scan.inProgress` branch is not the one that takes the strip down; an idle dashboard must carry no progress bar at all:\n%s", idle)
+	}
+	if strings.Contains(idle, "strip.hidden = false") {
+		t.Errorf("the `!scan.inProgress` branch shows the strip:\n%s", idle)
+	}
+	tail := strip[strings.Index(strip, idle)+len(idle):]
+	if !strings.Contains(tail, "strip.hidden = false") {
+		t.Errorf("the running path never shows the strip, so a live sweep would render nothing:\n%s", tail)
 	}
 }
 

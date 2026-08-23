@@ -2215,7 +2215,18 @@
   // timestamp on this page uses. It hides itself the moment the running cycle
   // has refreshed every card, which is the honest end of the condition rather
   // than a timer.
-  function renderStaleBanner(instances) {
+  //
+  // `scanning` is this snapshot's scan.inProgress, and it decides only the
+  // banner's SECOND clause. "showing last sweep from <t>" is true in every
+  // state a stale row can be on screen; "— refreshing now … each shelf updates
+  // as the running scan reaches it" is a claim about the daemon, and there are
+  // two ordinary ways for it to be false while the banner is up: nothing is
+  // running (recordUnreachable deliberately leaves an instance stale, so a
+  // permanently unreachable one keeps the banner for the whole 24h between
+  // sweeps), or the daemon is gone entirely (showDisconnected, which hides this
+  // banner outright for the same reason it tears the strip down). Round-3
+  // review fix: the clause used to be unconditional.
+  function renderStaleBanner(instances, scanning) {
     var banner = document.getElementById("staleBanner");
     var stale = 0;
     var newest = null;
@@ -2230,8 +2241,13 @@
       text(banner, "");
       return;
     }
-    text(banner, "showing last sweep from " + fmtRelative(newest) +
-      " — refreshing now. These numbers were restored from cutoffarr's own cache when it started; each shelf updates as the running scan reaches it.");
+    if (scanning) {
+      text(banner, "showing last sweep from " + fmtRelative(newest) +
+        " — refreshing now. These numbers were restored from cutoffarr's own cache when it started; each shelf updates as the running scan reaches it.");
+    } else {
+      text(banner, "showing last sweep from " + fmtRelative(newest) +
+        ". These numbers were restored from cutoffarr's own cache when it started; each shelf updates when a sweep next reaches it.");
+    }
     banner.hidden = false;
   }
 
@@ -2419,7 +2435,7 @@
     // away.
     scanInProgress = !!(data.scan && data.scan.inProgress);
 
-    renderStaleBanner(instances);
+    renderStaleBanner(instances, scanInProgress);
     renderScanStrip(data);
     renderScanButton();
 
@@ -2466,6 +2482,18 @@
     strip.textContent = "";
     scanRows = {};
     scanHead = null;
+
+    // [v0.2.0, round-3 review fix] And the warm-start banner with it, for
+    // exactly the same reason. The banner's second clause says the numbers are
+    // "refreshing now" — a claim about a daemon this page has just failed to
+    // reach — and the badge two lines below is about to read "disconnected —
+    // showing data from 4m ago". Leaving the two on screen together is the same
+    // lie the strip is torn down to avoid. The badge is now the only thing
+    // saying how old the numbers are, which is the one statement still true.
+    var staleBanner = document.getElementById("staleBanner");
+    staleBanner.hidden = true;
+    text(staleBanner, "");
+
     var since = lastSuccessAt ? fmtRelative(lastSuccessAt.toISOString()) : null;
     text(badge, since ? ("disconnected — showing data from " + since) : "disconnected — no data yet");
 

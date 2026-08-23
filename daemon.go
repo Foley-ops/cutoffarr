@@ -216,6 +216,14 @@ func runScanCycle(ctx context.Context, logger *slog.Logger, cfg Config, cycle sc
 			if stats != nil {
 				stats.recordUnreachable(inst.Name, inst.Type, unreachableReasonConnectivity)
 			}
+			// This cycle is done with this instance, so its row comes off the
+			// strip HERE rather than at endScan. Without it the page announced
+			// the instance as CONNECTIVITY, pulsing, for the rest of the sweep —
+			// on the same page where the card recordUnreachable has just written
+			// reads "last sweep incomplete", the strip masking the very
+			// warn-and-skip it exists to make visible. See
+			// (*scanProgress).clear.
+			scope.progress.clear()
 			continue
 		}
 		if inst.Type == "radarr" {
@@ -247,6 +255,14 @@ func runScanCycle(ctx context.Context, logger *slog.Logger, cfg Config, cycle sc
 				stats.recordUnreachable(inst.Name, inst.Type, unreachableReasonLibraryRead)
 			}
 		}
+
+		// Whatever happened above — the engine completed, the engine
+		// bare-returned mid-evaluation on one of §2.6's own warn-and-skip
+		// paths, or the library read failed — this instance's work in this
+		// cycle is over, and the strip must stop claiming otherwise. One
+		// statement covering both type branches rather than one inside each,
+		// so a third instance type added later cannot forget it.
+		scope.progress.clear()
 	}
 }
 
@@ -744,6 +760,30 @@ func (d *daemon) warmStartFromStateCache() {
 		if !found || v.Type != inst.Type {
 			continue
 		}
+		// The same containment rule one level down, and the case the name/type
+		// filter above cannot see (round-3 review fix). The file report is
+		// opt-in per instance — media_root_map, whose absence is the OFF state
+		// (binding controller resolution 1) — so for an instance whose map has
+		// been removed from config.yml since the cache was written, NO cycle of
+		// this process will ever run the pass. recordInstance only overwrites
+		// FileReport when it actually ran (cs.fileReportRan) while clearing
+		// Stale unconditionally, so a restored report would survive every
+		// subsequent cycle untouched and then be served with stale:false and no
+		// banner: a previous process's findings presented as current,
+		// indefinitely, with live trash and merge buttons beside them. The click
+		// itself is still safe — the action re-derives from live data and
+		// refuses — but the operator is handed findings they cannot act on and
+		// never told why. fileReportSnapshot carries no timestamp of its own
+		// (unlike ReverseAsOf, which is exactly why the reverse half self-heals
+		// and is age-marked), so nothing on the page could say otherwise
+		// either. Before [v0.2.0] this was impossible: with no media_root_map
+		// the snapshot stayed zero-value and the panel read "off".
+		if len(mediaRootsFor(inst)) == 0 && !fileReportSnapshotIsOff(v.FileReport) {
+			d.logger.Warn("the dashboard's warm-start cache holds file-clutter findings for an instance that has no media_root_map in this config, so they were dropped rather than restored: nothing in this process can refresh or correct them, and no button beside them could act. The panel reads \"off\" until media_root_map is configured again. The file is safe to delete",
+				"instance", inst.Name, "type", inst.Type, "configDir", d.stateCacheDir(), "file", stateCacheFileName,
+				"droppedFindings", len(v.FileReport.Findings), "sweptAt", writtenAt.Format(time.RFC3339))
+			v.FileReport = fileReportSnapshot{Status: "off", Findings: []fileReportFindingRecord{}}
+		}
 		inConfig = append(inConfig, v)
 	}
 
@@ -770,6 +810,21 @@ func (d *daemon) warmStartFromStateCache() {
 	// "showing last sweep from …" banner.
 	d.logger.Info("warm start: the dashboard is showing the last completed sweep from the state cache, marked stale, until this process's own first cycle finishes",
 		"instances", loaded, "ignored", len(cached)-loaded, "sweptAt", writtenAt.Format(time.RFC3339))
+}
+
+// fileReportSnapshotIsOff reports whether snap says nothing at all — the exact
+// shape an instance with no media_root_map has always had on the wire, and
+// therefore the shape warmStartFromStateCache resets one to when it drops it.
+//
+// Both spellings of "no status" count: "off" is what the store normalizes to,
+// and "" is what a hand-edited or older cache can carry (statsStore.warmStart
+// normalizes it the same way). Every counter is checked, not just Findings,
+// because the panel's headline numbers are as much a claim as its rows are.
+func fileReportSnapshotIsOff(snap fileReportSnapshot) bool {
+	return (snap.Status == "" || snap.Status == "off") &&
+		len(snap.Findings) == 0 &&
+		snap.Duplicates == 0 && snap.Orphans == 0 && snap.CaseCollisions == 0 &&
+		snap.ReclaimableBytes == 0 && snap.UnsizedFindings == 0
 }
 
 // saveStateCache writes the current stats snapshot to the state cache at the

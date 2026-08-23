@@ -872,9 +872,11 @@ script, a status-page widget, whatever) without ever loading the HTML:
   a live library read clears both; a cycle that could not REACH it
   deliberately does not, because it produced no fresher numbers. Both are
   always present (`false`/`null` on an ordinary instance). The dashboard
-  renders them as an amber "showing last sweep from &lt;time&gt; —
-  refreshing now" banner above the shelves plus an "as of &lt;time&gt;" note
-  on each still-cached card.
+  renders them as an amber "showing last sweep from &lt;time&gt;" banner above
+  the shelves plus an "as of &lt;time&gt;" note on each still-cached card. The
+  banner appends "— refreshing now" only while `scan.inProgress` is true, and
+  hides itself outright when the page cannot reach the daemon at all: the age
+  of the numbers is true in every state, a running refresh is not.
 
   `lastCycleStatus` is this instance's outcome on the single MOST RECENT
   cycle that named it, independent of everything else in this object:
@@ -932,7 +934,13 @@ script, a status-page widget, whatever) without ever loading the HTML:
     running and is otherwise `lastCycleKind`'s own vocabulary
     (`startup`/`sweep`/`webhook`/`once`).
   - `instances` is always an object (`{}` when idle), keyed by instance
-    name, holding only the instances the CURRENT cycle has reached.
+    name, holding only the instances the current cycle is working on RIGHT
+    NOW. An entry appears when the cycle starts on that instance and is
+    removed the moment it is finished with it — whether the engine completed,
+    the library read failed, or the connectivity check did — so a two-instance
+    sweep never shows the first instance still "in progress" while the second
+    one runs, and an instance the cycle gave up on never renders as a bar for
+    work nobody is doing.
   - each entry is `{"stage": "...", "done": N, "total": N}`. `stage` is one
     of `connectivity`, `library`, `wanted-set`, `evaluating`, `cross-check`,
     `writing`, `reverse-scan`, `file-walk`. `done`/`total` are `0`/`0` for a
@@ -1029,9 +1037,14 @@ already done its real work, and the next full cycle simply tries again.
 **Read back once, at startup, before the first cycle.** Instances the current
 config still names (and still names as the same type) are restored with
 `stale: true` and `asOf` set to the cache's own `writtenAt`; the dashboard
-shows them behind an amber "showing last sweep from … — refreshing now"
-banner, and each card drops its own "as of …" note as the running cycle
-reaches it. A cache that is missing, unreadable, not JSON, of a different
+shows them behind an amber "showing last sweep from …" banner (which adds
+"— refreshing now" only while a cycle is actually running), and each card
+drops its own "as of …" note as the running cycle reaches it. One part of a
+restored instance is dropped on the way in: cached file-clutter findings for
+an instance that has no `media_root_map` in the CURRENT config, since the file
+report is opt-in per instance and no cycle of this process would ever refresh
+or correct them — that panel reads `off` and the drop is a WARN naming the
+instance and the file. A cache that is missing, unreadable, not JSON, of a different
 `schemaVersion`, or missing any field the restore is built out of is ignored
 with a warning and the process cold-starts exactly as every version before
 this one did — including a valid cache whose instances no longer match any

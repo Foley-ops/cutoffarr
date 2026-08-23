@@ -282,6 +282,46 @@ func TestStateCacheDirInsideAMediaRoot_IsTheHalfOfContainmentTheOtherTestCannotS
 	if _, inside := stateCacheDirInsideAMediaRoot("/data/media/Movies", []Instance{{Name: "radarr-main", Type: "radarr"}}); inside {
 		t.Error("an instance with NO media_root_map produced a media root to be contained by; the file report is opt-in and an absent map is the OFF state")
 	}
+
+	// Round-3 review fix, and the bypass every case above is blind to: the
+	// guard matched a possibly-RELATIVE directory against absolute media roots.
+	// LoadConfig sets ConfigDir = filepath.Dir(--config) with no filepath.Abs,
+	// so `cd /data/media/Movies && cutoffarr --config config.yml` produced
+	// ConfigDir "." — which can never string-match any absolute root — and
+	// state-cache.json was written into the user's media library at the end of
+	// every full sweep, with no refusal and no WARN. Exactly what the brief's
+	// "never under any media root; path containment asserted" clause, and this
+	// whole function, exist to prevent.
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("reading the working directory: %v", err)
+	}
+	here := Instance{Name: "radarr-here", Type: "radarr", MediaRootMap: map[string]string{
+		"/movies": filepath.ToSlash(cwd),
+	}}
+	for _, tc := range []struct{ name, dir string }{
+		{"the working directory itself, named relatively", "."},
+		{"a child of it", "fixtures"},
+		{"the same place by the long way round", "./fixtures/.."},
+	} {
+		t.Run("relative "+tc.name, func(t *testing.T) {
+			root, inside := stateCacheDirInsideAMediaRoot(tc.dir, []Instance{here})
+			if !inside {
+				t.Fatalf("stateCacheDirInsideAMediaRoot(%q) allowed a relative directory whose absolute form is inside the media root %q: `cd <a media root> && cutoffarr --config config.yml` would drop %s into the user's library at the end of every sweep, unrefused and unlogged", tc.dir, filepath.ToSlash(cwd), stateCacheFileName)
+			}
+			if want := filepath.ToSlash(cwd); root != want {
+				t.Errorf("stateCacheDirInsideAMediaRoot(%q) named %q as the containing root, want %q", tc.dir, root, want)
+			}
+		})
+	}
+	t.Run("a relative directory outside every root is still allowed", func(t *testing.T) {
+		// The other half: absolutizing must not turn every relative path into a
+		// refusal. This one resolves under the working directory, which the two
+		// /data/media roots do not contain.
+		if root, inside := stateCacheDirInsideAMediaRoot("config", []Instance{radarr, sonarr}); inside {
+			t.Errorf("stateCacheDirInsideAMediaRoot(%q) refused a relative directory that resolves outside every media root, naming %q; the warm start would be lost for no reason", "config", root)
+		}
+	})
 }
 
 // TestDaemon_StateCacheDir_RefusesToWriteInsideAMediaRootAndSaysSoOnce is the
@@ -982,6 +1022,34 @@ func seedStateCache(t *testing.T, configPath string, at time.Time, instances ...
 	}
 }
 
+// writeDaemonConfigWithMediaRoot is writeDaemonConfig plus a media_root_map,
+// which is the file report's own opt-in switch (binding controller resolution
+// 1: an absent map is the OFF state). It exists for the pair of warm-start
+// tests that turn on exactly that difference — whether the instance whose
+// cached file report is being restored can still produce one at all.
+func writeDaemonConfigWithMediaRoot(t *testing.T, url, arrPath, diskPath string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := fmt.Sprintf(`
+dry_run: true
+log_level: info
+poll_interval: 0
+webhook_debounce: 45s
+instances:
+  - name: radarr-main
+    type: radarr
+    url: %s
+    api_key: key1
+    media_root_map:
+      %q: %q
+`, url, arrPath, diskPath)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing the daemon test config: %v", err)
+	}
+	return path
+}
+
 // holdTheLibraryRead makes a stateful Radarr fake block its GET /api/v3/movie
 // until the test lets it go, so a test can observe what the dashboard serves
 // WHILE the first cycle is still running. The release func is registered as
@@ -1130,6 +1198,127 @@ func TestDaemon_AnInstanceRemovedFromTheConfigIsNotResurrectedFromTheCache(t *te
 	if !strings.Contains(h.out.String(), "warm start") {
 		t.Errorf("the daemon warm-started without saying so; a dashboard showing a previous run's numbers must be explained in the log too:\n%s", h.out.String())
 	}
+}
+
+// TestDaemon_ACachedFileReportIsDroppedWhenTheInstanceHasNoMediaRootsLeft is
+// the third case of the same containment rule, and the one the name/type filter
+// cannot see: the instance is still configured, still the same *arr, but its
+// media_root_map has been REMOVED from config.yml since the cache was written.
+//
+// The file report is opt-in per instance and an absent map is the OFF state, so
+// no cycle of this process will ever run the pass — and recordInstance only
+// overwrites FileReport when the pass actually ran (cs.fileReportRan). So the
+// previous process's clutter findings would be restored from disk, survive
+// every subsequent cycle untouched, and, once the first cycle clears Stale, be
+// served with stale:false and no banner: a previous process's findings
+// presented as current, indefinitely, with live trash and merge buttons beside
+// them. fileReportSnapshot carries no timestamp of its own (unlike ReverseAsOf,
+// which is exactly why the reverse half self-heals and is age-marked), so
+// nothing on the page could have said otherwise. Round-3 review fix. Pre-v0.2.0
+// this was impossible: with no media_root_map the snapshot stayed zero-value
+// and the panel read "off".
+func TestDaemon_ACachedFileReportIsDroppedWhenTheInstanceHasNoMediaRootsLeft(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{wouldUnmonitorStatefulMovie(1, "Movie")})
+	reached, release := holdTheLibraryRead(t, fake)
+	// writeDaemonConfig writes no media_root_map at all, which is the "the
+	// operator removed it" state this test is about.
+	configPath := writeDaemonConfig(t, "radarr", fake.srv.URL, true, "info", "0", "45s")
+	seedStateCache(t, configPath, time.Date(2026, 8, 22, 9, 30, 0, 0, time.UTC),
+		instanceStatsView{
+			Name: "radarr-main", Type: "radarr", Total: 996, Monitored: 540, Unmonitored: 456,
+			FileReport: fileReportSnapshot{
+				Status: "ran", Duplicates: 1, ReclaimableBytes: 4096,
+				Findings: []fileReportFindingRecord{{
+					Kind: fileKindDuplicate, Path: "/data/media/Movies/Old/dupe.mkv",
+					Display: "dupe.mkv", Size: 4096,
+				}},
+			},
+		},
+	)
+
+	h := startDaemon(t, configPath)
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the startup scan never reached its library read:\n%s", h.out.String())
+	}
+
+	warm := getStats(t, h)
+	if len(warm.Instances) != 1 {
+		t.Fatalf("instances = %+v, want the cached instance warm-started (only its file report is in question)", warm.Instances)
+	}
+	if warm.Instances[0].Total != 996 {
+		t.Errorf("the instance's own numbers were dropped along with the file report: %+v — only the report is unrestorable", warm.Instances[0])
+	}
+	if got := warm.Instances[0].FileReport; got.Status != "off" || len(got.Findings) != 0 || got.Duplicates != 0 {
+		t.Errorf("fileReport = %+v, want the off state: this instance has no configured media roots, so no cycle will ever refresh or correct these findings", got)
+	}
+	// Said out loud, in coldStart's own vocabulary — which file, what was
+	// dropped, what happens instead — the same treatment the retired-instance
+	// and changed-type cases already get.
+	out := h.out.String()
+	for _, want := range []string{"level=WARN", stateCacheFileName, "radarr-main", "media_root_map"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("dropping a cached file report never mentioned %q in the log; a panel that silently loses its findings is the silent-skip shape §2.6 forbids:\n%s", want, out)
+		}
+	}
+
+	release()
+	h.waitReady()
+
+	// And it stays dropped: the first completed cycle does not run the pass
+	// either, so nothing would have corrected a restored snapshot.
+	after := getStats(t, h)
+	if len(after.Instances) != 1 {
+		t.Fatalf("instances = %+v after the cycle, want one", after.Instances)
+	}
+	if got := after.Instances[0]; got.Stale || got.FileReport.Status != "off" || len(got.FileReport.Findings) != 0 {
+		t.Errorf("after the first fresh cycle: stale=%v fileReport=%+v — the cycle clears stale unconditionally, so a restored report would be served as this process's own work from here on", got.Stale, got.FileReport)
+	}
+}
+
+// TestDaemon_ACachedFileReportSurvivesWhenTheInstanceStillHasMediaRoots is the
+// negative half: the drop above is about an instance that can no longer produce
+// a report, not about file reports in general. An instance whose media_root_map
+// is still configured keeps its cached findings — that is the warm start doing
+// its job — and nothing is warned about.
+func TestDaemon_ACachedFileReportSurvivesWhenTheInstanceStillHasMediaRoots(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{wouldUnmonitorStatefulMovie(1, "Movie")})
+	reached, release := holdTheLibraryRead(t, fake)
+	root := t.TempDir()
+	configPath := writeDaemonConfigWithMediaRoot(t, fake.srv.URL, "/movies", root)
+	seedStateCache(t, configPath, time.Date(2026, 8, 22, 9, 30, 0, 0, time.UTC),
+		instanceStatsView{
+			Name: "radarr-main", Type: "radarr", Total: 996,
+			FileReport: fileReportSnapshot{
+				Status: "ran", Duplicates: 1, ReclaimableBytes: 4096,
+				Findings: []fileReportFindingRecord{{
+					Kind: fileKindDuplicate, Path: "/movies/Old/dupe.mkv", Display: "dupe.mkv", Size: 4096,
+				}},
+			},
+		},
+	)
+
+	h := startDaemon(t, configPath)
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the startup scan never reached its library read:\n%s", h.out.String())
+	}
+
+	warm := getStats(t, h)
+	if len(warm.Instances) != 1 {
+		t.Fatalf("instances = %+v, want the cached instance", warm.Instances)
+	}
+	if got := warm.Instances[0].FileReport; got.Status != "ran" || len(got.Findings) != 1 {
+		t.Errorf("fileReport = %+v, want the cached findings kept: this instance is still configured to produce them, and the warm start's whole job is showing the last sweep", got)
+	}
+	if strings.Contains(h.out.String(), "media_root_map") {
+		t.Errorf("the daemon warned about media roots for an instance that has them:\n%s", h.out.String())
+	}
+
+	release()
+	h.waitReady()
 }
 
 // TestDaemon_ACachedInstanceWhoseTypeChangedIsNotWarmStarted is the same
@@ -1297,8 +1486,81 @@ func TestWebUIPage_WarmStartBannerSaysWhichSweepIsOnScreenAndThatItIsRefreshing(
 		t.Errorf("renderStaleBanner never hides the banner, so it would stay on screen after the first fresh cycle:\n%s", body)
 	}
 
-	if !strings.Contains(pageFunctionBody(t, "render"), "renderStaleBanner(instances)") {
+	if !strings.Contains(pageFunctionBody(t, "render"), "renderStaleBanner(instances,") {
 		t.Error("render() does not update the stale banner from each snapshot")
+	}
+
+	// Round-3 review fix, and it is exactly the defect round 2 closed for
+	// schedulePoll and renderScanButton, unfixed on this feature's headline UI
+	// element: everything above is VOCABULARY. Inverting `if (stale === 0)` —
+	// so the banner is hidden precisely when the dashboard is warm and shown
+	// when every card is fresh — left the whole suite green, and so did
+	// deleting `banner.hidden = false`. Which STATE carries which behavior is
+	// the contract, so that is what is pinned.
+	fresh := jsBracedBlockAfter(t, body, "if (stale === 0)")
+	if !strings.Contains(fresh, "hidden = true") {
+		t.Errorf("the `stale === 0` branch is not the one that HIDES the banner; a dashboard with no cached numbers must carry no banner at all:\n%s", fresh)
+	}
+	if strings.Contains(fresh, "showing last sweep from") {
+		t.Errorf("the `stale === 0` branch writes the warm-start copy; a fully fresh dashboard must never claim it is showing a previous sweep:\n%s", fresh)
+	}
+	tail := body[strings.Index(body, fresh)+len(fresh):]
+	if !strings.Contains(tail, "hidden = false") || !strings.Contains(tail, "showing last sweep from") {
+		t.Errorf("the warm path (at least one stale instance) does not both show the banner and name the sweep on screen:\n%s", tail)
+	}
+}
+
+// TestWebUIPage_TheWarmStartBannerOnlyClaimsARefreshWhenOneIsRunning is the
+// banner's other honesty rule, and the round-3 review fix for two states in
+// which it was asserting something untrue.
+//
+// "— refreshing now … each shelf updates as the running scan reaches it" is a
+// claim about the DAEMON, not about the cache, and there are two ordinary ways
+// for it to be false while stale rows are on screen:
+//
+//   - the daemon is gone. showDisconnected already tears the scan strip down,
+//     with a comment saying a progress indicator left up on a dead backend
+//     "would be the same lie the 'first sweep in progress' placeholder was
+//     fixed for" — but it never touched #staleBanner, so a page that
+//     warm-started and then lost its daemon read "disconnected — showing data
+//     from 4m ago" in the badge and "refreshing now" directly beneath it.
+//   - nothing is running. recordUnreachable deliberately does not clear Stale,
+//     so a permanently unreachable instance leaves the banner up — and, with
+//     the clause unconditional, leaves "refreshing now" on screen for the whole
+//     24h gap between sweeps.
+//
+// "showing last sweep from <t>" alone is true in every state, so the clause is
+// what moves, not the banner.
+func TestWebUIPage_TheWarmStartBannerOnlyClaimsARefreshWhenOneIsRunning(t *testing.T) {
+	body := pageFunctionBody(t, "renderStaleBanner")
+	if !strings.Contains(body, "scanning") {
+		t.Fatalf("renderStaleBanner never consults whether a scan is running, so its \"refreshing now\" clause cannot be conditional on one:\n%s", body)
+	}
+	refreshing := jsBracedBlockAfter(t, body, "if (scanning)")
+	if !strings.Contains(refreshing, "refreshing now") {
+		t.Errorf("the scanning branch is not the one that claims a refresh is under way:\n%s", refreshing)
+	}
+	idle := body[strings.Index(body, refreshing)+len(refreshing):]
+	if strings.Contains(idle, "refreshing now") {
+		t.Errorf("the idle path still claims the numbers are refreshing; with no cycle running that is simply false, and on a permanently unreachable instance it stays false for the whole 24h between sweeps:\n%s", idle)
+	}
+	if !strings.Contains(idle, "showing last sweep from") {
+		t.Errorf("the idle path drops the banner's true half along with its false one; \"showing last sweep from <t>\" is accurate in every state:\n%s", idle)
+	}
+
+	// The caller has to hand it the scan state for any of that to mean
+	// anything.
+	if !strings.Contains(pageFunctionBody(t, "render"), "renderStaleBanner(instances, scanInProgress)") {
+		t.Error("render() does not pass the snapshot's scan state to renderStaleBanner, so the banner cannot tell a running sweep from an idle daemon")
+	}
+
+	// And the disconnected path, where nothing at all is refreshing.
+	dis := pageFunctionBody(t, "showDisconnected")
+	if !strings.Contains(dis, "staleBanner") {
+		t.Errorf("showDisconnected tears the scan strip down but leaves the warm-start banner claiming a refresh on a backend it just failed to reach:\n%s", dis)
+	}
+	if !strings.Contains(dis, "staleBanner.hidden = true") {
+		t.Errorf("showDisconnected names #staleBanner but never hides it; the badge would read \"disconnected — showing data from 4m ago\" with \"refreshing now\" directly beneath it:\n%s", dis)
 	}
 }
 

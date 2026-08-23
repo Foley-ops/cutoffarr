@@ -236,7 +236,23 @@ func LoadConfig(path string) (*Config, error) {
 	// filesystem's own separator) rather than path.Dir, which this file uses
 	// deliberately for *arr-side paths: this one is a real path on the machine
 	// cutoffarr is running on.
+	//
+	// ABSOLUTE (round-3 review fix). `--config config.yml` used to record "."
+	// here, and a relative directory is a directory whose meaning depends on
+	// the working directory of whoever asks — which made the media-root
+	// containment guard (stateCacheDirInsideAMediaRoot) unable to match it
+	// against the absolute roots at all, so `cd /data/media/Movies && cutoffarr
+	// --config config.yml` wrote the display cache into the user's library
+	// unrefused. That guard now resolves what it is given on its own, and this
+	// makes the value it is given honest at the source: one path, the same for
+	// the log line, the WARN, and the file. A working directory this process
+	// cannot read is not a reason to refuse a config that is otherwise valid,
+	// so the relative form is kept in that case and the guard's own
+	// absolutization stays the backstop.
 	cfg.ConfigDir = filepath.Dir(path)
+	if abs, err := filepath.Abs(cfg.ConfigDir); err == nil {
+		cfg.ConfigDir = abs
+	}
 
 	return cfg, nil
 }
