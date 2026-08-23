@@ -327,6 +327,32 @@ type instanceStatsView struct {
 	FileReport      fileReportSnapshot `json:"fileReport"`
 	LastActions     []actionRecord     `json:"lastActions"`
 
+	// Stale/AsOf are [v0.2.0]'s warm-start pair, and they exist because a
+	// restarted container used to blank this instance's card entirely until a
+	// full sweep finished — minutes on a real library, during which the one
+	// surface whose job is "glance and trust these numbers" had none.
+	//
+	// They mean exactly one thing, and it is narrow: EVERY number on this
+	// instance was read out of the on-disk display cache (statecache.go)
+	// written by a PREVIOUS process, and no cycle of THIS process has yet
+	// recorded it. Stale is true and AsOf is that cache's own writtenAt —
+	// never "now", never the cycle that is currently running — following
+	// ReverseAsOf's convention exactly: the timestamp of the numbers being
+	// shown, not of the attempt to refresh them.
+	//
+	// The first recordInstance for this instance clears both (see that
+	// method): once a live library read has landed, these numbers are this
+	// process's own. recordUnreachable deliberately does NOT clear them — a
+	// cycle that could not reach the instance produced no fresher numbers, and
+	// claiming freshness on its behalf would be the false all-clear this file
+	// refuses everywhere else.
+	//
+	// Both are ALWAYS present on the wire (stale false, asOf null, on every
+	// ordinary instance), for the same reason LastRun/ReverseAsOf are: an
+	// absent key must never be readable as a value.
+	Stale bool       `json:"stale"`
+	AsOf  *time.Time `json:"asOf"`
+
 	// LastCycleStatus is this instance's outcome on the MOST RECENT cycle
 	// that named it at all — including a cycle that never reached the
 	// decision engine because §2.6's connectivity-gate or library-read
@@ -456,6 +482,19 @@ func (s *statsStore) recordInstance(kind string, at time.Time, name, typ string,
 	v.Monitored = cs.monitored
 	v.Unmonitored = cs.unmonitored
 
+	// [v0.2.0] The warm start ends here, for this instance, and it ends
+	// UNCONDITIONALLY — before every gated field below, and gated on nothing
+	// itself. The three lines above are the reason: they are written from the
+	// library read, which daemon.go only reaches after its own dataOK check, so
+	// by this point this instance's headline numbers are this process's own
+	// live read and can no longer honestly be labelled as a previous process's
+	// cache. What each PASS most recently managed is a separate question that
+	// the existing three-state fields already answer on their own terms
+	// (ReverseStatus/ReverseAsOf, FileReport.Status) — Stale was never a
+	// per-pass claim and must not start being read as one.
+	v.Stale = false
+	v.AsOf = nil
+
 	// This cycle reached the decision engine at all (runScanCycle only calls
 	// recordInstance from inside its dataOK branch) — a strictly stronger
 	// statement than the connectivity/library-read gates recordUnreachable
@@ -555,6 +594,78 @@ func (s *statsStore) recordInstance(kind string, at time.Time, name, typ string,
 		}
 		v.LastActions = merged
 	}
+}
+
+// warmStart seeds the store from the on-disk display cache (statecache.go)
+// before the first cycle of this process runs, and returns how many instances
+// it took. It is [v0.2.0]'s whole reason for existing: a restarted container
+// showed a blank dashboard until a full sweep completed, which on a real
+// library is minutes of the one surface an operator checks having nothing on it
+// at all.
+//
+// THIS IS THE CACHE'S ONLY CONSUMER, and it is a presentation-layer method by
+// construction — it writes the same fields recordInstance writes and nothing
+// else, so nothing it seeds can reach a decision, a write, or an action's
+// re-verification, all of which re-derive from live data on their own (see
+// statecache.go's header for the structural pins that keep it that way).
+//
+// Two properties make it safe to call from startup wiring:
+//
+//   - It REFUSES a store a cycle has already written to (len(s.order) > 0),
+//     returning 0. Warm start belongs strictly before the first cycle; running
+//     it later would replace live numbers with older ones and mark them stale —
+//     a dashboard moving backwards.
+//   - Everything it stores is COPIED and normalized to the store's own
+//     invariants (never a nil findings slice, never an empty status string), so
+//     an older or hand-edited cache cannot put a shape on the wire that the API
+//     contract says is impossible, and the decoded JSON the caller still holds
+//     shares no memory with the store.
+//
+// Every instance it seeds is marked Stale with AsOf set to the cache's own
+// writtenAt — see those fields. Instances arrive in the order the caller hands
+// them over, which is config order (daemon.go picks them that way), matching
+// the order a cold start's first cycle would have produced.
+func (s *statsStore) warmStart(instances []instanceStatsView, writtenAt time.Time) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.order) > 0 {
+		return 0
+	}
+
+	loaded := 0
+	for _, in := range instances {
+		if in.Name == "" || s.byName[in.Name] != nil {
+			// Both are already refused by the loader (statecache.go); repeated
+			// here because this method's own invariant — one entry per name,
+			// each keyed by a real name — must not depend on who calls it.
+			continue
+		}
+		v := cloneInstanceStatsView(in)
+		if v.ReverseFindings == nil {
+			v.ReverseFindings = []reverseFinding{}
+		}
+		if v.LastActions == nil {
+			v.LastActions = []actionRecord{}
+		}
+		if v.FileReport.Findings == nil {
+			v.FileReport.Findings = []fileReportFindingRecord{}
+		}
+		if v.ReverseStatus == "" {
+			v.ReverseStatus = "off"
+		}
+		if v.FileReport.Status == "" {
+			v.FileReport.Status = "off"
+		}
+		at := writtenAt
+		v.Stale = true
+		v.AsOf = &at
+
+		s.byName[in.Name] = &v
+		s.order = append(s.order, in.Name)
+		loaded++
+	}
+	return loaded
 }
 
 // recordUnreachable folds in the OTHER outcome runScanCycle's per-instance
@@ -718,6 +829,10 @@ func cloneInstanceStatsView(v instanceStatsView) instanceStatsView {
 	if v.ReverseAsOf != nil {
 		t := *v.ReverseAsOf
 		out.ReverseAsOf = &t
+	}
+	if v.AsOf != nil {
+		t := *v.AsOf
+		out.AsOf = &t
 	}
 
 	out.ReverseFindings = make([]reverseFinding, len(v.ReverseFindings))

@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -85,6 +86,23 @@ type Config struct {
 	GUIActions bool
 
 	Instances []Instance
+
+	// ConfigDir is PROVENANCE rather than configuration: the directory the
+	// config file was loaded from, filled in by LoadConfig and settable from no
+	// YAML key at all (rawConfig has no field for it, so KnownFields(true)
+	// refuses one).
+	//
+	// It exists for [v0.2.0]'s warm-start display cache (statecache.go), which
+	// needs one persistent, writable, container-mounted directory to keep a
+	// single file in, and this is the only such directory cutoffarr already
+	// knows about — never a media root.
+	//
+	// It is EMPTY for a Config built in memory rather than read from a file
+	// (every test that constructs one, any future embedding), and empty means
+	// the cache is disabled entirely, both directions: a program that does not
+	// know where its config lives must not guess a directory to write into. See
+	// stateCachePaths.
+	ConfigDir string
 }
 
 // Instance is a single Sonarr or Radarr instance to reconcile against.
@@ -212,6 +230,13 @@ func LoadConfig(path string) (*Config, error) {
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
 	}
+
+	// Provenance, recorded after validation so a config that was refused never
+	// hands anything a directory to write into. filepath.Dir (the local
+	// filesystem's own separator) rather than path.Dir, which this file uses
+	// deliberately for *arr-side paths: this one is a real path on the machine
+	// cutoffarr is running on.
+	cfg.ConfigDir = filepath.Dir(path)
 
 	return cfg, nil
 }

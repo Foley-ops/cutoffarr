@@ -454,6 +454,15 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 		stats: newStatsStore(cfg.DryRun), scan: newScanCoordinator(),
 	}
 
+	// [v0.2.0] The warm start, and it happens HERE — before the listener is
+	// bound, before the first cycle, before anything can serve a request —
+	// because its whole purpose is that the very first GET /api/stats of this
+	// process's life has the previous run's numbers to answer with instead of an
+	// empty array. See warmStartFromStateCache; a cache that is absent, invalid
+	// or unreadable simply leaves the store empty, which is a cold start,
+	// exactly as every version before this one behaved.
+	d.warmStartFromStateCache()
+
 	instanceTypes := make(map[string]string, len(cfg.Instances))
 	for _, inst := range cfg.Instances {
 		instanceTypes[inst.Name] = inst.Type
@@ -597,6 +606,7 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 		logger.Info("startup scan abandoned on shutdown: it stopped between items and did not cover every instance, so nothing above describes the whole library; the next start begins with a full scan")
 	} else {
 		logger.Info("startup scan complete")
+		d.saveStateCache()
 	}
 	if opts.onStartupScanDone != nil {
 		opts.onStartupScanDone()
@@ -619,6 +629,79 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 	<-serveDone
 	logger.Info("shutdown complete", "pendingWebhookItemsDropped", d.queue.size())
 	return 0
+}
+
+// --- the warm-start display cache's two wiring points ----------------------
+//
+// These two methods are the ONLY places in this program that name
+// statecache.go at all, and daemon.go is the only file permitted to
+// (TestTree_TheStateCacheIsReachableOnlyFromTheDaemonsStartupWiring). Both are
+// wiring rather than evaluation: nothing either of them touches can reach a
+// decision, a write, or an action's re-verification, every one of which
+// re-derives from live data on its own. See statecache.go's header.
+
+// warmStartFromStateCache seeds the stats store from the previous process's
+// end-of-cycle snapshot, so a restarted container shows the last sweep's
+// dashboard (labelled stale, with the sweep's own timestamp) instead of a blank
+// page for the minutes a full sweep takes. Called exactly once, before the
+// first cycle.
+//
+// It filters what the loader hands back through the CURRENT config, in config
+// ORDER, and that is not tidiness — it is containment. Nothing ever removes an
+// instance from the stats store, so an instance the config no longer names
+// would come back at every restart, be written out again at the end of every
+// cycle, and outlive the deployment that created it. A cached entry whose type
+// no longer matches the configured one is dropped for the same reason: the name
+// was reused for something else, and the numbers under it describe the old
+// thing.
+func (d *daemon) warmStartFromStateCache() {
+	cached, writtenAt, ok := loadStateCache(d.logger, d.cfg.ConfigDir)
+	if !ok {
+		return
+	}
+
+	byName := make(map[string]instanceStatsView, len(cached))
+	for _, v := range cached {
+		byName[v.Name] = v
+	}
+	inConfig := make([]instanceStatsView, 0, len(d.cfg.Instances))
+	for _, inst := range d.cfg.Instances {
+		v, found := byName[inst.Name]
+		if !found || v.Type != inst.Type {
+			continue
+		}
+		inConfig = append(inConfig, v)
+	}
+
+	loaded := d.stats.warmStart(inConfig, writtenAt)
+	if loaded == 0 {
+		return
+	}
+	// INFO, and once per process: a dashboard showing numbers this process did
+	// not produce is exactly the kind of thing a human reading the log at
+	// startup needs told, and it is the line that explains the page's own amber
+	// "showing last sweep from …" banner.
+	d.logger.Info("warm start: the dashboard is showing the last completed sweep from the state cache, marked stale, until this process's own first cycle finishes",
+		"instances", loaded, "ignored", len(cached)-loaded, "sweptAt", writtenAt.Format(time.RFC3339))
+}
+
+// saveStateCache writes the current stats snapshot to the state cache at the
+// end of a completed FULL cycle — the startup scan, a reconciliation sweep, and
+// a manual scan, each of which describes the whole library.
+//
+// Three cycles are deliberately NOT here:
+//
+//   - a WEBHOOK cycle, which is scoped to one item and runs neither the reverse
+//     pass nor the file report, so saving after one would overwrite a complete
+//     picture with a partial one.
+//   - any cycle ABANDONED on shutdown (each call site sits in the completed
+//     branch of its own ctx check), which by definition did not cover every
+//     instance — and which is, additionally, the worst moment to be writing a
+//     file, since the process may be seconds from being killed.
+//   - --once (main.go), which serves no dashboard, and whose scoped variants
+//     (--only-id, --instance) describe a fraction of one library.
+func (d *daemon) saveStateCache() {
+	writeStateCache(d.logger, d.cfg.ConfigDir, d.stats.snapshot(), d.clock.Now())
 }
 
 // installShutdownHandler wires the first signal to cancellation and the second
@@ -701,6 +784,7 @@ func (d *daemon) loop(ctx context.Context) {
 				continue
 			}
 			d.logger.Info("manual scan complete")
+			d.saveStateCache()
 			continue
 		}
 
@@ -725,6 +809,7 @@ func (d *daemon) loop(ctx context.Context) {
 			}
 			nextReconcile = d.clock.Now().Add(d.cfg.PollInterval)
 			d.logger.Info("reconciliation sweep complete", "nextSweep", nextReconcile)
+			d.saveStateCache()
 			continue
 		}
 
