@@ -622,9 +622,9 @@ func TestWebUIPage_ContainsTheSignatureShelfElement(t *testing.T) {
 		"shelf-rest",
 		"shelf-marker",
 		"shelf-count",
-		"#6FA08C", // REST sage
-		"#D9A05B", // HUNT amber
-		"#C46A5A", // ALERT clay
+		"#5FAE8C", // REST sage (DARK, [v0.3.0] identity nudge)
+		"#D4923F", // HUNT amber (DARK, [v0.3.0] identity nudge)
+		"#C4604E", // ALERT clay (DARK, [v0.3.0] identity nudge)
 		"Scan now",
 		"reverse scan",
 		"File clutter",
@@ -1568,8 +1568,12 @@ func TestWebUIPage_ReverseOffInstancesGetANoticeNotABlankBody(t *testing.T) {
 // side (statsStore never clearing ReverseFindings on a skipped cycle) is
 // not enough if the GUI never surfaces WHEN those findings are from — this
 // pins that renderReverse reads reverseAsOf and renders the controller's own
-// wording, using the same fmtRelative helper every other timestamp on the
-// page already uses.
+// wording, using the same shared timestamp helper every other timestamp on
+// the page already uses — [v0.3.0] fmtTimestamp, which is fmtRelative's own
+// settings-aware wrapper (see fmtTimestamp's doc comment): every call site
+// that used to call fmtRelative directly for a user-facing timestamp now
+// routes through it instead, so the Timestamps setting (relative/absolute)
+// changes this notice along with every other one.
 func TestWebUIPage_ReverseSkippedNoticeShowsStalenessTimestamp(t *testing.T) {
 	page := string(webUIPage)
 
@@ -1589,8 +1593,8 @@ func TestWebUIPage_ReverseSkippedNoticeShowsStalenessTimestamp(t *testing.T) {
 	if !strings.Contains(body, "showing last complete sweep from") {
 		t.Error("renderReverse is missing the controller-mandated staleness copy \"showing last complete sweep from <time>\"")
 	}
-	if !strings.Contains(body, "fmtRelative(notice.asOf)") && !strings.Contains(body, "fmtRelative(") {
-		t.Error("the staleness notice does not render the timestamp through fmtRelative, the same relative-time helper every other timestamp on the page uses")
+	if !strings.Contains(body, "fmtTimestamp(notice.asOf)") && !strings.Contains(body, "fmtTimestamp(") {
+		t.Error("the staleness notice does not render the timestamp through fmtTimestamp, the shared timestamp helper every other timestamp on the page uses")
 	}
 }
 
