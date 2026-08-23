@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -601,6 +602,86 @@ func TestWebUIPage_ScanStripPulseIsDisabledUnderReducedMotion(t *testing.T) {
 	}
 	if !strings.Contains(block, "scan-strip-indeterminate") {
 		t.Errorf("the prefers-reduced-motion block does not name the indeterminate strip's own selector:\n%s", block)
+	}
+}
+
+// TestWebUIPage_TheReducedMotionBlockIsTheLastWordOnMotion is round-2's fix for
+// the exact failure the review named: "the GUI pins assert source text, not
+// behavior".
+//
+// Both reduced-motion tests above check that a SELECTOR is mentioned inside the
+// media block. Neither can see the cascade — and the cascade was wrong. A media
+// query adds NO specificity, `.scan-strip-fill` inside one has exactly the
+// specificity of `.scan-strip-fill` outside one, and there is no `!important`
+// anywhere in this page (asserted below, because that is what makes document
+// order the deciding rule). So an override written ABOVE the rule it overrides
+// is simply lost: a reader who asked for no motion still got the 1.4s infinite
+// pulse, and — pre-existing, since round 3 — the disclosure caret's rotate too.
+//
+// The property that actually holds the behavior up is positional: the
+// prefers-reduced-motion block must come AFTER every rule that turns motion on.
+// This test asserts exactly that, over the whole stylesheet, so any future
+// animated rule appended below the block fails here on the day it is written.
+func TestWebUIPage_TheReducedMotionBlockIsTheLastWordOnMotion(t *testing.T) {
+	page := string(webUIPage)
+	styleStart := strings.Index(page, "<style>")
+	styleEnd := strings.Index(page, "</style>")
+	if styleStart == -1 || styleEnd == -1 || styleEnd < styleStart {
+		t.Fatal("page has no <style>...</style> block")
+	}
+	// Comments are stripped first, for the reason webui_test.go's own parser
+	// documents: this file's prose names `transition:` and `animation:` inside
+	// CSS comments, and a substring scan that counts those is measuring the
+	// commentary rather than the stylesheet.
+	css := regexp.MustCompile(`(?s)/\*.*?\*/`).ReplaceAllString(page[styleStart+len("<style>"):styleEnd], "")
+
+	if strings.Contains(css, "!important") {
+		t.Error("the stylesheet now uses !important; this test's positional argument (identical specificity, so document order decides) no longer describes how the reduced-motion block wins, and the block's placement must be re-reasoned rather than assumed")
+	}
+
+	const marker = "@media (prefers-reduced-motion: reduce)"
+	at := strings.Index(css, marker)
+	if at == -1 {
+		t.Fatal("the page has no @media (prefers-reduced-motion: reduce) block")
+	}
+	if again := strings.Index(css[at+len(marker):], marker); again != -1 {
+		t.Error("the page has more than one prefers-reduced-motion block; motion is turned off in exactly one place, and two of them make 'which one wins' a question again")
+	}
+	// The end of the block: brace depth back to zero from its own opening one.
+	depth, end := 0, -1
+	for i := at; i < len(css); i++ {
+		switch css[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				end = i + 1
+			}
+		}
+		if end != -1 {
+			break
+		}
+	}
+	if end == -1 {
+		t.Fatal("the prefers-reduced-motion block is never closed; this test cannot locate what follows it")
+	}
+
+	// Vacuity guard: the assertion below is only meaningful because motion IS
+	// declared somewhere above the block.
+	before := css[:at]
+	if !strings.Contains(before, "transition:") && !strings.Contains(before, "animation:") {
+		t.Fatal("no motion at all is declared before the reduced-motion block; this test would pass against a stylesheet it never read correctly")
+	}
+
+	for _, line := range strings.Split(css[end:], "\n") {
+		decl := strings.TrimSpace(line)
+		for _, prop := range []string{"transition:", "animation:"} {
+			if !strings.HasPrefix(decl, prop) || strings.HasPrefix(decl, prop+" none") {
+				continue
+			}
+			t.Errorf("%q is declared AFTER the prefers-reduced-motion block, so it overrides the block's own %s none for a reader who asked for no motion (identical selector specificity, later rule wins). Move the block below every rule that turns motion on.", decl, prop)
+		}
 	}
 }
 

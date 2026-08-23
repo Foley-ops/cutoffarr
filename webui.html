@@ -260,21 +260,12 @@
     transition: left 0.3s ease-out;
   }
 
-  @media (prefers-reduced-motion: reduce) {
-    /* The design plan is explicit: "No other animation." The disclosure
-       caret's own rotate transition (details.panel summary::before, below)
-       is exactly that other animation, so it is disabled here alongside the
-       shelf bar/marker — round-3 review fix; this selector list is the
-       ENTIRE set of animated properties in this page, and must stay that
-       way as the single place motion is turned off. */
-    .shelf-rest, .shelf-marker, details.panel summary::before, .scan-strip-fill { transition: none; }
-    /* [v0.2.0] The live scan strip's indeterminate pulse is a KEYFRAME
-       animation rather than a transition — a second kind of motion, which
-       the rule above cannot reach. Stopped here, and parked at full width:
-       a quiet full bar still reads as "working, with no count to give",
-       which is exactly what an indeterminate stage means. */
-    .scan-strip-indeterminate .scan-strip-fill { animation: none; width: 100%; }
-  }
+  /* Motion is turned off in ONE place, and that place is the very bottom of
+     this stylesheet — see the last rules in it. It used to sit here, and
+     that was a real bug: a media query adds no specificity, so
+     `.scan-strip-fill { transition: none }` written above
+     `.scan-strip-fill { transition: … }` simply loses to it on document order,
+     and a reader who asked for no motion got the animation anyway. */
 
   .shelf-sub {
     margin: 12px 0 0;
@@ -792,6 +783,38 @@
     font-family: var(--mono);
     font-size: 11px;
     color: var(--ink-faint);
+  }
+
+  /* --- motion, turned off ------------------------------------------------
+     THE LAST RULES IN THIS STYLESHEET, DELIBERATELY, AND THEY MUST STAY LAST.
+
+     The design plan is explicit: "No other animation." Every selector below
+     is one this page animates somewhere above, and this is the single place
+     any of it is turned off.
+
+     Placement is the whole mechanism. A media query contributes NOTHING to
+     specificity, so each rule here has exactly the specificity of the rule it
+     overrides, and there is no !important anywhere in this file — which
+     leaves document order as the only tie-break. Written above their targets
+     (where this block lived until round 2 of review), every one of these
+     declarations was silently discarded and a reader who had asked for no
+     motion got the shelf transitions, the caret's rotate and the scan strip's
+     1.4s infinite pulse regardless.
+     TestWebUIPage_TheReducedMotionBlockIsTheLastWordOnMotion fails if any
+     animated rule is ever added below this block. */
+  @media (prefers-reduced-motion: reduce) {
+    /* The disclosure caret's own rotate transition (details.panel
+       summary::before) is disabled alongside the shelf bar/marker and the
+       scan strip's bar — round-3 review fix; this selector list is the
+       ENTIRE set of transitioned properties in this page and must stay that
+       way. */
+    .shelf-rest, .shelf-marker, details.panel summary::before, .scan-strip-fill { transition: none; }
+    /* [v0.2.0] The live scan strip's indeterminate pulse is a KEYFRAME
+       animation rather than a transition — a second kind of motion, which
+       the rule above cannot reach. Stopped here, and parked at full width:
+       a quiet full bar still reads as "working, with no count to give",
+       which is exactly what an indeterminate stage means. */
+    .scan-strip-indeterminate .scan-strip-fill { animation: none; width: 100%; }
   }
 </style>
 </head>
