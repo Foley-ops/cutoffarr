@@ -633,8 +633,16 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 	if ctx.Err() != nil {
 		logger.Info("startup scan abandoned on shutdown: it stopped between items and did not cover every instance, so nothing above describes the whole library; the next start begins with a full scan")
 	} else {
-		logger.Info("startup scan complete")
+		// The cache is written BEFORE the completion line, not after, and the
+		// order is load-bearing rather than cosmetic: "startup scan complete"
+		// is this daemon's own statement that everything belonging to the cycle
+		// is done, and a line printed after it belongs to no cycle at all. It
+		// also made the sweep's own output non-deterministic — the write lands
+		// on the loop goroutine while a test (or an operator's `docker logs`)
+		// is already reading past the completion line, so the same cycle
+		// printed different output run to run.
 		d.saveStateCache()
+		logger.Info("startup scan complete")
 	}
 	if opts.onStartupScanDone != nil {
 		opts.onStartupScanDone()
@@ -811,8 +819,9 @@ func (d *daemon) loop(ctx context.Context) {
 				d.logger.Info("manual scan abandoned on shutdown: it stopped between items and did not cover every instance, so nothing above describes the whole library")
 				continue
 			}
-			d.logger.Info("manual scan complete")
+			// Before the completion line — see the startup scan's own comment.
 			d.saveStateCache()
+			d.logger.Info("manual scan complete")
 			continue
 		}
 
@@ -835,9 +844,10 @@ func (d *daemon) loop(ctx context.Context) {
 				d.logger.Info("reconciliation sweep abandoned on shutdown: it stopped between items and did not cover every instance, so nothing above describes the whole library; the schedule is not re-armed because this daemon is exiting")
 				continue
 			}
+			// Before the completion line — see the startup scan's own comment.
+			d.saveStateCache()
 			nextReconcile = d.clock.Now().Add(d.cfg.PollInterval)
 			d.logger.Info("reconciliation sweep complete", "nextSweep", nextReconcile)
-			d.saveStateCache()
 			continue
 		}
 

@@ -1171,3 +1171,34 @@ func TestActionScope_CarriesNoProgressHandle(t *testing.T) {
 		t.Errorf("scan = %+v, want empty: a publish arriving while no cycle is running must be dropped, never resurrect the surface", scan)
 	}
 }
+
+// TestDaemon_TheCacheIsWrittenBeforeTheCycleSaysItIsComplete is a self-review
+// finding with teeth: it was found by an intermittently failing -race run, not
+// by reading the code.
+//
+// The write used to happen AFTER "reconciliation sweep complete", which made
+// the same idle cycle print different output run to run — the write lands on
+// the loop goroutine while whatever is reading the log has already moved past
+// the completion line — and broke
+// TestDaemon_IdleCycleWithAWebUIPoller_StaysByteIdenticalToNoPoller roughly one
+// run in five. It is also just wrong: that line is this daemon's statement that
+// everything belonging to the cycle is done.
+func TestDaemon_TheCacheIsWrittenBeforeTheCycleSaysItIsComplete(t *testing.T) {
+	fake := newStatefulRadarrFake(t, []*statefulRadarrMovie{wouldUnmonitorStatefulMovie(1, "Movie")})
+	h := startDaemon(t, writeDaemonConfig(t, "radarr", fake.srv.URL, true, "debug", "1h", "45s"))
+	h.waitReady()
+	mark := h.mark()
+
+	h.clock.Advance(time.Hour)
+	h.awaitLogCount("reconciliation sweep complete", 1)
+	cycle := h.since(mark)
+
+	wrote := strings.Index(cycle, "warm-start cache written")
+	complete := strings.Index(cycle, "reconciliation sweep complete")
+	if wrote == -1 {
+		t.Fatalf("the sweep logged no cache write at all:\n%s", cycle)
+	}
+	if complete == -1 || wrote > complete {
+		t.Errorf("the cache write is logged after the sweep's completion line (write at %d, complete at %d); everything belonging to a cycle must land before the line that says the cycle is over, or the same cycle prints different output run to run:\n%s", wrote, complete, cycle)
+	}
+}
