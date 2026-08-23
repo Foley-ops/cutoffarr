@@ -5,8 +5,11 @@
   "explorer.fileNesting.enabled": true,
   "explorer.fileNesting.patterns": {
     "*.go": "${capture}_test.go",
+    "decision.go": "decision_test.go, sonarr_decision_test.go",
+    "stats.go": "stats_test.go, scanprogress_test.go",
+    "webui.go": "webui_test.go, daemon_webui_test.go, websettings_test.go",
+    "Dockerfile": ".dockerignore, container_test.go, template_test.go",
     "go.mod": "go.sum",
-    "Dockerfile": ".dockerignore",
     "docker-compose.example.yml": "config.example.yml"
   }
 }
