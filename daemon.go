@@ -345,6 +345,40 @@ type daemon struct {
 	// interleaving" true without an extra lock anywhere else.
 	stats *statsStore
 	scan  *scanCoordinator
+
+	// stateCacheRefused keeps (*daemon).stateCacheDir's media-root refusal to
+	// ONE line per process. The refusal is checked on every call — the loop
+	// reaches the write at the end of every full cycle — and a WARN repeated
+	// daily forever is how operators learn to filter warnings out. sync.Once
+	// rather than a bool because the daemon is always used through a pointer and
+	// nothing here is worth a second thought about ordering.
+	stateCacheRefused sync.Once
+}
+
+// stateCacheDir is the ONE place that decides where — or whether — the
+// warm-start display cache may live for this process, and both wiring points
+// below take their directory from it (pinned:
+// TestTree_TheDaemonFeedsTheCacheOnlyThroughItsOwnGuardedDirectory).
+//
+// It returns "" — the value both statecache.go entry points already treat as
+// "there is nowhere to read or write", quietly and without a fault — when the
+// config directory sits inside a configured media root. Round-2 review fix: the
+// filesystem-mutation audit amendment's whole argument is that actions.go
+// writes into a media root and statecache.go writes into the CONFIG directory,
+// and ConfigDir is only filepath.Dir(--config), so nothing else prevented
+// `--config /data/media/Movies/config.yml` from making those the same place.
+// Refused in BOTH directions deliberately: a cache a previous version already
+// left in a media root must not keep warm-starting the dashboard either.
+func (d *daemon) stateCacheDir() string {
+	root, inside := stateCacheDirInsideAMediaRoot(d.cfg.ConfigDir, d.cfg.Instances)
+	if !inside {
+		return d.cfg.ConfigDir
+	}
+	d.stateCacheRefused.Do(func() {
+		d.logger.Warn("the dashboard's warm-start cache is disabled for this process: the config directory sits inside a configured media root, and nothing this program writes may ever land in a media library. Every restart starts the dashboard cold until --config points somewhere outside the media roots",
+			"configDir", d.cfg.ConfigDir, "mediaRoot", root, "file", stateCacheFileName)
+	})
+	return ""
 }
 
 // scanCoordinator answers POST /api/scan's whole question — "is a full cycle
@@ -691,7 +725,11 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 // was reused for something else, and the numbers under it describe the old
 // thing.
 func (d *daemon) warmStartFromStateCache() {
-	cached, writtenAt, ok := loadStateCache(d.logger, d.cfg.ConfigDir)
+	// Both wiring points call d.stateCacheDir() INLINE, and must keep doing so:
+	// TestTree_TheDaemonFeedsTheCacheOnlyThroughItsOwnGuardedDirectory reads
+	// this file's syntax tree and requires the guard to be visible AT the call
+	// site, where a reader (and a reviewer) cannot miss it.
+	cached, writtenAt, ok := loadStateCache(d.logger, d.stateCacheDir())
 	if !ok {
 		return
 	}
@@ -711,6 +749,19 @@ func (d *daemon) warmStartFromStateCache() {
 
 	loaded := d.stats.warmStart(inConfig, writtenAt)
 	if loaded == 0 {
+		// Round-2 review fix: this used to be a bare `return`. A cache that was
+		// found, read, validated and then filtered down to nothing — every
+		// instance renamed, retyped, or removed — produced a blank dashboard and
+		// NOT ONE LINE at any level explaining it, which is precisely the
+		// silent-skip shape §2.6 forbids. It is a WARN rather than an INFO for
+		// the same reason every other refusal in loadStateCache is: a file IS
+		// there, it was readable, and the reason it bought nothing is a
+		// disagreement between it and the running config that a human is the only
+		// one who can resolve. Same vocabulary as coldStart's: which file, what is
+		// wrong, what happens instead.
+		d.logger.Warn("the dashboard's warm-start cache was read, but nothing in it matches this config's instance names and types, so this start is a cold one; the first completed sweep fills the dashboard in. The file is safe to delete",
+			"configDir", d.stateCacheDir(), "file", stateCacheFileName,
+			"cached", len(cached), "configured", len(d.cfg.Instances), "sweptAt", writtenAt.Format(time.RFC3339))
 		return
 	}
 	// INFO, and once per process: a dashboard showing numbers this process did
@@ -737,7 +788,7 @@ func (d *daemon) warmStartFromStateCache() {
 //   - --once (main.go), which serves no dashboard, and whose scoped variants
 //     (--only-id, --instance) describe a fraction of one library.
 func (d *daemon) saveStateCache() {
-	writeStateCache(d.logger, d.cfg.ConfigDir, d.stats.snapshot(), d.clock.Now())
+	writeStateCache(d.logger, d.stateCacheDir(), d.stats.snapshot(), d.clock.Now())
 }
 
 // installShutdownHandler wires the first signal to cancellation and the second

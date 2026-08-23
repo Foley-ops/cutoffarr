@@ -224,6 +224,176 @@ func TestStateCachePaths_StayInsideTheConfigDirectory(t *testing.T) {
 	}
 }
 
+// TestStateCacheDirInsideAMediaRoot_IsTheHalfOfContainmentTheOtherTestCannotSee
+// is a round-2 review fix, and it closes the gap the containment pin above left
+// wide open.
+//
+// TestStateCachePaths_StayInsideTheConfigDirectory proves both paths are direct
+// children of cfg.ConfigDir. Nothing proved cfg.ConfigDir is not ITSELF inside a
+// configured media root — and it is just filepath.Dir(--config) (config.go), so
+// `--config /data/media/Movies/config.yml` had cutoffarr writing a file into the
+// user's library at the end of every full sweep. That is the exact thing the
+// audit amendment's own argument ("statecache.go writes ONE file to the CONFIG
+// directory") assumes cannot happen, and the brief asked for a pin that it
+// cannot: "never under any media root; path containment asserted".
+//
+// Matching is on path SEGMENT boundaries (hasPathPrefix, the same helper the
+// file report maps every *arr path with), so a config directory merely named
+// like a media root — /data/media-config beside /data/media — is not refused.
+func TestStateCacheDirInsideAMediaRoot_IsTheHalfOfContainmentTheOtherTestCannotSee(t *testing.T) {
+	radarr := Instance{Name: "radarr-main", Type: "radarr", MediaRootMap: map[string]string{
+		"/movies": "/data/media/Movies",
+	}}
+	sonarr := Instance{Name: "sonarr-main", Type: "sonarr", MediaRootMap: map[string]string{
+		"/tv": "/data/media/TV",
+	}}
+
+	for _, tc := range []struct {
+		name     string
+		dir      string
+		wantRoot string
+	}{
+		{"the media root itself", "/data/media/Movies", "/data/media/Movies"},
+		{"a directory under it", "/data/media/Movies/cutoffarr", "/data/media/Movies"},
+		{"a trailing slash does not smuggle it past", "/data/media/Movies/", "/data/media/Movies"},
+		{"the SECOND instance's root counts too", "/data/media/TV/config", "/data/media/TV"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, inside := stateCacheDirInsideAMediaRoot(tc.dir, []Instance{radarr, sonarr})
+			if !inside || root != tc.wantRoot {
+				t.Errorf("stateCacheDirInsideAMediaRoot(%q) = %q, %v; want %q, true — a cache written there lands inside the user's library", tc.dir, root, inside, tc.wantRoot)
+			}
+		})
+	}
+
+	for _, tc := range []struct{ name, dir string }{
+		{"an ordinary config directory", "/config"},
+		{"a sibling that merely shares a prefix", "/data/media/Movies-config"},
+		{"the media root's own parent", "/data/media"},
+		{"no directory at all", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if root, inside := stateCacheDirInsideAMediaRoot(tc.dir, []Instance{radarr, sonarr}); inside {
+				t.Errorf("stateCacheDirInsideAMediaRoot(%q) refused a directory outside every media root, naming %q; the warm start would be lost for no reason", tc.dir, root)
+			}
+		})
+	}
+
+	if _, inside := stateCacheDirInsideAMediaRoot("/data/media/Movies", []Instance{{Name: "radarr-main", Type: "radarr"}}); inside {
+		t.Error("an instance with NO media_root_map produced a media root to be contained by; the file report is opt-in and an absent map is the OFF state")
+	}
+}
+
+// TestDaemon_StateCacheDir_RefusesToWriteInsideAMediaRootAndSaysSoOnce is the
+// wiring half: one WARN per process naming the root, and the cache disabled in
+// BOTH directions — a cache that may not be written must not be read either, or
+// a stale file already sitting in a media root would keep warm-starting the
+// dashboard forever.
+func TestDaemon_StateCacheDir_RefusesToWriteInsideAMediaRootAndSaysSoOnce(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "cutoffarr")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatalf("creating the config directory: %v", err)
+	}
+	logger, buf := newActionTestLogger()
+	d := &daemon{
+		logger: logger,
+		clock:  newFakeClock(),
+		stats:  newStatsStore(true),
+		cfg: Config{
+			ConfigDir: configDir,
+			Instances: []Instance{{Name: "radarr-main", Type: "radarr", MediaRootMap: map[string]string{"/movies": root}}},
+		},
+	}
+
+	if got := d.stateCacheDir(); got != "" {
+		t.Errorf("stateCacheDir() = %q, want \"\": the config directory is inside a configured media root, and nothing this program writes may land in a media library", got)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, root) {
+		t.Errorf("the refusal never warned, or never named the media root it refused for:\n%s", out)
+	}
+
+	// Once per process, not once per sweep: the reconciliation loop calls this
+	// at the end of every full cycle, and a line repeated daily forever is how
+	// operators learn to filter warnings out.
+	d.stateCacheDir()
+	d.saveStateCache()
+	if n := strings.Count(buf.String(), "sits inside a configured media root"); n != 1 {
+		t.Errorf("the refusal was logged %d times, want exactly 1 per process:\n%s", n, buf)
+	}
+
+	// And the write really did not happen.
+	d.stats.recordInstance(cycleKindSweep, time.Now(), "radarr-main", "radarr", cycleInstanceStats{total: 1, decisionsRan: true})
+	d.saveStateCache()
+	if names := dirEntryNames(t, configDir); len(names) != 0 {
+		t.Errorf("the config directory contains %v after a save; nothing may be written inside a media root", names)
+	}
+
+	// Nor the read: a cache left there by an earlier, unguarded version must not
+	// warm-start anything either.
+	seedStateCache(t, filepath.Join(configDir, "config.yml"), time.Date(2026, 8, 22, 9, 30, 0, 0, time.UTC),
+		instanceStatsView{Name: "radarr-main", Type: "radarr", Total: 996})
+	fresh := newStatsStore(true)
+	d.stats = fresh
+	d.warmStartFromStateCache()
+	if got := fresh.snapshot().Instances; len(got) != 0 {
+		t.Errorf("instances = %+v, want none: a cache sitting inside a media root is refused in both directions", got)
+	}
+}
+
+// TestTree_TheDaemonFeedsTheCacheOnlyThroughItsOwnGuardedDirectory pins the
+// mechanism the two tests above rest on. The media-root refusal lives in ONE
+// place — (*daemon).stateCacheDir — and it is worth nothing if a future call
+// site passes d.cfg.ConfigDir straight to the loader or the writer instead.
+//
+// So: every call to loadStateCache/writeStateCache in daemon.go must take its
+// directory from a stateCacheDir() call written INLINE at the call site. Inline
+// deliberately — a local variable assigned three lines up would be one more
+// thing to trace, for a reader and for this test, on the one call in this
+// program that can put a file inside someone's media library.
+func TestTree_TheDaemonFeedsTheCacheOnlyThroughItsOwnGuardedDirectory(t *testing.T) {
+	const file = "daemon.go"
+	fset := token.NewFileSet()
+	parsed, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		t.Fatalf("parsing %s: %v", file, err)
+	}
+
+	entryPoints := map[string]bool{"loadStateCache": true, "writeStateCache": true}
+	sites := 0
+	ast.Inspect(parsed, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		id, ok := call.Fun.(*ast.Ident)
+		if !ok || !entryPoints[id.Name] {
+			return true
+		}
+		sites++
+		guarded := false
+		for _, arg := range call.Args {
+			inner, ok := arg.(*ast.CallExpr)
+			if !ok {
+				continue
+			}
+			if sel, ok := inner.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "stateCacheDir" {
+				guarded = true
+			}
+		}
+		if !guarded {
+			t.Errorf("%s:%d passes %s a directory that did not come from d.stateCacheDir(): the media-root refusal is the only thing keeping this program from writing a file into the user's library, and it is bypassed by any call site that reads d.cfg.ConfigDir itself",
+				file, fset.Position(call.Pos()).Line, id.Name)
+		}
+		return true
+	})
+	// Vacuity guard, the twin of the mutation audit's own.
+	if sites != 2 {
+		t.Fatalf("found %d loadStateCache/writeStateCache call site(s) in %s, want exactly 2 (the startup load and the end-of-cycle write): this audit is vacuous unless it is actually finding them", sites, file)
+	}
+}
+
 // --- the loader -------------------------------------------------------------
 
 // TestLoadStateCache_RoundTripsACompletedSweep is the whole point of the file:
@@ -320,21 +490,35 @@ func TestLoadStateCache_EveryInvalidShapeColdStartsAndSaysWhy(t *testing.T) {
 	}
 }
 
-// TestLoadStateCache_AnAbsentCacheIsNotAWarning is the one non-fault among the
-// refusals: every fresh deployment's first start has no cache, and a warning
-// that fires on a healthy install is how operators learn to ignore warnings. It
-// still cold-starts; it just does not cry wolf.
-func TestLoadStateCache_AnAbsentCacheIsNotAWarning(t *testing.T) {
+// TestLoadStateCache_AnAbsentCacheWarnsAndColdStarts.
+//
+// This was TestLoadStateCache_AnAbsentCacheIsNotAWarning, asserting INFO, and
+// the argument for INFO was a good one: every fresh deployment's first start has
+// no cache, and a warning that fires on a healthy install is how operators learn
+// to ignore warnings. The brief settled it the other way and named this case
+// FIRST — "Invalid in ANY way (missing, unparseable, wrong schemaVersion,
+// pointer-decode misses on load-bearing fields) → WARN + ignore + cold start" —
+// and the deviation was not ratified in the controller's round-2 rulings. So it
+// is a WARN, and it says in the same breath that a first start is exactly when
+// this is expected.
+//
+// The line must still SAY the three things every refusal in this file says:
+// which file, what is wrong with it, and what happens instead.
+func TestLoadStateCache_AnAbsentCacheWarnsAndColdStarts(t *testing.T) {
+	dir := t.TempDir()
 	logger, buf := newActionTestLogger()
 
-	if _, _, ok := loadStateCache(logger, t.TempDir()); ok {
+	if _, _, ok := loadStateCache(logger, dir); ok {
 		t.Fatal("loadStateCache reported success with no cache file present")
 	}
-	if strings.Contains(buf.String(), "level=WARN") {
-		t.Errorf("a first-ever start warned about the cache it has not written yet:\n%s", buf)
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") {
+		t.Errorf("an absent cache did not warn; the brief lists `missing` first among the shapes that must WARN and cold-start:\n%s", out)
 	}
-	if !strings.Contains(buf.String(), "no warm-start cache yet") {
-		t.Errorf("a first-ever start said nothing at all about why the dashboard is empty:\n%s", buf)
+	for _, want := range []string{filepath.Join(dir, stateCacheFileName), "cold", "first start"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the absent-cache warning never mentions %q — a refusal here says which file, what is wrong, and what happens instead:\n%s", want, out)
+		}
 	}
 }
 
@@ -652,8 +836,15 @@ func TestStateCacheFile_EveryMutationIsTheCacheWriteConfinedToTheConfigDirectory
 // handlers may name any part of this file at all — which is what makes "the
 // cache is never an input to anything that decides or acts" a property of the
 // code rather than a promise in a comment.
+// stateCacheDirInsideAMediaRoot is the third name, added in round 2 of review,
+// and it is admitted on the opposite grounds from the other two: it is a
+// REFUSAL, not an access. It is a pure predicate over a path and the configured
+// media roots, it opens nothing, reads nothing and returns no cached value —
+// (*daemon).stateCacheDir is its only caller, and all it can do is decide the
+// cache is disabled for this process. A file that could reach it still could not
+// reach one byte of the cache.
 var stateCacheEntryPointsAllowedOutside = map[string]map[string]bool{
-	"daemon.go": {"loadStateCache": true, "writeStateCache": true},
+	"daemon.go": {"loadStateCache": true, "writeStateCache": true, "stateCacheDirInsideAMediaRoot": true},
 }
 
 // TestTree_TheStateCacheIsReachableOnlyFromTheDaemonsStartupWiring is the pin
@@ -965,6 +1156,21 @@ func TestDaemon_ACachedInstanceWhoseTypeChangedIsNotWarmStarted(t *testing.T) {
 		t.Errorf("instances = %+v, want none: the cached entry is a sonarr's numbers under a name this config now gives to a radarr", got.Instances)
 	}
 
+	// Round-2 review fix. Dropping the whole cache used to be TOTALLY silent:
+	// warmStartFromStateCache returned on `loaded == 0` with no line at any
+	// level, so an operator who renamed an instance, changed its type, or
+	// removed the last one restarted into a blank dashboard with nothing in the
+	// log about the cache at all — not the INFO that says one was found, not a
+	// WARN that says why it was dropped. That is the silent-skip shape §2.6
+	// exists to forbid, and this file already owns the right vocabulary for it
+	// (coldStart: which file, what is wrong, what happens instead).
+	out := h.out.String()
+	for _, want := range []string{"level=WARN", stateCacheFileName, "matches this config", "cached=1"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the daemon read a cache, dropped every entry in it, and its log never said %q — a warm start that silently becomes a cold one is exactly the silent skip this project forbids:\n%s", want, out)
+		}
+	}
+
 	release()
 	h.waitReady()
 }
@@ -986,8 +1192,18 @@ func TestDaemon_AColdStartWithNoCacheIsExactlyWhatItAlwaysWas(t *testing.T) {
 	if got := getStats(t, h); len(got.Instances) != 0 {
 		t.Errorf("instances = %+v on a cold start's first cycle, want the empty array every version before this one served", got.Instances)
 	}
-	if strings.Contains(h.out.String(), "level=WARN") {
-		t.Errorf("a first-ever start warned about the cache it has not written yet:\n%s", h.out.String())
+	// The one line this adds to a first start, and the brief asked for it at
+	// WARN (see TestLoadStateCache_AnAbsentCacheWarnsAndColdStarts). What
+	// matters here is that it is the ONLY thing a healthy cold start warns
+	// about: the daemon's noise budget is not open for anything else.
+	out := h.out.String()
+	if !strings.Contains(out, stateCacheFileName) {
+		t.Errorf("a first-ever start never mentioned the cache it has not written yet, so nothing explains the empty dashboard:\n%s", out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "level=WARN") && !strings.Contains(line, stateCacheFileName) {
+			t.Errorf("a healthy cold start warned about something other than the absent cache:\n%s", line)
+		}
 	}
 
 	release()

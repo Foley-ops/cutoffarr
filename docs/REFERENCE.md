@@ -1006,7 +1006,12 @@ something it cannot do.
 **Where.** `state-cache.json`, in the same directory as the config file you
 pointed `--config` at (`/config/state-cache.json` in the container image's
 own layout — the same volume you already mount). Never anywhere else, and
-never under a media root.
+never under a media root: if that directory turns out to sit inside one of
+this config's own `media_root_map` disk paths (`--config
+/data/media/Movies/config.yml`, say), cutoffarr refuses the cache outright —
+one warning naming the root at startup, no file written, no file read, and a
+cold dashboard after every restart until `--config` points somewhere outside
+your library.
 
 **When.** At the end of every FULL cycle: the startup scan, a reconciliation
 sweep, and a manual **Scan now**. Not after a webhook cycle (scoped to one
@@ -1029,7 +1034,11 @@ banner, and each card drops its own "as of …" note as the running cycle
 reaches it. A cache that is missing, unreadable, not JSON, of a different
 `schemaVersion`, or missing any field the restore is built out of is ignored
 with a warning and the process cold-starts exactly as every version before
-this one did.
+this one did — including a valid cache whose instances no longer match any
+name and type in `config.yml`, which warns and cold-starts rather than
+silently showing you nothing. The absent-file case warns too: a first start
+on a fresh deployment says so once and then writes the file at the end of its
+first sweep.
 
 **What it is NOT**, and this is the part worth stating plainly:
 

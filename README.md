@@ -60,6 +60,9 @@ plus the upgrade-until score. cutoffarr just makes that finish line real.
    cutoffarr:
      image: ghcr.io/foley-ops/cutoffarr:latest
      volumes:
+       # Writable for exactly one file — state-cache.json, the dashboard's
+       # warm start; mounting it :ro is supported and costs only that feature
+       # (one warning per sweep, and a cold page after every restart).
        - /path/to/appdata/cutoffarr:/config
      environment:
        - RADARR_API=${RADARR_API}

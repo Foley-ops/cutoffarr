@@ -148,6 +148,39 @@ func stateCachePaths(dir string) (final, tmp string, ok bool) {
 	return filepath.Join(clean, stateCacheFileName), filepath.Join(clean, stateCacheTempFileName), true
 }
 
+// stateCacheDirInsideAMediaRoot reports the disk path of the first configured
+// media root that CONTAINS dir, if any.
+//
+// It is the other half of the containment the audit amendment owes, and the
+// half stateCachePaths cannot supply. stateCachePaths proves the cache's two
+// paths are children of the config directory; this proves the config directory
+// is not itself inside a media library. ConfigDir is only filepath.Dir of
+// whatever --config was pointed at (config.go), so nothing but this stops
+// `--config /data/media/Movies/config.yml` from dropping a file into the user's
+// library at the end of every sweep — the precise scenario the amendment's own
+// argument ("actions.go writes to a MEDIA root … statecache.go writes ONE file
+// to the CONFIG directory") assumes away.
+//
+// Matching reuses hasPathPrefix (filereport.go), so it is lexical, case
+// sensitive and on path-SEGMENT boundaries: /data/media-config is not inside
+// /data/media. An instance with no media_root_map contributes no roots at all —
+// that map is the file report's opt-in switch and an absent one is the OFF
+// state (binding controller resolution 1).
+func stateCacheDirInsideAMediaRoot(dir string, instances []Instance) (string, bool) {
+	if dir == "" {
+		return "", false
+	}
+	clean := cleanArrPath(filepath.ToSlash(dir))
+	for _, inst := range instances {
+		for _, root := range mediaRootsFor(inst) {
+			if hasPathPrefix(clean, root.diskPath) {
+				return root.diskPath, true
+			}
+		}
+	}
+	return "", false
+}
+
 // writeStateCache writes snap to dir/state-cache.json, atomically, at the end
 // of one full cycle.
 //
@@ -224,11 +257,15 @@ func writeStateCache(logger *slog.Logger, dir string, snap statsResponse, at tim
 // cache into something usable, would put invented numbers on the one surface
 // whose entire job is "glance and trust these numbers".
 //
-// A cache that simply is not there yet is INFO rather than WARN: it is the
-// normal state of every first start of every fresh deployment, and a warning
-// that fires on a healthy install teaches operators to ignore warnings.
-// Everything else is a WARN, because everything else means a file IS there and
-// something is wrong with it.
+// EVERY refusal, including an absent file, is a WARN. That is the brief's rule
+// verbatim ("Invalid in ANY way (missing, unparseable, wrong schemaVersion,
+// pointer-decode misses on load-bearing fields) → WARN + ignore + cold start"),
+// and `missing` is the case it names first. This file shipped it at INFO for one
+// review round on the argument that a warning firing on every fresh
+// deployment's healthy first start is how operators learn to ignore warnings;
+// that argument was not ratified, so the level follows the brief and the line
+// itself carries the reassurance instead — it says a first start is exactly when
+// this is expected and what will fix it.
 func loadStateCache(logger *slog.Logger, dir string) ([]instanceStatsView, time.Time, bool) {
 	final, _, ok := stateCachePaths(dir)
 	if !ok {
@@ -238,7 +275,8 @@ func loadStateCache(logger *slog.Logger, dir string) ([]instanceStatsView, time.
 	raw, err := os.ReadFile(final)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			logger.Info("no warm-start cache yet, so the dashboard starts empty until the first sweep completes (this is normal on a first start)", "path", final)
+			logger.Warn("there is no warm-start cache to read, so this start is a cold one and the dashboard stays empty until the first sweep completes. On a first start that is expected; the next completed full cycle writes the file",
+				"path", final)
 			return nil, time.Time{}, false
 		}
 		logger.Warn("the dashboard's warm-start cache could not be read, so this start is a cold one; the first completed sweep fills the dashboard in",
