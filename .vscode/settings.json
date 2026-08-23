@@ -1,0 +1,12 @@
+{
+  // Collapse the test suite under its source files in the explorer.
+  // The tests are white-box (same package) and cannot live in a
+  // subdirectory — this keeps the sidebar readable instead.
+  "explorer.fileNesting.enabled": true,
+  "explorer.fileNesting.patterns": {
+    "*.go": "${capture}_test.go",
+    "go.mod": "go.sum",
+    "Dockerfile": ".dockerignore",
+    "docker-compose.example.yml": "config.example.yml"
+  }
+}

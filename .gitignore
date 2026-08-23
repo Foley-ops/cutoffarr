@@ -18,5 +18,6 @@ bin/
 
 # OS / editor noise
 .DS_Store
-.vscode/
+.vscode/*
+!.vscode/settings.json
 .idea/
