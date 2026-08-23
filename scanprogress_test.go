@@ -696,12 +696,46 @@ func TestWebUIPage_PollTightensWhileScanningAndReturnsAfterwards(t *testing.T) {
 	if !strings.Contains(body, "document.hidden") {
 		t.Errorf("schedulePoll no longer pauses on document.hidden:\n%s", body)
 	}
-	if !strings.Contains(body, "POLL_SCANNING_MS") || !strings.Contains(body, "POLL_MS") {
-		t.Errorf("schedulePoll does not choose between the two intervals:\n%s", body)
-	}
 	if !strings.Contains(body, "scanInProgress") {
 		t.Errorf("schedulePoll does not consult the last snapshot's scan state to pick its interval:\n%s", body)
 	}
+	// Round-2 review fix: this used to assert only that both identifiers were
+	// PRESENT, which is vocabulary rather than behavior. Inverting the ternary
+	// to `? POLL_MS : POLL_SCANNING_MS` — every idle dashboard polling every 2s
+	// forever, and a live scan updating once every 30s — passed it unchanged.
+	// The MAPPING is the contract, so the mapping is what is pinned.
+	if !strings.Contains(body, "? POLL_SCANNING_MS : POLL_MS") {
+		t.Errorf("schedulePoll does not map the scanning state to the FAST interval and the idle state to the slow one (want the literal `? POLL_SCANNING_MS : POLL_MS`):\n%s", body)
+	}
+}
+
+// jsBracedBlockAfter returns the `{ … }` block that follows header inside src,
+// header included, by counting braces. It lets a test assert what ONE branch of
+// a function does rather than what the whole function mentions somewhere.
+func jsBracedBlockAfter(t *testing.T, src, header string) string {
+	t.Helper()
+	at := strings.Index(src, header)
+	if at == -1 {
+		t.Fatalf("no %q in:\n%s", header, src)
+	}
+	open := strings.Index(src[at:], "{")
+	if open == -1 {
+		t.Fatalf("%q is not followed by a block:\n%s", header, src)
+	}
+	depth := 0
+	for i := at + open; i < len(src); i++ {
+		switch src[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return src[at : i+1]
+			}
+		}
+	}
+	t.Fatalf("the block after %q is never closed:\n%s", header, src)
+	return ""
 }
 
 // TestWebUIPage_ScanNowButtonReflectsTheScanSurfaceNotJustItsOwnPost is the
@@ -718,6 +752,25 @@ func TestWebUIPage_ScanNowButtonReflectsTheScanSurfaceNotJustItsOwnPost(t *testi
 	}
 	if !strings.Contains(body, "Scan now") {
 		t.Errorf("renderScanButton never restores the idle label:\n%s", body)
+	}
+
+	// Round-2 review fix, the same one schedulePoll's test needed: the three
+	// assertions above are vocabulary. Swapping the branches — so a running
+	// sweep leaves the button reading "Scan now" and enabled, which is EXACTLY
+	// the bug Feature B item 4 exists to fix — passed all three unchanged. What
+	// follows pins which state carries which label.
+	scanning := jsBracedBlockAfter(t, body, "if (scanInProgress)")
+	if !strings.Contains(scanning, "Scanning…") || !strings.Contains(scanning, "scanBtn.disabled = true") {
+		t.Errorf("the scanInProgress branch is not the one that disables the button and calls it \"Scanning…\":\n%s", scanning)
+	}
+	if strings.Contains(scanning, "Scan now") {
+		t.Errorf("the scanInProgress branch restores the idle label; a sweep the server says is running must never leave the button reading \"Scan now\":\n%s", scanning)
+	}
+	// The idle tail: whatever is left after both early-returning branches.
+	queued := jsBracedBlockAfter(t, body, "if (scanQueuedRecently())")
+	tail := body[strings.Index(body, queued)+len(queued):]
+	if !strings.Contains(tail, "Scan now") || !strings.Contains(tail, "scanBtn.disabled = false") {
+		t.Errorf("the idle path (neither scanning nor queued) does not re-enable the button and restore \"Scan now\":\n%s", tail)
 	}
 
 	// And the refresh path must route through it rather than resetting the
