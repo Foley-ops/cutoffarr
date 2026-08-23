@@ -5,7 +5,8 @@
   This file is deliberately kept in field-for-field agreement with
   docker-compose.example.yml at the repo root, which is the canonical,
   human-verified deployment shape (port 9898, the /config volume mounted
-  read-only, the Unraid uid:gid pair 99:100, the unless-stopped restart
+  read-write for the warm-start cache, the Unraid uid:gid pair 99:100, the
+  unless-stopped restart
   policy, the 90s stop_grace_period, the icon URL, and both Unraid labels'
   worth of caveats). template_test.go pins the two files against each other,
   the same way container_test.go pins the Dockerfile against the Go code it
@@ -73,7 +74,8 @@
     them: the user 99:100 override, matching the compose file's
     `user: "99:100"` (the image's own default is distroless's nonroot,
     65532:65532; Unraid's usual nobody:users pair is what makes the
-    read-only /config mount below actually readable); restart
+    /config mount below readable — and, since v0.2.0, writable for the one
+    state-cache.json file the dashboard's warm start keeps there); restart
     unless-stopped, matching the compose file's restart policy; and
     stop-timeout 90, matching its stop_grace_period: 90s. See that file's
     own long comment for why 90s specifically (a Sonarr season write is an
@@ -90,7 +92,7 @@
   <DonateText/>
   <DonateLink/>
   <Requires/>
-  <Config Name="Config" Target="/config" Default="/mnt/user/appdata/cutoffarr" Mode="ro" Description="Directory holding config.yml (copied from this repo's config.example.yml). Mounted read-only: cutoffarr never writes to disk." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/cutoffarr</Config>
+  <Config Name="Config" Target="/config" Default="/mnt/user/appdata/cutoffarr" Mode="rw" Description="Directory holding config.yml (copied from this repo's config.example.yml). Read-write since v0.2.0 for ONE file: state-cache.json, a copy of the dashboard's own numbers, written at the end of every full sweep and read back at startup so a restart does not blank the page. cutoffarr never writes config.yml and never writes anything else here; the file is display-only and safe to delete. Set this to ro if you would rather not have it -- the write fails with a warning and everything else behaves exactly as before. Your media paths are separate and stay read-only." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/cutoffarr</Config>
   <Config Name="Webhook Port" Target="9898" Default="9898" Mode="tcp" Description="POST /webhook/{instance-name} -- point each *arr's Settings -> Connect -> Webhook at http://cutoffarr:9898/webhook/&lt;instance-name&gt; on the shared network above; publishing this port is only needed to reach the endpoint from outside Docker. Also serves the read-only WebUI dashboard (GET /) and its two JSON endpoints on this same port -- see the WebUI button above." Type="Port" Display="always" Required="true" Mask="false">9898</Config>
   <!--
     Variable Configs below mirror docker-compose.example.yml's own

@@ -55,9 +55,13 @@ that setup — copy them, don't retype them:
    line in `docker-compose.yml` to point there instead — whatever that path
    is, it's what the `/config` path in the
    [Configuration reference](#configuration-reference) below refers to
-   inside the container. The volume is mounted read-only, so an empty or
-   missing host directory produces an empty, unwritable `/config` and the
-   container exits at startup rather than silently running with no config.
+   inside the container. An empty or missing host directory produces an
+   empty `/config` and the container exits at startup rather than silently
+   running with no config. The volume is mounted read-write for exactly one
+   file — `state-cache.json`, the dashboard's warm start (see [The warm-start
+   display cache](#the-warm-start-display-cache)); cutoffarr never writes
+   `config.yml` or anything else there, and mounting it `:ro` instead costs
+   only that one feature.
 
    `docker-compose.example.yml`'s `image:` already names cutoffarr's
    published GHCR image, so no build step is required; uncomment its
