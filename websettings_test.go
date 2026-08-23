@@ -1,10 +1,17 @@
 package main
 
 import (
+	"encoding/json"
+	"os/exec"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
+
+// runPageFunctionUnderNode, pageFunctionSource, and pageFunctionBody are
+// defined in statecache_test.go/scanprogress_test.go and reused here rather
+// than reimplemented.
 
 // websettings_test.go covers v0.3.0: the wide fluid layout + instance grid,
 // the light/dark token migration, the settings panel (gear button + native
@@ -227,6 +234,72 @@ func TestWebUIPage_MarkVsSurfaceContrastTokensAreDistinctPerMode(t *testing.T) {
 	}
 }
 
+// TestWebUIPage_DuplicatedThemeTokenBlocksStayInSyncTokenForToken pins the
+// two places each theme's token set is written out in full. LIGHT lives
+// twice — once inside `@media (prefers-color-scheme: light)
+// { :root:not([data-theme="dark"]) { ... } }` (the system-default path) and
+// once in the explicit `:root[data-theme="light"] { ... }` override — and
+// DARK likewise lives twice (the bare `:root { ... }` block and the explicit
+// `:root[data-theme="dark"] { ... }` override). Only the explicit blocks were
+// previously pinned (TestWebUIPage_MarkVsSurfaceContrastTokensAreDistinctPerMode,
+// TestWebUIPage_ThemeAttributeSwitchDefinesBothPalettes's "hex appears
+// somewhere" check): editing ONE copy of a pair and not the other — e.g.
+// reverting --rest in the media-query block while leaving the explicit block
+// alone — left the suite green while every reader on the DEFAULT theme
+// setting ("System" + an OS light/dark preference, i.e. the media-query
+// path) got un-validated colors nobody exercising only the explicit
+// data-theme paths would ever notice.
+func TestWebUIPage_DuplicatedThemeTokenBlocksStayInSyncTokenForToken(t *testing.T) {
+	page := string(webUIPage)
+
+	// assertOverrideMatchesBase checks every token the (smaller) override
+	// block declares against the same key's value in the (larger) base
+	// block. It is deliberately NOT a check that the two blocks declare an
+	// identical SET: the bare :root block also carries mode-agnostic tokens
+	// (--mono, --sans, --backdrop, --shelf-count-size) that no per-theme
+	// override needs to restate, so subset containment — rather than exact
+	// set equality — is the real invariant for the dark pair. For the light
+	// pair the two sets happen to be equal in practice, which this still
+	// verifies (every key in one exists with the same value in the other).
+	assertOverrideMatchesBase := func(t *testing.T, label, overrideHeader, baseHeader string) {
+		t.Helper()
+		overrideBlock := jsBracedBlockAfter(t, page, overrideHeader)
+		baseBlock := jsBracedBlockAfter(t, page, baseHeader)
+		override := cssTokenMap(overrideBlock)
+		base := cssTokenMap(baseBlock)
+		if len(override) < 10 {
+			t.Fatalf("%s: found only %d --token: value; declarations in %q; expected at least 10", label, len(override), overrideHeader)
+		}
+		for name, ov := range override {
+			bv, ok := base[name]
+			if !ok {
+				t.Errorf("%s: %s declares %s but %s does not define it at all", label, overrideHeader, name, baseHeader)
+				continue
+			}
+			if ov != bv {
+				t.Errorf("%s: %s = %q in %s but %q in %s; these two blocks must be edited together or they will silently drift apart", label, name, ov, overrideHeader, bv, baseHeader)
+			}
+		}
+	}
+
+	assertOverrideMatchesBase(t, "LIGHT", `:root:not([data-theme="dark"]) {`, `:root[data-theme="light"] {`)
+	assertOverrideMatchesBase(t, "DARK", `:root[data-theme="dark"] {`, ":root {")
+}
+
+// cssTokenMap returns every `--name: value;` custom-property declaration in
+// block as name -> normalized value (trimmed, no surrounding whitespace), so
+// two blocks with different indentation or declaration order but identical
+// tokens compare equal.
+func cssTokenMap(block string) map[string]string {
+	re := regexp.MustCompile(`(?m)^\s*(--[\w-]+)\s*:\s*([^;]+);`)
+	matches := re.FindAllStringSubmatch(block, -1)
+	out := make(map[string]string, len(matches))
+	for _, m := range matches {
+		out[m[1]] = strings.TrimSpace(m[2])
+	}
+	return out
+}
+
 // valueAfterToken returns the first line's value following `tok` inside src
 // (up to the next `;`), trimmed.
 func valueAfterToken(t *testing.T, src, tok string) string {
@@ -309,6 +382,83 @@ func TestWebUIPage_SettingsDialogIsANativeDialogWithFocusHandling(t *testing.T) 
 	}
 }
 
+// TestWebUIPage_SettingsDialogReloadsFromStorageBeforeRenderingOnOpen pins a
+// cross-tab correctness requirement: `settings` in memory is only ever
+// mutated by THIS tab's own onSettingsChange, so the gear button's click
+// handler must re-read localStorage (via the non-throwing loadSettings())
+// immediately before reflecting it onto the form — otherwise a second tab
+// open on the same origin shows its own stale copy forever, and changing
+// just one radio there would silently overwrite whatever a DIFFERENT tab had
+// written to the other four settings keys in between.
+func TestWebUIPage_SettingsDialogReloadsFromStorageBeforeRenderingOnOpen(t *testing.T) {
+	page := string(webUIPage)
+	clickBlock := jsBracedBlockAfter(t, page, `settingsBtn.addEventListener("click", function () {`)
+	if !strings.Contains(clickBlock, "settings = loadSettings()") {
+		t.Errorf("the gear button's click handler never reloads settings from storage before opening the dialog, so a second tab would show a stale panel and could clobber another tab's changes on its next edit:\n%s", clickBlock)
+	}
+	reload := strings.Index(clickBlock, "settings = loadSettings()")
+	render := strings.Index(clickBlock, "renderSettingsForm()")
+	if reload == -1 || render == -1 || reload > render {
+		t.Errorf("settings must be reloaded from storage BEFORE renderSettingsForm() reflects it onto the dialog's radios:\n%s", clickBlock)
+	}
+}
+
+// TestWebUIPage_SettingsChangeListenerCallsOnSettingsChange pins the ONE
+// call site that makes the whole settings panel real. Every other settings
+// assertion in this file is scoped to onSettingsChange's own function BODY
+// (pageFunctionBody cuts at the next top-level statement) — none of them can
+// see whether anything actually CALLS it. Deleting
+// `settingsDialog.addEventListener("change", ...)` turns all five settings
+// into permanent no-ops (every radio click updates the DOM's own checked
+// state and nothing else) while every body-scoped test stays green, because
+// they assert what the dead function would do if it ran, not that anything
+// ever runs it. This mirrors the existing "close" listener pin
+// (TestWebUIPage_SettingsDialogIsANativeDialogWithFocusHandling) for the
+// "change" listener specifically.
+func TestWebUIPage_SettingsChangeListenerCallsOnSettingsChange(t *testing.T) {
+	page := string(webUIPage)
+	if !strings.Contains(page, `settingsDialog.addEventListener("change"`) {
+		t.Fatal(`the settings dialog never listens for its own "change" event, so no radio click could ever apply or persist a setting`)
+	}
+	changeBlock := jsBracedBlockAfter(t, page, `settingsDialog.addEventListener("change"`)
+	if !strings.Contains(changeBlock, "onSettingsChange()") {
+		t.Errorf(`the settings dialog's "change" listener never calls onSettingsChange() — every setting would silently become a no-op:\n%s`, changeBlock)
+	}
+}
+
+// TestWebUIPage_LoadTimeAppliesEveryPersistedSetting pins the four call
+// sites that make "persisted in localStorage, applied on load" — the
+// panel's core promise — actually true, rather than only what
+// onSettingsChange (the WRITE path) does. loadSettings itself is referenced
+// by no other test at all; deleting any one of applyMotion(settings.motion),
+// the POLL_MS load-time assignment, or the DEFAULT_PAGE_SIZE load-time
+// assignment makes that setting silently reset to its default on every
+// reload while the rest of the suite (all scoped to onSettingsChange or to
+// static markup) stays green.
+func TestWebUIPage_LoadTimeAppliesEveryPersistedSetting(t *testing.T) {
+	page := string(webUIPage)
+	start := strings.Index(page, "var settings = loadSettings();")
+	if start == -1 {
+		t.Fatal("page never assigns var settings = loadSettings()")
+	}
+	end := strings.Index(page[start:], "function text(el, s)")
+	if end == -1 {
+		t.Fatal("could not find the end of the load-time settings-application region (function text)")
+	}
+	region := page[start : start+end]
+
+	for _, want := range []string{
+		"applyTheme(settings.theme)",
+		"applyMotion(settings.motion)",
+		"POLL_MS = settings.pollMs",
+		"DEFAULT_PAGE_SIZE = settings.pageSize",
+	} {
+		if !strings.Contains(region, want) {
+			t.Errorf("the load-time region (between `var settings = loadSettings();` and the first helper function) never contains %q — this setting would silently reset to its default on every reload:\n%s", want, region)
+		}
+	}
+}
+
 // TestWebUIPage_SettingsDialogHasAllFiveSettingsControls pins the exact
 // five setting groups the brief specifies, and every option each of them
 // must offer — a typo or a dropped radio value here would silently remove
@@ -349,6 +499,60 @@ func TestWebUIPage_SettingsDialogHasAllFiveSettingsControls(t *testing.T) {
 	}
 }
 
+// TestWebUIPage_FmtTimestampAbsoluteSettingActuallyRendersAbsoluteTime runs
+// fmtTimestamp under Node with a real settings global, rather than only
+// grepping its source for the string "absolute". Every OTHER reference to
+// fmtTimestamp in this suite either greps for the identifier or forces
+// settings.timestamps = "relative" (statecache_test.go's renderStaleBanner
+// case), so before this test, replacing fmtTimestamp's entire body with
+// `return fmtRelative(iso);` kept the whole suite green — one of the
+// brief's five mandated settings had zero discriminating coverage. Both
+// directions are pinned so an inverted condition fails just as loudly as a
+// dropped one.
+func TestWebUIPage_FmtTimestampAbsoluteSettingActuallyRendersAbsoluteTime(t *testing.T) {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; skipping the behavioural fmtTimestamp check")
+	}
+
+	fixed := time.Date(2023, 6, 15, 12, 34, 56, 0, time.UTC)
+	iso := fixed.Format(time.RFC3339)
+
+	t.Run(`"absolute" renders an absolute time, not the relative form`, func(t *testing.T) {
+		out := runPageFunctionUnderNode(t, nodePath, `
+var settings = { timestamps: "absolute" };
+`+pageFunctionSource(t, "fmtRelative")+pageFunctionSource(t, "fmtTimestamp")+`
+console.log(JSON.stringify(fmtTimestamp("`+iso+`")));
+`)
+		var got string
+		if err := json.Unmarshal([]byte(out), &got); err != nil {
+			t.Fatalf("could not read what fmtTimestamp rendered (%v):\n%s", err, out)
+		}
+		if strings.Contains(got, "ago") || got == "just now" {
+			t.Errorf(`fmtTimestamp("%s") with settings.timestamps="absolute" returned %q, which looks like the RELATIVE form — the absolute branch may not be executing at all`, iso, got)
+		}
+		if !strings.Contains(got, "2023") {
+			t.Errorf(`fmtTimestamp("%s") with settings.timestamps="absolute" returned %q, which does not name the year — doesn't look like an absolute rendering`, iso, got)
+		}
+	})
+
+	t.Run(`"relative" (the default) keeps rendering the relative form`, func(t *testing.T) {
+		recentISO := time.Now().UTC().Add(-5 * time.Minute).Format(time.RFC3339)
+		out := runPageFunctionUnderNode(t, nodePath, `
+var settings = { timestamps: "relative" };
+`+pageFunctionSource(t, "fmtRelative")+pageFunctionSource(t, "fmtTimestamp")+`
+console.log(JSON.stringify(fmtTimestamp("`+recentISO+`")));
+`)
+		var got string
+		if err := json.Unmarshal([]byte(out), &got); err != nil {
+			t.Fatalf("could not read what fmtTimestamp rendered (%v):\n%s", err, out)
+		}
+		if !strings.Contains(got, "ago") {
+			t.Errorf(`fmtTimestamp("%s") with settings.timestamps="relative" returned %q, want the relative form ("Nm ago") — an inverted condition would silently swap this to the absolute rendering`, recentISO, got)
+		}
+	})
+}
+
 // TestWebUIPage_ReadOnlySwitchesCardRendersThreeStatesWithExplanations pins
 // the read-only server-switches card: all three booleans present as
 // distinct elements, each with a sentence explaining it is config-file-only
@@ -385,6 +589,73 @@ func TestWebUIPage_ReadOnlySwitchesCardRendersThreeStatesWithExplanations(t *tes
 	if !strings.Contains(pageFunctionBody(t, "render"), "renderSwitchesCard(data)") {
 		t.Error("render() never calls renderSwitchesCard, so the card would never update")
 	}
+}
+
+// TestWebUIPage_ReadOnlySwitchesCardMapsEachBooleanToItsOwnElement runs
+// renderSwitchesCard under Node against a stub document, rather than only
+// grepping its source for the three field names. The substring check above
+// cannot tell WHICH element receives WHICH boolean: swapping the
+// swGuiActions/swReverseScanRemonitor targets, or hardcoding "on" for every
+// element, would both pass it unchanged. That matters more here than for a
+// cosmetic card: these are the write-safety switches, and a swap would
+// actively misinform an operator about whether click-to-act or re-monitor
+// writes are armed on the server.
+func TestWebUIPage_ReadOnlySwitchesCardMapsEachBooleanToItsOwnElement(t *testing.T) {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; the structural half of this pin ran, the behavioural half needs an interpreter")
+	}
+
+	runCase := func(t *testing.T, dryRun, guiActions, reverseScanRemonitor bool) map[string]string {
+		out := runPageFunctionUnderNode(t, nodePath, `
+var records = {};
+var document = {
+  getElementById: function (id) {
+    if (!records[id]) records[id] = { textContent: "" };
+    return records[id];
+  }
+};
+`+pageFunctionSource(t, "text")+pageFunctionSource(t, "renderSwitchesCard")+`
+renderSwitchesCard({ dryRun: `+boolLit(dryRun)+`, guiActions: `+boolLit(guiActions)+`, reverseScanRemonitor: `+boolLit(reverseScanRemonitor)+` });
+console.log(JSON.stringify({
+  swDryRun: records.swDryRun && records.swDryRun.textContent,
+  swGuiActions: records.swGuiActions && records.swGuiActions.textContent,
+  swReverseScanRemonitor: records.swReverseScanRemonitor && records.swReverseScanRemonitor.textContent
+}));
+`)
+		var got map[string]string
+		if err := json.Unmarshal([]byte(out), &got); err != nil {
+			t.Fatalf("could not read what renderSwitchesCard rendered (%v):\n%s", err, out)
+		}
+		return got
+	}
+
+	t.Run("mixed booleans map to the correct element each", func(t *testing.T) {
+		got := runCase(t, true, false, true)
+		want := map[string]string{"swDryRun": "on", "swGuiActions": "off", "swReverseScanRemonitor": "on"}
+		for id, w := range want {
+			if got[id] != w {
+				t.Errorf("%s = %q, want %q (input dryRun=true guiActions=false reverseScanRemonitor=true) — this catches a swapped target as well as a hardcoded value", id, got[id], w)
+			}
+		}
+	})
+
+	t.Run("all false renders all off", func(t *testing.T) {
+		got := runCase(t, false, false, false)
+		want := map[string]string{"swDryRun": "off", "swGuiActions": "off", "swReverseScanRemonitor": "off"}
+		for id, w := range want {
+			if got[id] != w {
+				t.Errorf("%s = %q, want %q", id, got[id], w)
+			}
+		}
+	})
+}
+
+func boolLit(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
 }
 
 // TestWebUIPage_LocalStorageNamespaceIsOneKeyReadBeforePaint pins the
@@ -454,6 +725,80 @@ func TestWebUIPage_ThemeSettingAppliesDataThemeAttributeOnChange(t *testing.T) {
 	}
 }
 
+// TestWebUIPage_SaveSettingsReportsStorageFailure pins the WRITE side of the
+// same honesty rule loadSettings already gets for reads: loadSettings' own
+// catch has an honest fallback (the System default it would have rendered
+// anyway), but a failed localStorage.setItem has no honest silent
+// equivalent — the setting applies for this session only and is gone on
+// reload, and previously the operator was never told why. saveSettings must
+// report success/failure rather than swallow it.
+func TestWebUIPage_SaveSettingsReportsStorageFailure(t *testing.T) {
+	body := pageFunctionBody(t, "saveSettings")
+	if !strings.Contains(body, "return true") {
+		t.Error("saveSettings never reports a successful write")
+	}
+	if !strings.Contains(body, "return false") {
+		t.Error("saveSettings never reports a failed write; a storage failure is silently swallowed with no way for the caller to know")
+	}
+
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; the structural half of this pin ran, the behavioural half needs an interpreter")
+	}
+
+	okOut := runPageFunctionUnderNode(t, nodePath, `
+var localStorage = { setItem: function () {} };
+var SETTINGS_KEY = "cutoffarr.settings.v1";
+`+pageFunctionSource(t, "saveSettings")+`
+console.log(JSON.stringify(saveSettings({theme:"dark"})));
+`)
+	if strings.TrimSpace(okOut) != "true" {
+		t.Errorf("saveSettings with a working localStorage.setItem returned %q, want true", okOut)
+	}
+
+	blockedOut := runPageFunctionUnderNode(t, nodePath, `
+var localStorage = { setItem: function () { throw new Error("blocked"); } };
+var SETTINGS_KEY = "cutoffarr.settings.v1";
+`+pageFunctionSource(t, "saveSettings")+`
+console.log(JSON.stringify(saveSettings({theme:"dark"})));
+`)
+	if strings.TrimSpace(blockedOut) != "false" {
+		t.Errorf("saveSettings with a throwing localStorage.setItem returned %q, want false", blockedOut)
+	}
+}
+
+// TestWebUIPage_SettingsDialogWarnsWhenStorageFails pins the surfacing half:
+// a false return from saveSettings must show the dialog's existing
+// .settings-note treatment naming the reason, and a successful save must
+// hide it again (storage being blocked is not necessarily permanent — e.g.
+// a privacy-mode toggle mid-session).
+func TestWebUIPage_SettingsDialogWarnsWhenStorageFails(t *testing.T) {
+	page := string(webUIPage)
+	dialog := jsBracedBlockAfterTag(t, page, `<dialog id="settingsDialog"`, "</dialog>")
+	if !strings.Contains(dialog, `id="settingsStorageWarning"`) {
+		t.Fatal("the settings dialog has no settingsStorageWarning element")
+	}
+	if !strings.Contains(dialog, `class="settings-note" id="settingsStorageWarning" hidden`) {
+		t.Error("settingsStorageWarning is not hidden by default, or does not use the dialog's existing .settings-note treatment")
+	}
+	if !strings.Contains(dialog, "will not survive a reload") {
+		t.Error("settingsStorageWarning never states the concrete consequence (the setting will not survive a reload)")
+	}
+
+	body := pageFunctionBody(t, "onSettingsChange")
+	if !strings.Contains(body, "saveSettings(settings)") {
+		t.Fatal("onSettingsChange no longer calls saveSettings")
+	}
+	if !strings.Contains(body, "settingsStorageWarning.hidden = ") {
+		t.Error("onSettingsChange never sets settingsStorageWarning.hidden from saveSettings' return value, so a storage failure would never be surfaced to the operator")
+	}
+	if strings.Contains(body, "settingsStorageWarning.hidden = true;") && !strings.Contains(body, "settingsStorageWarning.hidden = persisted") {
+		// A hardcoded `= true` (always hidden) would defeat the whole point;
+		// it must be driven by saveSettings' actual return value.
+		t.Error("settingsStorageWarning.hidden looks hardcoded rather than driven by saveSettings' return value")
+	}
+}
+
 // TestWebUIPage_PollCadenceSettingWiredWithoutAffectingScanningTighten pins
 // the brief's explicit "unaffected" clause structurally: the setting can
 // only ever reassign POLL_MS, and there is no statement anywhere that
@@ -481,6 +826,25 @@ func TestWebUIPage_PollCadenceSettingWiredWithoutAffectingScanningTighten(t *tes
 	}
 	if strings.Contains(page, "POLL_SCANNING_MS = settings") {
 		t.Error("a setting must never be able to override the 2s scanning-tighten interval")
+	}
+
+	// [v0.3.0 review fix] POLL_MS is only READ by schedulePoll at the moment it
+	// arms a new setTimeout; assigning it alone changes nothing until whatever
+	// timer is already outstanding happens to fire (up to the OLD cadence's
+	// full duration later). onSettingsChange must re-arm by calling
+	// schedulePoll() itself, in the same statement/block as the assignment —
+	// this is the identical defect already fixed once for the Scan-now button.
+	pollAssign := strings.Index(body, "POLL_MS = settings.pollMs")
+	if pollAssign == -1 {
+		t.Fatal("POLL_MS = settings.pollMs not found in onSettingsChange body")
+	}
+	afterAssign := body[pollAssign:]
+	closeBrace := strings.Index(afterAssign, "}")
+	if closeBrace == -1 {
+		t.Fatal("could not find the end of the POLL_MS assignment's guarding block")
+	}
+	if !strings.Contains(afterAssign[:closeBrace], "schedulePoll()") {
+		t.Errorf("onSettingsChange assigns POLL_MS but never calls schedulePoll() to re-arm the outstanding timer — a tightened cadence would not take effect until the timer armed at the OLD interval happens to fire on its own:\n%s", afterAssign[:closeBrace])
 	}
 }
 
@@ -586,5 +950,26 @@ func TestWebUIPage_DisconnectedStateClearsTheStaleTooltip(t *testing.T) {
 	}
 	if !strings.Contains(body, `badge.removeAttribute("aria-label")`) {
 		t.Error("showDisconnected never clears the badge's stale aria-label")
+	}
+}
+
+// TestWebUIPage_DisconnectedStateClearsTheStaleSwitchesCard is the badge
+// tooltip's honesty rule applied to the read-only server-switches card the
+// same commit added: renderSwitchesCard only ever runs from render() (i.e.
+// only on a SUCCESSFUL poll), so without an explicit reset here a
+// disconnected page would go on asserting the last-known dry_run/gui_actions/
+// reverse_scan_remonitor values as current fact — worse than the tooltip
+// case, since these are the write-safety switches and the only way any of
+// them changes is a config edit plus a daemon restart, exactly the event
+// that produces a disconnect.
+func TestWebUIPage_DisconnectedStateClearsTheStaleSwitchesCard(t *testing.T) {
+	body := pageFunctionBody(t, "showDisconnected")
+	for _, id := range []string{"swDryRun", "swGuiActions", "swReverseScanRemonitor"} {
+		if !strings.Contains(body, id) {
+			t.Errorf("showDisconnected never touches %s — the read-only switches card would keep asserting pre-outage values indefinitely on a disconnected page", id)
+		}
+	}
+	if !strings.Contains(body, `"—"`) {
+		t.Error(`showDisconnected never resets the switches card to the markup's own honest "—" placeholder`)
 	}
 }

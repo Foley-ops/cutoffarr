@@ -1169,6 +1169,7 @@
        namespaced localStorage key — see the script's SETTINGS_KEY. -->
   <dialog id="settingsDialog" aria-labelledby="settingsTitle">
     <h2 id="settingsTitle">Settings</h2>
+    <p class="settings-note" id="settingsStorageWarning" hidden>This browser is blocking storage for this page — these settings apply now but will not survive a reload.</p>
 
     <fieldset class="settings-group">
       <legend>Theme</legend>
@@ -1268,8 +1269,20 @@
     return out;
   }
 
+  // [v0.3.0 review fix] saveSettings now reports whether the write actually
+  // landed. A read failure has an honest silent fallback — the System
+  // default it would have rendered anyway (see loadSettings' own catch) —
+  // but a failed WRITE does not: the setting applies for this session only
+  // and is gone on reload, with the operator never told why it never
+  // sticks (they would just keep re-picking Light mode every visit). The
+  // caller (onSettingsChange) surfaces a false return in the dialog itself.
   function saveSettings(s) {
-    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch (e) { /* storage may be unavailable; the page keeps working from what is already applied */ }
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+      return true;
+    } catch (e) {
+      return false;
+    }
   }
 
   // applyTheme sets the SAME data-theme attribute the pre-paint head script
@@ -2982,6 +2995,21 @@
     badge.removeAttribute("title");
     badge.removeAttribute("aria-label");
 
+    // [v0.3.0 review fix] The read-only server-switches card in the settings
+    // panel restates these SAME three booleans from the SAME unreachable
+    // source, but renderSwitchesCard only ever runs from render() (i.e. only
+    // on a successful poll) — so without this, the card would go on
+    // asserting pre-outage values indefinitely. These are the write-safety
+    // switches; an operator opens Settings specifically to read them as
+    // current fact, and the only way any of them ever changes is a config
+    // edit plus a daemon restart — exactly the event that produces a
+    // disconnect. Reset to the markup's own honest "—" placeholder rather
+    // than leave the last-known answer standing unmarked as stale.
+    var swIds = ["swDryRun", "swGuiActions", "swReverseScanRemonitor"];
+    for (var i = 0; i < swIds.length; i++) {
+      text(document.getElementById(swIds[i]), "—");
+    }
+
     // [v0.2.0] A page that cannot reach the daemon knows nothing about
     // whether a cycle is running, so it must claim nothing: the strip comes
     // down and any queued-scan state of ours is forgotten. Leaving a progress
@@ -3103,6 +3131,7 @@
   var settingsBtn = document.getElementById("settingsBtn");
   var settingsDialog = document.getElementById("settingsDialog");
   var settingsCloseBtn = document.getElementById("settingsCloseBtn");
+  var settingsStorageWarning = document.getElementById("settingsStorageWarning");
 
   // radioValue/setRadioValue are the whole of this dialog's form handling —
   // five independent radio groups, read and written the same generic way
@@ -3123,9 +3152,20 @@
   }
 
   // renderSettingsForm reflects the CURRENT settings object onto the dialog's
-  // own radios — called once at load and again every time the dialog opens,
-  // so a control changed from another tab (a second window open on the same
-  // origin) is never shown stale the next time this one's dialog is raised.
+  // own radios. It is called once at load and again every time the gear
+  // button opens the dialog; the click handler below re-reads settings from
+  // localStorage (loadSettings()) immediately before calling this, so a
+  // control changed from another tab in the meantime is picked up as of the
+  // moment THIS dialog opens. That is not live cross-tab sync, though: there
+  // is no `storage` event listener, so a change made in another tab WHILE
+  // this dialog is already open, or before it is ever opened this load, is
+  // not reflected on screen — only the next open (or a reload) will show it.
+  // Because onSettingsChange re-reads every radio group and writes the whole
+  // object back as one blob, the re-read-on-open above also closes the
+  // window where an untouched setting from another tab could otherwise be
+  // silently overwritten: without it, changing just one radio here would
+  // resave all five keys from whatever this tab last loaded, discarding any
+  // change another tab made to the other four in between.
   function renderSettingsForm() {
     setRadioValue("settingTheme", settings.theme);
     setRadioValue("settingPollMs", settings.pollMs);
@@ -3156,12 +3196,31 @@
       next.pageSize = isNaN(n) ? settings.pageSize : n;
     }
     settings = next;
-    saveSettings(settings);
+    // [v0.3.0 review fix] saveSettings' return value used to be discarded —
+    // a storage write that fails (blocked origin, strict privacy mode, quota)
+    // left the operator with no way to learn a setting they just picked will
+    // not survive a reload; they would just keep re-picking it every visit.
+    // Surface it in the dialog itself, and clear it the moment a write
+    // succeeds again (storage being blocked is not necessarily permanent —
+    // e.g. a privacy-mode toggle mid-session).
+    var persisted = saveSettings(settings);
+    if (settingsStorageWarning) settingsStorageWarning.hidden = persisted;
 
     applyTheme(settings.theme);
     applyMotion(settings.motion);
 
-    if (VALID_POLL_MS.indexOf(settings.pollMs) !== -1) POLL_MS = settings.pollMs;
+    // [v0.3.0 review fix] POLL_MS only takes effect the NEXT time schedulePoll
+    // arms a timer — it reads the variable, it does not watch it — so without
+    // re-arming here an operator who tightens the cadence keeps polling at the
+    // OLD interval until whatever timeout is already outstanding happens to
+    // fire. This is the exact bug this codebase already fixed once for the
+    // Scan-now button (see its own click handler below): schedulePoll clears
+    // pollHandle before setting a new one, so calling it directly here is
+    // always safe and can never leave two timers running.
+    if (VALID_POLL_MS.indexOf(settings.pollMs) !== -1) {
+      POLL_MS = settings.pollMs;
+      schedulePoll();
+    }
 
     if (VALID_PAGE_SIZES.indexOf(settings.pageSize) !== -1) {
       DEFAULT_PAGE_SIZE = settings.pageSize;
@@ -3174,6 +3233,15 @@
 
   if (settingsBtn && settingsDialog) {
     settingsBtn.addEventListener("click", function () {
+      // [v0.3.0 review fix] Re-read from localStorage before reflecting onto
+      // the form: `settings` in memory is only ever written by THIS tab's own
+      // onSettingsChange, so without this line a second tab open on the same
+      // origin would show its own stale copy of the panel forever, and its
+      // next radio change would silently overwrite whatever a different tab
+      // had written to the other four keys in between. loadSettings() never
+      // throws and always returns every key, so this is safe even if storage
+      // is blocked.
+      settings = loadSettings();
       renderSettingsForm();
       settingsDialog.showModal();
     });
