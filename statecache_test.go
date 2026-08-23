@@ -531,21 +531,24 @@ func TestLoadStateCache_EveryInvalidShapeColdStartsAndSaysWhy(t *testing.T) {
 	}
 }
 
-// TestLoadStateCache_AnAbsentCacheWarnsAndColdStarts.
+// TestLoadStateCache_AnAbsentCacheIsNotAWarning is the one exception to this
+// file's every-refusal-is-a-WARN rule, and it is the controller's ruling
+// (round-5) on a deviation this file argued for and then reverted when it went
+// unratified in round 2.
 //
-// This was TestLoadStateCache_AnAbsentCacheIsNotAWarning, asserting INFO, and
-// the argument for INFO was a good one: every fresh deployment's first start has
-// no cache, and a warning that fires on a healthy install is how operators learn
-// to ignore warnings. The brief settled it the other way and named this case
-// FIRST — "Invalid in ANY way (missing, unparseable, wrong schemaVersion,
-// pointer-decode misses on load-bearing fields) → WARN + ignore + cold start" —
-// and the deviation was not ratified in the controller's round-2 rulings. So it
-// is a WARN, and it says in the same breath that a first start is exactly when
-// this is expected.
+// The brief lists `missing` first among the invalid shapes that WARN. The
+// counter-argument, now upheld: every fresh deployment's healthy first start has
+// no cache, so at WARN this line fires exactly once per install to say that
+// nothing is wrong — and a warning that fires when nothing is wrong is how
+// operators learn to skim past the ones that mean something. A program that has
+// never completed a cycle has not yet written the file it writes at the end of
+// one; that is a state, not a fault.
 //
-// The line must still SAY the three things every refusal in this file says:
-// which file, what is wrong with it, and what happens instead.
-func TestLoadStateCache_AnAbsentCacheWarnsAndColdStarts(t *testing.T) {
+// Every other shape stays a WARN (the table above this test), because every
+// other shape means a file EXISTS and could not be used. And the line still says
+// the three things every refusal in this file says: which file, what is wrong
+// with it, and what happens instead.
+func TestLoadStateCache_AnAbsentCacheIsNotAWarning(t *testing.T) {
 	dir := t.TempDir()
 	logger, buf := newActionTestLogger()
 
@@ -553,12 +556,15 @@ func TestLoadStateCache_AnAbsentCacheWarnsAndColdStarts(t *testing.T) {
 		t.Fatal("loadStateCache reported success with no cache file present")
 	}
 	out := buf.String()
-	if !strings.Contains(out, "level=WARN") {
-		t.Errorf("an absent cache did not warn; the brief lists `missing` first among the shapes that must WARN and cold-start:\n%s", out)
+	if strings.Contains(out, "level=WARN") {
+		t.Errorf("an absent cache warned; a first start on a fresh deployment has no cache by definition, and a warning that fires on a healthy install teaches operators to ignore warnings:\n%s", out)
+	}
+	if !strings.Contains(out, "level=INFO") {
+		t.Errorf("an absent cache said nothing at all; the empty dashboard a cold start shows needs one line explaining itself:\n%s", out)
 	}
 	for _, want := range []string{filepath.Join(dir, stateCacheFileName), "cold", "first start"} {
 		if !strings.Contains(out, want) {
-			t.Errorf("the absent-cache warning never mentions %q — a refusal here says which file, what is wrong, and what happens instead:\n%s", want, out)
+			t.Errorf("the absent-cache line never mentions %q — it says which file, what is wrong, and what happens instead, exactly as the WARNs do:\n%s", want, out)
 		}
 	}
 }
@@ -1510,17 +1516,19 @@ func TestDaemon_AColdStartWithNoCacheIsExactlyWhatItAlwaysWas(t *testing.T) {
 	if got := getStats(t, h); len(got.Instances) != 0 {
 		t.Errorf("instances = %+v on a cold start's first cycle, want the empty array every version before this one served", got.Instances)
 	}
-	// The one line this adds to a first start, and the brief asked for it at
-	// WARN (see TestLoadStateCache_AnAbsentCacheWarnsAndColdStarts). What
-	// matters here is that it is the ONLY thing a healthy cold start warns
-	// about: the daemon's noise budget is not open for anything else.
+	// The one line this adds to a first start, at INFO (see
+	// TestLoadStateCache_AnAbsentCacheIsNotAWarning for the ruling). What
+	// matters here is the whole point of that ruling: a healthy first-ever start
+	// warns about NOTHING. Round 5 strengthened this from "every WARN mentions
+	// the cache file" — which the INFO demotion would have left vacuously green
+	// — to "there are no WARNs".
 	out := h.out.String()
 	if !strings.Contains(out, stateCacheFileName) {
 		t.Errorf("a first-ever start never mentioned the cache it has not written yet, so nothing explains the empty dashboard:\n%s", out)
 	}
 	for _, line := range strings.Split(out, "\n") {
-		if strings.Contains(line, "level=WARN") && !strings.Contains(line, stateCacheFileName) {
-			t.Errorf("a healthy cold start warned about something other than the absent cache:\n%s", line)
+		if strings.Contains(line, "level=WARN") {
+			t.Errorf("a healthy cold start warned; the absent cache is the only thing unusual about it and that is a state, not a fault:\n%s", line)
 		}
 	}
 

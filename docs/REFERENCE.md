@@ -1064,9 +1064,11 @@ instance and the file. A cache that is missing, unreadable, not JSON, of a diffe
 with a warning and the process cold-starts exactly as every version before
 this one did — including a valid cache whose instances no longer match any
 name and type in `config.yml`, which warns and cold-starts rather than
-silently showing you nothing. The absent-file case warns too: a first start
-on a fresh deployment says so once and then writes the file at the end of its
-first sweep.
+silently showing you nothing. The one case that is NOT a warning is an absent
+file: a first start on a fresh deployment has no cache by definition, so that
+is an INFO saying as much, and the file appears at the end of the first
+completed sweep. Every other case warns because every other case means a file
+exists and could not be used.
 
 **What it is NOT**, and this is the part worth stating plainly:
 

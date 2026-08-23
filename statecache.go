@@ -278,15 +278,20 @@ func writeStateCache(logger *slog.Logger, dir string, snap statsResponse, at tim
 // cache into something usable, would put invented numbers on the one surface
 // whose entire job is "glance and trust these numbers".
 //
-// EVERY refusal, including an absent file, is a WARN. That is the brief's rule
-// verbatim ("Invalid in ANY way (missing, unparseable, wrong schemaVersion,
-// pointer-decode misses on load-bearing fields) → WARN + ignore + cold start"),
-// and `missing` is the case it names first. This file shipped it at INFO for one
-// review round on the argument that a warning firing on every fresh
-// deployment's healthy first start is how operators learn to ignore warnings;
-// that argument was not ratified, so the level follows the brief and the line
-// itself carries the reassurance instead — it says a first start is exactly when
-// this is expected and what will fix it.
+// EVERY refusal is a WARN except one: an ABSENT file is an INFO. The brief's
+// rule ("Invalid in ANY way (missing, unparseable, wrong schemaVersion,
+// pointer-decode misses on load-bearing fields) → WARN + ignore + cold start")
+// names `missing` first, and this file followed it to the letter for two review
+// rounds — but the controller has now ratified the deviation on noise-discipline
+// grounds: a warning that fires on every fresh deployment's healthy first start
+// is how operators learn to ignore warnings, and this one fires on a state that
+// is not a fault at all. Nothing has gone wrong when a program that has never
+// completed a cycle has not yet written the file it writes at the end of a
+// cycle. Every OTHER shape stays a WARN, because every other shape means a file
+// exists and could not be used — which is a thing someone may need to fix.
+//
+// The line still says the three things every refusal here says: which file, what
+// is wrong with it, and what happens instead.
 func loadStateCache(logger *slog.Logger, dir string) ([]instanceStatsView, time.Time, bool) {
 	final, _, ok := stateCachePaths(dir)
 	if !ok {
@@ -296,7 +301,7 @@ func loadStateCache(logger *slog.Logger, dir string) ([]instanceStatsView, time.
 	raw, err := os.ReadFile(final)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			logger.Warn("there is no warm-start cache to read, so this start is a cold one and the dashboard stays empty until the first sweep completes. On a first start that is expected; the next completed full cycle writes the file",
+			logger.Info("there is no warm-start cache to read, so this start is a cold one and the dashboard stays empty until the first sweep completes. On a first start that is expected; the next completed full cycle writes the file",
 				"path", final)
 			return nil, time.Time{}, false
 		}
