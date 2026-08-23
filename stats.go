@@ -509,17 +509,6 @@ const (
 	scanStageReverseScan  = "reverse-scan"
 )
 
-// scanProgressStride is how many items pass between two writes to the shared
-// surface during a counted stage. The call sites call count() per item, which
-// is what keeps them readable; this is what keeps that from becoming a mutex
-// acquisition per movie on a 100k-item library — the "counter updates bounded
-// (stage transitions + every ~100 items; never per-item lock churn)" rule.
-//
-// 100 is chosen against what a human can perceive: the page polls at 2s while a
-// scan runs, and a bar that advances in 100-item steps is already smoother than
-// the poll that reads it.
-const scanProgressStride = 100
-
 // statsStore is the mutex-guarded in-memory state GET /api/stats serves from.
 // It is updated at the end of every cycle (daemon.go's runScanCycle) and read
 // by the HTTP handler (webui.go); neither side ever blocks the other for
@@ -548,9 +537,12 @@ type statsStore struct {
 	// together, in one snapshot, by one HTTP handler: a second mutex would buy
 	// nothing but the possibility of a snapshot whose two halves came from
 	// different instants, plus a lock-ordering rule for someone to get wrong.
-	// Contention is not a concern either — every write to these fields comes
-	// from the single cycle goroutine, bounded to one per stage transition and
-	// one per scanProgressStride items.
+	// Contention is not a concern either: every write to these fields comes from
+	// the single cycle goroutine, and the only other party is one HTTP handler
+	// taking a snapshot every 2s. Writes are one per stage transition and one
+	// per ITEM (owner ruling, [fix/per-item-progress]) — a lock, a map write and
+	// a struct copy each, which the benchmarks beside this feature's tests
+	// measure against a library far larger than the ones this daemon runs on.
 	scanInProgress bool
 	scanCycleKind  string
 	scanByName     map[string]scanProgressView
@@ -625,54 +617,49 @@ func (s *statsStore) progressFor(name string) *scanProgress {
 }
 
 // scanProgress is the handle a running cycle publishes through: an instance
-// name, the store to publish into, and the small amount of state that makes the
-// stride bounding possible without a lock.
+// name and the store to publish into. That is the whole of it — it carries no
+// state, because it no longer has anything to decide.
 //
-// lastStage/lastDone are UNSYNCHRONIZED on purpose and are safe because of a
-// property this daemon has had since Phase 8: every cycle runs on the single
-// loop goroutine ((*daemon).loop's own comment — "everything that evaluates
-// anything runs here"), so one handle is only ever touched by one goroutine.
-// The shared surface it publishes INTO is the part other goroutines read, and
-// that is behind the store's mutex.
+// It used to hold lastStage/lastDone so count() could skip publishes between
+// stride boundaries. The owner ruled that bound out ([fix/per-item-progress]):
+// every item publishes, so there is nothing to remember between calls, and a
+// handle with no fields cannot develop a second, quieter opinion about what the
+// surface says.
 type scanProgress struct {
 	store    *statsStore
 	instance string
-
-	lastStage string
-	lastDone  int
 }
 
-// stage announces a new stage and resets the counters, publishing immediately:
-// a stage is the coarse thing an operator reads, and holding one back until a
-// stride boundary would leave "evaluating" on screen through the whole file
-// walk. total may be 0 for a stage with nothing to count.
+// stage announces a new stage and resets the counters. A stage is the coarse
+// thing an operator reads, so it is published the moment it changes; total may
+// be 0 for a stage with nothing to count.
 func (p *scanProgress) stage(stage string, total int) {
 	if p == nil {
 		return
 	}
-	p.lastStage = stage
-	p.lastDone = 0
 	p.publish(scanProgressView{Stage: stage, Total: total})
 }
 
-// count reports progress through a counted stage. It is called PER ITEM — that
-// is what keeps the engines' loops readable — and publishes only on a stride
-// boundary, on the last item, or when the stage itself has changed, so a
-// hundred-thousand-item library costs about a thousand lock acquisitions rather
-// than a hundred thousand.
+// count reports progress through a counted stage, and publishes EVERY item.
 //
-// The last item always publishes, whatever the stride left over, so a finished
-// pass never sits at "900 of 996" until the next stage begins.
+// This is the owner's ruling, and it reverses what this feature shipped with: a
+// 100-item stride, on the argument that a bar advancing in hundreds is smoother
+// than the 2s poll that reads it anyway. The argument was true and beside the
+// point — the number on screen was the last multiple of 100, so an instance 150
+// movies into its evaluation reported 100, and the surface whose entire job is
+// to say what the cycle is doing right now was routinely up to 99 items behind
+// what the cycle was doing right now. The saving it bought was a premature
+// optimization: one lock, one map write and one struct copy per item, against a
+// per-item budget that already contains an *arr API call
+// (BenchmarkScanProgress_CountPerItem, scanprogress_test.go, measures both).
+//
+// The mutex design is untouched. The publisher is still the single cycle
+// goroutine, the reader is still one HTTP handler every 2s, and the surface is
+// still the same map behind the same lock.
 func (p *scanProgress) count(stage string, done, total int) {
 	if p == nil {
 		return
 	}
-	changed := stage != p.lastStage
-	if !changed && done != total && done-p.lastDone < scanProgressStride {
-		return
-	}
-	p.lastStage = stage
-	p.lastDone = done
 	p.publish(scanProgressView{Stage: stage, Done: done, Total: total})
 }
 
@@ -714,8 +701,6 @@ func (p *scanProgress) clear() {
 		return
 	}
 	delete(s.scanByName, p.instance)
-	p.lastStage = ""
-	p.lastDone = 0
 }
 
 // publish is the one place stage and count touch the shared surface (clear,
