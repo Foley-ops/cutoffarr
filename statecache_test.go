@@ -692,6 +692,59 @@ func TestStatsStore_TheFirstFreshCycleClearsStaleAndAsOf(t *testing.T) {
 	}
 }
 
+// TestStatsStore_ACycleThatAbortedInsideTheEngineLeavesItWarmAndStale is the
+// third outcome, and it is the one that has no other marker at all — a
+// round-5 review fix.
+//
+// runScanCycle reaches recordInstance whenever the LIBRARY read succeeded
+// (dataOK), which is strictly weaker than the engine having completed an
+// evaluation: §2.6's warn-and-skip paths INSIDE the engine (a quality-profile
+// fetch failure at decision.go's fetchQualityProfiles, an exclusion-tag
+// resolution failure) bare-return with decisionsRan still false. Every field
+// such a cycle could not recompute is deliberately left alone thirty lines
+// below — WouldUnmonitor, ReverseFindings, FileReport — so what remains on the
+// dashboard is a previous PROCESS's cached findings. Clearing Stale/AsOf here
+// removed the only two markers that said so: the amber banner and the per-card
+// "as of …" note both key on stale, and the file-clutter panel carries no
+// timestamp of its own. That is R3-3's defect ("a previous process's findings
+// presented as current, indefinitely, with live trash and merge buttons beside
+// them") reached through the abort-inside-the-engine door, and it compounds:
+// the next saveStateCache would write the entry with stale:false, so the
+// following restart's warmStart would stamp those same cached findings as of
+// the cache's own write time.
+//
+// The brief's rule is "the FIRST COMPLETED fresh cycle clears stale/asOf". A
+// cycle that aborted before completing an evaluation is not one.
+func TestStatsStore_ACycleThatAbortedInsideTheEngineLeavesItWarmAndStale(t *testing.T) {
+	writtenAt := time.Now().Add(-3 * time.Hour)
+	store := newStatsStore(true)
+	store.warmStart([]instanceStatsView{{
+		Name: "radarr-main", Type: "radarr", Total: 10, Unmonitored: 4, WouldUnmonitor: 6,
+		FileReport: fileReportSnapshot{Status: "ran", Duplicates: 3,
+			Findings: []fileReportFindingRecord{{Kind: fileKindDuplicate, Path: "/movies/Movie A/Movie A (2).mkv", Display: "Movie A (2).mkv"}}},
+	}}, writtenAt)
+
+	// dataOK was true (the library read landed, so total/monitored/unmonitored
+	// below are this process's own), but the engine bare-returned before the
+	// evaluation loop: decisionsRan is false.
+	store.recordInstance(cycleKindStartup, time.Now(), "radarr-main", "radarr", cycleInstanceStats{
+		total: 12, monitored: 7, unmonitored: 5,
+	})
+
+	inst := store.snapshot().Instances[0]
+	if !inst.Stale || inst.AsOf == nil || !inst.AsOf.Equal(writtenAt) {
+		t.Errorf("instance = %+v (asOf %v), want still stale as of %s: this cycle never completed an evaluation, so wouldUnmonitor and the file-clutter findings on screen are still the cache's",
+			inst, inst.AsOf, writtenAt)
+	}
+	// The reason the markers must stay: these are the numbers they mark.
+	if inst.WouldUnmonitor != 6 || inst.FileReport.Duplicates != 3 || len(inst.FileReport.Findings) != 1 {
+		t.Errorf("instance = %+v, want the cached wouldUnmonitor and file-clutter findings left exactly as they were", inst)
+	}
+	if inst.LastCycleStatus.Status != cycleStatusSkipped {
+		t.Errorf("LastCycleStatus = %+v, want skipped: this cycle's own outcome is never stale", inst.LastCycleStatus)
+	}
+}
+
 // TestStatsStore_ACycleThatCouldNotReachAnInstanceLeavesItWarmAndStale is the
 // other half, and the honest one: recordUnreachable produced no new numbers, so
 // the cached ones are still what is on screen and must still say so. Clearing
@@ -1610,7 +1663,19 @@ func TestStatsStore_WarmStart_KeepsTheCachedNumbersOwnAgeAcrossRepeatedRestarts(
 		// Already stale in the cache: written out again by a later cycle that
 		// never reached this instance.
 		{Name: "radarr-unreachable", Type: "radarr", Total: 996, Stale: true, AsOf: &swept},
-		// Recorded fresh by the cycle that wrote this cache.
+		// Recorded fresh by the cycle that wrote this cache, and never
+		// recorded again since: the *arr went offline at 09:00 and every sweep
+		// after it took recordUnreachable's path, which by design touches
+		// neither Stale nor the numbers — so the entry keeps being rewritten
+		// with stale:false over 09:00's figures for as long as the outage
+		// lasts. This is the ORDINARY shape of the same lie the row above
+		// covers, and the file's writtenAt is the wrong answer for it too:
+		// LastRun is the only field that says when these numbers were
+		// produced (recordInstance sets it under decisionsRan, beside them).
+		{Name: "radarr-offline-since", Type: "radarr", Total: 996, LastRun: &swept},
+		// Recorded fresh by the cycle that wrote this cache, by a cache old
+		// enough to predate LastRun being written out at all: nothing states
+		// these numbers' own age, so the file's is the closest truth left.
 		{Name: "radarr-main", Type: "radarr", Total: 42},
 	}, rewritten)
 
@@ -1624,8 +1689,12 @@ func TestStatsStore_WarmStart_KeepsTheCachedNumbersOwnAgeAcrossRepeatedRestarts(
 	if got["radarr-unreachable"] == nil || !got["radarr-unreachable"].Equal(swept) {
 		t.Errorf("asOf = %v for numbers the cache itself already knew were stale, want their own age %s — not the file's rewrite time", got["radarr-unreachable"], swept)
 	}
+	if got["radarr-offline-since"] == nil || !got["radarr-offline-since"].Equal(swept) {
+		t.Errorf("asOf = %v for numbers last actually recorded at %s, want that — the banner would otherwise read \"showing last sweep from just now\" over figures a week-long outage has frozen, which is the age of the ATTEMPT to refresh them, never of the numbers",
+			got["radarr-offline-since"], swept)
+	}
 	if got["radarr-main"] == nil || !got["radarr-main"].Equal(rewritten) {
-		t.Errorf("asOf = %v for numbers this cache recorded fresh, want the cache's own write time %s", got["radarr-main"], rewritten)
+		t.Errorf("asOf = %v for numbers this cache recorded fresh with no LastRun of their own, want the cache's own write time %s", got["radarr-main"], rewritten)
 	}
 }
 

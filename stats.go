@@ -773,19 +773,6 @@ func (s *statsStore) recordInstance(kind string, at time.Time, name, typ string,
 	v.Monitored = cs.monitored
 	v.Unmonitored = cs.unmonitored
 
-	// [v0.2.0] The warm start ends here, for this instance, and it ends
-	// UNCONDITIONALLY — before every gated field below, and gated on nothing
-	// itself. The three lines above are the reason: they are written from the
-	// library read, which daemon.go only reaches after its own dataOK check, so
-	// by this point this instance's headline numbers are this process's own
-	// live read and can no longer honestly be labelled as a previous process's
-	// cache. What each PASS most recently managed is a separate question that
-	// the existing three-state fields already answer on their own terms
-	// (ReverseStatus/ReverseAsOf, FileReport.Status) — Stale was never a
-	// per-pass claim and must not start being read as one.
-	v.Stale = false
-	v.AsOf = nil
-
 	// This cycle reached the decision engine at all (runScanCycle only calls
 	// recordInstance from inside its dataOK branch) — a strictly stronger
 	// statement than the connectivity/library-read gates recordUnreachable
@@ -807,12 +794,14 @@ func (s *statsStore) recordInstance(kind string, at time.Time, name, typ string,
 		v.LastCycleStatus = cycleStatusView{Status: cycleStatusSkipped, Reason: abortedEvaluationReason}
 	}
 
-	// decisionsRan gates WouldUnmonitor and LastRun/LastCycleKind together
-	// (see cycleInstanceStats.decisionsRan's own comment): a cycle that
-	// aborted before the evaluation loop finished must not overwrite the
-	// last real WouldUnmonitor with the zero value it never actually
-	// computed, and must not claim "last swept just now" for a sweep that
-	// never produced a decision. total/monitored/unmonitored above are
+	// decisionsRan gates WouldUnmonitor, LastRun/LastCycleKind and the warm
+	// start's own Stale/AsOf together (see cycleInstanceStats.decisionsRan's
+	// own comment): a cycle that aborted before the evaluation loop finished
+	// must not overwrite the last real WouldUnmonitor with the zero value it
+	// never actually computed, must not claim "last swept just now" for a sweep
+	// that never produced a decision, and — see the block's own comment below —
+	// must not strip the markers that say those untouched numbers came off
+	// disk. total/monitored/unmonitored above are
 	// unconditional because they come from the library read, which already
 	// succeeded (daemon.go only calls the engine after dataOK) regardless of
 	// what happened after.
@@ -822,6 +811,27 @@ func (s *statsStore) recordInstance(kind string, at time.Time, name, typ string,
 		v.LastRun = &atCopy
 		kindCopy := kind
 		v.LastCycleKind = &kindCopy
+
+		// [v0.2.0] The warm start ends here, for this instance, and it ends
+		// under the SAME gate as the numbers immediately above it (round-5
+		// review fix). It used to be unconditional, on the strength of
+		// total/monitored/unmonitored being this process's own live read — but
+		// Stale/AsOf are not a claim about those three. They are the ONLY
+		// markers this view carries for WouldUnmonitor and for FileReport,
+		// neither of which an aborted cycle recomputes: the amber banner and
+		// the per-card "as of …" note both key on Stale, and the file-clutter
+		// panel has no timestamp of its own. Clearing them on a cycle that
+		// bare-returned inside the engine therefore presented a previous
+		// PROCESS's cached findings as current — R3-3's defect, with live
+		// trash and merge buttons beside them — and compounded, because the
+		// cache written at the end of that cycle would carry stale:false and
+		// the next warmStart would re-date those same findings to the cache's
+		// own write time. The brief's rule is the first COMPLETED fresh cycle;
+		// an aborted evaluation is not one. What each PASS most recently
+		// managed remains a separate question the three-state fields answer on
+		// their own terms (ReverseStatus/ReverseAsOf, FileReport.Status).
+		v.Stale = false
+		v.AsOf = nil
 	}
 
 	// Three-state fidelity (see cycleInstanceStats.reverseRan's own comment):
@@ -951,16 +961,34 @@ func (s *statsStore) warmStart(instances []instanceStatsView, writtenAt time.Tim
 		// The age of the NUMBERS, not of the file — ReverseAsOf's own rule, and
 		// a self-review finding. The cache is rewritten at the end of every full
 		// cycle including one that could not reach this instance, whose numbers
-		// are therefore still some earlier run's and are written out again
-		// already carrying stale: true and their original asOf. Taking the
-		// file's writtenAt for those would move their apparent age forward at
-		// every restart, so a week-unreachable instance would report "showing
-		// last sweep from just now" over week-old numbers. An entry the cache
-		// already knew was stale keeps its own timestamp; everything else — the
-		// numbers that cycle actually recorded — takes the file's.
+		// are therefore still some earlier run's. Taking the file's writtenAt
+		// would move their apparent age forward at every restart, so a
+		// week-unreachable instance would report "showing last sweep from just
+		// now" over week-old numbers.
+		//
+		// That happens in two shapes, and the entry's own stale flag only
+		// catches one of them (round-5 review fix):
+		//
+		//   - The cycle that wrote the cache was itself warm-started, so the
+		//     entry went out already carrying stale: true and its original
+		//     asOf. Those keep their own timestamp.
+		//   - The far more ordinary one: this process recorded the instance
+		//     fresh at T0, the *arr then went offline, and every sweep since
+		//     has taken recordUnreachable's path — which by design touches
+		//     neither Stale nor the numbers. So the entry is rewritten with
+		//     stale: false over T0's figures for the whole of the outage.
+		//     LastRun is the field that says when those numbers were actually
+		//     produced (recordInstance writes it beside them, under
+		//     decisionsRan), and it is what their age must come from.
+		//
+		// writtenAt is the last resort, for an entry that states neither — a
+		// cache written before either field existed, or a hand-edited one.
 		at := writtenAt
-		if v.Stale && v.AsOf != nil {
+		switch {
+		case v.Stale && v.AsOf != nil:
 			at = *v.AsOf
+		case !v.Stale && v.LastRun != nil:
+			at = *v.LastRun
 		}
 		v.Stale = true
 		v.AsOf = &at

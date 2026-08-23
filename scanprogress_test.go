@@ -371,11 +371,34 @@ func TestRunRadarrDecisionEngine_PublishesEveryStageItReaches(t *testing.T) {
 // The two engines are separate implementations of the same shape, and a stage
 // published by only one of them is a progress strip that stalls on half a
 // deployment.
+//
+// Round-5 review fix: it used to run the engine with fileReportOptions{} — the
+// pass switched OFF — and omit file-walk from its want list, which was the one
+// stage the two fixtures differed on and therefore the one the doc comment
+// above described without checking. Nothing anywhere in the suite reached
+// decision.go's sonarr `scope.progress.stage(scanStageFileWalk, 0)`: deleting
+// that line left every test green while a Sonarr file walk — the longest
+// uncountable phase of a Sonarr sweep, and the one an operator most needs to
+// see — froze the strip on cross-check/reverse-scan for its whole duration.
+// The fixture now mirrors the Radarr twin's: a real media root, a series path
+// that maps into it, and the file report enabled.
 func TestRunSonarrDecisionEngine_PublishesEveryStageItReaches(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureFiles(t, dir, filepath.Join("Show", "Show.S01E01.mkv"))
 	episodesJSON := "[" + episodeJSON(100, 1, 1, pastAirDate, 500) + "]"
-	filesJSON := "[" + episodeFileJSON(500, 1, 200, false) + "]"
+	// Spelled out rather than built by episodeFileJSON, which emits no `path`:
+	// /api/v3/episodefile is the ONLY Sonarr endpoint that carries a file's
+	// path, so without one buildSonarrTrackedSet finds no tracked files under
+	// the root and the mount-problem heuristic aborts the walk before it
+	// starts. The stage would still be published — it is announced ahead of
+	// runSonarrFileReport — but a fixture whose file walk cannot walk is not
+	// the Radarr twin's fixture.
+	filesJSON := `[{"id": 500, "seasonNumber": 1, "customFormatScore": 200, "qualityCutoffNotMet": false, "path": "/tv_shows/Show/Show.S01E01.mkv"}]`
 	fake := newSonarrEngineFake(t, episodesJSON, filesJSON)
+	inst := fake.instance()
+	inst.MediaRootMap = map[string]string{"/tv_shows": dir}
 	series := []seriesElement{testSeries(1, "Show", true, 1, []int{}, testSeason(1, true, 1, 1))}
+	series[0].Path = strPtr("/tv_shows/Show")
 
 	store := newStatsStore(false)
 	rec := newProgressRecorder(store)
@@ -384,10 +407,10 @@ func TestRunSonarrDecisionEngine_PublishesEveryStageItReaches(t *testing.T) {
 	scope.progress = store.progressFor("sonarr-main")
 
 	logger, buf := newDecisionTestLogger(slog.LevelInfo)
-	runSonarrDecisionEngine(context.Background(), logger, fake.instance(), series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude",
-		scope, false, reverseOptions{enabled: true}, fileReportOptions{})
+	runSonarrDecisionEngine(context.Background(), logger, inst, series, map[int]bool{}, map[seasonKey]bool{}, "cutoffarr-exclude",
+		scope, false, reverseOptions{enabled: true}, fileReportOptions{enabled: true})
 
-	for _, stage := range []string{scanStageEvaluating, scanStageCrossCheck, scanStageWriting, scanStageReverseScan, scanStageWantedSet} {
+	for _, stage := range []string{scanStageEvaluating, scanStageCrossCheck, scanStageWriting, scanStageReverseScan, scanStageWantedSet, scanStageFileWalk} {
 		if !containsString(rec.stages(), stage) {
 			t.Errorf("the sonarr engine never published stage %q; published: %v\n%s", stage, rec.stages(), buf.String())
 		}
@@ -682,8 +705,36 @@ func TestDaemon_ScanProgress_AFinishedInstancesRowIsGoneWhileTheNextOneStillRuns
 // of the sweep — on the very same page where its own card simultaneously read
 // "last sweep incomplete". The one surface whose job is to say what is
 // happening was masking the skip.
+//
+// Round-5 review fix — this fixture now holds the dead *arr INSIDE its GET
+// /api/v3/system/status before releasing it, so it covers both halves of
+// daemon.go's connectivity stage rather than only the clear. Nothing observed
+// the publish: this test asserted only that the row was ABSENT afterwards, the
+// two store-level uses of the constant call stage() directly rather than
+// through the daemon, and the whole-cycle test asserts `library`, by which
+// point connectivity has long passed. So deleting the daemon's
+// `scope.progress.stage(scanStageConnectivity, 0)` was invisible to the suite —
+// while its user-visible effect is the worst case the strip exists for: an *arr
+// that is slow or timing out on system/status produces NO row at all (a row is
+// only ever created by its first publish), so the one instance that is actually
+// stuck is the one instance the strip does not mention.
 func TestDaemon_ScanProgress_AnInstanceSkippedAtConnectivityLeavesNoRowBehind(t *testing.T) {
+	atStatus := make(chan struct{}, 1)
+	statusGate := make(chan struct{})
+	releaseStatus := sync.OnceFunc(func() { close(statusGate) })
+	t.Cleanup(releaseStatus)
 	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Held here, then 500: checkInstanceConnectivity's first request is GET
+		// /api/v3/system/status, so this is the window in which the daemon is
+		// doing exactly the thing the `connectivity` stage names — and the
+		// window a genuinely wedged *arr leaves open for minutes.
+		if r.Method == http.MethodGet && r.URL.Path == "/api/v3/system/status" {
+			select {
+			case atStatus <- struct{}{}:
+			default:
+			}
+			<-statusGate
+		}
 		http.Error(w, "the *arr is restarting", http.StatusInternalServerError)
 	}))
 	t.Cleanup(dead.Close)
@@ -692,11 +743,31 @@ func TestDaemon_ScanProgress_AnInstanceSkippedAtConnectivityLeavesNoRowBehind(t 
 
 	h := startDaemon(t, writeTwoInstanceDaemonConfig(t, dead.URL, sonarr.srv.URL))
 	select {
+	case <-atStatus:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the startup scan never reached the dead *arr's system/status:\n%s", h.out.String())
+	}
+
+	// Half one: while the check is outstanding, the strip must SAY so. This is
+	// the row an operator needs most, because it is the only thing on the page
+	// that will name the instance the sweep is hanging on.
+	stuck := getStats(t, h)
+	if !stuck.Scan.InProgress {
+		t.Fatalf("scan.inProgress = false while the startup scan is blocked inside the dead *arr's system/status: %+v", stuck.Scan)
+	}
+	if p, ok := stuck.Scan.Instances["radarr-main"]; !ok || p.Stage != scanStageConnectivity {
+		t.Errorf("scan.instances[\"radarr-main\"] = %+v (present=%v), want stage %q: an *arr timing out on system/status is exactly the instance the strip must name, and a row it never publishes is a row that does not exist",
+			p, ok, scanStageConnectivity)
+	}
+	releaseStatus()
+
+	select {
 	case <-reached:
 	case <-time.After(5 * time.Second):
 		t.Fatalf("the startup scan never reached the sonarr's library read:\n%s", h.out.String())
 	}
 
+	// Half two: and once the cycle has given up on it, the row must go.
 	mid := getStats(t, h)
 	if p, still := mid.Scan.Instances["radarr-main"]; still {
 		t.Errorf("scan.instances still carries radarr-main at stage %q after its connectivity check failed and the cycle moved on: the strip must never claim work is under way for an instance this cycle has given up on", p.Stage)
@@ -857,6 +928,24 @@ func TestWebUIPage_PollTightensWhileScanningAndReturnsAfterwards(t *testing.T) {
 	// The MAPPING is the contract, so the mapping is what is pinned.
 	if !strings.Contains(body, "? POLL_SCANNING_MS : POLL_MS") {
 		t.Errorf("schedulePoll does not map the scanning state to the FAST interval and the idle state to the slow one (want the literal `? POLL_SCANNING_MS : POLL_MS`):\n%s", body)
+	}
+
+	// Round-5 review fix, and the half the mapping above cannot see: the
+	// mapping is only ever consulted when schedulePoll RUNS. Every other path
+	// that changes what the interval should be re-arms the timer immediately —
+	// the poll's own tail (`refresh().then(schedulePoll)`), the
+	// visibilitychange handler, the bootstrap line. The Scan-now click did not:
+	// it POSTed, refreshed once, and then left whatever 30s setTimeout the last
+	// schedulePoll had armed to expire in its own time. So on the ONE
+	// interaction this feature exists for, the page sat on "Queued…" with no
+	// strip, no stage and no counter for up to 30 seconds while the cycle
+	// requestScan had already woken was genuinely running.
+	click := jsBracedBlockAfter(t, page, `scanBtn.addEventListener("click"`)
+	if !strings.Contains(click, "refresh()") {
+		t.Errorf("the Scan-now click handler no longer refreshes at all:\n%s", click)
+	}
+	if !strings.Contains(click, ".then(schedulePoll)") {
+		t.Errorf("the Scan-now click handler never re-arms the poll timer (want the literal `.then(schedulePoll)` chained onto its refresh), so the 2s interval cannot take effect until the outstanding 30s timeout happens to fire:\n%s", click)
 	}
 }
 

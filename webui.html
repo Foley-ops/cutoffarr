@@ -2619,7 +2619,16 @@
           if (body && body.status === "already-pending") {
             text(scanBtn, "Already scanning…");
           }
-        });
+          // Round-5 review fix: and RE-ARM. scanQueuedRecently() is now true,
+          // so schedulePoll picks POLL_SCANNING_MS — but only when it actually
+          // runs, and until this line the outstanding timeout was the 30s one
+          // the last schedulePoll armed. On the single interaction this whole
+          // feature exists for, the page could therefore sit on "Queued…" with
+          // no strip, no stage and no counter for half a minute while the
+          // cycle requestScan had already woken was running the entire time.
+          // schedulePoll clears pollHandle before re-arming, so calling it
+          // here cannot leave two timers behind.
+        }).then(schedulePoll);
       })
       .catch(function () {
         showDisconnected();

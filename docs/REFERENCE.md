@@ -866,11 +866,18 @@ script, a status-page widget, whatever) without ever loading the HTML:
   one narrow thing: EVERY number on this instance was restored from the
   on-disk display cache written by a previous run (see [The warm-start
   display cache](#the-warm-start-display-cache)), and no cycle of the
-  running process has recorded it yet. `asOf` is that cache's own write time
-  — the age of the numbers, never of the attempt to refresh them, exactly
-  like `reverseAsOf` above. The first cycle that records this instance from
-  a live library read clears both; a cycle that could not REACH it
-  deliberately does not, because it produced no fresher numbers. Both are
+  running process has recorded it yet. `asOf` is the age of the NUMBERS,
+  never of the attempt to refresh them, exactly like `reverseAsOf` above: the
+  cached entry's own `lastRun` when it has one, and the cache file's
+  `writtenAt` only when it does not. (The cache is rewritten at the end of
+  every full cycle, including cycles that could not reach this instance, so
+  its write time can be days newer than the numbers inside it.) The first
+  cycle that COMPLETES an evaluation for this instance clears both; a cycle
+  that could not REACH it, and one that reached it but aborted inside the
+  engine (`lastCycleStatus.status: "skipped"`), deliberately do not, because
+  neither produced fresher numbers — `wouldUnmonitor`, `reverseFindings` and
+  `fileReport` are all still the cache's, and `stale`/`asOf` are the only
+  markers that say so. Both are
   always present (`false`/`null` on an ordinary instance). The dashboard
   renders them as an amber "showing last sweep from &lt;time&gt;" banner above
   the shelves plus an "as of &lt;time&gt;" note on each still-cached card. The
@@ -1036,10 +1043,15 @@ already done its real work, and the next full cycle simply tries again.
 
 **Read back once, at startup, before the first cycle.** Instances the current
 config still names (and still names as the same type) are restored with
-`stale: true` and `asOf` set to the cache's own `writtenAt`; the dashboard
-shows them behind an amber "showing last sweep from …" banner (which adds
-"— refreshing now" only while a cycle is actually running), and each card
-drops its own "as of …" note as the running cycle reaches it. One part of a
+`stale: true` and `asOf` set to the age of the numbers themselves — the
+restored entry's own `lastRun`, falling back to the cache file's `writtenAt`
+only for an entry that carries none. (The file is rewritten at the end of
+every full cycle whether or not that cycle reached this instance, so its
+write time says when cutoffarr last TRIED, which is not what the banner
+claims.) The dashboard shows them behind an amber "showing last sweep from …"
+banner (which adds "— refreshing now" only while a cycle is actually
+running), and each card drops its own "as of …" note once a cycle completes
+an evaluation for it. One part of a
 restored instance is dropped on the way in: cached file-clutter findings for
 an instance that has no `media_root_map` in the CURRENT config, since the file
 report is opt-in per instance and no cycle of this process would ever refresh
