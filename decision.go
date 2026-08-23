@@ -580,7 +580,19 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	libraryWouldUnmonitor := 0 // Phase 12: see the loop's own comment
 	skipCounts := make(map[string]int)
 
-	for _, m := range movies {
+	// [v0.2.0] The evaluation is the longest countable stage of a Radarr cycle,
+	// so it is the one an operator most needs to see moving. The total is the
+	// whole library, not the scope: every movie is evaluated regardless of what
+	// is reported or written (see this loop's own comments), and a bar that
+	// counted only the scope would sit at 1/1 for a webhook cycle that is in
+	// fact reading a thousand movies.
+	scope.progress.stage(scanStageEvaluating, len(movies))
+
+	for i, m := range movies {
+		// Published per item, written to the shared surface once per
+		// scanProgressStride items — see scanProgress.count.
+		scope.progress.count(scanStageEvaluating, i+1, len(movies))
+
 		// PHASE 8: shutdown, checked between items here too — but with a
 		// different ending than the write pass's. A cycle interrupted
 		// mid-evaluation has an INCOMPLETE picture, and acting on a partial
@@ -733,6 +745,7 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// cycleInstanceStats.decisionsRan's own comment.
 	stats.decisionsRan = true
 
+	scope.progress.stage(scanStageCrossCheck, 0)
 	cc := runCrossCheck(cycleLogger, inst, decisions, wantedIDs)
 	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
 
@@ -749,11 +762,16 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		logger.Info("forward writes are suppressed for this run: it was started by a human clicking one finding's button, and the only write it may make is the one that button named",
 			append([]any{"instance", inst.Name, "type", inst.Type, "origin", scope.origin}, scope.summaryAttrs()...)...)
 	} else {
+		// [v0.2.0] Write mode only — see scanStageWriting (stats.go).
+		if !dryRun {
+			scope.progress.stage(scanStageWriting, len(reported))
+		}
 		unmonitoredCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount = runWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun, &forwardActions)
 	}
 
 	var rev reverseCounts
 	if reverse.enabled {
+		scope.progress.stage(scanStageReverseScan, len(movies))
 		rev = reversePass{
 			logger: logger, cycleLogger: cycleLogger, client: client, inst: inst,
 			profiles: profiles, exclusionTagID: exclusionTagID, tagActive: tagActive,
@@ -804,6 +822,11 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// this phase, and logFileReportSummary's off-state debug demotion can
 	// only do that from its own call, not as an attr on an always-INFO line.
 	if fileReport.enabled {
+		// The file walk has no cheap total to count against — how many entries
+		// live under the mapped roots is exactly what the walk is finding out —
+		// so this stage is announced with none, and the page renders an
+		// indeterminate pulse rather than a bar that would have to guess.
+		scope.progress.stage(scanStageFileWalk, 0)
 		frc := runRadarrFileReport(ctx, logger, scope.itemLevel, inst, movies, exclusionTagID, tagActive)
 		logFileReportSummary(logger, inst, frc)
 		// Phase 12: see stats.reverseRan above — the same "only overwrite
@@ -2470,7 +2493,16 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	alreadyUnmonitoredCount := 0
 	skipCounts := make(map[string]int)
 
-	for _, s := range series {
+	// [v0.2.0] See the Radarr twin: the evaluation is the longest countable
+	// stage, and it is counted over the WHOLE library rather than the scope,
+	// because the whole library is what is evaluated. Sonarr counts SERIES
+	// here, not seasons — the loop's own unit, and the only one whose total is
+	// known before the loop runs.
+	scope.progress.stage(scanStageEvaluating, len(series))
+
+	for i, s := range series {
+		scope.progress.count(scanStageEvaluating, i+1, len(series))
+
 		// PHASE 8: shutdown mid-evaluation abandons this instance's cycle
 		// entirely — see the Radarr twin for why a partial evaluation is never
 		// cross-checked or written.
@@ -2613,6 +2645,7 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// here rather than unconditionally at the top of the function.
 	stats.decisionsRan = true
 
+	scope.progress.stage(scanStageCrossCheck, 0)
 	cc := runSonarrCrossCheck(ctx, cycleLogger, client, inst, allDecisions, wantedEpisodeIDs)
 	crossCheckSummary := renderCrossCheckSummary(cc.status, cc.verified, cc.unverifiable)
 
@@ -2624,11 +2657,17 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 		logger.Info("forward writes are suppressed for this run: it was started by a human clicking one finding's button, and the only write it may make is the one that button named",
 			append([]any{"instance", inst.Name, "type", inst.Type, "origin", scope.origin}, scope.summaryAttrs()...)...)
 	} else {
+		// Write mode only — see the Radarr twin for why a rehearsal must never
+		// put "writing" on the strip.
+		if !dryRun {
+			scope.progress.stage(scanStageWriting, len(reported))
+		}
 		unmonitoredCount, recoveredWriteCount, writeErrorCount, echoUnverifiedCount, writesRefusedCount, withheldWriteCount = runSonarrWritePass(ctx, logger, client, inst, reported, cc, exclusionTagID, tagActive, dryRun, &forwardActions)
 	}
 
 	var rev reverseCounts
 	if reverse.enabled {
+		scope.progress.stage(scanStageReverseScan, len(series))
 		rev = reversePass{
 			logger: logger, cycleLogger: cycleLogger, client: client, inst: inst,
 			profiles: profiles, exclusionTagID: exclusionTagID, tagActive: tagActive,
@@ -2657,6 +2696,8 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	// forward engine distrusted for an episode-file-count mismatch (binding
 	// controller resolution 5).
 	if fileReport.enabled {
+		// No countable total — see the Radarr twin.
+		scope.progress.stage(scanStageFileWalk, 0)
 		mismatched := buildMismatchedSeasonsIndex(allDecisions)
 		frc := runSonarrFileReport(ctx, logger, scope.itemLevel, client, inst, series, mismatched, exclusionTagID, tagActive)
 		logFileReportSummary(logger, inst, frc)

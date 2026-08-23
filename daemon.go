@@ -158,6 +158,19 @@ const (
 // silently stale-looking (if it had been before) on the one surface whose
 // whole job is "glance and trust these numbers".
 func runScanCycle(ctx context.Context, logger *slog.Logger, cfg Config, cycle scanCycle, stats *statsStore) {
+	// [v0.2.0] The live progress surface's own bracket. This function is the
+	// single funnel every cycle in this program goes through — the startup
+	// scan, a reconciliation sweep, a manual scan, a webhook cycle and --once
+	// alike — so bracketing it here is what makes "scan.inProgress is true
+	// exactly while a cycle is running" structural rather than three call sites
+	// remembering to say so. endScan is deferred so an early return (shutdown
+	// between instances) clears the surface too: a bar left on a page that
+	// nothing will ever advance again is worse than no bar.
+	if stats != nil {
+		stats.beginScan(cycle.kind)
+		defer stats.endScan()
+	}
+
 	for _, inst := range cfg.Instances {
 		// An instance the caller did not name is not merely left unwritten: it
 		// is not contacted at all. "--instance radarr-4k" has to mean the run
@@ -184,6 +197,14 @@ func runScanCycle(ctx context.Context, logger *slog.Logger, cfg Config, cycle sc
 		// their own per-item report lines from the same scope.
 		readLogger := demoteInfoTo(logger, cycle.scope.itemLevel)
 
+		// [v0.2.0] This instance's own progress handle, and the ONLY place a
+		// scope acquires one. scope is a value, so this narrows a COPY for the
+		// engines called below — the cycle's own scope is untouched, and the
+		// next instance gets its own handle rather than inheriting this one's.
+		scope := cycle.scope
+		scope.progress = stats.progressFor(inst.Name)
+
+		scope.progress.stage(scanStageConnectivity, 0)
 		ok := checkInstanceConnectivity(ctx, readLogger, inst)
 		if !ok {
 			// checkInstanceConnectivity has already WARNed the specific cause
@@ -198,9 +219,15 @@ func runScanCycle(ctx context.Context, logger *slog.Logger, cfg Config, cycle sc
 			continue
 		}
 		if inst.Type == "radarr" {
+			// The library read covers BOTH GETs inspectRadarrLibrary makes (the
+			// movie list and the forward wanted/cutoff set), which is why the
+			// stage is announced once around the pair rather than split: the
+			// two are one uninterruptible read from this file's point of view,
+			// and a stage that flickered between them would say nothing extra.
+			scope.progress.stage(scanStageLibrary, 0)
 			movies, wantedIDs, dataOK := inspectRadarrLibrary(ctx, readLogger, inst, cycle.samples)
 			if dataOK {
-				result := runRadarrDecisionEngine(ctx, logger, inst, movies, wantedIDs, cfg.ExclusionTag, cycle.scope, cycle.dryRun, cycle.reverse, cycle.fileReport)
+				result := runRadarrDecisionEngine(ctx, logger, inst, movies, wantedIDs, cfg.ExclusionTag, scope, cycle.dryRun, cycle.reverse, cycle.fileReport)
 				if stats != nil {
 					stats.recordInstance(cycle.kind, cycle.now(), inst.Name, inst.Type, result)
 				}
@@ -209,9 +236,10 @@ func runScanCycle(ctx context.Context, logger *slog.Logger, cfg Config, cycle sc
 			}
 		}
 		if inst.Type == "sonarr" {
+			scope.progress.stage(scanStageLibrary, 0)
 			series, wantedEpisodeIDs, wantedSeasons, dataOK := inspectSonarrLibrary(ctx, readLogger, inst)
 			if dataOK {
-				result := runSonarrDecisionEngine(ctx, logger, inst, series, wantedEpisodeIDs, wantedSeasons, cfg.ExclusionTag, cycle.scope, cycle.dryRun, cycle.reverse, cycle.fileReport)
+				result := runSonarrDecisionEngine(ctx, logger, inst, series, wantedEpisodeIDs, wantedSeasons, cfg.ExclusionTag, scope, cycle.dryRun, cycle.reverse, cycle.fileReport)
 				if stats != nil {
 					stats.recordInstance(cycle.kind, cycle.now(), inst.Name, inst.Type, result)
 				}
