@@ -487,6 +487,18 @@ func TestWebUIPage_SettingsDialogReloadsFromStorageBeforeRenderingOnOpen(t *test
 // applies inline (kept inline there rather than routed through this
 // function, for the variable-declaration-ordering reason applySettings'
 // own comment in webui.html explains).
+//
+// [v0.3.0 review fix, round 4] It used to be enough for POLL_MS and
+// DEFAULT_PAGE_SIZE to merely be REASSIGNED here — but DEFAULT_PAGE_SIZE is
+// only ever read by the pager constructors (once, at construction, long
+// before any cross-tab adoption can run) and by onSettingsChange's own
+// gated block, so reassigning it alone never reached reversePager/filePager,
+// and the operator could not even correct it by hand afterwards (the radio
+// is already checked, so clicking it again fires no change event). This now
+// pins the SAME propagation onSettingsChange's own blocks are pinned for —
+// pushed onto whichever pager is untouched, both panels repainted, and the
+// poll timer re-armed — not merely that the right identifiers appear
+// somewhere in the function body.
 func TestWebUIPage_ApplySettingsBundlesEveryLoadTimeEffect(t *testing.T) {
 	page := string(webUIPage)
 	body := jsBracedBlockAfter(t, page, "function applySettings(")
@@ -500,6 +512,35 @@ func TestWebUIPage_ApplySettingsBundlesEveryLoadTimeEffect(t *testing.T) {
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("applySettings never contains %q — a genuine cross-tab settings change adopted by the gear button's click handler would not fully take effect on the page:\n%s", want, body)
+		}
+	}
+
+	// POLL_MS's own guard block must re-arm the poll timer, exactly as
+	// onSettingsChange's matching block does
+	// (TestWebUIPage_PollCadenceSettingWiredWithoutAffectingScanningTighten
+	// below) — otherwise an adopted cross-tab cadence change would not take
+	// effect until whatever timeout is already outstanding happens to fire
+	// on its own.
+	pollBlock := jsBracedBlockAfter(t, body, "if (VALID_POLL_MS.indexOf(s.pollMs) !== -1")
+	if !strings.Contains(pollBlock, "schedulePoll()") {
+		t.Errorf("applySettings' POLL_MS guard block never calls schedulePoll() to re-arm the outstanding timer:\n%s", pollBlock)
+	}
+
+	// DEFAULT_PAGE_SIZE's own guard block must reach the pagers themselves,
+	// not just the module-level default: pushed onto whichever of
+	// reversePager/filePager is untouched, and both panels repainted so the
+	// change is visible without a reload — the same propagation
+	// TestWebUIPage_PageSizeSettingFeedsPagerDefaultsButPerSectionOverridesPersist
+	// pins for onSettingsChange's own matching block.
+	pageSizeBlock := jsBracedBlockAfter(t, body, "if (VALID_PAGE_SIZES.indexOf(s.pageSize) !== -1")
+	for _, want := range []string{
+		"!reversePager.touched",
+		"!filePager.touched",
+		"renderReverse(lastInstances)",
+		"renderFileReport(lastInstances)",
+	} {
+		if !strings.Contains(pageSizeBlock, want) {
+			t.Errorf("applySettings' DEFAULT_PAGE_SIZE guard block never contains %q — an adopted cross-tab page-size change would be recorded in the module-level default but never reach the pagers or repaint the panels, leaving the dialog stating a value the page is not using:\n%s", want, pageSizeBlock)
 		}
 	}
 }

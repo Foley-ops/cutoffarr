@@ -76,18 +76,31 @@
          badge is clay, and they never touch), sharing a segment boundary is
          not.
 
-     MUTED-INK TEXT AA SCOPE [v0.3.0 review fix, round 3]: --ink-dim clears
-     WCAG AA (4.5:1 normal text) against both --panel and --bg, in both
-     modes. --ink-faint does not (about 3.0:1 light, about 2.9:1 dark) and is
-     reserved for de-emphasized, non-primary text where WCAG's inactive-UI
-     allowance applies — a struck-through completed action row, an "off"
-     status notice, a disabled label — never for text a reader needs in
-     order to use the page. table.findings td.path (a finding's own path —
-     the findings tables' real payload), .switch-why (the write-safety
-     switches' own required explanation) and .settings-group legend/h3 (each
-     settings group's own label) all use --ink-dim for exactly that reason;
-     every other --ink-faint use on this page predates this scope note and
-     is a genuinely de-emphasized/inactive state. */
+     MUTED-INK TEXT AA SCOPE [v0.3.0 review fix, round 3, revised round 4]:
+     --ink-dim clears WCAG AA (4.5:1 normal text) against both --panel and
+     --bg, in both modes. --ink-faint does not (about 3.0:1 light, about
+     2.9:1 dark) and is reserved for text that either is not text at all (a
+     disclosure glyph) or sits in a genuinely inactive UI state — never for
+     informational text a reader needs in order to use or trust the page.
+     Round 3 moved table.findings td.path (a finding's own path — the
+     findings tables' real payload), .switch-why (the write-safety
+     switches' own required explanation) and .settings-group legend/h3
+     (each settings group's own label) to --ink-dim for exactly that reason.
+     Round 4's own independent contrast re-check found the same defect still
+     live in six more rules, every one of them normal text a reader needs —
+     now moved to --ink-dim too: .shelf-type (the instance-type label),
+     .scan-strip-count (the live per-item progress counter), table.findings
+     th (the findings tables' own column headers — the rows are unreadable
+     without them), ul.status-notices li.status-off (the notice that keeps a
+     bare 0 count from reading as an all-clear, previously fainter than its
+     own .status-skipped sibling), .pager-sizes/.pager-nav (the page-size and
+     prev/next labels a reader must read to operate the pager) and footer
+     (the version label). What remains on --ink-faint after round 4 is
+     exhaustively this: details.panel summary::before (a ▸ glyph, not text —
+     clears the 3:1 non-text bar instead), .pager-nav button:disabled and
+     .action-btn:disabled (genuinely disabled controls), and
+     tr.action-performed td plus .case-collision-item.action-performed (a
+     completed row struck through and left in place on purpose). */
   :root {
     --bg: #0F1517;
     --panel: #1A2427;
@@ -478,7 +491,10 @@
     font-size: 10px;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: var(--ink-faint);
+    /* [v0.3.0 review fix, round 4] --ink-dim, not --ink-faint: this is the
+       instance-type label, required text, not a de-emphasized/inactive
+       state — see the MUTED-INK TEXT AA SCOPE note in the token block. */
+    color: var(--ink-dim);
   }
 
   /* The UNREACHABLE badge (controller addition N2): an instance whose most
@@ -673,7 +689,11 @@
     margin-left: auto;
     font-family: var(--mono);
     font-size: 11px;
-    color: var(--ink-faint);
+    /* [v0.3.0 review fix, round 4] --ink-dim, not --ink-faint: this is the
+       live per-item progress counter — the number updateScanRow's own
+       comment below calls "a bar alone cannot say" — required text, not a
+       de-emphasized/inactive state. */
+    color: var(--ink-dim);
     white-space: nowrap;
   }
 
@@ -761,7 +781,10 @@
     font-size: 10px;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: var(--ink-faint);
+    /* [v0.3.0 review fix, round 4] --ink-dim, not --ink-faint: these are the
+       findings tables' own column headers — the rows are unreadable without
+       them, not a de-emphasized/inactive state. */
+    color: var(--ink-dim);
     font-weight: 400;
     padding: 0 10px 8px 0;
     border-bottom: 1px solid var(--border);
@@ -880,7 +903,11 @@
   }
 
   ul.status-notices li { padding: 3px 0; }
-  ul.status-notices li.status-off { color: var(--ink-faint); }
+  /* [v0.3.0 review fix, round 4] --ink-dim, not --ink-faint: this is the
+     notice that stops a bare 0 count from reading as an all-clear — required
+     text, not a de-emphasized/inactive state, and it must not read fainter
+     than its own .status-skipped sibling below. */
+  ul.status-notices li.status-off { color: var(--ink-dim); }
   ul.status-notices li.status-skipped { color: var(--hunt); }
 
   /* [ROUND, inline-display fix] The case-collision block: user-reported —
@@ -972,7 +999,12 @@
     font-family: var(--mono);
     font-size: 12px;
     letter-spacing: 0.02em;
-    color: var(--ink-faint);
+    /* [v0.3.0 review fix, round 4] --ink-dim, not --ink-faint: the page-size
+       and prev/next labels must be read to operate the pager, same quiet
+       tone .pager-position (above) already uses for the same reason — not a
+       de-emphasized/inactive state. .pager-nav button:disabled (below)
+       still overrides to --ink-faint for its own genuinely inactive case. */
+    color: var(--ink-dim);
     white-space: nowrap;
   }
 
@@ -1084,7 +1116,9 @@
     margin-top: 48px;
     font-family: var(--mono);
     font-size: 11px;
-    color: var(--ink-faint);
+    /* [v0.3.0 review fix, round 4] --ink-dim, not --ink-faint: this is the
+       version label, required text, not a de-emphasized/inactive state. */
+    color: var(--ink-dim);
   }
 
   /* --- motion, turned off ------------------------------------------------
@@ -1377,30 +1411,62 @@
   }
 
   // applySettings pushes ALL FOUR load-time effects of a settings object onto
-  // the page at once: applyTheme/applyMotion (the two DOM attributes) and the
-  // two guarded module-level defaults, POLL_MS and DEFAULT_PAGE_SIZE, this
-  // file reads elsewhere. [v0.3.0 review fix, round 3] Exists so the gear
-  // button's click handler (below) can re-push a genuinely cross-tab-changed
-  // settings object onto the PAGE, not just the dialog's own radios — without
-  // this, a real change from another tab sat invisible on screen (the dialog
-  // showing "Light" over a still-dark page) until some unrelated radio here
-  // happened to get clicked. The initial load just below does NOT call this:
-  // POLL_MS and DEFAULT_PAGE_SIZE do not have their real default values yet
-  // at this point in the script — their own `var POLL_MS = 30000;`/
+  // the page at once: applyTheme/applyMotion (the two DOM attributes), POLL_MS
+  // — re-armed via schedulePoll() so an adopted cadence takes effect on the
+  // very next tick rather than whatever timeout is already outstanding, same
+  // as onSettingsChange's own POLL_MS block — and DEFAULT_PAGE_SIZE, pushed
+  // onto whichever of reversePager/filePager the operator has NOT already
+  // resized this session (pager.touched) and both panels repainted via
+  // renderReverse(lastInstances)/renderFileReport(lastInstances), again
+  // mirroring onSettingsChange's own pageSize block exactly.
+  //
+  // [v0.3.0 review fix, round 4] Before this, POLL_MS/DEFAULT_PAGE_SIZE were
+  // reassigned here but never propagated further. DEFAULT_PAGE_SIZE is only
+  // ever READ by the pager constructors (once, at construction — long before
+  // any cross-tab adoption can run) and by onSettingsChange's own gated
+  // block, so an adopted page-size change never reached reversePager/
+  // filePager — and because onSettingsChange itself gates on
+  // settings.pageSize !== previousPageSize, the operator could not even
+  // correct it by hand: the radio was already checked, so clicking it fired
+  // no change event, and if it somehow had, the gate would have blocked it
+  // too. Concrete failure this closes: tab A sets page size 50; tab B opens
+  // Settings, the dialog shows 50 selected (correct), but without the fix
+  // below both findings panels there kept paging by whatever they last used
+  // for the rest of the session — the dialog stating a value the page was
+  // not using.
+  //
+  // [v0.3.0 review fix, round 3] Exists so the gear button's click handler
+  // (below) can re-push a genuinely cross-tab-changed settings object onto
+  // the PAGE, not just the dialog's own radios — without this, a real change
+  // from another tab sat invisible on screen (the dialog showing "Light"
+  // over a still-dark page) until some unrelated radio here happened to get
+  // clicked. The initial load just below does NOT call this: POLL_MS and
+  // DEFAULT_PAGE_SIZE do not have their real default values yet at this
+  // point in the script — their own `var POLL_MS = 30000;`/
   // `var DEFAULT_PAGE_SIZE = 25;` lines run LATER, each immediately followed
   // by its own guarded settings-driven assignment (see each one's "order
   // matters" comment) — so calling applySettings here would have its
   // POLL_MS/DEFAULT_PAGE_SIZE assignments promptly clobbered back to 30000/25
-  // by those later `var` initializers. applyTheme/applyMotion apply inline
-  // at load instead, which is safe because they don't share that ordering
-  // dependency. By the time anything LATER in this script can call
+  // by those later `var` initializers, and reversePager/filePager/
+  // schedulePoll do not exist yet either. applyTheme/applyMotion apply
+  // inline at load instead, which is safe because they don't share that
+  // ordering dependency. By the time anything LATER in this script can call
   // applySettings — including the click handler below — every one of those
   // `var` initializers has already run, so no such hazard applies there.
   function applySettings(s) {
     applyTheme(s.theme);
     applyMotion(s.motion);
-    if (VALID_POLL_MS.indexOf(s.pollMs) !== -1) POLL_MS = s.pollMs;
-    if (VALID_PAGE_SIZES.indexOf(s.pageSize) !== -1) DEFAULT_PAGE_SIZE = s.pageSize;
+    if (VALID_POLL_MS.indexOf(s.pollMs) !== -1) {
+      POLL_MS = s.pollMs;
+      schedulePoll();
+    }
+    if (VALID_PAGE_SIZES.indexOf(s.pageSize) !== -1 && s.pageSize !== DEFAULT_PAGE_SIZE) {
+      DEFAULT_PAGE_SIZE = s.pageSize;
+      if (!reversePager.touched) { reversePager.size = DEFAULT_PAGE_SIZE; reversePager.page = 1; }
+      if (!filePager.touched) { filePager.size = DEFAULT_PAGE_SIZE; filePager.page = 1; }
+      renderReverse(lastInstances);
+      renderFileReport(lastInstances);
+    }
   }
 
   var settings = loadSettings();
