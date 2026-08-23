@@ -1051,7 +1051,10 @@ write time says when cutoffarr last TRIED, which is not what the banner
 claims.) The dashboard shows them behind an amber "showing last sweep from …"
 banner (which adds "— refreshing now" only while a cycle is actually
 running), and each card drops its own "as of …" note once a cycle completes
-an evaluation for it. One part of a
+an evaluation for it. The banner names the OLDEST of the ages on screen: it
+summarises every cached row beneath it, and a summary that reads fresher than
+the worst row under it is the same overstatement `asOf` itself is careful not
+to make. Each card's own note still gives you that card's real age. One part of a
 restored instance is dropped on the way in: cached file-clutter findings for
 an instance that has no `media_root_map` in the CURRENT config, since the file
 report is opt-in per instance and no cycle of this process would ever refresh

@@ -2226,15 +2226,28 @@
   // sweeps), or the daemon is gone entirely (showDisconnected, which hides this
   // banner outright for the same reason it tears the strip down). Round-3
   // review fix: the clause used to be unconditional.
+  //
+  // The age it names is the OLDEST of the stale rows, never the newest
+  // (round-5 review fix). This one line summarises everything below it, and the
+  // ordinary two-instance page carries two different ages: one instance
+  // restored from a cache written minutes ago, the other holding numbers a
+  // week-long outage froze, because recordUnreachable rewrites the entry
+  // without ever refreshing the figures. Taking the newest put "showing last
+  // sweep from 4m ago" above a card whose own numbers were nine days old — the
+  // summary reading fresher than the worst thing it summarises, which is the
+  // same overstatement warmStart's own asOf rule exists to prevent one level
+  // down ("the age of the numbers, never of the attempt to refresh them"). The
+  // per-card .shelf-stale notes still give each row its own real age, so this
+  // line is a floor, not a replacement for them.
   function renderStaleBanner(instances, scanning) {
     var banner = document.getElementById("staleBanner");
     var stale = 0;
-    var newest = null;
+    var oldest = null;
     for (var i = 0; i < instances.length; i++) {
       if (!instances[i].stale) continue;
       stale++;
       var at = instances[i].asOf;
-      if (at && (!newest || new Date(at) > new Date(newest))) newest = at;
+      if (at && (!oldest || new Date(at) < new Date(oldest))) oldest = at;
     }
     if (stale === 0) {
       banner.hidden = true;
@@ -2242,10 +2255,10 @@
       return;
     }
     if (scanning) {
-      text(banner, "showing last sweep from " + fmtRelative(newest) +
+      text(banner, "showing last sweep from " + fmtRelative(oldest) +
         " — refreshing now. These numbers were restored from cutoffarr's own cache when it started; each shelf updates as the running scan reaches it.");
     } else {
-      text(banner, "showing last sweep from " + fmtRelative(newest) +
+      text(banner, "showing last sweep from " + fmtRelative(oldest) +
         ". These numbers were restored from cutoffarr's own cache when it started; each shelf updates when a sweep next reaches it.");
     }
     banner.hidden = false;

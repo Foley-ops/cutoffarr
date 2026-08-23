@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1615,6 +1616,119 @@ func TestWebUIPage_TheWarmStartBannerOnlyClaimsARefreshWhenOneIsRunning(t *testi
 	if !strings.Contains(dis, "staleBanner.hidden = true") {
 		t.Errorf("showDisconnected names #staleBanner but never hides it; the badge would read \"disconnected — showing data from 4m ago\" with \"refreshing now\" directly beneath it:\n%s", dis)
 	}
+}
+
+// TestWebUIPage_TheWarmStartBannerNamesTheOldestNumbersUnderIt is the banner's
+// third honesty rule, and the one that only shows up on the ORDINARY mixed
+// page: two instances, one restored a few minutes ago and one carrying numbers
+// a week-long outage froze (recordUnreachable rewrites the cache entry without
+// ever refreshing the figures, so the two ages in one file routinely differ by
+// days).
+//
+// The banner is a SUMMARY of everything beneath it, so it must be as old as the
+// oldest thing beneath it. Picking the newest asOf — which is what it did — put
+// "showing last sweep from 4m ago" above a card whose own numbers were nine
+// days old: the same overstatement stats.go's warmStart fix exists to prevent
+// one level down, and a direct violation of this codebase's own rule, "the age
+// of the numbers, never of the attempt to refresh them". The per-card
+// `.shelf-stale` notes still carry each row's real age, so nothing is hidden by
+// this line — but the summary must never read fresher than the worst number it
+// summarises.
+//
+// The mapping is pinned twice. The substring assertions are the half that
+// survives a machine with no node on it; the node evaluation below is the half
+// that actually RUNS the function, because "the source mentions oldest" and
+// "the oldest one is what reaches the screen" are different claims and only the
+// second is the contract.
+func TestWebUIPage_TheWarmStartBannerNamesTheOldestNumbersUnderIt(t *testing.T) {
+	body := pageFunctionBody(t, "renderStaleBanner")
+	if strings.Contains(body, "newest") {
+		t.Errorf("renderStaleBanner still tracks the NEWEST stale asOf; the page-level banner summarises every stale row beneath it and must name the oldest of them:\n%s", body)
+	}
+	if !strings.Contains(body, "oldest") {
+		t.Errorf("renderStaleBanner never tracks an oldest stale asOf:\n%s", body)
+	}
+
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; the structural half of this pin ran, the behavioural half needs an interpreter")
+	}
+
+	// Three rows, and the ages are chosen to land in three different buckets of
+	// fmtRelative's own vocabulary so the assertions cannot confuse them: the
+	// freshly restored one ("3m ago"), the one whose *arr has been unreachable
+	// since yesterday ("1d ago"), and a row that is NOT stale at all whose
+	// timestamp must be ignored outright ("400d ago").
+	now := time.Now().UTC()
+	instances, err := json.Marshal([]map[string]any{
+		{"name": "radarr-main", "stale": true, "asOf": now.Add(-3 * time.Minute).Format(time.RFC3339)},
+		{"name": "sonarr-main", "stale": true, "asOf": now.Add(-26 * time.Hour).Format(time.RFC3339)},
+		{"name": "radarr-4k", "stale": false, "asOf": now.Add(-400 * 24 * time.Hour).Format(time.RFC3339)},
+	})
+	if err != nil {
+		t.Fatalf("encoding the fixture instances: %v", err)
+	}
+
+	out := runPageFunctionUnderNode(t, nodePath, `
+var banner = { textContent: "", hidden: null };
+var document = {
+  getElementById: function (id) {
+    if (id !== "staleBanner") throw new Error("renderStaleBanner asked for an unexpected element: " + id);
+    return banner;
+  }
+};
+`+pageFunctionSource(t, "text")+pageFunctionSource(t, "fmtRelative")+pageFunctionSource(t, "renderStaleBanner")+`
+renderStaleBanner(`+string(instances)+`, true);
+console.log(JSON.stringify({ text: banner.textContent, hidden: banner.hidden }));
+`)
+
+	var got struct {
+		Text   string `json:"text"`
+		Hidden any    `json:"hidden"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("could not read what the page rendered (%v):\n%s", err, out)
+	}
+	if got.Hidden != false {
+		t.Errorf("hidden = %v with two stale rows on screen, want false", got.Hidden)
+	}
+	if !strings.Contains(got.Text, "1d ago") {
+		t.Errorf("the banner reads %q, want it to name the OLDEST stale numbers on the page (1d ago): a summary line that is newer than the worst row under it makes the data look fresher than it is", got.Text)
+	}
+	if strings.Contains(got.Text, "3m ago") {
+		t.Errorf("the banner reads %q, which is the age of the FRESHEST stale row; the card beside it is a day older and the banner is the line the operator reads first", got.Text)
+	}
+	if strings.Contains(got.Text, "400d ago") {
+		t.Errorf("the banner reads %q, so it took its age from a row that is not stale at all; only cached rows have an age to report", got.Text)
+	}
+}
+
+// pageFunctionSource returns one page function as EXECUTABLE source.
+// pageFunctionBody starts one byte into the declaration (its own boundary
+// search needs the offset), which is invisible to a substring assertion and
+// fatal to an interpreter, so the missing `f` goes back on here.
+func pageFunctionSource(t *testing.T, name string) string {
+	t.Helper()
+	return "\n f" + pageFunctionBody(t, name) + "\n"
+}
+
+// runPageFunctionUnderNode runs script under node and returns its stdout. It is
+// the only way this project can assert what the embedded page DOES rather than
+// what it says — there is no browser in this test suite and no build step to
+// add one — so the script it is given stubs the two globals a page function
+// touches (document, and whatever the function calls) and prints its result as
+// JSON.
+func runPageFunctionUnderNode(t *testing.T, nodePath, script string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "page-fragment.js")
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
+		t.Fatalf("writing the extracted page fragment: %v", err)
+	}
+	out, err := exec.Command(nodePath, path).CombinedOutput()
+	if err != nil {
+		t.Fatalf("node could not run the extracted page fragment (%v):\n%s\n--- script ---\n%s", err, out, script)
+	}
+	return string(out)
 }
 
 // TestWebUIPage_AWarmStaleShelfCardSaysSoOnTheCardItself is the per-instance
