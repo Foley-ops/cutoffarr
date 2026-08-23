@@ -2223,6 +2223,66 @@
     return "Scan";
   }
 
+  // scanRows keys the strip's per-instance row elements by instance name, and
+  // scanHead is its heading, for exactly the reason shelfCards exists for the
+  // shelves: this strip is redrawn every 2s while a scan runs, and a CSS
+  // transition needs a prior computed value on an already-rendered element to
+  // animate from. Rebuilt from scratch each poll, the determinate bar would
+  // jump rather than glide and the indeterminate pulse would restart from frame
+  // one fifteen times a minute. Built once, updated in place.
+  var scanRows = {};
+  var scanHead = null;
+
+  // buildScanRow creates ONE instance's row shell, once. Every node a later
+  // update touches is kept on row._els, exactly as buildShelfCard does.
+  function buildScanRow() {
+    var row = el("div", "scan-strip-row");
+    var name = el("span", "scan-strip-name");
+    var stage = el("span", "scan-strip-stage");
+    var count = el("span", "scan-strip-count");
+    var bar = el("div", "scan-strip-bar");
+    var fill = el("div", "scan-strip-fill");
+    bar.appendChild(fill);
+    row.appendChild(name);
+    row.appendChild(stage);
+    row.appendChild(count);
+    row.appendChild(bar);
+    row._els = { name: name, stage: stage, count: count, bar: bar, fill: fill };
+    return row;
+  }
+
+  // updateScanRow writes one instance's current position into an EXISTING row's
+  // text nodes and style properties only — never replaces a node — so the
+  // browser sees an in-place change on every poll but the first, which is what
+  // a CSS transition animates.
+  function updateScanRow(row, name, p) {
+    var els = row._els;
+    var total = p.total || 0;
+    var done = p.done || 0;
+
+    text(els.name, name);
+    text(els.stage, p.stage || "working");
+
+    if (total > 0) {
+      // Determinate: the bar carries the fraction, and the count beside it
+      // carries the numbers, because a bar alone cannot say "996".
+      els.bar.className = "scan-strip-bar";
+      els.fill.style.width = clampPct((done / total) * 100).toFixed(1) + "%";
+      text(els.count, done + " / " + total);
+      els.count.hidden = false;
+      return;
+    }
+    // Nothing to count — pulse rather than show a 0% bar that would read as "no
+    // progress at all". The inline width is CLEARED rather than left as it was:
+    // an inline style always beats the stylesheet, so a row moving from a
+    // counted stage to an uncounted one would otherwise pin the pulse at
+    // whatever fraction the last stage happened to end on.
+    els.bar.className = "scan-strip-bar scan-strip-indeterminate";
+    els.fill.style.width = "";
+    text(els.count, "");
+    els.count.hidden = true;
+  }
+
   // renderScanStrip draws the live progress strip: one row per instance the
   // running cycle has reached, its coarse stage, and a bar.
   //
@@ -2231,73 +2291,68 @@
   // publishes progress into a surface of its own and no finding reaches
   // `instances` until the cycle completes.
   //
-  // Order follows the data's own (config) order where an instance is already
-  // on screen, then anything the scan names that is not — which is the cold
-  // start with no cache, where the strip is the only thing on the page.
+  // Order follows the data's own (config) order where an instance is already on
+  // screen, then anything the scan names that is not — which is the cold start
+  // with no cache, where the strip is the only thing on the page.
   function renderScanStrip(data) {
     var strip = document.getElementById("scanStrip");
     var scan = data.scan || {};
     var byName = scan.instances || {};
     if (!scan.inProgress) {
+      // Torn down rather than merely hidden: the next cycle is a NEW cycle, and
+      // its first frame must not animate away from the last one's numbers.
       strip.hidden = true;
       strip.textContent = "";
+      scanRows = {};
+      scanHead = null;
       return;
     }
 
+    if (!scanHead) {
+      strip.textContent = "";
+      scanRows = {};
+      scanHead = el("p", "scan-strip-head");
+      strip.appendChild(scanHead);
+    }
+    text(scanHead, scanKindLabel(scan.cycleKind) + " running");
+
     var order = [];
-    var seen = {};
+    var listed = {};
     var instances = data.instances || [];
     for (var i = 0; i < instances.length; i++) {
       var name = instances[i].name;
-      if (Object.prototype.hasOwnProperty.call(byName, name) && !seen[name]) {
-        seen[name] = true;
+      if (Object.prototype.hasOwnProperty.call(byName, name) && !listed[name]) {
+        listed[name] = true;
         order.push(name);
       }
     }
     var rest = [];
     for (var key in byName) {
-      if (Object.prototype.hasOwnProperty.call(byName, key) && !seen[key]) rest.push(key);
+      if (Object.prototype.hasOwnProperty.call(byName, key) && !listed[key]) rest.push(key);
     }
     rest.sort();
     order = order.concat(rest);
 
-    strip.textContent = "";
-    var head = el("p", "scan-strip-head");
-    text(head, scanKindLabel(scan.cycleKind) + " running");
-    strip.appendChild(head);
-
+    var seen = {};
     for (var r = 0; r < order.length; r++) {
-      var p = byName[order[r]] || {};
-      var total = p.total || 0;
-      var done = p.done || 0;
-
-      var row = el("div", "scan-strip-row");
-      var label = el("span", "scan-strip-name");
-      text(label, order[r]);
-      row.appendChild(label);
-
-      var stage = el("span", "scan-strip-stage");
-      text(stage, p.stage || "working");
-      row.appendChild(stage);
-
-      var bar = el("div", "scan-strip-bar");
-      var fill = el("div", "scan-strip-fill");
-      if (total > 0) {
-        // Determinate: the bar carries the fraction, and the count beside it
-        // carries the numbers, because a bar alone cannot say "996".
-        fill.style.width = clampPct((done / total) * 100).toFixed(1) + "%";
-        var count = el("span", "scan-strip-count");
-        text(count, done + " / " + total);
-        row.appendChild(count);
-      } else {
-        // Nothing to count — pulse rather than show a 0% bar that would read
-        // as "no progress at all".
-        bar.className = "scan-strip-bar scan-strip-indeterminate";
+      seen[order[r]] = true;
+      var row = scanRows[order[r]];
+      if (!row) {
+        row = buildScanRow();
+        scanRows[order[r]] = row;
       }
-      bar.appendChild(fill);
-      row.appendChild(bar);
+      // Keeps DOM order matching `order`; a no-op move once every instance has
+      // been seen once, which is the common case.
       strip.appendChild(row);
+      updateScanRow(row, order[r], byName[order[r]] || {});
     }
+    for (var known in scanRows) {
+      if (seen[known]) continue;
+      var gone = scanRows[known];
+      if (gone.parentNode) gone.parentNode.removeChild(gone);
+      delete scanRows[known];
+    }
+
     strip.hidden = false;
   }
 
@@ -2386,6 +2441,8 @@
     var strip = document.getElementById("scanStrip");
     strip.hidden = true;
     strip.textContent = "";
+    scanRows = {};
+    scanHead = null;
     var since = lastSuccessAt ? fmtRelative(lastSuccessAt.toISOString()) : null;
     text(badge, since ? ("disconnected — showing data from " + since) : "disconnected — no data yet");
 

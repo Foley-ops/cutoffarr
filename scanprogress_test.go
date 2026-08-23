@@ -480,20 +480,23 @@ func TestWebUIPage_ScanStripRendersEveryInstancesStageAndProgress(t *testing.T) 
 		}
 	}
 
-	body := pageFunctionBody(t, "renderScanStrip")
+	// The two halves of the renderer: the one that decides WHICH rows exist,
+	// and the one that fills a row in. Both are checked, because the property
+	// is that the strip is driven by the scan surface and by nothing else.
+	body := pageFunctionBody(t, "renderScanStrip") + pageFunctionBody(t, "updateScanRow")
 	for _, want := range []string{"inProgress", "data.scan", "stage", "done", "total"} {
 		if !strings.Contains(body, want) {
-			t.Errorf("renderScanStrip never reads %q from the scan surface:\n%s", want, body)
+			t.Errorf("the strip renderer never reads %q from the scan surface:\n%s", want, body)
 		}
 	}
 	// A determinate bar when there is something to count, an indeterminate
 	// pulse when there is not: "0 of 0" and "0 of 996" are different statements
 	// and must not render alike.
 	if !strings.Contains(body, "total > 0") {
-		t.Error("renderScanStrip does not distinguish a countable stage from one with no total; an indeterminate stage must pulse rather than show a 0% bar")
+		t.Error("the strip renderer does not distinguish a countable stage from one with no total; an indeterminate stage must pulse rather than show a 0% bar")
 	}
 	if !strings.Contains(body, "scan-strip-indeterminate") {
-		t.Error("renderScanStrip never applies the indeterminate class for a stage with no total")
+		t.Error("the strip renderer never applies the indeterminate class for a stage with no total")
 	}
 }
 
@@ -598,5 +601,44 @@ func TestWebUIPage_ScanStripPulseIsDisabledUnderReducedMotion(t *testing.T) {
 	}
 	if !strings.Contains(block, "scan-strip-indeterminate") {
 		t.Errorf("the prefers-reduced-motion block does not name the indeterminate strip's own selector:\n%s", block)
+	}
+}
+
+// TestWebUIPage_ScanStripReusesItsRowsAcrossPolls is a self-review finding, and
+// it is the same rule the shelf cards already live by
+// (TestWebUIPage_ReusesShelfCardsAcrossRefreshesForTransitions): a CSS
+// transition needs a prior computed value on an already-rendered element to
+// animate from, and a keyframe animation restarts from frame one every time its
+// element is replaced.
+//
+// The strip is redrawn every 2s while a scan runs. Rebuilt from scratch, its
+// determinate bar would jump rather than glide and — worse — its indeterminate
+// pulse would visibly stutter back to the start fifteen times a minute. So the
+// per-instance row is built once, keyed by instance name, and updated in place.
+func TestWebUIPage_ScanStripReusesItsRowsAcrossPolls(t *testing.T) {
+	page := string(webUIPage)
+	for _, want := range []string{"scanRows", "buildScanRow", "updateScanRow"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the page is missing %q: the strip's rows must be built once and updated in place, not recreated on every 2s poll", want)
+		}
+	}
+
+	body := pageFunctionBody(t, "renderScanStrip")
+	if !strings.Contains(body, "scanRows[") {
+		t.Errorf("renderScanStrip does not key its rows by instance name:\n%s", body)
+	}
+	if !strings.Contains(body, "updateScanRow(") {
+		t.Errorf("renderScanStrip never updates an existing row in place:\n%s", body)
+	}
+
+	update := pageFunctionBody(t, "updateScanRow")
+	// Switching a row from a countable stage to an uncountable one must clear
+	// the inline width, or it would override the indeterminate class's own and
+	// pin the pulse at whatever fraction the last countable stage ended on.
+	if !strings.Contains(update, `els.fill.style.width = "";`) {
+		t.Errorf("updateScanRow never clears the inline width when a stage stops being countable, so an indeterminate pulse would inherit the previous stage's fraction:\n%s", update)
+	}
+	if !strings.Contains(update, "scan-strip-indeterminate") || !strings.Contains(update, "total > 0") {
+		t.Errorf("updateScanRow does not switch between the determinate bar and the indeterminate pulse:\n%s", update)
 	}
 }
