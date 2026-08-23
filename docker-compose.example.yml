@@ -54,10 +54,24 @@ services:
       - SONARR_MAIN_API_KEY=${SONARR_MAIN_API_KEY}
 
     volumes:
-      # The config directory, read-only, and it stays that way even with v2.2's
-      # actions enabled: cutoffarr never writes its own config or any state
-      # file, so mounting it :ro removes a way for a bug to matter.
-      - /mnt/user/appdata/cutoffarr:/config:ro
+      # The config directory, and the ONE writable mount this deployment has.
+      #
+      # It was :ro until v0.2.0, and the sentence that justified it ("cutoffarr
+      # never writes any state file") stopped being true when the dashboard
+      # gained its warm start. cutoffarr now writes exactly one file here —
+      # state-cache.json, a copy of what GET /api/stats already serves — at the
+      # end of every full sweep, and reads it back at startup so a restart
+      # shows the last sweep's numbers instead of a blank page. It never writes
+      # config.yml, never writes anything else in this directory, and the file
+      # is display-only: it is never an input to any decision, any write, or
+      # any action's re-verification, all of which re-read live data every
+      # time. Delete it whenever you like; you lose one warm start.
+      #
+      # Keeping this :ro is supported and costs only that feature: the write
+      # fails, cutoffarr logs one WARN per sweep saying so, and every cycle
+      # behaves exactly as it always did. What is NOT negotiable is the media
+      # mounts below, which stay :ro by default whatever this line says.
+      - /mnt/user/appdata/cutoffarr:/config:rw
 
       # The file report (Phase 11, opt-in per instance via media_root_map in
       # config.yml) needs read access to your media to compare it against
@@ -65,7 +79,8 @@ services:
       # itself never writes, deletes, moves, or renames a file and never gains
       # an option to (enforced by TestTree_BansFilesystemMutationAPIsEverywhere,
       # not just documented), and :ro removes even the THEORETICAL blast
-      # radius of a bug, the same reasoning the :ro config mount above uses.
+      # radius of a bug — the reasoning the config mount above used to rest on
+      # too, and the reason THESE lines stay :ro now that it no longer can.
       # If you want v2.2's action buttons to be able to act, see the
       # ACTIONS-ENABLED VARIANT block further down before changing anything.
       # Uncomment and edit the right-hand side to match your real media
@@ -109,7 +124,8 @@ services:
       # dry_run: false for anything to actually happen, since with dry_run on
       # every button rehearses instead. See the README's "Acting on findings".
       #
-      # Nothing else changes: leave the /config mount :ro either way.
+      # Nothing else changes: the /config mount above is unrelated to this and
+      # stays as it is either way.
       # - /mnt/user/data/media/Movies:/data/media/Movies:rw
       # - /mnt/user/data/media/TV_Shows:/data/media/TV_Shows:rw
 

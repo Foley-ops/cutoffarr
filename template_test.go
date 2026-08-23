@@ -200,21 +200,42 @@ func TestTemplate_AgreesWithComposeExample_WebhookPort(t *testing.T) {
 }
 
 // TestTemplate_AgreesWithComposeExample_ConfigPath pins the mounted config
-// directory's container-side path and read-only mode against
-// docker-compose.example.yml's own `:/config:ro` volume line.
+// directory's container-side path and mount mode against
+// docker-compose.example.yml's own `:/config:rw` volume line.
+//
+// [v0.2.0] That mode changed, deliberately, from ro to rw — and the sentence
+// that justified :ro ("cutoffarr never writes any state file") is what changed
+// with it: the dashboard's warm start keeps one file, state-cache.json, in this
+// directory (statecache.go), written at the end of every full sweep and read
+// back at startup so a restart does not serve a blank page. A read-only /config
+// is still a supported deployment; it simply loses that one feature, with a
+// WARN per sweep saying so.
+//
+// What did NOT change, and what this test deliberately does not touch, is the
+// MEDIA mount posture: those stay :ro by default, pinned separately and far
+// more strictly by
+// TestComposeExample_MediaStaysReadOnlyByDefaultWithAnActionsVariantExplained
+// (container_test.go). The blast-radius argument this project makes is about
+// the media, and it is untouched.
 func TestTemplate_AgreesWithComposeExample_ConfigPath(t *testing.T) {
 	tmpl := parseUnraidTemplate(t)
 	cfg := findConfigByType(t, tmpl, "Path")
 	if cfg.Target != "/config" {
 		t.Errorf("the Path Config's Target = %q, want %q", cfg.Target, "/config")
 	}
-	if cfg.Mode != "ro" {
-		t.Errorf("the Path Config's Mode = %q, want %q (docker-compose.example.yml mounts /config read-only)", cfg.Mode, "ro")
+	if cfg.Mode != "rw" {
+		t.Errorf("the Path Config's Mode = %q, want %q (docker-compose.example.yml mounts /config read-write for the warm-start cache)", cfg.Mode, "rw")
 	}
 
 	compose := readRepoFile(t, "docker-compose.example.yml")
-	if !strings.Contains(uncommented(compose), ":/config:ro") {
-		t.Errorf("docker-compose.example.yml no longer mounts /config read-only; the template's Path Config Mode must be updated to match")
+	if !strings.Contains(uncommented(compose), ":/config:rw") {
+		t.Errorf("docker-compose.example.yml no longer mounts /config read-write; the template's Path Config Mode must be updated to match")
+	}
+	// The template must SAY what the writable mount is for. An operator reading
+	// "rw" with no explanation cannot tell a needed permission from a careless
+	// one, and this one is needed for exactly one file.
+	if !strings.Contains(cfg.Description, "state-cache.json") {
+		t.Errorf("the Path Config's Description does not name the one file this writable mount exists for:\n%s", cfg.Description)
 	}
 }
 

@@ -3297,10 +3297,42 @@ func TestDaemon_IdleCycleWithFileReportFindings_StaysWithinTheNoiseBudget(t *tes
 // against the allowlist itself). True deletion does not exist in this
 // codebase — every removal is a move into .cutoffarr-trash, and emptying that
 // is a human's job with their own shell.
+//
+// [v0.2.0 AMENDMENT, made on the same terms as v2.2's: deliberately, argued
+// for, and narrower than it looks.] A second file joins, and it is a different
+// kind of writer from the first. actions.go writes to a MEDIA root, on a
+// human's click. statecache.go writes ONE file to the CONFIG directory, on the
+// daemon's own schedule, and that file contains nothing but a copy of what the
+// unauthenticated GET /api/stats endpoint already serves to anyone on the LAN
+// (see that file's header for why the warm-start cache exists and why it can
+// never be a decision input). It may make exactly two calls:
+//
+//   - os.WriteFile — the temp file the snapshot is written into.
+//   - os.Rename — the atomic move of that temp file onto state-cache.json.
+//
+// Three things keep this from being the "legitimate-looking os.WriteFile just
+// for a cache file three phases from now" that this whole allowlist exists to
+// refuse, and each of them is pinned by its own test:
+//
+//   - CONFINEMENT. Both paths come from stateCachePaths, which joins two
+//     separator-free constants onto the config directory, so no media path, no
+//     finding, and nothing derived from an *arr can ever steer where this file
+//     writes (TestStateCachePaths_StayInsideTheConfigDirectory,
+//     TestStateCacheFile_EveryMutationIsTheCacheWriteConfinedToTheConfigDirectory).
+//   - ONE FUNCTION. Both calls must sit inside writeStateCache, the way
+//     actions.go's must sit inside its three approved functions
+//     (fsMutationApprovedFunctions has a statecache.go twin below).
+//   - NO DELETION, still. os.Remove stays banned here as everywhere, which is
+//     why the temp file has a fixed name it can overwrite rather than a unique
+//     one it would have to clean up (see stateCacheTempFileName).
 var fsMutationAllowlist = map[string]map[string]bool{
 	"actions.go": {
 		"os.Rename(":   true,
 		"os.MkdirAll(": true,
+	},
+	"statecache.go": {
+		"os.WriteFile(": true,
+		"os.Rename(":    true,
 	},
 }
 

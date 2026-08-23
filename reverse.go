@@ -415,6 +415,12 @@ type reversePass struct {
 func (p reversePass) runRadarr(ctx context.Context, movies []movieListElement) reverseCounts {
 	var c reverseCounts
 
+	// [v0.2.0] The unmonitored wanted/cutoff fetch is announced as its own
+	// stage rather than folded into "reverse-scan", because on a large library
+	// it is the single slowest call in the cycle — a paged fetch of every
+	// unmonitored item below cutoff — and a strip that sat on "reverse-scan
+	// 0/996" through all of it would look wedged. See scanStageWantedSet.
+	p.scope.progress.stage(scanStageWantedSet, 0)
 	wantedIDs, ok := fetchWantedCutoff(ctx, p.cycleLogger, p.client, p.inst, unmonitoredWantedFilter())
 	if !ok {
 		// The completeness contract, in the direction where an incomplete set
@@ -438,7 +444,10 @@ func (p reversePass) runRadarr(ctx context.Context, movies []movieListElement) r
 	// evaluated=0 on the one line explaining how far it got.
 	evaluated := 0
 	var findings []movieDecision
-	for _, m := range movies {
+	p.scope.progress.stage(scanStageReverseScan, len(movies))
+	for i, m := range movies {
+		p.scope.progress.count(scanStageReverseScan, i+1, len(movies))
+
 		// The same shutdown boundary the forward evaluation draws, and the same
 		// ending: a partial reverse scan is not a reverse scan, so nothing it
 		// half-saw is reported or counted as a finding total.
@@ -541,6 +550,8 @@ type reverseSeasonFinding struct {
 func (p reversePass) runSonarr(ctx context.Context, series []seriesElement) reverseCounts {
 	var c reverseCounts
 
+	// See the Radarr twin: its own stage, because it is the slowest call here.
+	p.scope.progress.stage(scanStageWantedSet, 0)
 	_, wantedSeasons, ok := fetchSonarrWantedCutoff(ctx, p.cycleLogger, p.client, p.inst, unmonitoredWantedFilter())
 	if !ok {
 		p.logger.Warn("skipping the reverse scan for this instance: the unmonitored wanted/cutoff set could not be fetched completely, and an incomplete set would report seasons as below cutoff that are not; the forward pass is unaffected",
@@ -556,7 +567,10 @@ func (p reversePass) runSonarr(ctx context.Context, series []seriesElement) reve
 	// and never what the reader is asking.
 	seriesEvaluated := 0
 	var findings []reverseSeasonFinding
-	for _, s := range series {
+	p.scope.progress.stage(scanStageReverseScan, len(series))
+	for i, s := range series {
+		p.scope.progress.count(scanStageReverseScan, i+1, len(series))
+
 		if ctx.Err() != nil {
 			p.logger.Info("shutdown requested: abandoning this instance's reverse scan mid-evaluation; a partial reverse scan is never reported as a finding count",
 				"instance", p.inst.Name, "type", p.inst.Type, "seriesEvaluated", seriesEvaluated, "libraryTotal", len(series))

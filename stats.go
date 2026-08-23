@@ -327,6 +327,32 @@ type instanceStatsView struct {
 	FileReport      fileReportSnapshot `json:"fileReport"`
 	LastActions     []actionRecord     `json:"lastActions"`
 
+	// Stale/AsOf are [v0.2.0]'s warm-start pair, and they exist because a
+	// restarted container used to blank this instance's card entirely until a
+	// full sweep finished — minutes on a real library, during which the one
+	// surface whose job is "glance and trust these numbers" had none.
+	//
+	// They mean exactly one thing, and it is narrow: EVERY number on this
+	// instance was read out of the on-disk display cache (statecache.go)
+	// written by a PREVIOUS process, and no cycle of THIS process has yet
+	// recorded it. Stale is true and AsOf is that cache's own writtenAt —
+	// never "now", never the cycle that is currently running — following
+	// ReverseAsOf's convention exactly: the timestamp of the numbers being
+	// shown, not of the attempt to refresh them.
+	//
+	// The first recordInstance for this instance clears both (see that
+	// method): once a live library read has landed, these numbers are this
+	// process's own. recordUnreachable deliberately does NOT clear them — a
+	// cycle that could not reach the instance produced no fresher numbers, and
+	// claiming freshness on its behalf would be the false all-clear this file
+	// refuses everywhere else.
+	//
+	// Both are ALWAYS present on the wire (stale false, asOf null, on every
+	// ordinary instance), for the same reason LastRun/ReverseAsOf are: an
+	// absent key must never be readable as a value.
+	Stale bool       `json:"stale"`
+	AsOf  *time.Time `json:"asOf"`
+
 	// LastCycleStatus is this instance's outcome on the MOST RECENT cycle
 	// that named it at all — including a cycle that never reached the
 	// decision engine because §2.6's connectivity-gate or library-read
@@ -391,7 +417,108 @@ type statsResponse struct {
 	GUIActions           bool                `json:"guiActions"`
 	ReverseScanRemonitor bool                `json:"reverseScanRemonitor"`
 	Version              string              `json:"version"`
+
+	// Scan is [v0.2.0]'s live progress surface, and it is DELIBERATELY a
+	// sibling of Instances rather than a field on each of them. The two answer
+	// different questions on different clocks: Instances is the end-of-cycle
+	// DATA snapshot, which changes only when a cycle completes, and Scan is
+	// what is happening right now, which changes throughout one. Folding
+	// progress into the data would have meant a struct whose fields update at
+	// two different times — the shape in which a partial finding eventually
+	// leaks into a total.
+	Scan scanView `json:"scan"`
 }
+
+// scanView is the `scan` object GET /api/stats carries: whether a cycle is
+// running at all, which kind it is (scanCycle.kind's own four-value vocabulary,
+// so the page can say "startup scan" rather than inventing a fifth word), and
+// how far each instance this cycle has reached has got.
+//
+// Instances is always an object, never null, and never carries an instance the
+// CURRENT cycle has not reached: a stale entry would render as a progress bar
+// for work nobody is doing. CycleKind is omitted when nothing is running, since
+// there is no cycle to name.
+type scanView struct {
+	InProgress bool                        `json:"inProgress"`
+	CycleKind  string                      `json:"cycleKind,omitempty"`
+	Instances  map[string]scanProgressView `json:"instances"`
+}
+
+// scanProgressView is one instance's coarse position in the cycle: which stage,
+// and — when the stage is a pass over a countable set — how far through it.
+//
+// Done/Total are 0/0 for a stage with nothing to count (a connectivity check, a
+// wanted-set fetch), which the page renders as an indeterminate pulse rather
+// than a 0% bar: "0 of 0" and "0 of 996" are different statements and must not
+// look alike.
+type scanProgressView struct {
+	Stage string `json:"stage"`
+	Done  int    `json:"done"`
+	Total int    `json:"total"`
+}
+
+// The stage vocabulary. Named constants rather than repeated string literals
+// for the same reason cycleKind's are (daemon.go): these values are read
+// LITERALLY by the page, and a typo in one of eight scattered string literals
+// would silently render an unlabelled bar.
+//
+// Every one of them is published by something, and each is published at the
+// point the work STARTS — a stage on screen is what the cycle is doing, never
+// what it just finished:
+//
+//	connectivity — daemon.go, before checkInstanceConnectivity.
+//	library      — daemon.go, before the library read (which includes the
+//	               forward wanted/cutoff fetch).
+//	evaluating   — both engines' decision loops, counted.
+//	cross-check  — both engines, before the cross-check.
+//	writing      — both engines, before the forward write pass, and ONLY in
+//	               write mode. A rehearsal runs that same pass and composes no
+//	               write at all (§2.1's gate sits immediately before each PUT),
+//	               so a strip reading "writing" during one would be a lie in
+//	               the one place this project is most careful not to tell one;
+//	               a rehearsal simply stays on the previous stage
+//	               (TestBothEngines_ARehearsalNeverPublishesTheWritingStage).
+//	               UNCOUNTABLE, total 0, deliberately: runWritePass takes no
+//	               progress handle, so nothing can advance a counter through it,
+//	               and a total nothing advances renders as a 0%-wide bar reading
+//	               "0 / 340" for the whole of a pass that is one PUT plus an
+//	               echo verification per item — minutes, looking wedged, during
+//	               the one phase that is actually mutating the user's *arrs.
+//	               An uncountable stage pulses instead, which is what every
+//	               other uncountable stage here already does. Round-2 review
+//	               fix; TestBothEngines_TheWritingStageNeverClaimsACountNothing
+//	               WillAdvance keeps it honest. (Both call sites keep their
+//	               comment SHORT for a reason —
+//	               TestTree_BothEnginesGuardTheirForwardWritePassWithTheScope
+//	               Suppression reads a fixed window of source before each write
+//	               pass call looking for its guard.)
+//	reverse-scan — both engines, before the reverse pass, then counted by the
+//	               pass itself.
+//	wanted-set   — the reverse pass, before its own unmonitored wanted/cutoff
+//	               fetch, which on a large library is the slowest single call in
+//	               the cycle.
+//	file-walk    — both engines, before the file report's walk of the roots.
+const (
+	scanStageConnectivity = "connectivity"
+	scanStageLibrary      = "library"
+	scanStageWantedSet    = "wanted-set"
+	scanStageEvaluating   = "evaluating"
+	scanStageCrossCheck   = "cross-check"
+	scanStageFileWalk     = "file-walk"
+	scanStageWriting      = "writing"
+	scanStageReverseScan  = "reverse-scan"
+)
+
+// scanProgressStride is how many items pass between two writes to the shared
+// surface during a counted stage. The call sites call count() per item, which
+// is what keeps them readable; this is what keeps that from becoming a mutex
+// acquisition per movie on a 100k-item library — the "counter updates bounded
+// (stage transitions + every ~100 items; never per-item lock churn)" rule.
+//
+// 100 is chosen against what a human can perceive: the page polls at 2s while a
+// scan runs, and a bar that advances in 100-item steps is already smoother than
+// the poll that reads it.
+const scanProgressStride = 100
 
 // statsStore is the mutex-guarded in-memory state GET /api/stats serves from.
 // It is updated at the end of every cycle (daemon.go's runScanCycle) and read
@@ -413,6 +540,28 @@ type statsStore struct {
 	// felt like.
 	order  []string
 	byName map[string]*instanceStatsView
+
+	// --- [v0.2.0] the live progress surface ---------------------------------
+	//
+	// Guarded by the SAME mutex as the data above, deliberately. The two are
+	// separate surfaces (see statsResponse.Scan for why) but they are read
+	// together, in one snapshot, by one HTTP handler: a second mutex would buy
+	// nothing but the possibility of a snapshot whose two halves came from
+	// different instants, plus a lock-ordering rule for someone to get wrong.
+	// Contention is not a concern either — every write to these fields comes
+	// from the single cycle goroutine, bounded to one per stage transition and
+	// one per scanProgressStride items.
+	scanInProgress bool
+	scanCycleKind  string
+	scanByName     map[string]scanProgressView
+
+	// observeProgress is a TEST SEAM, nil in production, mirroring
+	// actionRunner.observe (actions.go) exactly. It is called under the lock
+	// for every publish that actually reaches the surface, so a test can assert
+	// the SEQUENCE of stages a cycle went through and — the property that
+	// matters — how MANY writes a long pass costs. It must never call back into
+	// the store.
+	observeProgress func(instance string, view scanProgressView)
 }
 
 // newStatsStore creates an empty store. dryRun is fixed for the process's
@@ -420,7 +569,175 @@ type statsStore struct {
 // every cycle already carries) and is never learned from a cycle, so it is
 // set once here rather than threaded through recordInstance.
 func newStatsStore(dryRun bool) *statsStore {
-	return &statsStore{dryRun: dryRun, byName: make(map[string]*instanceStatsView)}
+	return &statsStore{
+		dryRun:     dryRun,
+		byName:     make(map[string]*instanceStatsView),
+		scanByName: make(map[string]scanProgressView),
+	}
+}
+
+// --- [v0.2.0] the live progress surface -------------------------------------
+//
+// A sweep used to be entirely invisible from the dashboard: the same numbers,
+// unchanged, for however long it took, with no way to tell a running scan from
+// a wedged one. These five methods (beginScan, endScan, stage, count, clear)
+// are what a cycle says about itself WHILE it runs, and they are strictly
+// one-directional — a cycle only ever writes here, and nothing that decides,
+// writes or re-verifies anything ever reads it. There is no getter on
+// scanProgress at all, which is what makes that structural rather than a
+// convention: the type a cycle holds cannot answer a question.
+
+// beginScan marks a cycle started and clears the previous one's stages. Called
+// once per cycle, from runScanCycle (daemon.go), which is the single funnel
+// every cycle in this program goes through.
+func (s *statsStore) beginScan(kind string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.scanInProgress = true
+	s.scanCycleKind = kind
+	// A fresh map, not a clear: the previous cycle's stages describe work
+	// nobody is doing, and an instance THIS cycle never reaches (a webhook
+	// cycle names exactly one) must not show a bar left over from the last one.
+	s.scanByName = make(map[string]scanProgressView)
+}
+
+// endScan clears the surface. The cycle is over, its data snapshot has landed
+// (recordInstance ran before this for every instance the cycle reached), and a
+// progress bar left on screen would be a bar nothing will ever advance again.
+func (s *statsStore) endScan() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.scanInProgress = false
+	s.scanCycleKind = ""
+	s.scanByName = make(map[string]scanProgressView)
+}
+
+// progressFor hands one instance's write-only publishing handle to the cycle
+// about to work on it. A nil store yields a nil handle, and every method on a
+// nil handle is a no-op, so every call site that predates this feature (a
+// --once run passing no store, an engine test constructing a bare scope) keeps
+// working untouched.
+func (s *statsStore) progressFor(name string) *scanProgress {
+	if s == nil {
+		return nil
+	}
+	return &scanProgress{store: s, instance: name}
+}
+
+// scanProgress is the handle a running cycle publishes through: an instance
+// name, the store to publish into, and the small amount of state that makes the
+// stride bounding possible without a lock.
+//
+// lastStage/lastDone are UNSYNCHRONIZED on purpose and are safe because of a
+// property this daemon has had since Phase 8: every cycle runs on the single
+// loop goroutine ((*daemon).loop's own comment — "everything that evaluates
+// anything runs here"), so one handle is only ever touched by one goroutine.
+// The shared surface it publishes INTO is the part other goroutines read, and
+// that is behind the store's mutex.
+type scanProgress struct {
+	store    *statsStore
+	instance string
+
+	lastStage string
+	lastDone  int
+}
+
+// stage announces a new stage and resets the counters, publishing immediately:
+// a stage is the coarse thing an operator reads, and holding one back until a
+// stride boundary would leave "evaluating" on screen through the whole file
+// walk. total may be 0 for a stage with nothing to count.
+func (p *scanProgress) stage(stage string, total int) {
+	if p == nil {
+		return
+	}
+	p.lastStage = stage
+	p.lastDone = 0
+	p.publish(scanProgressView{Stage: stage, Total: total})
+}
+
+// count reports progress through a counted stage. It is called PER ITEM — that
+// is what keeps the engines' loops readable — and publishes only on a stride
+// boundary, on the last item, or when the stage itself has changed, so a
+// hundred-thousand-item library costs about a thousand lock acquisitions rather
+// than a hundred thousand.
+//
+// The last item always publishes, whatever the stride left over, so a finished
+// pass never sits at "900 of 996" until the next stage begins.
+func (p *scanProgress) count(stage string, done, total int) {
+	if p == nil {
+		return
+	}
+	changed := stage != p.lastStage
+	if !changed && done != total && done-p.lastDone < scanProgressStride {
+		return
+	}
+	p.lastStage = stage
+	p.lastDone = done
+	p.publish(scanProgressView{Stage: stage, Done: done, Total: total})
+}
+
+// clear removes this instance's row from the surface. Its work in THIS cycle is
+// over — the engine returned, or the cycle gave up on it at one of §2.6's
+// warn-and-skip paths — and the stage last published describes something nobody
+// is doing any more.
+//
+// It is the third thing that touches scanByName, and the only per-INSTANCE one:
+// beginScan and endScan bracket the whole cycle, which is why, until this
+// round-3 review fix, the last stage an instance published stayed on the wire
+// (and pulsing on the page) for the entire remainder of the sweep. Two shapes
+// of that, both from an ordinary deployment: an instance skipped at its
+// connectivity check read CONNECTIVITY on the strip while its own card read
+// "last sweep incomplete" — the strip masking a warn-and-skip — and on the
+// two-instance norm, radarr sat frozen at FILE-WALK, total 0 and therefore
+// indeterminately pulsing, for the whole of sonarr's pass. Both are exactly
+// what scanView's own contract forbids: "never carries an instance the CURRENT
+// cycle has not reached: a stale entry would render as a progress bar for work
+// nobody is doing".
+//
+// Deleting rather than publishing a terminal `done` stage is deliberate: the
+// page's whole rule is that a row on the strip is work under way, and a
+// finished instance's evidence is its DATA — the shelf card recordInstance has
+// just refreshed — not a bar reading 100%.
+func (p *scanProgress) clear() {
+	if p == nil {
+		return
+	}
+	s := p.store
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Same rule as publish's: outside a running cycle this surface belongs to
+	// nobody, and a late handle must not reach into the next cycle's map.
+	if !s.scanInProgress {
+		return
+	}
+	delete(s.scanByName, p.instance)
+	p.lastStage = ""
+	p.lastDone = 0
+}
+
+// publish is the one place stage and count touch the shared surface (clear,
+// which removes rather than writes, is the only other method that does).
+//
+// A publish arriving after endScan (a late goroutine, a future refactor) is
+// DROPPED rather than resurrecting the surface: "in progress" must mean a cycle
+// is running, and the completion signal is the data snapshot landing.
+func (p *scanProgress) publish(v scanProgressView) {
+	s := p.store
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.scanInProgress {
+		return
+	}
+	s.scanByName[p.instance] = v
+	if s.observeProgress != nil {
+		s.observeProgress(p.instance, v)
+	}
 }
 
 // recordInstance folds one cycle's result for one instance into the store.
@@ -477,12 +794,14 @@ func (s *statsStore) recordInstance(kind string, at time.Time, name, typ string,
 		v.LastCycleStatus = cycleStatusView{Status: cycleStatusSkipped, Reason: abortedEvaluationReason}
 	}
 
-	// decisionsRan gates WouldUnmonitor and LastRun/LastCycleKind together
-	// (see cycleInstanceStats.decisionsRan's own comment): a cycle that
-	// aborted before the evaluation loop finished must not overwrite the
-	// last real WouldUnmonitor with the zero value it never actually
-	// computed, and must not claim "last swept just now" for a sweep that
-	// never produced a decision. total/monitored/unmonitored above are
+	// decisionsRan gates WouldUnmonitor, LastRun/LastCycleKind and the warm
+	// start's own Stale/AsOf together (see cycleInstanceStats.decisionsRan's
+	// own comment): a cycle that aborted before the evaluation loop finished
+	// must not overwrite the last real WouldUnmonitor with the zero value it
+	// never actually computed, must not claim "last swept just now" for a sweep
+	// that never produced a decision, and — see the block's own comment below —
+	// must not strip the markers that say those untouched numbers came off
+	// disk. total/monitored/unmonitored above are
 	// unconditional because they come from the library read, which already
 	// succeeded (daemon.go only calls the engine after dataOK) regardless of
 	// what happened after.
@@ -492,6 +811,27 @@ func (s *statsStore) recordInstance(kind string, at time.Time, name, typ string,
 		v.LastRun = &atCopy
 		kindCopy := kind
 		v.LastCycleKind = &kindCopy
+
+		// [v0.2.0] The warm start ends here, for this instance, and it ends
+		// under the SAME gate as the numbers immediately above it (round-5
+		// review fix). It used to be unconditional, on the strength of
+		// total/monitored/unmonitored being this process's own live read — but
+		// Stale/AsOf are not a claim about those three. They are the ONLY
+		// markers this view carries for WouldUnmonitor and for FileReport,
+		// neither of which an aborted cycle recomputes: the amber banner and
+		// the per-card "as of …" note both key on Stale, and the file-clutter
+		// panel has no timestamp of its own. Clearing them on a cycle that
+		// bare-returned inside the engine therefore presented a previous
+		// PROCESS's cached findings as current — R3-3's defect, with live
+		// trash and merge buttons beside them — and compounded, because the
+		// cache written at the end of that cycle would carry stale:false and
+		// the next warmStart would re-date those same findings to the cache's
+		// own write time. The brief's rule is the first COMPLETED fresh cycle;
+		// an aborted evaluation is not one. What each PASS most recently
+		// managed remains a separate question the three-state fields answer on
+		// their own terms (ReverseStatus/ReverseAsOf, FileReport.Status).
+		v.Stale = false
+		v.AsOf = nil
 	}
 
 	// Three-state fidelity (see cycleInstanceStats.reverseRan's own comment):
@@ -557,6 +897,109 @@ func (s *statsStore) recordInstance(kind string, at time.Time, name, typ string,
 	}
 }
 
+// warmStart seeds the store from the on-disk display cache (statecache.go)
+// before the first cycle of this process runs, and returns how many instances
+// it took. It is [v0.2.0]'s whole reason for existing: a restarted container
+// showed a blank dashboard until a full sweep completed, which on a real
+// library is minutes of the one surface an operator checks having nothing on it
+// at all.
+//
+// THIS IS THE CACHE'S ONLY CONSUMER, and it is a presentation-layer method by
+// construction — it writes the same fields recordInstance writes and nothing
+// else, so nothing it seeds can reach a decision, a write, or an action's
+// re-verification, all of which re-derive from live data on their own (see
+// statecache.go's header for the structural pins that keep it that way).
+//
+// Two properties make it safe to call from startup wiring:
+//
+//   - It REFUSES a store a cycle has already written to (len(s.order) > 0),
+//     returning 0. Warm start belongs strictly before the first cycle; running
+//     it later would replace live numbers with older ones and mark them stale —
+//     a dashboard moving backwards.
+//   - Everything it stores is COPIED and normalized to the store's own
+//     invariants (never a nil findings slice, never an empty status string), so
+//     an older or hand-edited cache cannot put a shape on the wire that the API
+//     contract says is impossible, and the decoded JSON the caller still holds
+//     shares no memory with the store.
+//
+// Every instance it seeds is marked Stale with AsOf set to the cache's own
+// writtenAt — see those fields. Instances arrive in the order the caller hands
+// them over, which is config order (daemon.go picks them that way), matching
+// the order a cold start's first cycle would have produced.
+func (s *statsStore) warmStart(instances []instanceStatsView, writtenAt time.Time) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.order) > 0 {
+		return 0
+	}
+
+	loaded := 0
+	for _, in := range instances {
+		if in.Name == "" || s.byName[in.Name] != nil {
+			// Both are already refused by the loader (statecache.go); repeated
+			// here because this method's own invariant — one entry per name,
+			// each keyed by a real name — must not depend on who calls it.
+			continue
+		}
+		v := cloneInstanceStatsView(in)
+		if v.ReverseFindings == nil {
+			v.ReverseFindings = []reverseFinding{}
+		}
+		if v.LastActions == nil {
+			v.LastActions = []actionRecord{}
+		}
+		if v.FileReport.Findings == nil {
+			v.FileReport.Findings = []fileReportFindingRecord{}
+		}
+		if v.ReverseStatus == "" {
+			v.ReverseStatus = "off"
+		}
+		if v.FileReport.Status == "" {
+			v.FileReport.Status = "off"
+		}
+		// The age of the NUMBERS, not of the file — ReverseAsOf's own rule, and
+		// a self-review finding. The cache is rewritten at the end of every full
+		// cycle including one that could not reach this instance, whose numbers
+		// are therefore still some earlier run's. Taking the file's writtenAt
+		// would move their apparent age forward at every restart, so a
+		// week-unreachable instance would report "showing last sweep from just
+		// now" over week-old numbers.
+		//
+		// That happens in two shapes, and the entry's own stale flag only
+		// catches one of them (round-5 review fix):
+		//
+		//   - The cycle that wrote the cache was itself warm-started, so the
+		//     entry went out already carrying stale: true and its original
+		//     asOf. Those keep their own timestamp.
+		//   - The far more ordinary one: this process recorded the instance
+		//     fresh at T0, the *arr then went offline, and every sweep since
+		//     has taken recordUnreachable's path — which by design touches
+		//     neither Stale nor the numbers. So the entry is rewritten with
+		//     stale: false over T0's figures for the whole of the outage.
+		//     LastRun is the field that says when those numbers were actually
+		//     produced (recordInstance writes it beside them, under
+		//     decisionsRan), and it is what their age must come from.
+		//
+		// writtenAt is the last resort, for an entry that states neither — a
+		// cache written before either field existed, or a hand-edited one.
+		at := writtenAt
+		switch {
+		case v.Stale && v.AsOf != nil:
+			at = *v.AsOf
+		case !v.Stale && v.LastRun != nil:
+			at = *v.LastRun
+		}
+		v.Stale = true
+		v.AsOf = &at
+
+		s.byName[in.Name] = &v
+		s.order = append(s.order, in.Name)
+		loaded++
+	}
+	return loaded
+}
+
 // recordUnreachable folds in the OTHER outcome runScanCycle's per-instance
 // loop can have: this cycle never even reached the decision engine for name,
 // because checkInstanceConnectivity or the library read (inspectRadarrLibrary
@@ -614,6 +1057,17 @@ func (s *statsStore) snapshot() statsResponse {
 	for _, name := range s.order {
 		resp.Instances = append(resp.Instances, cloneInstanceStatsView(*s.byName[name]))
 	}
+
+	// [v0.2.0] The progress surface, copied out for the same reason the data is
+	// (see this method's own doc comment): the map the running cycle keeps
+	// writing into must never be the one an HTTP handler is serializing. It is
+	// always a real map, never nil, so the wire carries {} rather than null.
+	scan := scanView{InProgress: s.scanInProgress, CycleKind: s.scanCycleKind, Instances: make(map[string]scanProgressView, len(s.scanByName))}
+	for name, v := range s.scanByName {
+		scan.Instances[name] = v
+	}
+	resp.Scan = scan
+
 	return resp
 }
 
@@ -718,6 +1172,10 @@ func cloneInstanceStatsView(v instanceStatsView) instanceStatsView {
 	if v.ReverseAsOf != nil {
 		t := *v.ReverseAsOf
 		out.ReverseAsOf = &t
+	}
+	if v.AsOf != nil {
+		t := *v.AsOf
+		out.AsOf = &t
 	}
 
 	out.ReverseFindings = make([]reverseFinding, len(v.ReverseFindings))

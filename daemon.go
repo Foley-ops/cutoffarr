@@ -158,6 +158,19 @@ const (
 // silently stale-looking (if it had been before) on the one surface whose
 // whole job is "glance and trust these numbers".
 func runScanCycle(ctx context.Context, logger *slog.Logger, cfg Config, cycle scanCycle, stats *statsStore) {
+	// [v0.2.0] The live progress surface's own bracket. This function is the
+	// single funnel every cycle in this program goes through — the startup
+	// scan, a reconciliation sweep, a manual scan, a webhook cycle and --once
+	// alike — so bracketing it here is what makes "scan.inProgress is true
+	// exactly while a cycle is running" structural rather than three call sites
+	// remembering to say so. endScan is deferred so an early return (shutdown
+	// between instances) clears the surface too: a bar left on a page that
+	// nothing will ever advance again is worse than no bar.
+	if stats != nil {
+		stats.beginScan(cycle.kind)
+		defer stats.endScan()
+	}
+
 	for _, inst := range cfg.Instances {
 		// An instance the caller did not name is not merely left unwritten: it
 		// is not contacted at all. "--instance radarr-4k" has to mean the run
@@ -184,6 +197,14 @@ func runScanCycle(ctx context.Context, logger *slog.Logger, cfg Config, cycle sc
 		// their own per-item report lines from the same scope.
 		readLogger := demoteInfoTo(logger, cycle.scope.itemLevel)
 
+		// [v0.2.0] This instance's own progress handle, and the ONLY place a
+		// scope acquires one. scope is a value, so this narrows a COPY for the
+		// engines called below — the cycle's own scope is untouched, and the
+		// next instance gets its own handle rather than inheriting this one's.
+		scope := cycle.scope
+		scope.progress = stats.progressFor(inst.Name)
+
+		scope.progress.stage(scanStageConnectivity, 0)
 		ok := checkInstanceConnectivity(ctx, readLogger, inst)
 		if !ok {
 			// checkInstanceConnectivity has already WARNed the specific cause
@@ -195,12 +216,26 @@ func runScanCycle(ctx context.Context, logger *slog.Logger, cfg Config, cycle sc
 			if stats != nil {
 				stats.recordUnreachable(inst.Name, inst.Type, unreachableReasonConnectivity)
 			}
+			// This cycle is done with this instance, so its row comes off the
+			// strip HERE rather than at endScan. Without it the page announced
+			// the instance as CONNECTIVITY, pulsing, for the rest of the sweep —
+			// on the same page where the card recordUnreachable has just written
+			// reads "last sweep incomplete", the strip masking the very
+			// warn-and-skip it exists to make visible. See
+			// (*scanProgress).clear.
+			scope.progress.clear()
 			continue
 		}
 		if inst.Type == "radarr" {
+			// The library read covers BOTH GETs inspectRadarrLibrary makes (the
+			// movie list and the forward wanted/cutoff set), which is why the
+			// stage is announced once around the pair rather than split: the
+			// two are one uninterruptible read from this file's point of view,
+			// and a stage that flickered between them would say nothing extra.
+			scope.progress.stage(scanStageLibrary, 0)
 			movies, wantedIDs, dataOK := inspectRadarrLibrary(ctx, readLogger, inst, cycle.samples)
 			if dataOK {
-				result := runRadarrDecisionEngine(ctx, logger, inst, movies, wantedIDs, cfg.ExclusionTag, cycle.scope, cycle.dryRun, cycle.reverse, cycle.fileReport)
+				result := runRadarrDecisionEngine(ctx, logger, inst, movies, wantedIDs, cfg.ExclusionTag, scope, cycle.dryRun, cycle.reverse, cycle.fileReport)
 				if stats != nil {
 					stats.recordInstance(cycle.kind, cycle.now(), inst.Name, inst.Type, result)
 				}
@@ -209,9 +244,10 @@ func runScanCycle(ctx context.Context, logger *slog.Logger, cfg Config, cycle sc
 			}
 		}
 		if inst.Type == "sonarr" {
+			scope.progress.stage(scanStageLibrary, 0)
 			series, wantedEpisodeIDs, wantedSeasons, dataOK := inspectSonarrLibrary(ctx, readLogger, inst)
 			if dataOK {
-				result := runSonarrDecisionEngine(ctx, logger, inst, series, wantedEpisodeIDs, wantedSeasons, cfg.ExclusionTag, cycle.scope, cycle.dryRun, cycle.reverse, cycle.fileReport)
+				result := runSonarrDecisionEngine(ctx, logger, inst, series, wantedEpisodeIDs, wantedSeasons, cfg.ExclusionTag, scope, cycle.dryRun, cycle.reverse, cycle.fileReport)
 				if stats != nil {
 					stats.recordInstance(cycle.kind, cycle.now(), inst.Name, inst.Type, result)
 				}
@@ -219,6 +255,14 @@ func runScanCycle(ctx context.Context, logger *slog.Logger, cfg Config, cycle sc
 				stats.recordUnreachable(inst.Name, inst.Type, unreachableReasonLibraryRead)
 			}
 		}
+
+		// Whatever happened above — the engine completed, the engine
+		// bare-returned mid-evaluation on one of §2.6's own warn-and-skip
+		// paths, or the library read failed — this instance's work in this
+		// cycle is over, and the strip must stop claiming otherwise. One
+		// statement covering both type branches rather than one inside each,
+		// so a third instance type added later cannot forget it.
+		scope.progress.clear()
 	}
 }
 
@@ -317,6 +361,40 @@ type daemon struct {
 	// interleaving" true without an extra lock anywhere else.
 	stats *statsStore
 	scan  *scanCoordinator
+
+	// stateCacheRefused keeps (*daemon).stateCacheDir's media-root refusal to
+	// ONE line per process. The refusal is checked on every call — the loop
+	// reaches the write at the end of every full cycle — and a WARN repeated
+	// daily forever is how operators learn to filter warnings out. sync.Once
+	// rather than a bool because the daemon is always used through a pointer and
+	// nothing here is worth a second thought about ordering.
+	stateCacheRefused sync.Once
+}
+
+// stateCacheDir is the ONE place that decides where — or whether — the
+// warm-start display cache may live for this process, and both wiring points
+// below take their directory from it (pinned:
+// TestTree_TheDaemonFeedsTheCacheOnlyThroughItsOwnGuardedDirectory).
+//
+// It returns "" — the value both statecache.go entry points already treat as
+// "there is nowhere to read or write", quietly and without a fault — when the
+// config directory sits inside a configured media root. Round-2 review fix: the
+// filesystem-mutation audit amendment's whole argument is that actions.go
+// writes into a media root and statecache.go writes into the CONFIG directory,
+// and ConfigDir is only filepath.Dir(--config), so nothing else prevented
+// `--config /data/media/Movies/config.yml` from making those the same place.
+// Refused in BOTH directions deliberately: a cache a previous version already
+// left in a media root must not keep warm-starting the dashboard either.
+func (d *daemon) stateCacheDir() string {
+	root, inside := stateCacheDirInsideAMediaRoot(d.cfg.ConfigDir, d.cfg.Instances)
+	if !inside {
+		return d.cfg.ConfigDir
+	}
+	d.stateCacheRefused.Do(func() {
+		d.logger.Warn("the dashboard's warm-start cache is disabled for this process: the config directory sits inside a configured media root, and nothing this program writes may ever land in a media library. Every restart starts the dashboard cold until --config points somewhere outside the media roots",
+			"configDir", d.cfg.ConfigDir, "mediaRoot", root, "file", stateCacheFileName)
+	})
+	return ""
 }
 
 // scanCoordinator answers POST /api/scan's whole question — "is a full cycle
@@ -453,6 +531,15 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 		logger: logger, cfg: cfg, clock: clk, queue: newDebounceQueue(webhookQueueLimit),
 		stats: newStatsStore(cfg.DryRun), scan: newScanCoordinator(),
 	}
+
+	// [v0.2.0] The warm start, and it happens HERE — before the listener is
+	// bound, before the first cycle, before anything can serve a request —
+	// because its whole purpose is that the very first GET /api/stats of this
+	// process's life has the previous run's numbers to answer with instead of an
+	// empty array. See warmStartFromStateCache; a cache that is absent, invalid
+	// or unreadable simply leaves the store empty, which is a cold start,
+	// exactly as every version before this one behaved.
+	d.warmStartFromStateCache()
 
 	instanceTypes := make(map[string]string, len(cfg.Instances))
 	for _, inst := range cfg.Instances {
@@ -596,6 +683,15 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 	if ctx.Err() != nil {
 		logger.Info("startup scan abandoned on shutdown: it stopped between items and did not cover every instance, so nothing above describes the whole library; the next start begins with a full scan")
 	} else {
+		// The cache is written BEFORE the completion line, not after, and the
+		// order is load-bearing rather than cosmetic: "startup scan complete"
+		// is this daemon's own statement that everything belonging to the cycle
+		// is done, and a line printed after it belongs to no cycle at all. It
+		// also made the sweep's own output non-deterministic — the write lands
+		// on the loop goroutine while a test (or an operator's `docker logs`)
+		// is already reading past the completion line, so the same cycle
+		// printed different output run to run.
+		d.saveStateCache()
 		logger.Info("startup scan complete")
 	}
 	if opts.onStartupScanDone != nil {
@@ -619,6 +715,135 @@ func runDaemon(ctx context.Context, logger *slog.Logger, cfg Config, opts daemon
 	<-serveDone
 	logger.Info("shutdown complete", "pendingWebhookItemsDropped", d.queue.size())
 	return 0
+}
+
+// --- the warm-start display cache's two wiring points ----------------------
+//
+// These two methods are the ONLY places in this program that name
+// statecache.go at all, and daemon.go is the only file permitted to
+// (TestTree_TheStateCacheIsReachableOnlyFromTheDaemonsStartupWiring). Both are
+// wiring rather than evaluation: nothing either of them touches can reach a
+// decision, a write, or an action's re-verification, every one of which
+// re-derives from live data on its own. See statecache.go's header.
+
+// warmStartFromStateCache seeds the stats store from the previous process's
+// end-of-cycle snapshot, so a restarted container shows the last sweep's
+// dashboard (labelled stale, with the sweep's own timestamp) instead of a blank
+// page for the minutes a full sweep takes. Called exactly once, before the
+// first cycle.
+//
+// It filters what the loader hands back through the CURRENT config, in config
+// ORDER, and that is not tidiness — it is containment. Nothing ever removes an
+// instance from the stats store, so an instance the config no longer names
+// would come back at every restart, be written out again at the end of every
+// cycle, and outlive the deployment that created it. A cached entry whose type
+// no longer matches the configured one is dropped for the same reason: the name
+// was reused for something else, and the numbers under it describe the old
+// thing.
+func (d *daemon) warmStartFromStateCache() {
+	// Both wiring points call d.stateCacheDir() INLINE, and must keep doing so:
+	// TestTree_TheDaemonFeedsTheCacheOnlyThroughItsOwnGuardedDirectory reads
+	// this file's syntax tree and requires the guard to be visible AT the call
+	// site, where a reader (and a reviewer) cannot miss it.
+	cached, writtenAt, ok := loadStateCache(d.logger, d.stateCacheDir())
+	if !ok {
+		return
+	}
+
+	byName := make(map[string]instanceStatsView, len(cached))
+	for _, v := range cached {
+		byName[v.Name] = v
+	}
+	inConfig := make([]instanceStatsView, 0, len(d.cfg.Instances))
+	for _, inst := range d.cfg.Instances {
+		v, found := byName[inst.Name]
+		if !found || v.Type != inst.Type {
+			continue
+		}
+		// The same containment rule one level down, and the case the name/type
+		// filter above cannot see (round-3 review fix). The file report is
+		// opt-in per instance — media_root_map, whose absence is the OFF state
+		// (binding controller resolution 1) — so for an instance whose map has
+		// been removed from config.yml since the cache was written, NO cycle of
+		// this process will ever run the pass. recordInstance only overwrites
+		// FileReport when it actually ran (cs.fileReportRan) while clearing
+		// Stale unconditionally, so a restored report would survive every
+		// subsequent cycle untouched and then be served with stale:false and no
+		// banner: a previous process's findings presented as current,
+		// indefinitely, with live trash and merge buttons beside them. The click
+		// itself is still safe — the action re-derives from live data and
+		// refuses — but the operator is handed findings they cannot act on and
+		// never told why. fileReportSnapshot carries no timestamp of its own
+		// (unlike ReverseAsOf, which is exactly why the reverse half self-heals
+		// and is age-marked), so nothing on the page could say otherwise
+		// either. Before [v0.2.0] this was impossible: with no media_root_map
+		// the snapshot stayed zero-value and the panel read "off".
+		if len(mediaRootsFor(inst)) == 0 && !fileReportSnapshotIsOff(v.FileReport) {
+			d.logger.Warn("the dashboard's warm-start cache holds file-clutter findings for an instance that has no media_root_map in this config, so they were dropped rather than restored: nothing in this process can refresh or correct them, and no button beside them could act. The panel reads \"off\" until media_root_map is configured again. The file is safe to delete",
+				"instance", inst.Name, "type", inst.Type, "configDir", d.stateCacheDir(), "file", stateCacheFileName,
+				"droppedFindings", len(v.FileReport.Findings), "sweptAt", writtenAt.Format(time.RFC3339))
+			v.FileReport = fileReportSnapshot{Status: "off", Findings: []fileReportFindingRecord{}}
+		}
+		inConfig = append(inConfig, v)
+	}
+
+	loaded := d.stats.warmStart(inConfig, writtenAt)
+	if loaded == 0 {
+		// Round-2 review fix: this used to be a bare `return`. A cache that was
+		// found, read, validated and then filtered down to nothing — every
+		// instance renamed, retyped, or removed — produced a blank dashboard and
+		// NOT ONE LINE at any level explaining it, which is precisely the
+		// silent-skip shape §2.6 forbids. It is a WARN rather than an INFO for
+		// the same reason every other refusal in loadStateCache is: a file IS
+		// there, it was readable, and the reason it bought nothing is a
+		// disagreement between it and the running config that a human is the only
+		// one who can resolve. Same vocabulary as coldStart's: which file, what is
+		// wrong, what happens instead.
+		d.logger.Warn("the dashboard's warm-start cache was read, but nothing in it matches this config's instance names and types, so this start is a cold one; the first completed sweep fills the dashboard in. The file is safe to delete",
+			"configDir", d.stateCacheDir(), "file", stateCacheFileName,
+			"cached", len(cached), "configured", len(d.cfg.Instances), "sweptAt", writtenAt.Format(time.RFC3339))
+		return
+	}
+	// INFO, and once per process: a dashboard showing numbers this process did
+	// not produce is exactly the kind of thing a human reading the log at
+	// startup needs told, and it is the line that explains the page's own amber
+	// "showing last sweep from …" banner.
+	d.logger.Info("warm start: the dashboard is showing the last completed sweep from the state cache, marked stale, until this process's own first cycle finishes",
+		"instances", loaded, "ignored", len(cached)-loaded, "sweptAt", writtenAt.Format(time.RFC3339))
+}
+
+// fileReportSnapshotIsOff reports whether snap says nothing at all — the exact
+// shape an instance with no media_root_map has always had on the wire, and
+// therefore the shape warmStartFromStateCache resets one to when it drops it.
+//
+// Both spellings of "no status" count: "off" is what the store normalizes to,
+// and "" is what a hand-edited or older cache can carry (statsStore.warmStart
+// normalizes it the same way). Every counter is checked, not just Findings,
+// because the panel's headline numbers are as much a claim as its rows are.
+func fileReportSnapshotIsOff(snap fileReportSnapshot) bool {
+	return (snap.Status == "" || snap.Status == "off") &&
+		len(snap.Findings) == 0 &&
+		snap.Duplicates == 0 && snap.Orphans == 0 && snap.CaseCollisions == 0 &&
+		snap.ReclaimableBytes == 0 && snap.UnsizedFindings == 0
+}
+
+// saveStateCache writes the current stats snapshot to the state cache at the
+// end of a completed FULL cycle — the startup scan, a reconciliation sweep, and
+// a manual scan, each of which describes the whole library.
+//
+// Three cycles are deliberately NOT here:
+//
+//   - a WEBHOOK cycle, which is scoped to one item and runs neither the reverse
+//     pass nor the file report, so saving after one would overwrite a complete
+//     picture with a partial one.
+//   - any cycle ABANDONED on shutdown (each call site sits in the completed
+//     branch of its own ctx check), which by definition did not cover every
+//     instance — and which is, additionally, the worst moment to be writing a
+//     file, since the process may be seconds from being killed.
+//   - --once (main.go), which serves no dashboard, and whose scoped variants
+//     (--only-id, --instance) describe a fraction of one library.
+func (d *daemon) saveStateCache() {
+	writeStateCache(d.logger, d.stateCacheDir(), d.stats.snapshot(), d.clock.Now())
 }
 
 // installShutdownHandler wires the first signal to cancellation and the second
@@ -700,6 +925,8 @@ func (d *daemon) loop(ctx context.Context) {
 				d.logger.Info("manual scan abandoned on shutdown: it stopped between items and did not cover every instance, so nothing above describes the whole library")
 				continue
 			}
+			// Before the completion line — see the startup scan's own comment.
+			d.saveStateCache()
 			d.logger.Info("manual scan complete")
 			continue
 		}
@@ -723,6 +950,8 @@ func (d *daemon) loop(ctx context.Context) {
 				d.logger.Info("reconciliation sweep abandoned on shutdown: it stopped between items and did not cover every instance, so nothing above describes the whole library; the schedule is not re-armed because this daemon is exiting")
 				continue
 			}
+			// Before the completion line — see the startup scan's own comment.
+			d.saveStateCache()
 			nextReconcile = d.clock.Now().Add(d.cfg.PollInterval)
 			d.logger.Info("reconciliation sweep complete", "nextSweep", nextReconcile)
 			continue

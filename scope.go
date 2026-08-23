@@ -98,6 +98,23 @@ type evalScope struct {
 	// Zero value false: every sweep, webhook, --once and startup path keeps the
 	// forward write pass it has always had, without naming this field.
 	noForwardWrites bool
+
+	// progress is [v0.2.0]'s live-progress handle: where this evaluation
+	// announces which coarse stage it has reached, so the dashboard can show a
+	// sweep happening instead of the same numbers for however long it takes.
+	//
+	// It rides on the scope because the scope is already this cycle's REPORTING
+	// context — which items are reported, and at what level — and progress is
+	// the same kind of thing: a place to report to. Threading it as a tenth
+	// parameter through both engines instead would have changed 120-odd call
+	// sites to say "no progress" out loud, which is what the zero value already
+	// says.
+	//
+	// It is WRITE-ONLY by construction (scanProgress has no getter at all, on
+	// purpose — see stats.go), so nothing an engine does can ever depend on
+	// what is in it, and nil — every pre-v0.2.0 call site, every --once run —
+	// makes every publish a no-op.
+	progress *scanProgress
 }
 
 // suppressesForwardWrites reports whether this scope forbids the forward write

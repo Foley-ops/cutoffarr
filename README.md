@@ -60,6 +60,9 @@ plus the upgrade-until score. cutoffarr just makes that finish line real.
    cutoffarr:
      image: ghcr.io/foley-ops/cutoffarr:latest
      volumes:
+       # Writable for exactly one file — state-cache.json, the dashboard's
+       # warm start; mounting it :ro is supported and costs only that feature
+       # (one warning per sweep, and a cold page after every restart).
        - /path/to/appdata/cutoffarr:/config
      environment:
        - RADARR_API=${RADARR_API}
@@ -116,6 +119,20 @@ and rehearse instead of acting while dry-run is on. Every button states the
 exact operation it will perform, re-verifies against live data when clicked,
 and refuses if reality changed since the sweep. There is no authentication:
 treat it as a LAN tool.
+
+**It comes up warm, and it shows you the scan.** A restart no longer blanks
+the page: cutoffarr saves the dashboard's numbers to `state-cache.json` beside
+your config at the end of every full sweep, and restores them at startup behind
+an amber "showing last sweep from …" banner until the running scan replaces
+each shelf with fresh numbers. The banner adds "— refreshing now" only while a
+sweep is actually running, and disappears entirely if the page loses the
+daemon — it never claims a refresh that is not happening. That file is display
+only — never
+an input to any decision, write, or action, all of which re-read live data
+every time — and it is safe to delete whenever you like; you lose one warm
+start. While any scan is running, a progress strip above the shelves shows what
+each instance is doing (connectivity, library, evaluating, cross-check,
+reverse-scan, file-walk…) and the page polls every 2s instead of 30s.
 
 ## FAQ
 

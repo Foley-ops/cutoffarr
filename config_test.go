@@ -922,3 +922,49 @@ instances: []
 		}
 	}
 }
+
+// TestLoadConfig_ConfigDirIsAbsoluteEvenWhenTheFlagWasRelative pins the
+// provenance field's own shape, and it is a containment test wearing a config
+// test's clothes.
+//
+// ConfigDir is where [v0.2.0]'s warm-start display cache lives, and the guard
+// that keeps that file out of the user's media library
+// (stateCacheDirInsideAMediaRoot) matches it against media roots that are
+// absolute by validation. `cutoffarr --config config.yml` used to record "."
+// here — a directory whose meaning depends on the working directory of whoever
+// asks, and one that can never string-match an absolute root — so
+// `cd /data/media/Movies && cutoffarr --config config.yml` wrote state-cache.json
+// straight into the library, unrefused and unlogged. Round-3 review fix; the
+// guard absolutizes on its own too, and this makes the value it is handed
+// honest at the source.
+func TestLoadConfig_ConfigDirIsAbsoluteEvenWhenTheFlagWasRelative(t *testing.T) {
+	path := writeConfig(t, `
+instances:
+  - name: radarr-main
+    type: radarr
+    url: http://radarr:7878
+    api_key: key1
+`)
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("reading the working directory: %v", err)
+	}
+	relative, err := filepath.Rel(cwd, path)
+	if err != nil {
+		t.Fatalf("expressing %q relative to %q: %v", path, cwd, err)
+	}
+	if filepath.IsAbs(relative) {
+		t.Fatalf("the fixture is not relative: %q", relative)
+	}
+
+	cfg, err := LoadConfig(relative)
+	if err != nil {
+		t.Fatalf("LoadConfig(%q) returned error: %v", relative, err)
+	}
+	if !filepath.IsAbs(cfg.ConfigDir) {
+		t.Fatalf("ConfigDir = %q for --config %q, want an absolute path: a relative one cannot be matched against the media roots the containment guard protects", cfg.ConfigDir, relative)
+	}
+	if want := filepath.Dir(path); cfg.ConfigDir != want {
+		t.Errorf("ConfigDir = %q, want %q — the directory the file actually came from", cfg.ConfigDir, want)
+	}
+}
