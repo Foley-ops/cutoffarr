@@ -172,43 +172,165 @@ func TestStatsStore_ScanProgress_ANewCycleNeverInheritsTheLastOnesStages(t *test
 	}
 }
 
-// TestStatsStore_ScanProgress_CounterUpdatesAreBounded is the "never per-item
-// lock churn" rule made observable. The call site may call count() per item —
-// that is what keeps the engines readable — but the store must only be written
-// to on a stride boundary and at the end, so a 100k-item library costs about a
-// thousand lock acquisitions rather than a hundred thousand.
-func TestStatsStore_ScanProgress_CounterUpdatesAreBounded(t *testing.T) {
+// TestStatsStore_ScanProgress_EveryItemPublishesItsOwnCount is the owner's
+// ruling, and it replaces the "counter updates are bounded" pin this feature
+// shipped with.
+//
+// count() used to write to the shared surface only on a 100-item stride
+// boundary, on the last item, or on a stage change — so the number on screen was
+// the last multiple of 100, and an instance whose evaluation was 150 movies in
+// reported 100. The bound was a premature optimization: the owner overruled it,
+// and every item now publishes its own count. The mutex design is unchanged (one
+// lock, taken by the same single cycle goroutine that always took it); what is
+// gone is the arithmetic that decided some items were not worth reporting.
+//
+// The assertion is the SEQUENCE, not the total, and that is the whole design of
+// this pin: a total could be reached by any number of publishing schemes, while
+// "the recorded views are exactly 0,1,2,…,N" can only be produced by publishing
+// on every single item. A 100-stride publishes 2 of these 150 values, a
+// 10-stride publishes 15, an every-other-item scheme publishes 75 — none of them
+// pass.
+func TestStatsStore_ScanProgress_EveryItemPublishesItsOwnCount(t *testing.T) {
+	const (
+		items = 150
+		total = 1000
+	)
 	s := newStatsStore(true)
 	rec := newProgressRecorder(s)
 	s.beginScan(cycleKindSweep)
 	p := s.progressFor("radarr-main")
 
-	p.stage(scanStageEvaluating, 1000)
-	for i := 1; i <= 150; i++ {
-		p.count(scanStageEvaluating, i, 1000)
+	p.stage(scanStageEvaluating, total)
+	for i := 1; i <= items; i++ {
+		p.count(scanStageEvaluating, i, total)
 	}
 
-	if got := s.snapshot().Scan.Instances["radarr-main"].Done; got != 100 {
-		t.Errorf("done = %d after 150 items, want 100: the surface advances on stride boundaries, not per item", got)
-	}
-	// One stage transition + one stride boundary. Anything more is per-item
-	// churn; anything less means the counter never moved at all.
-	if n := rec.count(); n != 2 {
-		t.Errorf("the store was written to %d times for 150 items, want 2 (the stage transition and one stride boundary)", n)
+	// What an operator polling mid-pass reads: the item the cycle has actually
+	// finished, not the last stride boundary behind it.
+	if got := s.snapshot().Scan.Instances["radarr-main"].Done; got != items {
+		t.Errorf("done = %d after %d items, want %d: every item publishes its own count now, so the surface is never behind the pass", got, items, items)
 	}
 
-	for i := 151; i <= 1000; i++ {
-		p.count(scanStageEvaluating, i, 1000)
+	// The stage transition is views[0] (done 0, announcing the total), and every
+	// item after it contributes exactly one view, in order, with nothing
+	// missing and nothing repeated.
+	views := rec.viewsFor(scanStageEvaluating)
+	if len(views) != items+1 {
+		t.Fatalf("the store was written to %d times for %d items, want %d (the stage transition plus one per item): a chunked publisher lands on some smaller number, which is exactly what this pin exists to reject", len(views), items, items+1)
 	}
-	if got := s.snapshot().Scan.Instances["radarr-main"]; got.Done != 1000 || got.Total != 1000 {
-		t.Errorf("done/total = %d/%d at the end of the pass, want 1000/1000: the LAST item must always publish, whatever the stride left over", got.Done, got.Total)
+	for i, v := range views {
+		if v.Done != i || v.Total != total {
+			t.Fatalf("views[%d] = %+v, want done %d of %d: the published counts must be the unbroken run 0..%d, which no strided or sampled scheme can produce", i, v, i, total, items)
+		}
+	}
+
+	for i := items + 1; i <= total; i++ {
+		p.count(scanStageEvaluating, i, total)
+	}
+	if got := s.snapshot().Scan.Instances["radarr-main"]; got.Done != total || got.Total != total {
+		t.Errorf("done/total = %d/%d at the end of the pass, want %d/%d", got.Done, got.Total, total, total)
+	}
+	if n := rec.count(); n != total+1 {
+		t.Errorf("the whole %d-item pass cost %d publishes, want %d (one per item plus the stage transition)", total, n, total+1)
 	}
 }
 
+// TestRunRadarrDecisionEngine_CountsEveryItemThroughToTheSurface is the same
+// rule one level up, and it is the half the store-level pin cannot see: the
+// bound could be reintroduced at the CALL SITE — an `if i%100 == 0` around the
+// count() call — and every store test would stay green while the strip advanced
+// in steps again. This walks a real engine run over a fixture of known size and
+// requires one published count per movie, in order.
+func TestRunRadarrDecisionEngine_CountsEveryItemThroughToTheSurface(t *testing.T) {
+	fake := newRadarrFake(t, "", nil)
+	movies := []movieListElement{
+		crossCheckWitnessMovie(5, "Ordinary Monitored"),
+		crossCheckWitnessMovie(6, "Second"),
+		crossCheckWitnessMovie(8, "Third"),
+		crossCheckWitnessMovie(9, "Fourth"),
+		unmonitoredBelowCutoffMovie(7, "Accidentally Unmonitored"),
+	}
+
+	store := newStatsStore(false)
+	rec := newProgressRecorder(store)
+	store.beginScan(cycleKindSweep)
+	scope := fullLibraryScope(slog.LevelInfo)
+	scope.progress = store.progressFor("radarr-main")
+
+	logger, buf := newDecisionTestLogger(slog.LevelInfo)
+	runRadarrDecisionEngine(context.Background(), logger, fake.instance(), movies, map[int]bool{5: true}, "cutoffarr-exclude",
+		scope, false, reverseOptions{}, fileReportOptions{})
+
+	views := rec.viewsFor(scanStageEvaluating)
+	if len(views) != len(movies)+1 {
+		t.Fatalf("the evaluation of %d movies published %d views, want %d (the stage transition plus one per movie):\n%s", len(movies), len(views), len(movies)+1, buf.String())
+	}
+	for i, v := range views {
+		if v.Done != i || v.Total != len(movies) {
+			t.Errorf("views[%d] = %+v, want done %d of %d", i, v, i, len(movies))
+		}
+	}
+}
+
+// BenchmarkScanProgress_CountPerItem is the number the owner's ruling was
+// decided against, kept in the tree so it stays checkable: what per-item
+// publishing costs, measured as one lock, one map write and one struct copy per
+// item on the single cycle goroutine.
+//
+// The report quotes it against a 10k-item library. For scale, the per-item
+// budget it has to fit inside is one *arr API call plus a decision — hundreds of
+// microseconds at best — and the poll that reads the surface arrives every 2s.
+func BenchmarkScanProgress_CountPerItem(b *testing.B) {
+	s := newStatsStore(true)
+	s.beginScan(cycleKindSweep)
+	p := s.progressFor("radarr-main")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		p.count(scanStageEvaluating, i+1, b.N)
+	}
+}
+
+// BenchmarkScanProgress_CountPerItemWhileThePageIsPolling is the same
+// measurement with the contention the design actually has: a cycle publishing
+// while an HTTP handler takes snapshots on another goroutine, which is the only
+// reason this surface has a mutex at all.
+func BenchmarkScanProgress_CountPerItemWhileThePageIsPolling(b *testing.B) {
+	s := newStatsStore(true)
+	s.beginScan(cycleKindSweep)
+	p := s.progressFor("radarr-main")
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = s.snapshot()
+			}
+		}
+	}()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		p.count(scanStageEvaluating, i+1, b.N)
+	}
+	b.StopTimer()
+	close(stop)
+	wg.Wait()
+}
+
 // TestStatsStore_ScanProgress_AStageTransitionAlwaysPublishesImmediately: a
-// stage is the coarse thing an operator reads, and holding one back until a
-// stride boundary would leave "evaluating" on screen through the whole file
-// walk.
+// stage is the coarse thing an operator reads, and a transition resets the
+// counters with it, so the strip never shows a new stage carrying the previous
+// one's numbers. (This mattered doubly while counts were strided — a held-back
+// transition left "evaluating" on screen through the whole file walk — and it is
+// unchanged by the per-item ruling, which touched counts only.)
 func TestStatsStore_ScanProgress_AStageTransitionAlwaysPublishesImmediately(t *testing.T) {
 	s := newStatsStore(true)
 	s.beginScan(cycleKindSweep)

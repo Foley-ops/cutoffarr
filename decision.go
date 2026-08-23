@@ -589,8 +589,8 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 	scope.progress.stage(scanStageEvaluating, len(movies))
 
 	for i, m := range movies {
-		// Published per item, written to the shared surface once per
-		// scanProgressStride items — see scanProgress.count.
+		// Published per item, and written to the shared surface per item —
+		// see scanProgress.count.
 		scope.progress.count(scanStageEvaluating, i+1, len(movies))
 
 		// PHASE 8: shutdown, checked between items here too — but with a

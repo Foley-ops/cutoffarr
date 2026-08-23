@@ -958,8 +958,14 @@ script, a status-page widget, whatever) without ever loading the HTML:
   - `writing` appears in WRITE MODE only. A dry-run runs the same pass and
     composes no write at all, so a strip reading "writing" during a
     rehearsal would be a lie.
-  - counters advance in steps (roughly every 100 items) rather than per
-    item, so a hundred-thousand-item library does not pay a lock per movie.
+  - counters advance PER ITEM: every movie, season or finding a counted
+    stage passes through updates `done` before the next one starts, so the
+    number you read is the item the cycle is actually on. (It shipped
+    advancing in 100-item steps; the step was removed as a premature
+    optimization — the cost is one lock and one map write per item, against
+    a per-item budget that already contains an *arr API call.) What you SEE
+    still changes at the poll's own rate, 2s, with the bar's 300ms width
+    transition smoothing between polls.
 
   The dashboard polls every 2s while `inProgress` is true and every 30s when
   it is not (and not at all while the tab is hidden), and the **Scan now**
