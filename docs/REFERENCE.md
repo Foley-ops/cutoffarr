@@ -25,6 +25,7 @@ enforced and checked.
 - [Known limitations](#known-limitations)
 - [Webhook setup](#webhook-setup)
 - [The web dashboard](#the-web-dashboard)
+- [The warm-start display cache](#the-warm-start-display-cache)
 - [Acting on findings](#acting-on-findings)
 - [FAQ](#faq)
 - [License](#license)
@@ -752,13 +753,20 @@ script, a status-page widget, whatever) without ever loading the HTML:
         "reverseFindings": [],
         "fileReport": { "status": "ran", "duplicates": 0, "orphans": 1, "caseCollisions": 0, "reclaimableBytes": 0, "unsizedFindings": 0, "findings": [] },
         "lastActions": [],
-        "lastCycleStatus": { "status": "ok" }
+        "lastCycleStatus": { "status": "ok" },
+        "stale": false,
+        "asOf": null
       }
     ],
     "dryRun": true,
     "guiActions": false,
     "reverseScanRemonitor": false,
-    "version": "dev"
+    "version": "dev",
+    "scan": {
+      "inProgress": true,
+      "cycleKind": "sweep",
+      "instances": { "radarr-main": { "stage": "evaluating", "done": 400, "total": 996 } }
+    }
   }
   ```
 
@@ -850,6 +858,20 @@ script, a status-page widget, whatever) without ever loading the HTML:
   presenting stale findings as fresh. It is `null` until the first cycle
   that ever completes a trustworthy pass.
 
+  `stale` and `asOf` (v0.2.0) are the warm start's own pair, and they mean
+  one narrow thing: EVERY number on this instance was restored from the
+  on-disk display cache written by a previous run (see [The warm-start
+  display cache](#the-warm-start-display-cache)), and no cycle of the
+  running process has recorded it yet. `asOf` is that cache's own write time
+  — the age of the numbers, never of the attempt to refresh them, exactly
+  like `reverseAsOf` above. The first cycle that records this instance from
+  a live library read clears both; a cycle that could not REACH it
+  deliberately does not, because it produced no fresher numbers. Both are
+  always present (`false`/`null` on an ordinary instance). The dashboard
+  renders them as an amber "showing last sweep from &lt;time&gt; —
+  refreshing now" banner above the shelves plus an "as of &lt;time&gt;" note
+  on each still-cached card.
+
   `lastCycleStatus` is this instance's outcome on the single MOST RECENT
   cycle that named it, independent of everything else in this object:
   `{"status": "ok"}` once that cycle's decision engine actually completed an
@@ -895,6 +917,37 @@ script, a status-page widget, whatever) without ever loading the HTML:
   a finding — it is logged and refused), so nothing a caller sends can invent
   an instance here.
 
+  `scan` (v0.2.0) is the live progress surface, and it is a SIBLING of
+  `instances` rather than part of it because the two change on different
+  clocks: `instances` is the end-of-cycle data snapshot and only ever
+  changes when a cycle completes, while `scan` changes throughout one. **No
+  partial finding ever appears in the data fields mid-cycle** — a cycle in
+  flight adds progress, it never publishes half a sweep.
+
+  - `inProgress` is always present. `cycleKind` is omitted when nothing is
+    running and is otherwise `lastCycleKind`'s own vocabulary
+    (`startup`/`sweep`/`webhook`/`once`).
+  - `instances` is always an object (`{}` when idle), keyed by instance
+    name, holding only the instances the CURRENT cycle has reached.
+  - each entry is `{"stage": "...", "done": N, "total": N}`. `stage` is one
+    of `connectivity`, `library`, `wanted-set`, `evaluating`, `cross-check`,
+    `writing`, `reverse-scan`, `file-walk`. `done`/`total` are `0`/`0` for a
+    stage with nothing countable (a connectivity check, a wanted-set fetch,
+    a file walk whose size is what it is finding out) — which the dashboard
+    renders as an indeterminate pulse rather than a 0% bar, because "0 of 0"
+    and "0 of 996" are different statements.
+  - `writing` appears in WRITE MODE only. A dry-run runs the same pass and
+    composes no write at all, so a strip reading "writing" during a
+    rehearsal would be a lie.
+  - counters advance in steps (roughly every 100 items) rather than per
+    item, so a hundred-thousand-item library does not pay a lock per movie.
+
+  The dashboard polls every 2s while `inProgress` is true and every 30s when
+  it is not (and not at all while the tab is hidden), and the **Scan now**
+  button renders its running/queued state from this surface rather than from
+  its own last POST — so a sweep started by the timer, or from another tab,
+  no longer leaves it reading "Scan now".
+
 - **`POST /api/scan`** — queues one full-library sweep (the same
   `fullLibraryScope`/reverse/file-report shape the reconciliation sweep and
   the startup scan use — never webhook-scoped, never `--only-id`-narrowed).
@@ -934,6 +987,67 @@ endpoint without CORS ever being consulted, and neither `confirm: true` nor
 strict JSON decoding stops it — a form can carry both. A header is the thing
 such a page cannot set. A peer on the LAN with `curl` still can, which is the
 point of the sentence above and of `gui_actions` defaulting to false.
+
+## The warm-start display cache
+
+Every container restart used to blank the dashboard until a full sweep
+finished — minutes, on a real library, of the one surface whose job is
+"glance and trust these numbers" having none. Since v0.2.0 cutoffarr keeps
+one small file so a restart comes up warm.
+
+**There is no config switch for it.** It is display-only and always on: a
+flag would only ever be turned off by someone who suspected it of doing
+something it cannot do.
+
+**Where.** `state-cache.json`, in the same directory as the config file you
+pointed `--config` at (`/config/state-cache.json` in the container image's
+own layout — the same volume you already mount). Never anywhere else, and
+never under a media root.
+
+**When.** At the end of every FULL cycle: the startup scan, a reconciliation
+sweep, and a manual **Scan now**. Not after a webhook cycle (scoped to one
+item, no reverse pass, no file report — saving after one would overwrite a
+complete picture with a partial one), not after a cycle abandoned on
+shutdown, and not on `--once`, which serves no dashboard.
+
+**What.** Exactly the `GET /api/stats` body, plus a `schemaVersion` and a
+`writtenAt`. It is written to a temp file in the same directory and renamed
+into place, so a reader always sees one complete file — the previous one or
+the new one, never half of either. A write that fails for any reason is a
+single WARN in the log and nothing else: the cycle that produced it has
+already done its real work, and the next full cycle simply tries again.
+
+**Read back once, at startup, before the first cycle.** Instances the current
+config still names (and still names as the same type) are restored with
+`stale: true` and `asOf` set to the cache's own `writtenAt`; the dashboard
+shows them behind an amber "showing last sweep from … — refreshing now"
+banner, and each card drops its own "as of …" note as the running cycle
+reaches it. A cache that is missing, unreadable, not JSON, of a different
+`schemaVersion`, or missing any field the restore is built out of is ignored
+with a warning and the process cold-starts exactly as every version before
+this one did.
+
+**What it is NOT**, and this is the part worth stating plainly:
+
+- It is **never an input to any decision, any write, or any action's
+  re-verification.** Every one of those still re-reads live data within its
+  own cycle, as they always have. The cache is read by one loader, consumed
+  by one presentation-layer function, and reachable from nothing else in the
+  program — a test parses the source tree and fails the build if any other
+  file so much as names it.
+- It carries **no authority**. A row you click after a restart was rendered
+  from this file; the action still re-derives the finding from live data and
+  still refuses when the world has moved on. The cache buys a row's
+  existence, never its authority.
+- The `dryRun`/`guiActions`/`reverseScanRemonitor`/`version` values in it are
+  written so the file is readable on its own terms and are **never restored**:
+  a file claiming `dryRun: false` cannot make a rehearsing daemon report that
+  it is live.
+
+**Safe to delete, any time.** Stop worrying about it; you lose one warm start.
+The same goes for a stray `state-cache.json.tmp` beside it, which can only
+exist if a write was interrupted (cutoffarr never deletes anything, here
+included — it overwrites that one name rather than accumulating temp files).
 
 ## Acting on findings
 

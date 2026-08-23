@@ -117,6 +117,17 @@ exact operation it will perform, re-verifies against live data when clicked,
 and refuses if reality changed since the sweep. There is no authentication:
 treat it as a LAN tool.
 
+**It comes up warm, and it shows you the scan.** A restart no longer blanks
+the page: cutoffarr saves the dashboard's numbers to `state-cache.json` beside
+your config at the end of every full sweep, and restores them at startup behind
+an amber "showing last sweep from … — refreshing now" banner until the running
+scan replaces each shelf with fresh numbers. That file is display only — never
+an input to any decision, write, or action, all of which re-read live data
+every time — and it is safe to delete whenever you like; you lose one warm
+start. While any scan is running, a progress strip above the shelves shows what
+each instance is doing (connectivity, library, evaluating, cross-check,
+reverse-scan, file-walk…) and the page polls every 2s instead of 30s.
+
 ## FAQ
 
 **Does it delete anything?** No. No delete call exists in the codebase — a
