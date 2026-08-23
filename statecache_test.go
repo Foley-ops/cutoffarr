@@ -1110,3 +1110,64 @@ func TestWebUIPage_AWarmStaleShelfCardSaysSoOnTheCardItself(t *testing.T) {
 		t.Errorf("updateShelfCard no longer sets the bar's width unconditionally; a stale card must still show its numbers:\n%s", body)
 	}
 }
+
+// TestStatsStore_WarmStart_KeepsTheCachedNumbersOwnAgeAcrossRepeatedRestarts is
+// a self-review finding, and it is an honesty bug rather than a crash.
+//
+// The cache is rewritten at the end of every full cycle, INCLUDING one that
+// could not reach an instance — whose numbers are therefore still the ones some
+// earlier run recorded, and are written out again carrying stale: true and their
+// original asOf. Taking the file's own writtenAt for those would move their
+// apparent age forward at every restart, so a daemon that has been unable to
+// reach an instance for a week would say "showing last sweep from just now"
+// over week-old numbers. The instance's OWN asOf wins whenever the cache
+// already knew it was stale — the same rule ReverseAsOf follows: the age of the
+// numbers, never of the attempt to refresh them.
+func TestStatsStore_WarmStart_KeepsTheCachedNumbersOwnAgeAcrossRepeatedRestarts(t *testing.T) {
+	swept := time.Date(2026, 8, 22, 9, 0, 0, 0, time.UTC)
+	rewritten := time.Date(2026, 8, 22, 17, 0, 0, 0, time.UTC)
+	store := newStatsStore(true)
+
+	store.warmStart([]instanceStatsView{
+		// Already stale in the cache: written out again by a later cycle that
+		// never reached this instance.
+		{Name: "radarr-unreachable", Type: "radarr", Total: 996, Stale: true, AsOf: &swept},
+		// Recorded fresh by the cycle that wrote this cache.
+		{Name: "radarr-main", Type: "radarr", Total: 42},
+	}, rewritten)
+
+	got := map[string]*time.Time{}
+	for _, inst := range store.snapshot().Instances {
+		if !inst.Stale {
+			t.Fatalf("%s came back not stale; every warm-started instance is", inst.Name)
+		}
+		got[inst.Name] = inst.AsOf
+	}
+	if got["radarr-unreachable"] == nil || !got["radarr-unreachable"].Equal(swept) {
+		t.Errorf("asOf = %v for numbers the cache itself already knew were stale, want their own age %s — not the file's rewrite time", got["radarr-unreachable"], swept)
+	}
+	if got["radarr-main"] == nil || !got["radarr-main"].Equal(rewritten) {
+		t.Errorf("asOf = %v for numbers this cache recorded fresh, want the cache's own write time %s", got["radarr-main"], rewritten)
+	}
+}
+
+// TestActionScope_CarriesNoProgressHandle is the separation the live-progress
+// surface owes the action system. A human-clicked action drives the SAME
+// decision engine, scoped to one item — and it is not a cycle: it must not
+// appear on the dashboard's scan strip, where it would read as a sweep nobody
+// started and would replace whatever a real running cycle was reporting.
+//
+// Two independent things make that true, which is why both are asserted: the
+// scope an action builds carries no handle at all, and the store drops any
+// publish that arrives while no cycle is in progress.
+func TestActionScope_CarriesNoProgressHandle(t *testing.T) {
+	if scope := actionScope(7, nil); scope.progress != nil {
+		t.Error("a GUI action's scope carries a progress handle: a human clicking one finding would publish into the live scan strip as though a cycle were running")
+	}
+
+	store := newStatsStore(true)
+	store.progressFor("radarr-main").stage(scanStageEvaluating, 10)
+	if scan := store.snapshot().Scan; scan.InProgress || len(scan.Instances) != 0 {
+		t.Errorf("scan = %+v, want empty: a publish arriving while no cycle is running must be dropped, never resurrect the surface", scan)
+	}
+}

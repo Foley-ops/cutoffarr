@@ -893,7 +893,20 @@ func (s *statsStore) warmStart(instances []instanceStatsView, writtenAt time.Tim
 		if v.FileReport.Status == "" {
 			v.FileReport.Status = "off"
 		}
+		// The age of the NUMBERS, not of the file — ReverseAsOf's own rule, and
+		// a self-review finding. The cache is rewritten at the end of every full
+		// cycle including one that could not reach this instance, whose numbers
+		// are therefore still some earlier run's and are written out again
+		// already carrying stale: true and their original asOf. Taking the
+		// file's writtenAt for those would move their apparent age forward at
+		// every restart, so a week-unreachable instance would report "showing
+		// last sweep from just now" over week-old numbers. An entry the cache
+		// already knew was stale keeps its own timestamp; everything else — the
+		// numbers that cycle actually recorded — takes the file's.
 		at := writtenAt
+		if v.Stale && v.AsOf != nil {
+			at = *v.AsOf
+		}
 		v.Stale = true
 		v.AsOf = &at
 

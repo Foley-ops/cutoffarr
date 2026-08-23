@@ -771,7 +771,10 @@ func runRadarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 
 	var rev reverseCounts
 	if reverse.enabled {
-		scope.progress.stage(scanStageReverseScan, len(movies))
+		// No stage announced here: the reverse pass's own first step is its
+		// unmonitored wanted/cutoff fetch, which announces itself (and is the
+		// slower half). Announcing "reverse-scan" here too would put a stage on
+		// screen that the very next call replaces.
 		rev = reversePass{
 			logger: logger, cycleLogger: cycleLogger, client: client, inst: inst,
 			profiles: profiles, exclusionTagID: exclusionTagID, tagActive: tagActive,
@@ -2667,7 +2670,7 @@ func runSonarrDecisionEngine(ctx context.Context, logger *slog.Logger, inst Inst
 
 	var rev reverseCounts
 	if reverse.enabled {
-		scope.progress.stage(scanStageReverseScan, len(series))
+		// See the Radarr twin: the pass announces its own stages.
 		rev = reversePass{
 			logger: logger, cycleLogger: cycleLogger, client: client, inst: inst,
 			profiles: profiles, exclusionTagID: exclusionTagID, tagActive: tagActive,
