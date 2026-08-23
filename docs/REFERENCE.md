@@ -1075,7 +1075,9 @@ first sweep.
   own cycle, as they always have. The cache is read by one loader, consumed
   by one presentation-layer function, and reachable from nothing else in the
   program — a test parses the source tree and fails the build if any other
-  file so much as names it.
+  file so much as names any part of it, the file-name constant and the
+  document type included (naming those two is all it would take to read the
+  cache without calling a line of its code).
 - It carries **no authority**. A row you click after a restart was rendered
   from this file; the action still re-derives the finding from live data and
   still refuses when the world has moved on. The cache buys a row's

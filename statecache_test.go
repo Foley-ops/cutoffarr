@@ -937,8 +937,17 @@ func TestStateCacheFile_EveryMutationIsTheCacheWriteConfinedToTheConfigDirectory
 // (*daemon).stateCacheDir is its only caller, and all it can do is decide the
 // cache is disabled for this process. A file that could reach it still could not
 // reach one byte of the cache.
+// stateCacheFileName is the fourth, added in round 5 with the audit that can
+// finally see it, and it is admitted on the narrowest grounds of all: daemon.go
+// names it three times and every one of them is inside a log line's attrs
+// (`"file", stateCacheFileName`), telling the operator which file the sentence
+// they are reading is about. A const holding a file NAME opens nothing; what
+// made it worth banning in the first place is that a name plus os.ReadFile is
+// how a cache becomes a decision input, and daemon.go is the one file already
+// trusted with the loader itself. Any OTHER file naming it now fails this
+// audit, which is the change.
 var stateCacheEntryPointsAllowedOutside = map[string]map[string]bool{
-	"daemon.go": {"loadStateCache": true, "writeStateCache": true, "stateCacheDirInsideAMediaRoot": true},
+	"daemon.go": {"loadStateCache": true, "writeStateCache": true, "stateCacheDirInsideAMediaRoot": true, "stateCacheFileName": true},
 }
 
 // TestTree_TheStateCacheIsReachableOnlyFromTheDaemonsStartupWiring is the pin
@@ -997,6 +1006,50 @@ func (a *actionRunner) authorizeFromDisk(dir string) bool {
 	if len(got) != 1 || !strings.Contains(got[0], "stateCachePaths") {
 		t.Errorf("violations = %v, want exactly one naming stateCachePaths: the internal helpers are as off-limits as the loader, which is why the banned set is derived rather than listed", got)
 	}
+
+	// Round-5 review fix, and the bypass that was invisible to BOTH audits: an
+	// engine that never calls a single function of statecache.go and reads the
+	// cache anyway. The filename and the document type are all it needs —
+	// os.ReadFile is not a filesystem MUTATION, so the v2.2 audit does not look
+	// at it, and derived-from-FuncDecl left every const and type this file
+	// declares nameable from anywhere in the tree. Two lines in decision.go and
+	// the cache is a decision input, which is the one thing the structural pin
+	// exists to make impossible.
+	sneaking := writeActionFile(t, dir, "reverse.go", `package main
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+)
+
+func lastNightsNumbers(cfg Config) []instanceStatsView {
+	raw, err := os.ReadFile(filepath.Join(cfg.ConfigDir, stateCacheFileName))
+	if err != nil {
+		return nil
+	}
+	var doc stateCacheDocument
+	if err := json.Unmarshal(raw, &doc); err != nil || doc.Instances == nil {
+		return nil
+	}
+	return *doc.Instances
+}
+`)
+	got = stateCacheEntryPointViolations(t, source, []string{sneaking})
+	if len(got) != 2 {
+		t.Fatalf("violations = %v, want two (the file name and the document type): a file that opens the cache by name and decodes it into this file's own type never touches a function of it, so a banned set derived only from func declarations cannot see it at all", got)
+	}
+	for _, want := range []string{"stateCacheFileName", "stateCacheDocument"} {
+		found := false
+		for _, v := range got {
+			if strings.Contains(v, want) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("violations = %v, want one naming %s: every top-level name this file declares — consts and types included — is part of the surface an engine must not be able to reach", got, want)
+		}
+	}
 }
 
 // stateCacheEntryPointViolations is the audit body, returning one message per
@@ -1015,23 +1068,45 @@ func stateCacheEntryPointViolations(t *testing.T, source string, others []string
 	if err != nil {
 		t.Fatalf("parsing %s: %v", source, err)
 	}
-	bannedFuncs, bannedMethods := map[string]bool{}, map[string]bool{}
+	bannedNames, bannedMethods := map[string]bool{}, map[string]bool{}
 	for _, decl := range parsed.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok {
-			continue
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if d.Recv != nil {
+				bannedMethods[d.Name.Name] = true
+				continue
+			}
+			bannedNames[d.Name.Name] = true
+		case *ast.GenDecl:
+			// Round-5 review fix: the CONSTS and TYPES too, not only the
+			// functions. Derived-from-FuncDecl left stateCacheFileName,
+			// stateCacheSchemaVersion and stateCacheDocument nameable from any
+			// file in the tree, which is a two-line bypass of this whole audit —
+			// os.ReadFile(filepath.Join(cfg.ConfigDir, stateCacheFileName)) plus a
+			// json.Unmarshal into stateCacheDocument reaches every byte of the
+			// cache without calling one function of statecache.go, and reads are
+			// not filesystem MUTATIONS so the v2.2 audit never looks at them
+			// either. The surface an engine must not be able to reach is every
+			// top-level name this file declares, so that is what is derived.
+			for _, spec := range d.Specs {
+				switch s := spec.(type) {
+				case *ast.ValueSpec:
+					for _, name := range s.Names {
+						bannedNames[name.Name] = true
+					}
+				case *ast.TypeSpec:
+					bannedNames[s.Name.Name] = true
+				}
+			}
 		}
-		if fn.Recv != nil {
-			bannedMethods[fn.Name.Name] = true
-			continue
-		}
-		bannedFuncs[fn.Name.Name] = true
 	}
 	// Vacuity guard: a rename, a moved file or a parse that silently produced
-	// nothing would leave this test green while checking an empty set.
-	for _, must := range []string{"loadStateCache", "writeStateCache", "stateCachePaths", "coldStart"} {
-		if !bannedFuncs[must] {
-			t.Fatalf("%s no longer declares func %s, so this audit is not looking at the state cache at all", source, must)
+	// nothing would leave this test green while checking an empty set. One name
+	// of each KIND, because the derivation now has three branches and a broken
+	// one would otherwise be silent.
+	for _, must := range []string{"loadStateCache", "writeStateCache", "stateCachePaths", "coldStart", "stateCacheFileName", "stateCacheSchemaVersion", "stateCacheDocument"} {
+		if !bannedNames[must] {
+			t.Fatalf("%s no longer declares %s, so this audit is not looking at the whole state cache: the banned set is every top-level name the file declares — funcs, consts and types alike", source, must)
 		}
 	}
 
@@ -1051,7 +1126,7 @@ func stateCacheEntryPointViolations(t *testing.T, source string, others []string
 			}
 			switch {
 			case selectors[id.Pos()] && bannedMethods[id.Name] && !ambiguous[id.Name]:
-			case !selectors[id.Pos()] && bannedFuncs[id.Name]:
+			case !selectors[id.Pos()] && bannedNames[id.Name]:
 			default:
 				return true
 			}
